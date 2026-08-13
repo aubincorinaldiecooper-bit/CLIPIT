@@ -70,6 +70,15 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       throw HttpError.conflict(`Search failed: ${clipRequest.errorMessage ?? 'unknown error'}`);
     }
 
+    // Generation waits for the search to finish, even though partial matches
+    // are already readable. The aggregation pass at the end of a search
+    // rewrites the match rows, and `clips.clip_match_id` cascades on delete —
+    // so a clip generated from a partial result would be deleted out from
+    // under its own running job.
+    if (clipRequest.status !== 'completed') {
+      throw HttpError.conflict('The search is still running — wait for it to complete before generating clips');
+    }
+
     const video = await getVideo(clipRequest.videoId);
     if (!video) throw HttpError.notFound('Video not found');
 
@@ -78,11 +87,7 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       : await listMatches(requestId);
 
     if (matches.length === 0) {
-      throw HttpError.unprocessable(
-        clipRequest.status === 'searching'
-          ? 'The search is still running — wait for it to complete before generating clips'
-          : 'No matches to generate. Try a different instruction.',
-      );
+      throw HttpError.unprocessable('No matches to generate. Try a different instruction.');
     }
 
     if (body.matchIds?.length && matches.length !== body.matchIds.length) {

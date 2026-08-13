@@ -20,12 +20,25 @@ function migrationsDir(): string {
   return found;
 }
 
+/**
+ * Arbitrary constant identifying this application's migration lock. Any
+ * process holding it is the only one allowed to inspect and apply migrations.
+ */
+const MIGRATION_LOCK_ID = 8_143_027;
+
 export async function runMigrations(): Promise<void> {
   const dir = migrationsDir();
   const files = (await readdir(dir)).filter((file) => file.endsWith('.sql')).sort();
 
   const client = await pool.connect();
   try {
+    // The API and the worker both migrate on boot and start concurrently on
+    // Railway. Without this lock both can read the same migration as
+    // unapplied, both apply it, and the loser hits a duplicate key on
+    // schema_migrations and exits during startup. The lock is taken before the
+    // applied set is read so the waiter sees a fresh view.
+    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_ID]);
+
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         name       TEXT PRIMARY KEY,
@@ -66,6 +79,7 @@ export async function runMigrations(): Promise<void> {
 
     logger.info('migrations up to date', { count: files.length });
   } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]).catch(() => undefined);
     client.release();
   }
 }

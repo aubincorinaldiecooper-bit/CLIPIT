@@ -64,35 +64,74 @@ export function getQueues() {
 }
 
 /**
- * Job IDs are derived from the row they act on, so a duplicate enqueue (double
- * click, retried request) collapses into the existing job.
+ * Adds a job under an id derived from the row it acts on.
  *
- * BullMQ forbids ":" in custom job IDs — it is the delimiter in its own Redis
- * key scheme — so the separator here is "-".
+ * The stable id is what makes a duplicate enqueue — a double click, a retried
+ * request — collapse into the work already queued. BullMQ enforces that by
+ * refusing any add whose id already exists, and it counts *retained* terminal
+ * jobs too: failed jobs stay for a week, completed ones for a day. So an
+ * explicit retry ("generate this clip again", "I've re-uploaded the file")
+ * would silently never run, leaving the row stuck in `pending`.
+ *
+ * A completed or failed job under the same id is therefore dropped first, so
+ * the retry really is queued, while a waiting, delayed or active job still
+ * de-duplicates as intended.
+ *
+ * BullMQ also forbids ":" in custom job IDs — it delimits its own Redis keys —
+ * so the separator here is "-".
  */
+// The explicit generic list pins BullMQ's inferred NameType to `string`; left
+// to inference it stays unresolved for a generic data type.
+async function addWithStableId<T>(
+  queue: Queue<T, unknown, string, T, unknown, string>,
+  name: string,
+  data: T,
+  jobId: string,
+  options: JobsOptions = {},
+): Promise<void> {
+  const existing = await queue.getJob(jobId);
+
+  if (existing) {
+    const state = await existing.getState().catch(() => 'unknown');
+    if (state !== 'completed' && state !== 'failed') return;
+
+    try {
+      await existing.remove();
+    } catch {
+      // Raced with BullMQ's own retention cleanup, or the job just became
+      // active again; either way the add below is still the right move.
+    }
+  }
+
+  await queue.add(name, data, { jobId, ...options });
+}
+
 export async function enqueueIngestion(data: IngestionJob): Promise<void> {
-  await getQueues().ingestion.add('ingest', data, { jobId: `ingest-${data.videoId}` });
+  await addWithStableId(getQueues().ingestion, 'ingest', data, `ingest-${data.videoId}`);
 }
 
 export async function enqueuePreprocessing(data: PreprocessingJob): Promise<void> {
-  await getQueues().preprocessing.add('preprocess', data, { jobId: `preprocess-${data.videoId}` });
+  await addWithStableId(getQueues().preprocessing, 'preprocess', data, `preprocess-${data.videoId}`);
 }
 
 export async function enqueueTranscription(data: TranscriptionJob): Promise<void> {
-  await getQueues().transcription.add('transcribe', data, { jobId: `transcribe-${data.videoId}` });
+  await addWithStableId(getQueues().transcription, 'transcribe', data, `transcribe-${data.videoId}`);
 }
 
 export async function enqueueClipSearch(data: ClipSearchJob, options: JobsOptions = {}): Promise<void> {
   // The wait counter is part of the id so each transcript-wait re-enqueue is a
   // distinct job rather than a collision with the one that just finished.
-  await getQueues().clipSearch.add('search', data, {
-    jobId: `search-${data.clipRequestId}-${data.waitedMs ?? 0}`,
-    ...options,
-  });
+  await addWithStableId(
+    getQueues().clipSearch,
+    'search',
+    data,
+    `search-${data.clipRequestId}-${data.waitedMs ?? 0}`,
+    options,
+  );
 }
 
 export async function enqueueClipGeneration(data: ClipGenerationJob): Promise<void> {
-  await getQueues().clipGeneration.add('generate', data, { jobId: `generate-${data.clipId}` });
+  await addWithStableId(getQueues().clipGeneration, 'generate', data, `generate-${data.clipId}`);
 }
 
 export async function closeQueues(): Promise<void> {

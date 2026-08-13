@@ -25,6 +25,9 @@ import type { TranscriptionJob } from '../../queues/index.js';
  * For YouTube sources, creator or automatic captions downloaded by yt-dlp are
  * used when present, and OpenRouter STT is the fallback.
  */
+/** Shortest span a stored segment may occupy, so it can still be matched. */
+const MIN_SEGMENT_SECONDS = 0.5;
+
 export async function handleTranscription(job: Job<TranscriptionJob>): Promise<void> {
   const { videoId } = job.data;
   const log = logger.child({ job: 'transcription', videoId });
@@ -119,9 +122,23 @@ async function transcribeWithStt(
     for (const [index, audio] of audioSegments.entries()) {
       const transcribed = await transcribeAudioFile(audio.filePath);
 
+      // A model that ignores the verbose-json contract returns flat text with
+      // no timings, which the client surfaces as a single [0, 0] segment.
+      const isUntimed =
+        transcribed.length === 1 && transcribed[0]!.startSeconds === 0 && transcribed[0]!.endSeconds === 0;
+
       for (const segment of transcribed) {
         const start = audio.globalStartSeconds + segment.startSeconds;
-        const end = audio.globalStartSeconds + Math.max(segment.endSeconds, segment.startSeconds);
+        let end = audio.globalStartSeconds + Math.max(segment.endSeconds, segment.startSeconds);
+
+        if (isUntimed) {
+          // Span the audio piece it came from: a zero-length segment matches no
+          // chunk range query, so the words would be stored but never searched.
+          end = audio.globalStartSeconds + audio.durationSeconds;
+        } else if (end - start < MIN_SEGMENT_SECONDS) {
+          end = start + MIN_SEGMENT_SECONDS;
+        }
+
         collected.push({
           startSeconds: Number(start.toFixed(3)),
           endSeconds: Number(end.toFixed(3)),
