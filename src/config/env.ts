@@ -88,8 +88,15 @@ const envSchema = z.object({
   MINICPM_MAX_RETRIES: int(3, 0, 10),
   MINICPM_MAX_TOKENS: int(1024, 128, 8192),
   MINICPM_TEMPERATURE: num(0.1, 0, 2),
-  /** Frames sampled from each analysis chunk and sent to the model. */
-  MINICPM_FRAMES_PER_CHUNK: int(32, 2, 256),
+  /**
+   * Frames sampled from each analysis chunk and sent to the model.
+   *
+   * At the default 600s chunk this is one frame roughly every 4.7s, chosen so
+   * short visual events (a goal, a headshot) are not missed between samples.
+   * That costs proportionally more per request than a sparser sample; lower it
+   * if inference volume matters more than recall on brief moments.
+   */
+  MINICPM_FRAMES_PER_CHUNK: int(128, 2, 512),
   /** Longest edge of each sampled frame, in pixels. */
   MINICPM_FRAME_MAX_WIDTH: int(448, 128, 1920),
   MINICPM_FRAME_JPEG_QUALITY: int(4, 1, 31),
@@ -145,6 +152,12 @@ const envSchema = z.object({
   CLIP_PRESET: z.string().default('veryfast'),
   CLIP_AUDIO_BITRATE: z.string().default('160k'),
   MIN_MATCH_CONFIDENCE: num(0.3, 0, 1),
+  /**
+   * Aggregation-stage merging of matches that describe the same moment,
+   * including a moment split across a chunk boundary.
+   */
+  MATCH_MERGE_GAP_SECONDS: num(1.5, 0, 60),
+  MATCH_MERGE_MIN_OVERLAP_RATIO: num(0.5, 0, 1),
   /** Default search modality when a request does not pin one. */
   CLIP_SEARCH_MODE: z.enum(['auto', 'visual', 'transcript', 'both']).default('auto'),
   /** How long a clip search waits for an in-flight transcript before searching without it. */

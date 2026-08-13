@@ -52,9 +52,15 @@ end. A search fans out over those chunks.
 
 Each chunk is searched with one or both kinds of evidence:
 
-- **Frames** — evenly spaced stills sampled from the chunk, sent to MiniCPM-V.
+- **Frames** — `MINICPM_FRAMES_PER_CHUNK` evenly spaced stills sampled from the
+  chunk (128 by default, one every ~4.7s), sent to MiniCPM-V.
 - **Transcript** — the slice of the video's transcript covering that chunk,
   rebased to chunk-local time.
+
+Once every chunk has been searched, matches describing the same moment are
+merged — whether they are duplicate detections inside one chunk or the two
+halves of a moment split across a chunk boundary. See
+`src/services/search/aggregateMatches.ts`.
 
 Which one is used comes from the instruction itself
 (`src/services/search/instructionMode.ts`): "explain", "mentions", "why" and
@@ -172,8 +178,10 @@ curl -X PUT "$UPLOAD_URL" -H 'Content-Type: video/mp4' --upload-file stream.mp4
 curl -sX POST $API/api/videos/$VIDEO_ID/uploaded -H "Authorization: Bearer $TOKEN"
 ```
 
-(If the client cannot call `/uploaded`, polling `GET /api/videos/:videoId` also
-detects the uploaded object and starts the pipeline.)
+`/uploaded` verifies the object is really in storage before queueing, and is
+idempotent — calling it again once the pipeline has started just reports
+current state. It is the only way an upload enters the pipeline; reading
+`GET /api/videos/:videoId` has no side effects.
 
 **3. Wait for preprocessing.** Poll until `status` is `ready`.
 
@@ -257,7 +265,8 @@ AAC with `+faststart`.
 ```
 
 `400` validation · `401` missing/expired token · `404` unknown or not yours ·
-`409` wrong state · `422` nothing to generate · `429` rate limited.
+`409` wrong state · `422` nothing to generate · `429` rate limited ·
+`502` a dependency (storage, model) is unreachable, named in the message.
 
 ---
 
@@ -373,13 +382,16 @@ raising it.
 
 ## Known limitations
 
-- A moment that straddles a chunk boundary can surface as two adjacent
-  matches. Duplicates are merged *within* a chunk, not across chunks, because
-  every match is anchored to the chunk it came from.
-- Visual search sees `MINICPM_FRAMES_PER_CHUNK` stills per chunk (32 by
-  default, one every ~19s at the default chunk size). Events shorter than the
-  sampling interval can fall between frames — raise the frame count for
-  fast-moving sources, at proportional cost.
+- Visual search sees `MINICPM_FRAMES_PER_CHUNK` stills per chunk (128 by
+  default, one every ~4.7s at the default chunk size), chosen so short events
+  are not missed between samples. An event briefer than the sampling interval
+  can still fall between frames; raising the count improves recall at
+  proportionally higher cost per request.
+- Aggregation merges matches that overlap substantially or sit within
+  `MATCH_MERGE_GAP_SECONDS` of each other, so a moment split across a chunk
+  boundary is reported once. A merged match is anchored to the chunk of its
+  earliest contributor, so when it spans a boundary its *local* timestamps
+  extend past that chunk's end. Clips are always cut from the global range.
 - Live streams are rejected; the VOD must have ended.
 - Clip generation re-downloads the original per clip, so generating many clips
   from one video repeats that download.

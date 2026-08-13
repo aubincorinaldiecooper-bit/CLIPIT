@@ -9,6 +9,7 @@ import { getStorage } from '../../services/storage/s3.js';
 import { extractFrames } from '../../services/media/ffmpeg.js';
 import { searchChunk } from '../../services/search/minicpm.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
+import { aggregateMatches } from '../../services/search/aggregateMatches.js';
 import type { TranscriptLine } from '../../services/search/prompt.js';
 import { mapGlobalRangeToChunk, mapLocalRangeToGlobal, mergeOverlappingRanges } from '../../services/timestamps.js';
 import { getVideo, listChunks } from '../../db/repositories/videos.js';
@@ -18,6 +19,7 @@ import {
   finishClipRequest,
   getClipRequest,
   insertMatches,
+  listMatches,
   recordChunkCompleted,
   recordChunkFailure,
   startClipRequest,
@@ -163,8 +165,17 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         throw new Error(`Every chunk failed to search (${failed}/${chunks.length})`);
       }
 
+      // Chunks were searched independently, so the same moment can appear
+      // twice — including as two pieces either side of a chunk boundary. Fold
+      // duplicates together before the search is reported complete.
+      const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
+
       await finishClipRequest(clipRequestId, 'completed');
-      log.info('clip search complete', { matches: totalMatches, failedChunks: failed });
+      log.info('clip search complete', {
+        matches: finalCount,
+        mergedFrom: totalMatches,
+        failedChunks: failed,
+      });
     });
   } catch (error) {
     const message = errorMessage(error);
@@ -172,6 +183,73 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     await finishClipRequest(clipRequestId, 'failed', message);
     throw error;
   }
+}
+
+/**
+ * Re-reads every match stored for a request, merges the ones describing the
+ * same moment, and writes the result back.
+ *
+ * A merged match keeps the chunk of its earliest contributor, so its local
+ * timestamps stay anchored to a real chunk; when a moment spans a boundary the
+ * local range extends past that chunk's end, which is the honest description of
+ * what was found. Clips are always cut using the global range.
+ */
+async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[]): Promise<number> {
+  const stored = await listMatches(clipRequestId);
+  if (stored.length <= 1) return stored.length;
+
+  const merged = aggregateMatches(
+    stored.map((match) => ({
+      chunkId: match.chunkId,
+      globalStartSeconds: match.globalStartSeconds,
+      globalEndSeconds: match.globalEndSeconds,
+      description: match.description,
+      confidence: match.confidence,
+      source: match.source,
+      quote: match.quote,
+    })),
+    {
+      gapSeconds: env.MATCH_MERGE_GAP_SECONDS,
+      minOverlapRatio: env.MATCH_MERGE_MIN_OVERLAP_RATIO,
+      maxDurationSeconds: env.MAX_CLIP_SECONDS,
+    },
+  );
+
+  if (merged.length === stored.length) return stored.length;
+
+  const chunkById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+
+  const rows: NewClipMatch[] = merged.flatMap((match) => {
+    const anchor = chunkById.get(match.chunkId);
+    if (!anchor) return [];
+
+    return [
+      {
+        chunkId: match.chunkId,
+        localStartSeconds: Number((match.globalStartSeconds - anchor.globalStartSeconds).toFixed(3)),
+        localEndSeconds: Number((match.globalEndSeconds - anchor.globalStartSeconds).toFixed(3)),
+        globalStartSeconds: match.globalStartSeconds,
+        globalEndSeconds: match.globalEndSeconds,
+        description: match.description,
+        confidence: match.confidence,
+        source: match.source,
+        quote: match.quote,
+      } satisfies NewClipMatch,
+    ];
+  });
+
+  // Safe to replace: clips are only created from the generate endpoint, which
+  // cannot run until the search reports complete.
+  await deleteMatches(clipRequestId);
+  await insertMatches(clipRequestId, rows);
+
+  logger.info('merged overlapping matches', {
+    clipRequestId,
+    before: stored.length,
+    after: rows.length,
+  });
+
+  return rows.length;
 }
 
 interface SearchSingleChunkInput {

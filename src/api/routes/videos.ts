@@ -223,27 +223,12 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const { videoId } = parse(z.object({ videoId: uuidSchema }), request.params, 'path parameters');
 
-    let video = await getVideo(videoId);
+    // This route is a pure read. Ingestion starts only through the explicit
+    // POST /api/videos/:videoId/uploaded, so polling for status never has a
+    // side effect and there is exactly one path into the pipeline.
+    const video = await getVideo(videoId);
     if (!video) throw HttpError.notFound('Video not found');
     assertOwnership(request, video, 'Video');
-
-    // Fallback for clients that upload and then poll without calling
-    // /uploaded: if the object has landed, start the pipeline here. A storage
-    // failure must not break status polling, so it only logs.
-    if (video.status === 'pending_upload' && video.originalStorageKey) {
-      try {
-        const object = await getStorage().head(video.originalStorageKey);
-        if (object) {
-          await updateVideoMedia(videoId, { sizeBytes: object.sizeBytes });
-          await setVideoStatus(videoId, 'queued');
-          await enqueueIngestion({ videoId });
-          logger.info('upload detected on poll, ingestion queued', { videoId });
-          video = (await getVideo(videoId))!;
-        }
-      } catch (error) {
-        logger.warn('could not check for uploaded object', { videoId, err: error });
-      }
-    }
 
     const chunks = video.status === 'ready' ? await listChunks(videoId) : [];
     return reply.send({ video: serializeVideo(video, chunks) });

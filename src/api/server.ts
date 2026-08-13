@@ -1,7 +1,7 @@
 import Fastify, { type FastifyError, type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import { env } from '../config/env.js';
-import { HttpError } from '../lib/errors.js';
+import { ExternalServiceError, HttpError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { attachPrincipal } from './auth.js';
 import { registerHealthRoutes } from './routes/health.js';
@@ -40,6 +40,23 @@ export async function buildServer(): Promise<FastifyInstance> {
     if (error instanceof HttpError) {
       return reply.code(error.statusCode).send({
         error: { code: error.code, message: error.message, details: error.details ?? undefined },
+      });
+    }
+
+    // A dependency being unreachable is not a bug in the request. Say which
+    // one failed — a misconfigured bucket otherwise reads as a generic 500.
+    if (error instanceof ExternalServiceError) {
+      logger.error('external service unavailable', {
+        method: request.method,
+        url: request.url,
+        service: error.service,
+        err: error,
+      });
+      return reply.code(502).send({
+        error: {
+          code: 'upstream_unavailable',
+          message: `The ${error.service} service is currently unavailable`,
+        },
       });
     }
 
