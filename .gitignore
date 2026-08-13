@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+
+# Never commit real credentials. .env.example is the only env file tracked.
+.env
+.env.*
+!.env.example
+
+*.log
+npm-debug.log*
+tmp/
+.tmp/
+.DS_Store
+.vscode/
+.idea/
+
+# Redis dump from a locally started redis-server
+dump.rdb
