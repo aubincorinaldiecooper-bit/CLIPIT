@@ -1,0 +1,88 @@
+import type { FastifyReply, FastifyRequest } from 'fastify';
+import { env } from '../config/env.js';
+import { HttpError } from '../lib/errors.js';
+import { findSessionByToken } from '../db/repositories/sessions.js';
+import type { Principal } from '../domain/types.js';
+
+/**
+ * Anonymous session authentication.
+ *
+ * A client calls POST /api/sessions once, stores the returned bearer token, and
+ * sends it on every subsequent request. Resources are owned by the session that
+ * created them.
+ *
+ * The indirection through `Principal` is deliberate: when real user accounts
+ * land, `userId` becomes populated and ownership checks switch to it without
+ * any route needing to change.
+ */
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    principal: Principal | null;
+  }
+}
+
+function extractToken(request: FastifyRequest): string | null {
+  const header = request.headers.authorization;
+  if (typeof header === 'string') {
+    const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+    if (match?.[1]) return match[1].trim();
+  }
+
+  // Convenience for browser clients that cannot set headers on media requests.
+  const headerToken = request.headers['x-session-token'];
+  if (typeof headerToken === 'string' && headerToken.trim()) return headerToken.trim();
+
+  return null;
+}
+
+/** Resolves the principal when a token is present; never rejects. */
+export async function attachPrincipal(request: FastifyRequest): Promise<void> {
+  request.principal = null;
+  const token = extractToken(request);
+  if (!token) return;
+
+  const session = await findSessionByToken(token);
+  if (!session) return;
+
+  request.principal = { sessionId: session.id, userId: session.userId };
+}
+
+/** preHandler for routes that require a caller identity. */
+export async function requireSession(request: FastifyRequest, _reply: FastifyReply): Promise<void> {
+  if (!env.REQUIRE_SESSION) return;
+  if (request.principal) return;
+
+  throw new HttpError(
+    401,
+    'unauthenticated',
+    'A session token is required. Create one with POST /api/sessions and send it as "Authorization: Bearer <token>".',
+  );
+}
+
+export function principalOrNull(request: FastifyRequest): Principal | null {
+  return request.principal ?? null;
+}
+
+/**
+ * Ownership check for a resource. Rows created before sessions existed, or by a
+ * server-side process, have a null owner and are readable by anyone — which
+ * only happens when REQUIRE_SESSION is off.
+ */
+export function assertOwnership(
+  request: FastifyRequest,
+  resource: { sessionId: string | null; userId: string | null },
+  resourceName: string,
+): void {
+  if (!env.REQUIRE_SESSION) return;
+  if (resource.sessionId === null && resource.userId === null) return;
+
+  const principal = request.principal;
+  if (!principal) throw HttpError.notFound(`${resourceName} not found`);
+
+  if (principal.userId && resource.userId && principal.userId === resource.userId) return;
+  if (resource.sessionId && principal.sessionId === resource.sessionId) return;
+
+  // 404 rather than 403: an unauthorised caller should not learn the id exists.
+  throw HttpError.notFound(`${resourceName} not found`);
+}
