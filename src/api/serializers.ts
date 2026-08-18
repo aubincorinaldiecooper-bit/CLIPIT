@@ -58,6 +58,11 @@ export function serializeVideo(video: Video, chunks?: VideoChunk[]) {
       segmentCount: video.transcriptSegmentCount,
       error: video.transcriptError,
     },
+    index: {
+      status: video.indexStatus,
+      sceneCount: video.sceneCount,
+      error: video.indexError,
+    },
     createdAt: video.createdAt.toISOString(),
     updatedAt: video.updatedAt.toISOString(),
     ...(chunks

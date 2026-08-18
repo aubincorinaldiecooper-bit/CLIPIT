@@ -101,17 +101,36 @@ const envSchema = z.object({
   MINICPM_MAX_TOKENS: int(1024, 128, 8192),
   MINICPM_TEMPERATURE: num(0.1, 0, 2),
   /**
-   * Frames sampled from each analysis chunk and sent to the model.
-   *
-   * At the default 600s chunk this is one frame roughly every 4.7s, chosen so
-   * short visual events (a goal, a headshot) are not missed between samples.
-   * That costs proportionally more per request than a sparser sample; lower it
-   * if inference volume matters more than recall on brief moments.
+   * Frames per chunk for the FALLBACK query-time visual search — the path used
+   * only when a video has no scene index. 128 frames measured ~208k prompt
+   * tokens in production, past every current model's context window, so a
+   * request at that size can never succeed. Recall on brief moments is the
+   * index's job now (INDEX_FRAMES_PER_CHUNK); this stays sized to fit.
    */
-  MINICPM_FRAMES_PER_CHUNK: int(128, 2, 512),
+  MINICPM_FRAMES_PER_CHUNK: int(32, 2, 64),
   /** Longest edge of each sampled frame, in pixels. */
   MINICPM_FRAME_MAX_WIDTH: int(448, 128, 1920),
   MINICPM_FRAME_JPEG_QUALITY: int(4, 1, 31),
+
+  // --- Scene index (ingest-time visual understanding) ---------------------
+  /**
+   * Build a timestamped scene index of each video at ingest, the way an LLM
+   * ingests a book once and then answers questions about it. Queries run
+   * against this index as text — seconds and a few thousand tokens — instead
+   * of re-sending frames to the model on every search.
+   */
+  INDEXING_ENABLED: bool(true),
+  /** Frames sampled per analysis chunk while building the index. */
+  INDEX_FRAMES_PER_CHUNK: int(48, 8, 256),
+  /**
+   * Frames per model call during indexing. Batches stay small so one request
+   * is always far inside the context window; a chunk is indexed across
+   * ceil(INDEX_FRAMES_PER_CHUNK / this) calls.
+   */
+  INDEX_FRAMES_PER_CALL: int(16, 4, 32),
+  INDEXING_CONCURRENCY: int(2, 1, 16),
+  /** How long a visual search waits for an in-flight index before falling back. */
+  INDEX_WAIT_TIMEOUT_MS: int(900_000, 0, 3_600_000),
 
   // --- Transcription (OpenRouter speech-to-text) -------------------------
   TRANSCRIPTION_ENABLED: bool(true),

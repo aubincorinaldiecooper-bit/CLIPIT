@@ -207,8 +207,16 @@ export interface ExtractedFrame {
 }
 
 /**
- * Samples evenly spaced frames from a chunk. Input seeking (`-ss` before `-i`)
- * keeps each extraction near-instant even late in a file.
+ * Samples evenly spaced frames from a chunk in ONE ffmpeg pass.
+ *
+ * The previous implementation spawned a separate ffmpeg per frame; at 128
+ * frames × 2 concurrent chunks that was a 256-process storm which exhausted
+ * the container's threads (`ff_frame_thread_encoder_init failed`) and got
+ * individual extractions SIGKILLed at their timeout. One decode of the
+ * low-fps proxy writing every frame is drastically cheaper and cannot storm.
+ *
+ * Sampling matches planFrameTimestamps: seeking to step/2 and emitting at
+ * 1/step fps lands each frame at the centre of its slice, `(i + 0.5) * step`.
  */
 export async function extractFrames(
   inputPath: string,
@@ -217,41 +225,43 @@ export async function extractFrames(
   outputDir: string,
 ): Promise<ExtractedFrame[]> {
   const timestamps = planFrameTimestamps(durationSeconds, frameCount);
+  if (timestamps.length === 0) return [];
 
-  const results = await mapWithConcurrency(timestamps, 4, async (seconds, index) => {
-    const filePath = path.join(outputDir, `frame_${String(index).padStart(4, '0')}.jpg`);
-    await run(
-      env.FFMPEG_PATH,
-      [
-        '-hide_banner',
-        '-loglevel', 'error',
-        '-y',
-        '-ss', seconds.toFixed(3),
-        '-i', inputPath,
-        '-frames:v', '1',
-        '-vf', `scale='min(${env.MINICPM_FRAME_MAX_WIDTH},iw)':-2`,
-        '-q:v', String(env.MINICPM_FRAME_JPEG_QUALITY),
-        filePath,
-      ],
-      { timeoutMs: 120_000 },
-    );
+  const step = durationSeconds / timestamps.length;
+  const pattern = path.join(outputDir, 'frame_%04d.jpg');
 
-    // Seeking past the last decodable frame exits 0 without writing anything,
-    // so the file has to be confirmed rather than assumed — a missing frame
-    // would otherwise fail the whole chunk when it is read back for upload.
+  await run(
+    env.FFMPEG_PATH,
+    [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-y',
+      '-ss', (step / 2).toFixed(3),
+      '-i', inputPath,
+      '-vf', `fps=${(1 / step).toFixed(6)},scale='min(${env.MINICPM_FRAME_MAX_WIDTH},iw)':-2`,
+      '-frames:v', String(timestamps.length),
+      '-q:v', String(env.MINICPM_FRAME_JPEG_QUALITY),
+      pattern,
+    ],
+    // One pass over a whole chunk, so the budget scales with the chunk rather
+    // than with a single frame.
+    { timeoutMs: 10 * 60 * 1000 },
+  );
+
+  // A source that runs slightly short writes fewer frames than planned; report
+  // only frames that verifiably exist so a missing file can never be uploaded.
+  const frames: ExtractedFrame[] = [];
+  for (const [index, seconds] of timestamps.entries()) {
+    // ffmpeg's image2 muxer numbers output from 1.
+    const filePath = path.join(outputDir, `frame_${String(index + 1).padStart(4, '0')}.jpg`);
     const info = await stat(filePath).catch(() => null);
     if (!info || info.size === 0) {
-      throw new Error(`no frame was written at ${seconds.toFixed(3)}s`);
+      logger.warn('frame extraction failed', { index, seconds, err: 'no frame was written' });
+      continue;
     }
-
-    return { localSeconds: seconds, filePath } satisfies ExtractedFrame;
-  });
-
-  const frames: ExtractedFrame[] = [];
-  for (const [index, result] of results.entries()) {
-    if (result.status === 'fulfilled') frames.push(result.value);
-    else logger.warn('frame extraction failed', { index, seconds: timestamps[index], err: result.reason });
+    frames.push({ localSeconds: seconds, filePath });
   }
+
   return frames;
 }
 

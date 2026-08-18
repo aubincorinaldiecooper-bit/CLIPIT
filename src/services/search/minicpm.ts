@@ -14,11 +14,11 @@ import { SYSTEM_PROMPT, buildFrameLabel, buildInstructionBlock, buildTranscriptB
  * the environment and is never returned by, or reachable from, the public API.
  */
 
-type ContentPart =
+export type ContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string } };
 
-interface ChatMessage {
+export interface ChatMessage {
   role: 'system' | 'user';
   content: string | ContentPart[];
 }
@@ -49,7 +49,7 @@ export interface SearchChunkResult {
   rawResponse: string;
 }
 
-async function frameToDataUrl(filePath: string): Promise<string> {
+export async function frameToDataUrl(filePath: string): Promise<string> {
   const buffer = await readFile(filePath);
   return `data:image/jpeg;base64,${buffer.toString('base64')}`;
 }
@@ -139,20 +139,20 @@ async function requestCompletion(messages: ChatMessage[]): Promise<string> {
 }
 
 /**
- * Asks the model whether the user's instruction occurs anywhere in one chunk.
- * Returns chunk-local timestamps; the caller maps them to source time.
+ * Runs one chat completion under the shared concurrency cap, retrying only
+ * errors the API reported as transient. Every model call in the codebase —
+ * query-time search and ingest-time indexing alike — goes through here.
  */
-export async function searchChunk(input: SearchChunkInput): Promise<SearchChunkResult> {
-  const messages = await buildMessages(input);
-
+export async function completeWithRetry(
+  messages: ChatMessage[],
+  logContext: Record<string, unknown> = {},
+): Promise<string> {
   return limiter.run(async () => {
     let lastError: unknown;
 
     for (let attempt = 0; attempt <= env.MINICPM_MAX_RETRIES; attempt += 1) {
       try {
-        const rawResponse = await requestCompletion(messages);
-        const { matches, warnings } = parseModelMatches(rawResponse);
-        return { matches, warnings, rawResponse };
+        return await requestCompletion(messages);
       } catch (error) {
         lastError = error;
         const retryable = error instanceof ExternalServiceError ? error.retryable : false;
@@ -161,7 +161,7 @@ export async function searchChunk(input: SearchChunkInput): Promise<SearchChunkR
         logger.warn('retrying model request', {
           attempt: attempt + 1,
           delayMs: delay,
-          chunkIndex: input.chunkIndex,
+          ...logContext,
         });
         await sleep(delay);
       }
@@ -169,4 +169,15 @@ export async function searchChunk(input: SearchChunkInput): Promise<SearchChunkR
 
     throw lastError;
   });
+}
+
+/**
+ * Asks the model whether the user's instruction occurs anywhere in one chunk.
+ * Returns chunk-local timestamps; the caller maps them to source time.
+ */
+export async function searchChunk(input: SearchChunkInput): Promise<SearchChunkResult> {
+  const messages = await buildMessages(input);
+  const rawResponse = await completeWithRetry(messages, { chunkIndex: input.chunkIndex });
+  const { matches, warnings } = parseModelMatches(rawResponse);
+  return { matches, warnings, rawResponse };
 }
