@@ -334,6 +334,23 @@ here provisions Railway resources — create them in the dashboard.
 its credentials into `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_ENDPOINT_URL`, `AWS_REGION`, `BUCKET_NAME`.
 
+Uploads go **browser → bucket**, bypassing the API, which makes them a
+cross-origin request. A bucket with no CORS rule blocks them before a single
+byte is sent, and — because no response is ever received — the browser reports
+no status code, only a generic error. The API therefore applies the rule itself
+on boot, from `BUCKET_CORS_ORIGINS` (defaulting to `API_CORS_ORIGIN`).
+
+This is deliberately non-fatal: if the credentials can write objects but not
+bucket policy, the API still starts and logs
+
+```
+could not configure bucket CORS — browser uploads will fail with no status
+code until this is set manually
+```
+
+in which case set the policy yourself, allowing `PUT`, `GET`, `HEAD` from the
+frontend's origin. Set `BUCKET_CORS_AUTOCONFIGURE=false` to opt out entirely.
+
 **3. API service.** Point it at this repo; the `Dockerfile` is detected
 automatically.
 

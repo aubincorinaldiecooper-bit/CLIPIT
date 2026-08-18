@@ -78,6 +78,18 @@ const envSchema = z.object({
   S3_FORCE_PATH_STYLE: bool(true),
   SIGNED_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
   UPLOAD_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
+  /**
+   * Browsers PUT straight to the bucket, which is a cross-origin request, so
+   * the bucket needs a CORS rule naming the frontend's origin or the upload is
+   * blocked before a byte moves. The API applies the rule on boot rather than
+   * leaving it as an undocumented manual step.
+   */
+  BUCKET_CORS_AUTOCONFIGURE: bool(true),
+  /**
+   * Comma-separated origins allowed to upload. Defaults to API_CORS_ORIGIN,
+   * since anything permitted to call the API is what will be uploading.
+   */
+  BUCKET_CORS_ORIGINS: z.string().trim().optional(),
 
   // --- MiniCPM ------------------------------------------------------------
   MINICPM_API_BASE_URL: z.string().trim().default('https://api.modelbest.cn/v1'),
