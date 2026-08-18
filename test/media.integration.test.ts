@@ -104,8 +104,9 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
   }, 120_000);
 
   it('samples a verification window inside its bounds', async () => {
+    // Deliberately not pre-created: extraction must make its own directory,
+    // since a lenient caller masks the failure as "verification skipped".
     const windowDir = path.join(dir, 'window-frames');
-    await mkdir(windowDir, { recursive: true });
 
     const frames = await extractWindowFrames(source, 1, 3, 4, windowDir);
 

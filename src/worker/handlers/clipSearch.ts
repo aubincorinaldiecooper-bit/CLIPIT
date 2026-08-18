@@ -542,23 +542,30 @@ async function verifyMatches(input: VerifyMatchesInput): Promise<NewClipMatch[]>
       }
 
       if (!verdict.confirmed) {
-        const demoted = Number((match.confidence * 0.35).toFixed(4));
+        // The verifier looked at the footage and said no. Reporting it anyway
+        // would defeat the point of looking.
         logger.info('verification rejected match', {
           matchIndex: index,
           start: match.globalStartSeconds,
           end: match.globalEndSeconds,
-          demotedConfidence: demoted,
         });
-        if (demoted >= env.MIN_MATCH_CONFIDENCE) kept.push({ ...match, confidence: demoted });
         continue;
       }
 
       // Confirmed: refine to what the footage showed, when a range came back.
+      // The refinement is validated against the WINDOW the verifier was shown
+      // — it saw nothing outside it, so times outside it (or on the wrong
+      // clock) are discarded rather than relocating the match blind.
+      const windowGlobalStart = anchor.globalStartSeconds + localStart;
+      const windowGlobalEnd = anchor.globalStartSeconds + localEnd;
       let refined = match;
       if (verdict.startSeconds !== null && verdict.endSeconds !== null) {
         const range = mapLocalRangeToGlobal(
-          { globalStartSeconds: 0, globalEndSeconds: input.durationSeconds },
-          { startSeconds: verdict.startSeconds, endSeconds: verdict.endSeconds },
+          { globalStartSeconds: windowGlobalStart, globalEndSeconds: windowGlobalEnd },
+          {
+            startSeconds: verdict.startSeconds - windowGlobalStart,
+            endSeconds: verdict.endSeconds - windowGlobalStart,
+          },
           { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
         );
         if (range) {

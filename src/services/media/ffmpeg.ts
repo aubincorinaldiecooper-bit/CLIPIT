@@ -1,4 +1,4 @@
-import { readdir, stat } from 'node:fs/promises';
+import { mkdir, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { env } from '../../config/env.js';
 import { run } from '../../lib/exec.js';
@@ -283,6 +283,10 @@ export async function extractWindowFrames(
   const count = Math.max(1, Math.floor(frameCount));
   const step = window / count;
   const pattern = path.join(outputDir, 'vframe_%04d.jpg');
+
+  // ffmpeg does not create output directories; without this every extraction
+  // into a fresh directory fails, and a lenient caller can mask that.
+  await mkdir(outputDir, { recursive: true });
 
   await run(
     env.FFMPEG_PATH,
