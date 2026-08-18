@@ -9,7 +9,7 @@ upload / YouTube URL
   → preprocess (probe, proxy, 10-minute analysis chunks)
   → transcribe (once, over the whole source)
   → user enters a clip instruction
-  → MiniCPM-V searches each chunk (frames and/or transcript)
+  → video model searches each chunk (actual video and/or transcript)
   → map chunk-local timestamps to source timestamps
   → FFmpeg cuts the clips from the original
   → playable signed URLs
@@ -31,8 +31,15 @@ where I explain why I left", and "clip the boss fight" all take the same path.
 | Queues | Redis + BullMQ |
 | Media | FFmpeg / FFprobe, yt-dlp |
 | Storage | S3-compatible adapter (Railway bucket, S3, R2, MinIO) |
-| Vision search | MiniCPM-V 4.6 hosted API |
+| Video understanding | OpenRouter-first; Gemini actual-video candidate |
 | Speech-to-text | OpenRouter (`openai/whisper-1`), YouTube captions preferred |
+
+The checked-in search client still represents the MiniCPM sampled-frame
+baseline. It is not the production provider decision: OpenRouter is the target
+for production video understanding and STT, while MiniCPM actual-video support
+is shadow benchmarking only. See
+[`docs/openrouter-video-investigation.md`](docs/openrouter-video-investigation.md)
+for the candidate, transport constraints, limits, and cutover gates.
 
 Two processes run from one image:
 
@@ -284,7 +291,8 @@ Redis-backed fixed-window limits apply **per session and per IP** to session
 creation, video creation, searches, generation, and reads. Per-IP matters
 because anonymous sessions are free to mint.
 
-Provider credentials (MiniCPM, OpenRouter, storage, database) are read only in
+Provider credentials (including the legacy MiniCPM benchmark, OpenRouter,
+storage, and database) are read only in
 the server process and are never returned by any endpoint.
 
 ---
@@ -296,7 +304,7 @@ the server process and are never returned by any endpoint.
 | `video-ingestion` | confirm the upload, or download with yt-dlp (+ captions) |
 | `video-preprocessing` | ffprobe, build the proxy, cut analysis chunks |
 | `video-transcription` | parse captions, or extract audio once and run STT |
-| `clip-search` | fan out over chunks, call MiniCPM, store matches |
+| `clip-search` | fan out over chunks, call the configured video model, store matches |
 | `clip-generation` | cut the clip from the original, upload, sign |
 
 All long-running work happens in the worker. Job IDs are derived from the row
