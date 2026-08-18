@@ -168,6 +168,21 @@ const envSchema = z.object({
   YTDLP_PATH: z.string().default('yt-dlp'),
   YTDLP_FORMAT: z.string().default('bv*[height<=1080]+ba/b[height<=1080]/b'),
   YTDLP_COOKIES_FILE: z.string().trim().optional(),
+  /**
+   * Cookie jar contents (Netscape format) rather than a path.
+   *
+   * Hosted platforms block YouTube's bot check by IP, and cookies are the
+   * documented remedy — but a container has no persistent disk to keep a
+   * cookie file on. This is written to a file at startup so the deployment
+   * needs nothing but an environment variable.
+   */
+  YTDLP_COOKIES_CONTENT: z.string().optional(),
+  /**
+   * Passed through to `--extractor-args`. YouTube's bot checks vary by player
+   * client, so being able to try another one without a code change is the
+   * difference between a variable edit and a deploy.
+   */
+  YTDLP_EXTRACTOR_ARGS: z.string().trim().optional(),
   /** Root for transient ffmpeg / yt-dlp scratch files. */
   WORK_DIR: z.string().default('/tmp/clipit'),
 

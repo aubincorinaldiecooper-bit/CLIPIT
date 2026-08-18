@@ -1,5 +1,6 @@
-import { Worker, type Job, type Processor } from 'bullmq';
+import { UnrecoverableError, Worker, type Job, type Processor } from 'bullmq';
 import { env } from '../config/env.js';
+import { ExternalServiceError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { closePool } from '../db/pool.js';
 import { runMigrations } from '../db/migrate.js';
@@ -21,8 +22,26 @@ import { handleClipGeneration } from './handlers/clipGeneration.js';
 
 const workers: Worker[] = [];
 
+/**
+ * Honours `ExternalServiceError.retryable`. Some dependency failures — YouTube's
+ * bot check, a rejected API key — will fail identically on every attempt, and
+ * retrying them only delays the error the user is waiting on.
+ */
+function withTerminalFailures<T>(processor: Processor<T>): Processor<T> {
+  return async (job, token) => {
+    try {
+      return await processor(job, token);
+    } catch (error) {
+      if (error instanceof ExternalServiceError && !error.retryable) {
+        throw new UnrecoverableError(error.message);
+      }
+      throw error;
+    }
+  };
+}
+
 function startWorker<T>(name: string, processor: Processor<T>, concurrency: number): Worker<T> {
-  const worker = new Worker<T>(name, processor, {
+  const worker = new Worker<T>(name, withTerminalFailures(processor), {
     connection: getWorkerConnection(),
     concurrency,
     // Media jobs are long; give them room before BullMQ considers them stalled.

@@ -1,4 +1,4 @@
-import { readdir } from 'node:fs/promises';
+import { mkdir, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { env } from '../../config/env.js';
 import { run } from '../../lib/exec.js';
@@ -37,21 +37,80 @@ export interface YoutubeMetadata {
   availableAutoCaptionLangs: string[];
 }
 
-function baseArgs(): string[] {
+/**
+ * Resolved once per process: either the configured path, or a file written
+ * from YTDLP_COOKIES_CONTENT. `null` means no cookies are configured.
+ */
+let cookiesFile: string | null | undefined;
+
+async function resolveCookiesFile(): Promise<string | null> {
+  if (cookiesFile !== undefined) return cookiesFile;
+
+  if (env.YTDLP_COOKIES_FILE) {
+    cookiesFile = env.YTDLP_COOKIES_FILE;
+    return cookiesFile;
+  }
+
+  if (env.YTDLP_COOKIES_CONTENT?.trim()) {
+    // Environment variables frequently arrive with escaped newlines and tabs
+    // (pasted through a dashboard), but the Netscape format is defined by
+    // real ones, so restore them before writing.
+    const content = env.YTDLP_COOKIES_CONTENT.replace(/\\n/g, '\n').replace(/\\t/g, '\t').trim();
+    const withHeader = content.startsWith('#') ? content : `# Netscape HTTP Cookie File\n${content}`;
+
+    const target = path.join(env.WORK_DIR, 'youtube-cookies.txt');
+    await mkdir(path.dirname(target), { recursive: true });
+    // Readable only by this process' user: it is a live YouTube session.
+    await writeFile(target, `${withHeader}\n`, { mode: 0o600 });
+
+    logger.info('wrote yt-dlp cookie jar from configuration', { target });
+    cookiesFile = target;
+    return cookiesFile;
+  }
+
+  cookiesFile = null;
+  return cookiesFile;
+}
+
+async function baseArgs(): Promise<string[]> {
   const args = ['--no-playlist', '--no-progress', '--no-warnings'];
-  if (env.YTDLP_COOKIES_FILE) args.push('--cookies', env.YTDLP_COOKIES_FILE);
+
+  const cookies = await resolveCookiesFile();
+  if (cookies) args.push('--cookies', cookies);
+  if (env.YTDLP_EXTRACTOR_ARGS) args.push('--extractor-args', env.YTDLP_EXTRACTOR_ARGS);
+
   return args;
+}
+
+/** Matches YouTube's "confirm you're not a bot" refusal, however it is worded. */
+export function isBotCheck(message: string): boolean {
+  return /confirm you.{0,3}re not a bot|sign in to confirm|cookies-from-browser/i.test(message);
+}
+
+/**
+ * YouTube's bot check is by far the most common ingestion failure on a hosted
+ * platform, and yt-dlp's raw output buries the actionable part under two wiki
+ * links. Say what happened and what to do instead.
+ */
+export function describeYtdlpFailure(message: string): string {
+  if (!isBotCheck(message)) return message;
+
+  return env.YTDLP_COOKIES_CONTENT || env.YTDLP_COOKIES_FILE
+    ? 'YouTube rejected this request as automated even with cookies configured. The cookies may have expired — export a fresh jar from a logged-in browser.'
+    : 'YouTube is blocking this server as automated traffic, which it does for most cloud hosts. Upload the file directly instead, or set YTDLP_COOKIES_CONTENT with a cookie jar exported from a logged-in browser.';
 }
 
 export async function fetchYoutubeMetadata(url: string): Promise<YoutubeMetadata> {
   let stdout: string;
   try {
-    ({ stdout } = await run(env.YTDLP_PATH, [...baseArgs(), '--dump-single-json', url], {
+    ({ stdout } = await run(env.YTDLP_PATH, [...(await baseArgs()), '--dump-single-json', url], {
       timeoutMs: 120_000,
     }));
   } catch (error) {
-    throw new ExternalServiceError('yt-dlp', `Failed to read video metadata: ${(error as Error).message}`, {
-      retryable: true,
+    const message = (error as Error).message;
+    throw new ExternalServiceError('yt-dlp', describeYtdlpFailure(message), {
+      // Retrying a bot check just burns the attempt budget on the same answer.
+      retryable: !isBotCheck(message),
       cause: error,
     });
   }
@@ -94,7 +153,7 @@ const VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.webm', '.mov', '.m4v', '.flv
  */
 export async function downloadYoutubeVideo(url: string, outputDir: string): Promise<YoutubeDownload> {
   const args = [
-    ...baseArgs(),
+    ...(await baseArgs()),
     '-f', env.YTDLP_FORMAT,
     '--merge-output-format', 'mp4',
     '--restrict-filenames',
@@ -116,8 +175,9 @@ export async function downloadYoutubeVideo(url: string, outputDir: string): Prom
   try {
     await run(env.YTDLP_PATH, args, { timeoutMs: 6 * 60 * 60 * 1000 });
   } catch (error) {
-    throw new ExternalServiceError('yt-dlp', `Download failed: ${(error as Error).message}`, {
-      retryable: true,
+    const message = (error as Error).message;
+    throw new ExternalServiceError('yt-dlp', describeYtdlpFailure(message), {
+      retryable: !isBotCheck(message),
       cause: error,
     });
   }

@@ -380,6 +380,46 @@ raising it.
 
 ---
 
+## YouTube ingestion on a hosted platform
+
+Expect this ingestion failure on any cloud host, including Railway:
+
+```
+ERROR: [youtube] <id>: Sign in to confirm you're not a bot.
+       Use --cookies-from-browser or --cookies for the authentication.
+```
+
+Nothing is wrong with yt-dlp — it ran, and YouTube refused it. The request
+egresses from a shared datacenter IP that a great many other containers also
+use, and YouTube challenges those addresses by default. The same URL downloads
+fine from a laptop and fails from the server. No alternative downloader avoids
+it, because the block is on the address, not the client.
+
+Three ways to deal with it, in order of how much they cost you:
+
+**Upload the file instead.** Direct uploads never touch YouTube and exercise
+the entire rest of the pipeline. If you are testing the product, do this.
+
+**Supply cookies.** Export a cookie jar for `youtube.com` from a logged-in
+browser in Netscape format and set either `YTDLP_COOKIES_FILE` (a path) or
+`YTDLP_COOKIES_CONTENT` (the file's contents, written to `WORK_DIR` at
+startup — the inline form is what a container without a persistent disk
+needs). Cookies are live session credentials, so use a throwaway Google
+account, treat the variable as a secret, and expect to refresh it: YouTube
+expires these, at which point the bot check returns.
+
+**Try another player client.** `YTDLP_EXTRACTOR_ARGS=youtube:player_client=android`
+sometimes gets through where the default client does not. It is a variable
+change rather than a deploy, and it is not reliable — treat it as worth one
+attempt, not as a fix.
+
+A bot check is raised as a non-retryable `ExternalServiceError`, so the worker
+fails the job on the first attempt instead of spending its retry budget on an
+answer that will not change, and the video's `errorMessage` says which of the
+above applies to your configuration.
+
+---
+
 ## Known limitations
 
 - Visual search sees `MINICPM_FRAMES_PER_CHUNK` stills per chunk (128 by
@@ -393,5 +433,8 @@ raising it.
   earliest contributor, so when it spans a boundary its *local* timestamps
   extend past that chunk's end. Clips are always cut from the global range.
 - Live streams are rejected; the VOD must have ended.
+- YouTube ingestion from a datacenter IP generally requires cookies — see
+  [YouTube ingestion on a hosted platform](#youtube-ingestion-on-a-hosted-platform).
+  Uploads are unaffected.
 - Clip generation re-downloads the original per clip, so generating many clips
   from one video repeats that download.
