@@ -93,8 +93,28 @@ function mapTotals(rows: TotalsRow[]): UsageTotals[] {
   }));
 }
 
-/** Cost-per-video: indexing and transcription, by stage. */
+/**
+ * Stages paid once, to make a video searchable at all.
+ *
+ * Search rows also carry a video_id — that is what lets the whole lifetime
+ * cost of a video be totalled — so anything scoped to "what did ingesting
+ * this cost" must say so explicitly. Otherwise the figure climbs every time
+ * someone searches, and cost-per-video silently becomes a function of how
+ * popular the video is.
+ */
+const INGESTION_STAGES: UsageStage[] = ['transcription', 'indexing'];
+
+/** Cost of making one video searchable. Excludes searches run against it. */
 export async function usageForVideo(videoId: string): Promise<UsageTotals[]> {
+  const rows = await queryRows<TotalsRow>(
+    `${totalsSelect} WHERE video_id = $1 AND stage = ANY($2::text[]) GROUP BY stage`,
+    [videoId, INGESTION_STAGES],
+  );
+  return mapTotals(rows);
+}
+
+/** Everything one video has ever cost: ingestion plus every search against it. */
+export async function usageForVideoLifetime(videoId: string): Promise<UsageTotals[]> {
   const rows = await queryRows<TotalsRow>(`${totalsSelect} WHERE video_id = $1 GROUP BY stage`, [videoId]);
   return mapTotals(rows);
 }
