@@ -45,31 +45,41 @@ npm run start:worker   # ingestion, preprocessing, transcription, search, clip c
 
 ## How the search works
 
-A six-hour VOD is never sent to the model in one request. Preprocessing cuts a
-low-resolution **analysis proxy** into fixed **analysis chunks**
-(`ANALYSIS_CHUNK_SECONDS`, default 600s), each stored with its global start and
-end. A search fans out over those chunks.
+The model reads each video **once, at upload** — the way an LLM ingests a book
+and then answers questions about it. Queries never re-watch the video.
 
-Each chunk is searched with one or both kinds of evidence:
+**At ingest**, after preprocessing cuts the low-resolution analysis proxy into
+fixed chunks (`ANALYSIS_CHUNK_SECONDS`, default 600s), two records of the video
+are built in the background:
 
-- **Frames** — `MINICPM_FRAMES_PER_CHUNK` evenly spaced stills sampled from the
-  chunk (128 by default, one every ~4.7s), sent to MiniCPM-V.
-- **Transcript** — the slice of the video's transcript covering that chunk,
-  rebased to chunk-local time.
+- **The scene index** — frames are sampled from each chunk
+  (`INDEX_FRAMES_PER_CHUNK`) and sent to the model in small batches
+  (`INDEX_FRAMES_PER_CALL`, sized to stay far inside any context window). The
+  model writes a neutral, timestamped account of everything it sees — scenes,
+  actions, people, on-screen text — stored in `video_scenes` on the source
+  timeline. No user instruction exists yet, so nothing pre-filters what gets
+  written down.
+- **The transcript** — the audio is extracted once and transcribed with
+  timestamped segments (or YouTube captions are used when available).
 
-Once every chunk has been searched, matches describing the same moment are
-merged — whether they are duplicate detections inside one chunk or the two
-halves of a moment split across a chunk boundary. See
-`src/services/search/aggregateMatches.ts`.
+**At query time**, the user's instruction runs as ONE text-only model request
+over the whole video: the instruction plus the scene index and/or transcript.
+That is a few thousand tokens and a few seconds, instead of hundreds of images
+per chunk per question. Matches come back on the global timeline, are
+validated by the timestamp module, merged
+(`src/services/search/aggregateMatches.ts`), and stored.
 
-Which one is used comes from the instruction itself
+Which evidence is used comes from the instruction itself
 (`src/services/search/instructionMode.ts`): "explain", "mentions", "why" and
 friends route to the transcript; "score", "boss fight", "on screen" route to
-frames; anything ambiguous searches both. Callers can override it per request
-with `mode`, and the resolved choice is returned as `resolvedMode`.
+the scene index; anything ambiguous uses both. Callers can override it per
+request with `mode`, and the resolved choice is returned as `resolvedMode`.
 
-If no transcript is available, a spoken-word search degrades to visual rather
-than failing.
+A visual search on a video whose index is still being built waits up to
+`INDEX_WAIT_TIMEOUT_MS`, then falls back to the legacy per-chunk frame search
+(`MINICPM_FRAMES_PER_CHUNK` stills per chunk, one request per chunk) — the
+same fallback used when indexing failed outright. If no transcript is
+available, a spoken-word search degrades to visual rather than failing.
 
 ### Timestamp mapping
 

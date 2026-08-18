@@ -6,6 +6,7 @@ export const QUEUE_NAMES = {
   ingestion: 'video-ingestion',
   preprocessing: 'video-preprocessing',
   transcription: 'video-transcription',
+  indexing: 'video-indexing',
   clipSearch: 'clip-search',
   clipGeneration: 'clip-generation',
 } as const;
@@ -24,9 +25,13 @@ export interface TranscriptionJob {
   captionsStorageKey?: string | null;
 }
 
+export interface IndexingJob {
+  videoId: string;
+}
+
 export interface ClipSearchJob {
   clipRequestId: string;
-  /** Milliseconds already spent waiting for an in-flight transcript. */
+  /** Milliseconds already spent waiting for an in-flight transcript or index. */
   waitedMs?: number;
 }
 
@@ -45,6 +50,7 @@ let queues: {
   ingestion: Queue<IngestionJob>;
   preprocessing: Queue<PreprocessingJob>;
   transcription: Queue<TranscriptionJob>;
+  indexing: Queue<IndexingJob>;
   clipSearch: Queue<ClipSearchJob>;
   clipGeneration: Queue<ClipGenerationJob>;
 } | null = null;
@@ -56,6 +62,7 @@ export function getQueues() {
       ingestion: new Queue<IngestionJob>(QUEUE_NAMES.ingestion, { connection, defaultJobOptions }),
       preprocessing: new Queue<PreprocessingJob>(QUEUE_NAMES.preprocessing, { connection, defaultJobOptions }),
       transcription: new Queue<TranscriptionJob>(QUEUE_NAMES.transcription, { connection, defaultJobOptions }),
+      indexing: new Queue<IndexingJob>(QUEUE_NAMES.indexing, { connection, defaultJobOptions }),
       clipSearch: new Queue<ClipSearchJob>(QUEUE_NAMES.clipSearch, { connection, defaultJobOptions }),
       clipGeneration: new Queue<ClipGenerationJob>(QUEUE_NAMES.clipGeneration, { connection, defaultJobOptions }),
     };
@@ -116,6 +123,10 @@ export async function enqueuePreprocessing(data: PreprocessingJob): Promise<void
 
 export async function enqueueTranscription(data: TranscriptionJob): Promise<void> {
   await addWithStableId(getQueues().transcription, 'transcribe', data, `transcribe-${data.videoId}`);
+}
+
+export async function enqueueIndexing(data: IndexingJob): Promise<void> {
+  await addWithStableId(getQueues().indexing, 'index', data, `index-${data.videoId}`);
 }
 
 export async function enqueueClipSearch(data: ClipSearchJob, options: JobsOptions = {}): Promise<void> {

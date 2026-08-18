@@ -1,5 +1,6 @@
 import { queryOne, queryRows } from '../pool.js';
 import type {
+  IndexStatus,
   SourceType,
   TranscriptSource,
   TranscriptStatus,
@@ -36,6 +37,9 @@ interface VideoRow {
   transcript_source: TranscriptSource | null;
   transcript_error: string | null;
   transcript_segment_count: number;
+  index_status: IndexStatus;
+  index_error: string | null;
+  scene_count: number;
   created_at: Date;
   updated_at: Date;
 }
@@ -69,6 +73,9 @@ function mapVideo(row: VideoRow): Video {
     transcriptSource: row.transcript_source,
     transcriptError: row.transcript_error,
     transcriptSegmentCount: row.transcript_segment_count,
+    indexStatus: row.index_status,
+    indexError: row.index_error,
+    sceneCount: row.scene_count,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -189,6 +196,22 @@ export async function setTranscriptStatus(
             updated_at = now()
       WHERE id = $1`,
     [videoId, status, options.source ?? null, options.error ?? null, options.segmentCount ?? null],
+  );
+}
+
+export async function setIndexStatus(
+  videoId: string,
+  status: IndexStatus,
+  options: { error?: string | null; sceneCount?: number } = {},
+): Promise<void> {
+  await queryOne(
+    `UPDATE videos
+        SET index_status = $2,
+            index_error = $3,
+            scene_count = COALESCE($4, scene_count),
+            updated_at = now()
+      WHERE id = $1`,
+    [videoId, status, options.error ?? null, options.sceneCount ?? null],
   );
 }
 

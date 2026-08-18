@@ -2,17 +2,23 @@ import path from 'node:path';
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
-import { errorMessage } from '../../lib/errors.js';
+import { errorMessage, ExternalServiceError } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { extractFrames } from '../../services/media/ffmpeg.js';
-import { searchChunk } from '../../services/search/minicpm.js';
+import { completeWithRetry, searchChunk } from '../../services/search/minicpm.js';
+import { parseModelMatches } from '../../services/search/modelResponse.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
-import type { TranscriptLine } from '../../services/search/prompt.js';
+import {
+  buildIndexSearchUserMessage,
+  INDEX_SEARCH_SYSTEM_PROMPT,
+  type TranscriptLine,
+} from '../../services/search/prompt.js';
 import { mapGlobalRangeToChunk, mapLocalRangeToGlobal, mergeOverlappingRanges } from '../../services/timestamps.js';
 import { getVideo, listChunks } from '../../db/repositories/videos.js';
+import { listScenes } from '../../db/repositories/scenes.js';
 import { listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
 import {
   deleteMatches,
@@ -26,7 +32,7 @@ import {
   type NewClipMatch,
 } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, type ClipSearchJob } from '../../queues/index.js';
-import type { MatchSource, ResolvedSearchMode, VideoChunk } from '../../domain/types.js';
+import type { MatchSource, ResolvedSearchMode, Video, VideoChunk } from '../../domain/types.js';
 
 /**
  * Runs the user's instruction against every analysis chunk.
@@ -90,6 +96,25 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       return;
     }
 
+    // A visual search is worth waiting for the scene index for the same
+    // reason: answering from the index takes one small request, while the
+    // fallback re-sends frames per chunk. The wait budget is shared with the
+    // transcript wait above.
+    const indexPending =
+      video.indexStatus === 'pending' || video.indexStatus === 'queued' || video.indexStatus === 'running';
+
+    if (desired.mode !== 'transcript' && env.INDEXING_ENABLED && indexPending && waitedMs < env.INDEX_WAIT_TIMEOUT_MS) {
+      log.info('waiting for scene index before searching', {
+        waitedMs,
+        indexStatus: video.indexStatus,
+      });
+      await enqueueClipSearch(
+        { clipRequestId, waitedMs: waitedMs + env.TRANSCRIPT_WAIT_POLL_MS },
+        { delay: env.TRANSCRIPT_WAIT_POLL_MS },
+      );
+      return;
+    }
+
     // Re-resolve now that waiting is over: the transcript may have failed, or
     // never arrived, in which case we search visually rather than not at all.
     const resolved = resolveSearchMode({
@@ -98,16 +123,47 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       transcriptAvailable: transcriptReady,
     });
 
+    // Answer from the index whenever the evidence the resolved mode needs is
+    // already text: the whole video in ONE small request, instead of
+    // re-sending frames per chunk. The per-chunk frame path survives only as
+    // the fallback for visual searches on videos with no usable index.
+    const indexReady = video.indexStatus === 'ready' && video.sceneCount > 0;
+    const useIndexSearch = resolved.mode === 'transcript' ? transcriptReady : indexReady;
+
     log.info('starting clip search', {
       mode: resolved.mode,
       rationale: resolved.rationale,
+      evidence: useIndexSearch ? 'index' : 'chunk-frames',
       chunks: chunks.length,
       instruction: request.instruction,
     });
 
-    await startClipRequest(clipRequestId, { chunksTotal: chunks.length, resolvedMode: resolved.mode });
+    await startClipRequest(clipRequestId, {
+      chunksTotal: useIndexSearch ? 1 : chunks.length,
+      resolvedMode: resolved.mode,
+    });
     // Clear anything from a previous attempt so a retry cannot double-insert.
     await deleteMatches(clipRequestId);
+
+    if (useIndexSearch) {
+      const found = await searchFromIndex({
+        video,
+        chunks,
+        instruction: request.instruction,
+        mode: resolved.mode,
+        indexReady,
+        transcriptReady,
+      });
+
+      if (found.length > 0) await insertMatches(clipRequestId, found);
+      await recordChunkCompleted(clipRequestId);
+      await job.updateProgress({ stage: 'searching', percent: 100, chunksCompleted: 1, chunksTotal: 1, matches: found.length });
+
+      const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
+      await finishClipRequest(clipRequestId, 'completed');
+      log.info('clip search complete', { matches: finalCount, evidence: 'index' });
+      return;
+    }
 
     let completed = 0;
     let totalMatches = 0;
@@ -159,10 +215,19 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         });
       }
 
-      const failed = results.filter((result) => result.status === 'rejected').length;
+      const rejected = results.filter((result) => result.status === 'rejected');
+      const failed = rejected.length;
 
       if (failed === chunks.length) {
-        throw new Error(`Every chunk failed to search (${failed}/${chunks.length})`);
+        // If every chunk failed with an error its API called permanent — a
+        // rejected key, an over-limit prompt — the retry produces the same
+        // answer, so fail the job terminally instead of burning attempts.
+        const allTerminal = rejected.every(
+          (result) => result.reason instanceof ExternalServiceError && !result.reason.retryable,
+        );
+        const message = `Every chunk failed to search (${failed}/${chunks.length})`;
+        if (allTerminal) throw new ExternalServiceError('minicpm', message, { retryable: false });
+        throw new Error(message);
       }
 
       // Chunks were searched independently, so the same moment can appear
@@ -250,6 +315,117 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
   });
 
   return rows.length;
+}
+
+interface SearchFromIndexInput {
+  video: Video;
+  chunks: VideoChunk[];
+  instruction: string;
+  mode: ResolvedSearchMode;
+  indexReady: boolean;
+  transcriptReady: boolean;
+}
+
+/**
+ * Answers the instruction from what was written down at ingest — the scene
+ * index and/or the transcript — in one text-only model call over the whole
+ * video. Matches come back on the global timeline and are validated with the
+ * same mapping module as chunk matches, using the video itself as the window.
+ */
+async function searchFromIndex(input: SearchFromIndexInput): Promise<NewClipMatch[]> {
+  const { video, chunks, mode } = input;
+  const durationSeconds = video.durationSeconds ?? chunks.at(-1)!.globalEndSeconds;
+
+  const scenes = mode !== 'transcript' && input.indexReady ? await listScenes(video.id) : [];
+  const transcript =
+    mode !== 'visual' && input.transcriptReady
+      ? await listTranscriptSegmentsInRange(video.id, 0, durationSeconds)
+      : [];
+
+  const raw = await completeWithRetry(
+    [
+      { role: 'system', content: INDEX_SEARCH_SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: buildIndexSearchUserMessage({
+          instruction: input.instruction,
+          durationSeconds,
+          scenes: scenes.map((scene) => ({
+            startSeconds: scene.startSeconds,
+            endSeconds: scene.endSeconds,
+            description: scene.description,
+          })),
+          transcript: transcript.map((line) => ({
+            startSeconds: line.startSeconds,
+            endSeconds: line.endSeconds,
+            text: line.text,
+          })),
+        }),
+      },
+    ],
+    { stage: 'index-search' },
+  );
+
+  const { matches, warnings } = parseModelMatches(raw);
+  if (warnings.length > 0) {
+    logger.warn('model output warnings', { stage: 'index-search', warnings: warnings.slice(0, 5) });
+  }
+
+  // The whole video is the mapping window: local time IS global time.
+  const wholeVideo = { globalStartSeconds: 0, globalEndSeconds: durationSeconds };
+
+  const mapped = matches
+    .filter((match) => match.confidence >= env.MIN_MATCH_CONFIDENCE)
+    .flatMap((match) => {
+      const range = mapLocalRangeToGlobal(
+        wholeVideo,
+        { startSeconds: match.startSeconds, endSeconds: match.endSeconds },
+        { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
+      );
+      if (!range) {
+        logger.warn('discarding out-of-range match', {
+          stage: 'index-search',
+          start: match.startSeconds,
+          end: match.endSeconds,
+          durationSeconds,
+        });
+        return [];
+      }
+      return [
+        {
+          startSeconds: range.globalStartSeconds,
+          endSeconds: range.globalEndSeconds,
+          confidence: match.confidence,
+          description: match.description,
+          quote: match.quote,
+        },
+      ];
+    });
+
+  const deduped = mergeOverlappingRanges(mapped);
+
+  return deduped.flatMap((range) => {
+    // Anchor to the chunk containing the match's start, as aggregation does;
+    // the local range may honestly extend past that chunk's end.
+    const anchor =
+      chunks.find(
+        (chunk) => range.startSeconds >= chunk.globalStartSeconds && range.startSeconds < chunk.globalEndSeconds,
+      ) ?? chunks.at(-1)!;
+
+    return [
+      {
+        chunkId: anchor.id,
+        localStartSeconds: Number((range.startSeconds - anchor.globalStartSeconds).toFixed(3)),
+        localEndSeconds: Number((range.endSeconds - anchor.globalStartSeconds).toFixed(3)),
+        globalStartSeconds: Number(range.startSeconds.toFixed(3)),
+        globalEndSeconds: Number(range.endSeconds.toFixed(3)),
+        description: range.description,
+        confidence: range.confidence ?? 0,
+        source: MATCH_SOURCE[mode],
+        quote: range.quote,
+      } satisfies NewClipMatch,
+    ];
+  });
 }
 
 interface SearchSingleChunkInput {
