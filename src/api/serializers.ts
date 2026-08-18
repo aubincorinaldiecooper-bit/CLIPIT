@@ -164,13 +164,13 @@ export function serializeClipRequest(
 export async function serializeVideoWithPlayback(video: Video, chunks?: VideoChunk[]) {
   const base = serializeVideo(video, chunks);
 
-  // The original is playable as soon as its bytes are confirmed in storage:
-  // uploads from the moment ingestion confirms them, YouTube sources once the
-  // download landed. `pending_upload` has no bytes yet — and neither,
-  // reliably, does `failed`: a failed upload that reserved a retry URL holds a
-  // key whose object was never PUT, so signing it would advertise a 404.
-  const playable =
-    video.originalStorageKey !== null && video.status !== 'pending_upload' && video.status !== 'failed';
+  // The original is playable exactly when bytes were confirmed for the
+  // CURRENT key. Both ingestion paths set sizeBytes at that moment — the
+  // upload HEAD-confirm and the YouTube download — and reserving a retry URL
+  // clears it, because the new key's object has not been PUT yet. Status is
+  // deliberately not consulted: a video that failed AFTER its source landed
+  // (say, in preprocessing) still has a perfectly playable original.
+  const playable = video.originalStorageKey !== null && video.sizeBytes !== null;
   if (!playable) return { ...base, playback: null };
 
   const url = await getStorage().createDownloadUrl(video.originalStorageKey!);
