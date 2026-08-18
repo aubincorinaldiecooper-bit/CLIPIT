@@ -39,6 +39,9 @@ model, Qwen3-VL 32B through OpenRouter. There is no fallback model, routing
 cascade, scene-index summary, or sampled-frame primary search stage. OpenRouter
 STT remains separate for timestamped speech.
 
+The provider decision and functional acceptance case are recorded in
+[`docs/openrouter-video-investigation.md`](docs/openrouter-video-investigation.md).
+
 Two processes run from one image:
 
 ```bash

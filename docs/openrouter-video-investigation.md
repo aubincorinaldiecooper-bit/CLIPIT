@@ -1,6 +1,6 @@
 # OpenRouter actual-video MVP
 
-Status: **implementation decision**, reviewed 2026-08-18.
+Status: **implemented MVP decision**, reviewed 2026-08-18.
 
 ## One production path
 
