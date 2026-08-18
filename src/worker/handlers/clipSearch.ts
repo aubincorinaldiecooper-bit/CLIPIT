@@ -8,8 +8,15 @@ import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { extractFrames, extractWindowFrames } from '../../services/media/ffmpeg.js';
 import { completeWithRetry, searchChunk } from '../../services/search/minicpm.js';
-import { parseModelMatches } from '../../services/search/modelResponse.js';
+import { parseModelMatches, type ParsedMatch } from '../../services/search/modelResponse.js';
 import { buildVerifyMessages, parseVerifyResponse } from '../../services/search/verify.js';
+import {
+  estimateTokens,
+  itemsInWindow,
+  planSearchWindows,
+  planWindowCount,
+} from '../../services/search/searchWindows.js';
+import { recordModelUsage, type UsageStage } from '../../db/repositories/usage.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
 import {
@@ -154,6 +161,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         mode: resolved.mode,
         indexReady,
         transcriptReady,
+        clipRequestId,
       });
 
       // The agentic step: check each proposed moment against the frames
@@ -168,6 +176,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
             durationSeconds: video.durationSeconds ?? chunks.at(-1)!.globalEndSeconds,
             instruction: request.instruction,
             workDir: dir,
+            clipRequestId,
+            videoId: video.id,
           }),
         );
       }
@@ -194,6 +204,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           mode: resolved.mode,
           videoId: video.id,
           workDir: dir,
+          clipRequestId,
         });
 
         if (found.length > 0) await insertMatches(clipRequestId, found);
@@ -341,57 +352,104 @@ interface SearchFromIndexInput {
   mode: ResolvedSearchMode;
   indexReady: boolean;
   transcriptReady: boolean;
+  clipRequestId: string;
 }
 
 /**
  * Answers the instruction from what was written down at ingest — the scene
- * index and/or the transcript — in one text-only model call over the whole
- * video. Matches come back on the global timeline and are validated with the
- * same mapping module as chunk matches, using the video itself as the window.
+ * index and/or the transcript.
+ *
+ * Normally that is ONE text-only call carrying the whole video's evidence.
+ * When the evidence is too large for a single request — a multi-hour
+ * transcript will be — the timeline is split into ordered windows and each is
+ * searched separately, because truncating would silently discard the part of
+ * the video the answer might be in. Timestamps are global throughout, so the
+ * results merge exactly like chunk-boundary duplicates.
  */
 async function searchFromIndex(input: SearchFromIndexInput): Promise<NewClipMatch[]> {
   const { video, chunks, mode } = input;
   const durationSeconds = video.durationSeconds ?? chunks.at(-1)!.globalEndSeconds;
 
-  const scenes = mode !== 'transcript' && input.indexReady ? await listScenes(video.id) : [];
+  const scenes =
+    mode !== 'transcript' && input.indexReady
+      ? (await listScenes(video.id)).map((scene) => ({
+          startSeconds: scene.startSeconds,
+          endSeconds: scene.endSeconds,
+          description: scene.description,
+        }))
+      : [];
   const transcript =
     mode !== 'visual' && input.transcriptReady
-      ? await listTranscriptSegmentsInRange(video.id, 0, durationSeconds)
+      ? (await listTranscriptSegmentsInRange(video.id, 0, durationSeconds)).map((line) => ({
+          startSeconds: line.startSeconds,
+          endSeconds: line.endSeconds,
+          text: line.text,
+        }))
       : [];
 
-  const raw = await completeWithRetry(
-    [
-      { role: 'system', content: INDEX_SEARCH_SYSTEM_PROMPT },
-      {
-        role: 'user',
-        content: buildIndexSearchUserMessage({
-          instruction: input.instruction,
-          durationSeconds,
-          scenes: scenes.map((scene) => ({
-            startSeconds: scene.startSeconds,
-            endSeconds: scene.endSeconds,
-            description: scene.description,
-          })),
-          transcript: transcript.map((line) => ({
-            startSeconds: line.startSeconds,
-            endSeconds: line.endSeconds,
-            text: line.text,
-          })),
-        }),
-      },
-    ],
-    { stage: 'index-search' },
-  );
+  const buildMessage = (
+    windowScenes: typeof scenes,
+    windowTranscript: typeof transcript,
+    windowDurationSeconds: number,
+  ) =>
+    buildIndexSearchUserMessage({
+      instruction: input.instruction,
+      durationSeconds: windowDurationSeconds,
+      scenes: windowScenes,
+      transcript: windowTranscript,
+    });
 
-  const { matches, warnings } = parseModelMatches(raw);
-  if (warnings.length > 0) {
-    logger.warn('model output warnings', { stage: 'index-search', warnings: warnings.slice(0, 5) });
+  const fullMessage = buildMessage(scenes, transcript, durationSeconds);
+  const estimated = estimateTokens(INDEX_SEARCH_SYSTEM_PROMPT) + estimateTokens(fullMessage);
+  const windowCount = planWindowCount(estimated, env.SEARCH_TOKEN_BUDGET);
+  const windows = windowCount === 1 ? null : planSearchWindows(durationSeconds, windowCount);
+
+  if (windows) {
+    logger.info('splitting search across windows to stay inside the prompt budget', {
+      estimatedTokens: estimated,
+      budgetTokens: env.SEARCH_TOKEN_BUDGET,
+      windows: windows.length,
+      scenes: scenes.length,
+      transcriptLines: transcript.length,
+    });
+  }
+
+  const requests = windows
+    ? windows.map((window) => ({
+        label: `window ${window.index + 1}/${windows.length}`,
+        // Timestamps stay global: the model is told the true bounds of the
+        // window it is looking at, so nothing needs rebasing on the way back.
+        message: buildMessage(itemsInWindow(scenes, window), itemsInWindow(transcript, window), durationSeconds),
+      }))
+    : [{ label: 'whole video', message: fullMessage }];
+
+  const collected: ParsedMatch[] = [];
+
+  for (const request of requests) {
+    const raw = await completeWithRetry(
+      [
+        { role: 'system', content: INDEX_SEARCH_SYSTEM_PROMPT },
+        { role: 'user', content: request.message },
+      ],
+      { stage: 'index-search', window: request.label },
+      usageReporter('search', video.id, input.clipRequestId),
+    );
+
+    const { matches, warnings } = parseModelMatches(raw);
+    if (warnings.length > 0) {
+      logger.warn('model output warnings', {
+        stage: 'index-search',
+        window: request.label,
+        warnings: warnings.slice(0, 5),
+      });
+    }
+    collected.push(...matches);
   }
 
   // The whole video is the mapping window: local time IS global time.
   const wholeVideo = { globalStartSeconds: 0, globalEndSeconds: durationSeconds };
 
-  const mapped = matches
+  const mapped = collected
     .filter((match) => match.confidence >= env.MIN_MATCH_CONFIDENCE)
     .flatMap((match) => {
       const range = mapLocalRangeToGlobal(
@@ -419,6 +477,7 @@ async function searchFromIndex(input: SearchFromIndexInput): Promise<NewClipMatc
       ];
     });
 
+  // Merges duplicates within one answer and across window seams alike.
   const deduped = mergeOverlappingRanges(mapped);
 
   return deduped.map((range) =>
@@ -434,6 +493,13 @@ async function searchFromIndex(input: SearchFromIndexInput): Promise<NewClipMatc
       MATCH_SOURCE[mode],
     ),
   );
+}
+
+/** Records a model call's tokens against the work that caused it. */
+function usageReporter(stage: UsageStage, videoId: string, clipRequestId: string | null) {
+  return (usage: { promptTokens: number; completionTokens: number; totalTokens: number; provider: string; model: string }) => {
+    void recordModelUsage({ ...usage, stage, videoId, clipRequestId });
+  };
 }
 
 /**
@@ -469,6 +535,37 @@ interface VerifyMatchesInput {
   durationSeconds: number;
   instruction: string;
   workDir: string;
+  clipRequestId: string;
+  videoId: string;
+}
+
+/**
+ * Whether a match's claim rests on speech rather than on what is visible.
+ *
+ * Verification looks at frames and answers "is this VISIBLE here" — a question
+ * a spoken moment can legitimately fail while being perfectly correct (someone
+ * mentions the thing off-camera). Speech and visuals are independent signals,
+ * so the visual check may never be the sole reason a spoken claim disappears.
+ */
+export function hasSpokenEvidence(match: NewClipMatch): boolean {
+  return match.source === 'transcript' || (match.quote?.trim().length ?? 0) > 0;
+}
+
+/** Confidence retained by a rejected match whose spoken evidence still stands. */
+export const SPOKEN_EVIDENCE_DEMOTION = 0.6;
+
+/**
+ * What becomes of a match the verifier could not see, given that speech and
+ * visuals are independent signals:
+ *
+ * - purely visual claim → dropped; the footage is the only evidence it had
+ * - claim with spoken evidence → demoted, never deleted by a visual check
+ *
+ * Returns null when the match should be dropped.
+ */
+export function applyVisualRejection(match: NewClipMatch): NewClipMatch | null {
+  if (!hasSpokenEvidence(match)) return null;
+  return { ...match, confidence: Number((match.confidence * SPOKEN_EVIDENCE_DEMOTION).toFixed(4)) };
 }
 
 /**
@@ -486,6 +583,13 @@ async function verifyMatches(input: VerifyMatchesInput): Promise<NewClipMatch[]>
 
   for (const [index, match] of input.matches.entries()) {
     if (index >= env.VERIFY_MAX_MATCHES) {
+      kept.push(match);
+      continue;
+    }
+
+    // A purely spoken match has no visual claim to check. Sending it to a
+    // "is this visible?" verifier can only produce a wrong rejection.
+    if (match.source === 'transcript') {
       kept.push(match);
       continue;
     }
@@ -532,7 +636,11 @@ async function verifyMatches(input: VerifyMatchesInput): Promise<NewClipMatch[]>
         })),
       });
 
-      const raw = await completeWithRetry(messages, { stage: 'verify', matchIndex: index });
+      const raw = await completeWithRetry(
+        messages,
+        { stage: 'verify', matchIndex: index },
+        usageReporter('verification', input.videoId, input.clipRequestId),
+      );
       const verdict = parseVerifyResponse(raw);
 
       if (!verdict) {
@@ -542,13 +650,22 @@ async function verifyMatches(input: VerifyMatchesInput): Promise<NewClipMatch[]>
       }
 
       if (!verdict.confirmed) {
-        // The verifier looked at the footage and said no. Reporting it anyway
-        // would defeat the point of looking.
-        logger.info('verification rejected match', {
-          matchIndex: index,
-          start: match.globalStartSeconds,
-          end: match.globalEndSeconds,
-        });
+        const survivor = applyVisualRejection(match);
+        if (survivor) {
+          logger.info('verification did not see the claim, but spoken evidence stands', {
+            matchIndex: index,
+            start: match.globalStartSeconds,
+            end: match.globalEndSeconds,
+            demotedConfidence: survivor.confidence,
+          });
+          kept.push(survivor);
+        } else {
+          logger.info('verification rejected match', {
+            matchIndex: index,
+            start: match.globalStartSeconds,
+            end: match.globalEndSeconds,
+          });
+        }
         continue;
       }
 
@@ -615,7 +732,7 @@ const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
   both: 'multimodal',
 };
 
-async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClipMatch[]> {
+async function searchSingleChunk(input: SearchSingleChunkInput & { clipRequestId?: string }): Promise<NewClipMatch[]> {
   const { chunk } = input;
   const chunkDir = path.join(input.workDir, `chunk-${chunk.chunkIndex}`);
 
@@ -644,15 +761,18 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     }));
   }
 
-  const response = await searchChunk({
-    instruction: input.instruction,
-    mode: input.mode,
-    chunkIndex: chunk.chunkIndex,
-    chunkCount: input.chunkCount,
-    chunkDurationSeconds: chunk.durationSeconds,
-    frames,
-    transcript,
-  });
+  const response = await searchChunk(
+    {
+      instruction: input.instruction,
+      mode: input.mode,
+      chunkIndex: chunk.chunkIndex,
+      chunkCount: input.chunkCount,
+      chunkDurationSeconds: chunk.durationSeconds,
+      frames,
+      transcript,
+    },
+    usageReporter('search', input.videoId, input.clipRequestId ?? null),
+  );
 
   if (response.warnings.length > 0) {
     logger.warn('model output warnings', {

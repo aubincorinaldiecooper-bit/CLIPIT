@@ -12,6 +12,7 @@ import { buildSceneIndexMessages, parseSceneResponse } from '../../services/sear
 import { mapLocalRangeToGlobal } from '../../services/timestamps.js';
 import { getVideo, listChunks, setIndexStatus } from '../../db/repositories/videos.js';
 import { replaceScenes, type NewVideoScene } from '../../db/repositories/scenes.js';
+import { recordModelUsage } from '../../db/repositories/usage.js';
 import type { IndexingJob } from '../../queues/index.js';
 import type { VideoChunk } from '../../domain/types.js';
 
@@ -47,7 +48,7 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
 
     await withWorkDir(`index-${videoId}`, async (dir) => {
       const results = await mapWithConcurrency(chunks, env.INDEXING_CONCURRENCY, async (chunk) => {
-        const found = await indexSingleChunk({ chunk, chunkCount: chunks.length, workDir: dir, log });
+        const found = await indexSingleChunk({ chunk, chunkCount: chunks.length, workDir: dir, videoId, log });
         scenes.push(...found);
         chunksDone += 1;
         await job.updateProgress({
@@ -97,6 +98,7 @@ interface IndexSingleChunkInput {
   chunk: VideoChunk;
   chunkCount: number;
   workDir: string;
+  videoId: string;
   log: ReturnType<typeof logger.child>;
 }
 
@@ -130,7 +132,9 @@ async function indexSingleChunk(input: IndexSingleChunkInput): Promise<NewVideoS
       frames: batch,
     });
 
-    const raw = await completeWithRetry(messages, { chunkIndex: chunk.chunkIndex, stage: 'index' });
+    const raw = await completeWithRetry(messages, { chunkIndex: chunk.chunkIndex, stage: 'index' }, (usage) => {
+      void recordModelUsage({ ...usage, stage: 'indexing', videoId: input.videoId, clipRequestId: null });
+    });
     const { scenes: parsed, warnings } = parseSceneResponse(raw);
 
     if (warnings.length > 0) {

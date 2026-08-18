@@ -75,6 +75,15 @@ friends route to the transcript; "score", "boss fight", "on screen" route to
 the scene index; anything ambiguous uses both. Callers can override it per
 request with `mode`, and the resolved choice is returned as `resolvedMode`.
 
+**Long videos.** The search sends every scene and transcript line at once,
+which is right until the evidence outgrows a context window — a six-hour
+transcript does. Before sending, the prompt is estimated against
+`SEARCH_TOKEN_BUDGET`; past it, the timeline is split into ordered windows and
+each is searched separately, with results merged by the same aggregation that
+handles chunk boundaries. Evidence straddling a window seam is given to both
+windows, so a moment on the boundary stays findable. Nothing is ever truncated:
+dropping part of the timeline would silently discard the answer.
+
 **Verification.** The index is sampled at `INDEX_FRAMES_PER_CHUNK` granularity,
 so its timestamps carry that fuzz — and a wrong pick would otherwise never be
 checked. Before matches are reported, each one (up to `VERIFY_MAX_MATCHES`) is
