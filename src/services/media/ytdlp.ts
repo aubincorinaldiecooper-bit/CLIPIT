@@ -1,7 +1,7 @@
 import { mkdir, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { env } from '../../config/env.js';
-import { run } from '../../lib/exec.js';
+import { run, type ProcessError } from '../../lib/exec.js';
 import { ExternalServiceError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 
@@ -74,7 +74,12 @@ async function resolveCookiesFile(): Promise<string | null> {
 
 /** Exported so the flag wiring can be asserted without invoking yt-dlp. */
 export async function baseArgs(): Promise<string[]> {
-  const args = ['--no-playlist', '--no-progress', '--no-warnings'];
+  const args = ['--no-playlist', '--no-progress'];
+
+  // Warnings are the only place yt-dlp says a PO-token provider was
+  // unreachable, so suppress them everywhere except when diagnosing.
+  if (env.YTDLP_VERBOSE) args.push('--verbose');
+  else args.push('--no-warnings');
 
   // YouTube's signature challenges need a real JS engine, and yt-dlp will not
   // pick one up unless it is named explicitly.
@@ -94,6 +99,20 @@ export async function baseArgs(): Promise<string[]> {
   if (env.YTDLP_EXTRACTOR_ARGS) args.push('--extractor-args', env.YTDLP_EXTRACTOR_ARGS);
 
   return args;
+}
+
+/**
+ * Emits yt-dlp's full stderr when YTDLP_VERBOSE is on.
+ *
+ * ProcessError keeps only the last handful of lines in its message, which is
+ * the right default but drops exactly what a YouTube failure needs: which
+ * player clients were attempted, and whether the PO-token provider was
+ * consulted or unreachable.
+ */
+function logYtdlpDiagnostics(error: unknown): void {
+  if (!env.YTDLP_VERBOSE) return;
+  const stderr = (error as ProcessError)?.stderr;
+  if (stderr) logger.error('yt-dlp verbose output', { stderr });
 }
 
 /** Matches YouTube's "confirm you're not a bot" refusal, however it is worded. */
@@ -135,6 +154,7 @@ export async function fetchYoutubeMetadata(url: string): Promise<YoutubeMetadata
     }));
   } catch (error) {
     const message = (error as Error).message;
+    logYtdlpDiagnostics(error);
     throw new ExternalServiceError('yt-dlp', describeYtdlpFailure(message), {
       // Retrying a bot check just burns the attempt budget on the same answer.
       retryable: !isBotCheck(message),
@@ -203,6 +223,7 @@ export async function downloadYoutubeVideo(url: string, outputDir: string): Prom
     await run(env.YTDLP_PATH, args, { timeoutMs: 6 * 60 * 60 * 1000 });
   } catch (error) {
     const message = (error as Error).message;
+    logYtdlpDiagnostics(error);
     throw new ExternalServiceError('yt-dlp', describeYtdlpFailure(message), {
       retryable: !isBotCheck(message),
       cause: error,
