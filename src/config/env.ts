@@ -203,6 +203,15 @@ const envSchema = z.object({
    */
   MATCH_MERGE_GAP_SECONDS: num(1.5, 0, 60),
   MATCH_MERGE_MIN_OVERLAP_RATIO: num(0.5, 0, 1),
+  /**
+   * Prompt-size ceiling for one index-backed search request.
+   *
+   * The search sends every scene and transcript line for the video at once,
+   * which is correct until the video is long enough that the evidence exceeds
+   * a context window. Past this estimate the timeline is split into ordered
+   * windows and searched in several requests — never truncated.
+   */
+  SEARCH_TOKEN_BUDGET: int(100_000, 5_000, 1_000_000),
   /** Default search modality when a request does not pin one. */
   CLIP_SEARCH_MODE: z.enum(['auto', 'visual', 'transcript', 'both']).default('auto'),
   /** How long a clip search waits for an in-flight transcript before searching without it. */

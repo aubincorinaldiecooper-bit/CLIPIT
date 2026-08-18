@@ -3,6 +3,9 @@ import { env } from '../../config/env.js';
 import { ExternalServiceError } from '../../lib/errors.js';
 import { Semaphore, sleep } from '../../lib/concurrency.js';
 import { logger } from '../../lib/logger.js';
+// Type-only: this service reports usage through a callback and never reaches
+// the database itself.
+import type { ModelTokenUsage } from '../../db/repositories/usage.js';
 import type { ResolvedSearchMode } from '../../domain/types.js';
 import { parseModelMatches, type ParsedMatch } from './modelResponse.js';
 import { SYSTEM_PROMPT, buildFrameLabel, buildInstructionBlock, buildTranscriptBlock, type TranscriptLine } from './prompt.js';
@@ -87,9 +90,27 @@ async function buildMessages(input: SearchChunkInput): Promise<ChatMessage[]> {
 
 interface ChatCompletionResponse {
   choices?: Array<{ message?: { content?: string | null } }>;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
 }
 
-async function requestCompletion(messages: ChatMessage[]): Promise<string> {
+/**
+ * Reports one call's token usage. The caller decides what to do with it, so
+ * the model client stays free of storage concerns. `model` is passed through
+ * because the caller cannot otherwise know which model actually served it.
+ */
+export type UsageReporter = (usage: ModelTokenUsage & { provider: string; model: string }) => void;
+
+function readUsage(payload: ChatCompletionResponse): ModelTokenUsage | null {
+  const usage = payload.usage;
+  if (!usage) return null;
+  const promptTokens = Math.max(0, Math.round(usage.prompt_tokens ?? 0));
+  const completionTokens = Math.max(0, Math.round(usage.completion_tokens ?? 0));
+  const totalTokens = Math.max(0, Math.round(usage.total_tokens ?? promptTokens + completionTokens));
+  if (promptTokens === 0 && completionTokens === 0 && totalTokens === 0) return null;
+  return { promptTokens, completionTokens, totalTokens };
+}
+
+async function requestCompletion(messages: ChatMessage[], onUsage?: UsageReporter): Promise<string> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), env.MINICPM_REQUEST_TIMEOUT_MS);
 
@@ -131,11 +152,25 @@ async function requestCompletion(messages: ChatMessage[]): Promise<string> {
   }
 
   const payload = (await response.json()) as ChatCompletionResponse;
+
+  // Reported before the content check: a malformed reply still cost tokens.
+  const usage = readUsage(payload);
+  if (usage && onUsage) onUsage({ ...usage, provider: providerName(), model: env.MINICPM_MODEL });
+
   const content = payload.choices?.[0]?.message?.content;
   if (typeof content !== 'string') {
     throw new ExternalServiceError('minicpm', 'Model response contained no message content', { retryable: false });
   }
   return content;
+}
+
+/** Derived from the base URL, so switching hosts labels usage correctly. */
+function providerName(): string {
+  try {
+    return new URL(env.MINICPM_API_BASE_URL).hostname;
+  } catch {
+    return 'unknown';
+  }
 }
 
 /**
@@ -146,13 +181,14 @@ async function requestCompletion(messages: ChatMessage[]): Promise<string> {
 export async function completeWithRetry(
   messages: ChatMessage[],
   logContext: Record<string, unknown> = {},
+  onUsage?: UsageReporter,
 ): Promise<string> {
   return limiter.run(async () => {
     let lastError: unknown;
 
     for (let attempt = 0; attempt <= env.MINICPM_MAX_RETRIES; attempt += 1) {
       try {
-        return await requestCompletion(messages);
+        return await requestCompletion(messages, onUsage);
       } catch (error) {
         lastError = error;
         const retryable = error instanceof ExternalServiceError ? error.retryable : false;
@@ -175,9 +211,12 @@ export async function completeWithRetry(
  * Asks the model whether the user's instruction occurs anywhere in one chunk.
  * Returns chunk-local timestamps; the caller maps them to source time.
  */
-export async function searchChunk(input: SearchChunkInput): Promise<SearchChunkResult> {
+export async function searchChunk(
+  input: SearchChunkInput,
+  onUsage?: UsageReporter,
+): Promise<SearchChunkResult> {
   const messages = await buildMessages(input);
-  const rawResponse = await completeWithRetry(messages, { chunkIndex: input.chunkIndex });
+  const rawResponse = await completeWithRetry(messages, { chunkIndex: input.chunkIndex }, onUsage);
   const { matches, warnings } = parseModelMatches(rawResponse);
   return { matches, warnings, rawResponse };
 }

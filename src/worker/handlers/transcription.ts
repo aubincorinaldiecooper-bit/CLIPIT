@@ -9,6 +9,7 @@ import { getStorage } from '../../services/storage/s3.js';
 import { extractAudioSegments } from '../../services/media/ffmpeg.js';
 import { parseVttToSegments } from '../../services/transcription/vtt.js';
 import { transcribeAudioFile } from '../../services/transcription/openrouter.js';
+import { recordModelUsage } from '../../db/repositories/usage.js';
 import { getVideo, setTranscriptStatus } from '../../db/repositories/videos.js';
 import { replaceTranscript, type NewTranscriptSegment } from '../../db/repositories/transcripts.js';
 import type { TranscriptSource } from '../../domain/types.js';
@@ -120,7 +121,9 @@ async function transcribeWithStt(
 
     // Sequential over pieces; the OpenRouter client caps real concurrency itself.
     for (const [index, audio] of audioSegments.entries()) {
-      const transcribed = await transcribeAudioFile(audio.filePath);
+      const transcribed = await transcribeAudioFile(audio.filePath, (usage) => {
+        void recordModelUsage({ ...usage, stage: 'transcription', videoId, clipRequestId: null });
+      });
 
       // A model that ignores the verbose-json contract returns flat text with
       // no timings, which the client surfaces as a single [0, 0] segment.
