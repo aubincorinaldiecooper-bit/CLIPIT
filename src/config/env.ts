@@ -183,6 +183,29 @@ const envSchema = z.object({
    * difference between a variable edit and a deploy.
    */
   YTDLP_EXTRACTOR_ARGS: z.string().trim().optional(),
+  /**
+   * Base URL of a bgutil PO-token provider server.
+   *
+   * YouTube demands a Proof-of-Origin token from IP ranges it has flagged —
+   * which is most of any cloud host — and refuses with "Sign in to confirm
+   * you're not a bot" when one is absent. The provider mints them; this points
+   * yt-dlp's plugin at it. Empty means no PO tokens, which on a hosted
+   * platform usually means no YouTube.
+   */
+  YTDLP_POT_BASE_URL: z.string().trim().optional(),
+  /**
+   * JavaScript runtimes yt-dlp may use to solve YouTube's signature
+   * challenges. These are opt-in, and YouTube extraction fails without one.
+   * The runtime image is Node-based, so `node` is always present.
+   */
+  YTDLP_JS_RUNTIMES: z.string().trim().default('node'),
+  /**
+   * Optional `--proxy` for yt-dlp only. The block YouTube applies is on the
+   * source address, so routing just this traffic through a residential
+   * address sidesteps it where tokens and cookies fall short. Supports
+   * http(s) and socks5 (e.g. socks5://user:pass@host:1080).
+   */
+  YTDLP_PROXY: z.string().trim().optional(),
   /** Root for transient ffmpeg / yt-dlp scratch files. */
   WORK_DIR: z.string().default('/tmp/clipit'),
 

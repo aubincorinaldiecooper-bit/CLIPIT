@@ -395,28 +395,81 @@ use, and YouTube challenges those addresses by default. The same URL downloads
 fine from a laptop and fails from the server. No alternative downloader avoids
 it, because the block is on the address, not the client.
 
-Three ways to deal with it, in order of how much they cost you:
+Getting YouTube working from a server takes three separate things. The image
+ships the first two; the third is deployment configuration.
 
-**Upload the file instead.** Direct uploads never touch YouTube and exercise
-the entire rest of the pipeline. If you are testing the product, do this.
+### 1. A current yt-dlp
 
-**Supply cookies.** Export a cookie jar for `youtube.com` from a logged-in
-browser in Netscape format and set either `YTDLP_COOKIES_FILE` (a path) or
-`YTDLP_COOKIES_CONTENT` (the file's contents, written to `WORK_DIR` at
-startup — the inline form is what a container without a persistent disk
-needs). Cookies are live session credentials, so use a throwaway Google
-account, treat the variable as a secret, and expect to refresh it: YouTube
-expires these, at which point the bot check returns.
+YouTube changes deliberately and often, and breaks old versions in the process.
+`YTDLP_VERSION` in the `Dockerfile` is expected to move regularly — a yt-dlp
+more than a few months old fails for reasons fixed upstream long ago. This is
+the cheapest thing to check first and the most often overlooked.
 
-**Try another player client.** `YTDLP_EXTRACTOR_ARGS=youtube:player_client=android`
-sometimes gets through where the default client does not. It is a variable
-change rather than a deploy, and it is not reliable — treat it as worth one
-attempt, not as a fix.
+### 2. A JavaScript runtime, plus `yt-dlp-ejs`
+
+YouTube protects its format URLs with JavaScript signature challenges. Solving
+them needs a real JS engine *and* the `yt-dlp-ejs` components — which the
+official standalone executable bundles but a `pip` install does not. yt-dlp
+will not use a runtime it was not explicitly told about, so the worker always
+passes `--js-runtimes` from `YTDLP_JS_RUNTIMES` (default `node`, always present
+in this Node-based image). Without this, extraction fails no matter what else
+is configured. Verify with:
+
+```
+yt-dlp --verbose --js-runtimes node --simulate 2>&1 | grep -E 'JS runtimes|ejs'
+# [debug] Optional libraries: …, yt_dlp_ejs-0.8.0
+# [debug] JS runtimes: node-22.22.2
+```
+
+The image build asserts both, so a regression fails the build rather than every
+YouTube job.
+
+### 3. A PO-token provider — the actual bot-check remedy
+
+YouTube demands a Proof-of-Origin token from addresses it has flagged. Minting
+one requires running YouTube's own attestation JavaScript, which is what
+[bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+does; its stated purpose is to "bypass the 'Sign in to confirm you're not a
+bot' message when invoking yt-dlp from an IP address flagged by YouTube". The
+yt-dlp plugin is installed in the image and does nothing until you run the
+provider and point the worker at it:
+
+1. Deploy `brainicism/bgutil-ytdlp-pot-provider` as its own service. It listens
+   on **4416** and needs no variables, no volume, and no public domain.
+2. On the **worker**, set
+   `YTDLP_POT_BASE_URL=http://<provider-service>.railway.internal:4416`.
+
+Keep the provider image and the `bgutil-ytdlp-pot-provider` pip package roughly
+in step; they are versioned together.
+
+### If that still is not enough
+
+Two fallbacks, in order:
+
+**Cookies.** Export a jar for `youtube.com` from a logged-in browser in
+Netscape format and set `YTDLP_COOKIES_FILE` (a path) or `YTDLP_COOKIES_CONTENT`
+(the contents, written to `WORK_DIR` at startup — the inline form is what a
+container without a persistent disk needs). These are live session credentials:
+use a throwaway Google account, treat the variable as a secret, and expect to
+refresh it when the bot check returns.
+
+**A residential address.** `YTDLP_PROXY` routes yt-dlp's traffic only — not the
+rest of the pipeline — through an `http(s)` or `socks5://` proxy. The block is
+on the source IP, so this addresses the cause directly. Self-hosting an exit on
+a home connection works as well as a paid pool.
+
+`YTDLP_EXTRACTOR_ARGS=youtube:player_client=android` is worth one attempt, but
+do not treat it as a fix.
+
+### What the failure looks like now
 
 A bot check is raised as a non-retryable `ExternalServiceError`, so the worker
 fails the job on the first attempt instead of spending its retry budget on an
-answer that will not change, and the video's `errorMessage` says which of the
-above applies to your configuration.
+answer that will not change. The video's `errorMessage` lists the remedies you
+have *not* yet configured, so it gets shorter as you work through the list.
+
+**Uploads bypass all of this.** If the goal is to exercise the pipeline rather
+than YouTube specifically, upload a file and skip this section entirely.
 
 ---
 
