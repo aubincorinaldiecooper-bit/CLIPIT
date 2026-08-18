@@ -1,7 +1,7 @@
 /* eslint-disable no-console */
 import { spawn } from 'node:child_process';
 import { readFile, mkdir } from 'node:fs/promises';
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
@@ -32,7 +32,25 @@ const s3 = new S3Client({
   ...(process.env.AWS_ENDPOINT_URL ? { endpoint: process.env.AWS_ENDPOINT_URL, forcePathStyle: true } : {}),
 });
 const BUCKET = need('BUCKET_NAME');
-const SOURCE_KEY = need('SPIKE_SOURCE_KEY');
+
+/**
+ * The uploaded test source. If SPIKE_SOURCE_KEY is unset, find the largest
+ * object under originals/ — the source videos all live there, and the benchmark
+ * only needs one real one.
+ */
+async function resolveSourceKey(): Promise<string> {
+  if (process.env.SPIKE_SOURCE_KEY) return process.env.SPIKE_SOURCE_KEY;
+
+  const listing = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET, Prefix: 'originals/' }));
+  const objects = (listing.Contents ?? [])
+    .filter((object) => object.Key?.endsWith('.mp4'))
+    .sort((a, b) => (b.Size ?? 0) - (a.Size ?? 0));
+  if (objects.length === 0 || !objects[0]?.Key) {
+    throw new Error('no source video found under originals/; set SPIKE_SOURCE_KEY');
+  }
+  console.log('auto-selected source:', objects[0].Key, `(${objects[0].Size} bytes)`);
+  return objects[0].Key;
+}
 
 const SEG_START = 30;
 const SEG_END = 90;
@@ -146,11 +164,46 @@ async function chatWithVideo(opts: {
   console.log(JSON.stringify(result, null, 2));
 }
 
+interface OpenRouterModel {
+  id: string;
+  architecture?: { input_modalities?: string[] };
+}
+
+/** Finds models that accept video input, and picks the two MVP candidates. */
+async function discoverVideoModels(
+  baseUrl: string,
+  apiKey: string,
+): Promise<{ gemini: string | null; qwen: string | null; allVideoModels: string[] }> {
+  const response = await fetch(`${baseUrl}/models`, { headers: { Authorization: `Bearer ${apiKey}` } });
+  if (!response.ok) throw new Error(`/models failed: ${response.status} ${(await response.text()).slice(0, 300)}`);
+  const body = (await response.json()) as { data?: OpenRouterModel[] };
+
+  const allVideoModels = (body.data ?? [])
+    .filter((model) => (model.architecture?.input_modalities ?? []).includes('video'))
+    .map((model) => model.id)
+    .sort();
+
+  // Prefer a non-preview flash Gemini, then any Gemini; a VL Qwen, then any Qwen.
+  const gemini =
+    allVideoModels.find((id) => /google\/gemini.*flash/i.test(id) && !/preview|thinking/i.test(id)) ??
+    allVideoModels.find((id) => /google\/gemini.*flash/i.test(id)) ??
+    allVideoModels.find((id) => /google\/gemini/i.test(id)) ??
+    null;
+  const qwen =
+    allVideoModels.find((id) => /qwen.*vl/i.test(id)) ??
+    allVideoModels.find((id) => /qwen.*flash/i.test(id)) ??
+    allVideoModels.find((id) => /qwen/i.test(id)) ??
+    null;
+
+  return { gemini, qwen, allVideoModels };
+}
+
 async function main(): Promise<void> {
   await mkdir('/tmp/spike', { recursive: true });
 
-  console.log('downloading source…', SOURCE_KEY);
-  const object = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: SOURCE_KEY }));
+  const sourceKey = await resolveSourceKey();
+  console.log('downloading source…', sourceKey);
+  const object = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: sourceKey }));
   await pipeline(object.Body as Readable, createWriteStream('/tmp/spike/source.mp4'));
 
   console.log('cutting segments…');
@@ -172,12 +225,25 @@ async function main(): Promise<void> {
   console.log('presigned URL host:', new URL(presigned).host);
 
   const or = { baseUrl: 'https://openrouter.ai/api/v1', apiKey: need('OPENROUTER_API_KEY'), provider: 'openrouter' };
-  const GEMINI = process.env.SPIKE_GEMINI_MODEL ?? 'google/gemini-3-flash-preview';
-  const QWEN = process.env.SPIKE_QWEN_MODEL ?? 'qwen/qwen3-vl-30b-a3b-instruct';
+
+  // Discover video-capable models at runtime rather than trusting a guessed
+  // slug: OpenRouter renames and deprecates constantly, and a 404 here would
+  // waste the whole run. Prefer a Gemini flash and a Qwen-VL as the two
+  // realistic MVP candidates, falling back to whatever else reports video in.
+  const { gemini, qwen, allVideoModels } = await discoverVideoModels(or.baseUrl, or.apiKey);
+  console.log('video-input models on OpenRouter (first 25):', allVideoModels.slice(0, 25));
+  const GEMINI = process.env.SPIKE_GEMINI_MODEL ?? gemini ?? allVideoModels[0];
+  const QWEN = process.env.SPIKE_QWEN_MODEL ?? qwen ?? allVideoModels[1] ?? allVideoModels[0];
+  console.log('chosen candidates:', { GEMINI, QWEN });
+  if (!GEMINI) throw new Error('no video-input model found on OpenRouter');
 
   await chatWithVideo({ ...or, test: 'T1-gemini-base64-visualtext', model: GEMINI, prompt: Q_VISUAL_TEXT, videoUrl: data720, format: 'base64-720p', videoSeconds: 60, payloadBytes: seg720.length });
   await chatWithVideo({ ...or, test: 'T2-gemini-presigned-visualtext', model: GEMINI, prompt: Q_VISUAL_TEXT, videoUrl: presigned, format: 'presigned-url-720p', videoSeconds: 60, payloadBytes: seg720.length });
-  await chatWithVideo({ ...or, test: 'T3-qwen-base64-visualtext', model: QWEN, prompt: Q_VISUAL_TEXT, videoUrl: data720, format: 'base64-720p', videoSeconds: 60, payloadBytes: seg720.length });
+  if (QWEN) {
+    await chatWithVideo({ ...or, test: 'T3-qwen-base64-visualtext', model: QWEN, prompt: Q_VISUAL_TEXT, videoUrl: data720, format: 'base64-720p', videoSeconds: 60, payloadBytes: seg720.length });
+  } else {
+    console.log('no Qwen video model discovered; skipping T3');
+  }
   await chatWithVideo({ ...or, test: 'T4-gemini-base64-action', model: GEMINI, prompt: Q_ACTION, videoUrl: data720, format: 'base64-720p', videoSeconds: 60, payloadBytes: seg720.length });
   await chatWithVideo({ ...or, test: 'T5-gemini-base64-mixed-audio', model: GEMINI, prompt: Q_MIXED, videoUrl: data720, format: 'base64-720p', videoSeconds: 60, payloadBytes: seg720.length });
 
