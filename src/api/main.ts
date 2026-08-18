@@ -4,11 +4,16 @@ import { closePool } from '../db/pool.js';
 import { runMigrations } from '../db/migrate.js';
 import { closeRedis } from '../queues/connection.js';
 import { closeQueues } from '../queues/index.js';
+import { ensureUploadCors } from '../services/storage/cors.js';
 import { buildServer } from './server.js';
 
 async function main(): Promise<void> {
   // Migrations run on boot so a fresh Railway deploy is usable immediately.
   await runMigrations();
+
+  // Same reasoning: uploads go browser-to-bucket, so the bucket needs a CORS
+  // rule before the first one. Non-fatal — see ensureUploadCors.
+  await ensureUploadCors();
 
   const app = await buildServer();
   await app.listen({ port: env.PORT, host: env.HOST });

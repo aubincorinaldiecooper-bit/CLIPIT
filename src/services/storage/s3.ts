@@ -7,6 +7,7 @@ import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  PutBucketCorsCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
@@ -38,6 +39,36 @@ export class S3StorageAdapter implements StorageAdapter {
   async createUploadUrl(key: string, contentType: string, expiresInSeconds = env.UPLOAD_URL_EXPIRY_SECONDS): Promise<string> {
     const command = new PutObjectCommand({ Bucket: this.bucket, Key: key, ContentType: contentType });
     return getSignedUrl(this.client, command, { expiresIn: expiresInSeconds });
+  }
+
+  /**
+   * A presigned PUT is only half the story: the browser is on the app's origin
+   * and the bucket is on another, so without a CORS rule the request never
+   * leaves the browser and the failure carries no HTTP status to explain
+   * itself. `PutBucketCors` replaces the whole policy, so one rule covers it.
+   */
+  async ensureUploadCors(origins: string[]): Promise<void> {
+    try {
+      await this.client.send(
+        new PutBucketCorsCommand({
+          Bucket: this.bucket,
+          CORSConfiguration: {
+            CORSRules: [
+              {
+                AllowedOrigins: origins,
+                // HEAD and GET cover playback of clips through signed URLs.
+                AllowedMethods: ['PUT', 'GET', 'HEAD'],
+                AllowedHeaders: ['*'],
+                ExposeHeaders: ['ETag'],
+                MaxAgeSeconds: 3600,
+              },
+            ],
+          },
+        }),
+      );
+    } catch (error) {
+      throw new ExternalServiceError('storage', `Failed to configure CORS on ${this.bucket}`, { cause: error });
+    }
   }
 
   async createDownloadUrl(key: string, expiresInSeconds = env.SIGNED_URL_EXPIRY_SECONDS): Promise<string> {
