@@ -72,11 +72,25 @@ async function resolveCookiesFile(): Promise<string | null> {
   return cookiesFile;
 }
 
-async function baseArgs(): Promise<string[]> {
+/** Exported so the flag wiring can be asserted without invoking yt-dlp. */
+export async function baseArgs(): Promise<string[]> {
   const args = ['--no-playlist', '--no-progress', '--no-warnings'];
+
+  // YouTube's signature challenges need a real JS engine, and yt-dlp will not
+  // pick one up unless it is named explicitly.
+  if (env.YTDLP_JS_RUNTIMES) args.push('--js-runtimes', env.YTDLP_JS_RUNTIMES);
+
+  // Applies to yt-dlp only; the rest of the pipeline keeps its own egress.
+  if (env.YTDLP_PROXY) args.push('--proxy', env.YTDLP_PROXY);
 
   const cookies = await resolveCookiesFile();
   if (cookies) args.push('--cookies', cookies);
+
+  // Separate --extractor-args flags rather than one joined string, so an
+  // operator-supplied override cannot corrupt the provider wiring.
+  if (env.YTDLP_POT_BASE_URL) {
+    args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${env.YTDLP_POT_BASE_URL}`);
+  }
   if (env.YTDLP_EXTRACTOR_ARGS) args.push('--extractor-args', env.YTDLP_EXTRACTOR_ARGS);
 
   return args;
@@ -95,9 +109,22 @@ export function isBotCheck(message: string): boolean {
 export function describeYtdlpFailure(message: string): string {
   if (!isBotCheck(message)) return message;
 
-  return env.YTDLP_COOKIES_CONTENT || env.YTDLP_COOKIES_FILE
-    ? 'YouTube rejected this request as automated even with cookies configured. The cookies may have expired — export a fresh jar from a logged-in browser.'
-    : 'YouTube is blocking this server as automated traffic, which it does for most cloud hosts. Upload the file directly instead, or set YTDLP_COOKIES_CONTENT with a cookie jar exported from a logged-in browser.';
+  // Listed in the order worth trying: a token provider is the purpose-built
+  // remedy, cookies are the fallback, a residential address is the last resort.
+  const remedies: string[] = [];
+  if (!env.YTDLP_POT_BASE_URL) {
+    remedies.push('point YTDLP_POT_BASE_URL at a bgutil PO-token provider');
+  }
+  remedies.push(
+    env.YTDLP_COOKIES_CONTENT || env.YTDLP_COOKIES_FILE
+      ? 'refresh the configured cookies, which expire'
+      : 'set YTDLP_COOKIES_CONTENT from a logged-in browser',
+  );
+  if (!env.YTDLP_PROXY) {
+    remedies.push('route yt-dlp through a residential address with YTDLP_PROXY');
+  }
+
+  return `YouTube refused this request as automated traffic, which it does for most cloud hosts. Upload the file directly, or ${remedies.join('; ')}.`;
 }
 
 export async function fetchYoutubeMetadata(url: string): Promise<YoutubeMetadata> {
