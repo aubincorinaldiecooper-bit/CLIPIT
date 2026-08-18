@@ -9,7 +9,7 @@ upload / YouTube URL
   → preprocess (probe, proxy, configurable 2-minute analysis chunks)
   → transcribe (once, over the whole source)
   → user enters a clip instruction
-  → video model searches each chunk (actual video and/or transcript)
+  → Qwen3-VL 32B searches each actual MP4 chunk (video and/or transcript)
   → map chunk-local timestamps to source timestamps
   → FFmpeg cuts the clips from the original
   → playable signed URLs
@@ -36,10 +36,8 @@ where I explain why I left", and "clip the boss fight" all take the same path.
 
 Visual and mixed searches send each actual MP4 analysis chunk to one production
 model, Qwen3-VL 32B through OpenRouter. There is no fallback model, routing
-cascade, or sampled-frame summary stage. OpenRouter STT remains separate for
-timestamped speech. See
-[`docs/openrouter-video-investigation.md`](docs/openrouter-video-investigation.md)
-for the MVP decision and operating constraints.
+cascade, scene-index summary, or sampled-frame primary search stage. OpenRouter
+STT remains separate for timestamped speech.
 
 Two processes run from one image:
 
@@ -72,7 +70,7 @@ halves of a moment split across a chunk boundary. See
 Which one is used comes from the instruction itself
 (`src/services/search/instructionMode.ts`): "explain", "mentions", "why" and
 friends route to the transcript; "score", "boss fight", "on screen" route to
-frames; anything ambiguous searches both. Callers can override it per request
+video; anything ambiguous searches both. Callers can override it per request
 with `mode`, and the resolved choice is returned as `resolvedMode`.
 
 If no transcript is available, a spoken-word search degrades to visual rather
@@ -291,7 +289,7 @@ Redis-backed fixed-window limits apply **per session and per IP** to session
 creation, video creation, searches, generation, and reads. Per-IP matters
 because anonymous sessions are free to mint.
 
-Provider credentials (OpenRouter, storage, and database) are read only in
+Provider credentials (OpenRouter, storage, database) are read only in
 the server process and are never returned by any endpoint.
 
 ---
@@ -303,7 +301,7 @@ the server process and are never returned by any endpoint.
 | `video-ingestion` | confirm the upload, or download with yt-dlp (+ captions) |
 | `video-preprocessing` | ffprobe, build the proxy, cut analysis chunks |
 | `video-transcription` | parse captions, or extract audio once and run STT |
-| `clip-search` | fan out over chunks, call the configured video model, store matches |
+| `clip-search` | fan out over chunks, call Qwen with actual MP4s, store matches |
 | `clip-generation` | cut the clip from the original, upload, sign |
 
 All long-running work happens in the worker. Job IDs are derived from the row
@@ -340,6 +338,23 @@ here provisions Railway resources — create them in the dashboard.
 **2. Bucket.** Add a Railway Storage Bucket (or bring your own S3/R2) and copy
 its credentials into `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_ENDPOINT_URL`, `AWS_REGION`, `BUCKET_NAME`.
+
+Uploads go **browser → bucket**, bypassing the API, which makes them a
+cross-origin request. A bucket with no CORS rule blocks them before a single
+byte is sent, and — because no response is ever received — the browser reports
+no status code, only a generic error. The API therefore applies the rule itself
+on boot, from `BUCKET_CORS_ORIGINS` (defaulting to `API_CORS_ORIGIN`).
+
+This is deliberately non-fatal: if the credentials can write objects but not
+bucket policy, the API still starts and logs
+
+```
+could not configure bucket CORS — browser uploads will fail with no status
+code until this is set manually
+```
+
+in which case set the policy yourself, allowing `PUT`, `GET`, `HEAD` from the
+frontend's origin. Set `BUCKET_CORS_AUTOCONFIGURE=false` to opt out entirely.
 
 **3. API service.** Point it at this repo; the `Dockerfile` is detected
 automatically.
@@ -386,16 +401,112 @@ raising it.
 
 ---
 
+## YouTube ingestion on a hosted platform
+
+Expect this ingestion failure on any cloud host, including Railway:
+
+```
+ERROR: [youtube] <id>: Sign in to confirm you're not a bot.
+       Use --cookies-from-browser or --cookies for the authentication.
+```
+
+Nothing is wrong with yt-dlp — it ran, and YouTube refused it. The request
+egresses from a shared datacenter IP that a great many other containers also
+use, and YouTube challenges those addresses by default. The same URL downloads
+fine from a laptop and fails from the server. No alternative downloader avoids
+it, because the block is on the address, not the client.
+
+Getting YouTube working from a server takes three separate things. The image
+ships the first two; the third is deployment configuration.
+
+### 1. A current yt-dlp
+
+YouTube changes deliberately and often, and breaks old versions in the process.
+`YTDLP_VERSION` in the `Dockerfile` is expected to move regularly — a yt-dlp
+more than a few months old fails for reasons fixed upstream long ago. This is
+the cheapest thing to check first and the most often overlooked.
+
+### 2. A JavaScript runtime, plus `yt-dlp-ejs`
+
+YouTube protects its format URLs with JavaScript signature challenges. Solving
+them needs a real JS engine *and* the `yt-dlp-ejs` components — which the
+official standalone executable bundles but a `pip` install does not. yt-dlp
+will not use a runtime it was not explicitly told about, so the worker always
+passes `--js-runtimes` from `YTDLP_JS_RUNTIMES` (default `node`, always present
+in this Node-based image). Without this, extraction fails no matter what else
+is configured. Verify with:
+
+```
+yt-dlp --verbose --js-runtimes node --simulate 2>&1 | grep -E 'JS runtimes|ejs'
+# [debug] Optional libraries: …, yt_dlp_ejs-0.8.0
+# [debug] JS runtimes: node-22.22.2
+```
+
+The image build asserts both, so a regression fails the build rather than every
+YouTube job.
+
+### 3. A PO-token provider — the actual bot-check remedy
+
+YouTube demands a Proof-of-Origin token from addresses it has flagged. Minting
+one requires running YouTube's own attestation JavaScript, which is what
+[bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+does; its stated purpose is to "bypass the 'Sign in to confirm you're not a
+bot' message when invoking yt-dlp from an IP address flagged by YouTube". The
+yt-dlp plugin is installed in the image and does nothing until you run the
+provider and point the worker at it:
+
+1. Deploy `brainicism/bgutil-ytdlp-pot-provider` as its own service. It listens
+   on **4416** and needs no variables, no volume, and no public domain.
+2. On the **worker**, set
+   `YTDLP_POT_BASE_URL=http://<provider-service>.railway.internal:4416`.
+
+Keep the provider image and the `bgutil-ytdlp-pot-provider` pip package roughly
+in step; they are versioned together.
+
+### If that still is not enough
+
+Two fallbacks, in order:
+
+**Cookies.** Export a jar for `youtube.com` from a logged-in browser in
+Netscape format and set `YTDLP_COOKIES_FILE` (a path) or `YTDLP_COOKIES_CONTENT`
+(the contents, written to `WORK_DIR` at startup — the inline form is what a
+container without a persistent disk needs). These are live session credentials:
+use a throwaway Google account, treat the variable as a secret, and expect to
+refresh it when the bot check returns.
+
+**A residential address.** `YTDLP_PROXY` routes yt-dlp's traffic only — not the
+rest of the pipeline — through an `http(s)` or `socks5://` proxy. The block is
+on the source IP, so this addresses the cause directly. Self-hosting an exit on
+a home connection works as well as a paid pool.
+
+`YTDLP_EXTRACTOR_ARGS=youtube:player_client=android` is worth one attempt, but
+do not treat it as a fix.
+
+### What the failure looks like now
+
+A bot check is raised as a non-retryable `ExternalServiceError`, so the worker
+fails the job on the first attempt instead of spending its retry budget on an
+answer that will not change. The video's `errorMessage` lists the remedies you
+have *not* yet configured, so it gets shorter as you work through the list.
+
+**Uploads bypass all of this.** If the goal is to exercise the pipeline rather
+than YouTube specifically, upload a file and skip this section entirely.
+
+---
+
 ## Known limitations
 
 - Visual search depends on the routed OpenRouter provider accepting the actual
   base64 MP4 payload. Chunk duration is configurable and defaults to two
-  minutes; payload size and provider limits still need production observation.
+  minutes; payload size and provider limits require production observation.
 - Aggregation merges matches that overlap substantially or sit within
   `MATCH_MERGE_GAP_SECONDS` of each other, so a moment split across a chunk
   boundary is reported once. A merged match is anchored to the chunk of its
   earliest contributor, so when it spans a boundary its *local* timestamps
   extend past that chunk's end. Clips are always cut from the global range.
 - Live streams are rejected; the VOD must have ended.
+- YouTube ingestion from a datacenter IP generally requires cookies — see
+  [YouTube ingestion on a hosted platform](#youtube-ingestion-on-a-hosted-platform).
+  Uploads are unaffected.
 - Clip generation re-downloads the original per clip, so generating many clips
   from one video repeats that download.

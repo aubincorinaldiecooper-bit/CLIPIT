@@ -17,6 +17,11 @@ export interface StorageAdapter {
   downloadToFile(key: string, destinationPath: string): Promise<void>;
   head(key: string): Promise<StoredObject | null>;
   remove(key: string): Promise<void>;
+  /**
+   * Allows `origins` to PUT directly to the bucket. Optional: an adapter whose
+   * backing store has no CORS concept simply omits it.
+   */
+  ensureUploadCors?(origins: string[]): Promise<void>;
 }
 
 export const StoragePrefix = {

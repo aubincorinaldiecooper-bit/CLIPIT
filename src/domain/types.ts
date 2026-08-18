@@ -6,6 +6,9 @@ export type TranscriptStatus = 'pending' | 'queued' | 'running' | 'ready' | 'fai
 
 export type TranscriptSource = 'youtube_captions' | 'openrouter_stt';
 
+/** State of the ingest-time visual understanding (scene index) for a video. */
+export type IndexStatus = 'pending' | 'queued' | 'running' | 'ready' | 'failed' | 'unavailable';
+
 export type ClipRequestStatus = 'pending' | 'searching' | 'completed' | 'failed';
 
 export type ClipStatus = 'pending' | 'generating' | 'ready' | 'failed';
@@ -60,8 +63,24 @@ export interface Video {
   transcriptSource: TranscriptSource | null;
   transcriptError: string | null;
   transcriptSegmentCount: number;
+  indexStatus: IndexStatus;
+  indexError: string | null;
+  sceneCount: number;
   createdAt: Date;
   updatedAt: Date;
+}
+
+/**
+ * One entry in a video's scene index: what the model saw during
+ * [startSeconds, endSeconds] of the source, written at ingest time.
+ */
+export interface VideoScene {
+  id: string;
+  videoId: string;
+  sceneIndex: number;
+  startSeconds: number;
+  endSeconds: number;
+  description: string;
 }
 
 export interface VideoChunk {

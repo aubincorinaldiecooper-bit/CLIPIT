@@ -26,7 +26,7 @@ export interface TranscriptionJob {
 
 export interface ClipSearchJob {
   clipRequestId: string;
-  /** Milliseconds already spent waiting for an in-flight transcript. */
+  /** Milliseconds already spent waiting for an in-flight transcript or index. */
   waitedMs?: number;
 }
 

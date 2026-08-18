@@ -58,6 +58,11 @@ export function serializeVideo(video: Video, chunks?: VideoChunk[]) {
       segmentCount: video.transcriptSegmentCount,
       error: video.transcriptError,
     },
+    index: {
+      status: video.indexStatus,
+      sceneCount: video.sceneCount,
+      error: video.indexError,
+    },
     createdAt: video.createdAt.toISOString(),
     updatedAt: video.updatedAt.toISOString(),
     ...(chunks
@@ -148,6 +153,33 @@ export function serializeClipRequest(
     ...(matches
       ? { matches: matches.map((match) => serializeMatch(match, clipsByMatchId?.get(match.id) ?? null)) }
       : {}),
+  };
+}
+
+/**
+ * The detail view adds a signed playback URL for the source, so the client
+ * can seat the video in a player and seek straight to matched moments. Reads
+ * stay side-effect free — this only signs a URL for bytes already in storage.
+ */
+export async function serializeVideoWithPlayback(video: Video, chunks?: VideoChunk[]) {
+  const base = serializeVideo(video, chunks);
+
+  // The original is playable exactly when bytes were confirmed for the
+  // CURRENT key. Both ingestion paths set sizeBytes at that moment — the
+  // upload HEAD-confirm and the YouTube download — and reserving a retry URL
+  // clears it, because the new key's object has not been PUT yet. Status is
+  // deliberately not consulted: a video that failed AFTER its source landed
+  // (say, in preprocessing) still has a perfectly playable original.
+  const playable = video.originalStorageKey !== null && video.sizeBytes !== null;
+  if (!playable) return { ...base, playback: null };
+
+  const url = await getStorage().createDownloadUrl(video.originalStorageKey!);
+  return {
+    ...base,
+    playback: {
+      url,
+      expiresAt: new Date(Date.now() + env.SIGNED_URL_EXPIRY_SECONDS * 1000).toISOString(),
+    },
   };
 }
 

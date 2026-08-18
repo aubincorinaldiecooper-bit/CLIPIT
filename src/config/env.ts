@@ -78,6 +78,8 @@ const envSchema = z.object({
   S3_FORCE_PATH_STYLE: bool(true),
   SIGNED_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
   UPLOAD_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
+  BUCKET_CORS_AUTOCONFIGURE: bool(true),
+  BUCKET_CORS_ORIGINS: z.string().trim().optional(),
 
   // --- OpenRouter video understanding and speech-to-text -----------------
   TRANSCRIPTION_ENABLED: bool(true),
@@ -149,7 +151,13 @@ const envSchema = z.object({
   FFPROBE_PATH: z.string().default('ffprobe'),
   YTDLP_PATH: z.string().default('yt-dlp'),
   YTDLP_FORMAT: z.string().default('bv*[height<=1080]+ba/b[height<=1080]/b'),
+  YTDLP_JS_RUNTIMES: z.string().trim().default('node'),
+  YTDLP_POT_BASE_URL: z.string().trim().optional(),
   YTDLP_COOKIES_FILE: z.string().trim().optional(),
+  YTDLP_COOKIES_CONTENT: z.string().optional(),
+  YTDLP_PROXY: z.string().trim().optional(),
+  YTDLP_VERBOSE: bool(false),
+  YTDLP_EXTRACTOR_ARGS: z.string().trim().optional(),
   /** Root for transient ffmpeg / yt-dlp scratch files. */
   WORK_DIR: z.string().default('/tmp/clipit'),
 

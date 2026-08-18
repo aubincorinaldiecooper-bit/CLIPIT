@@ -27,7 +27,25 @@ const segmentSchema = z.object({
 const responseSchema = z.object({
   text: z.string().optional(),
   segments: z.array(z.unknown()).optional(),
+  // Speech endpoints do not always report usage; when they do, it is recorded
+  // like any other model call.
+  usage: z
+    .object({
+      prompt_tokens: z.number().optional(),
+      completion_tokens: z.number().optional(),
+      total_tokens: z.number().optional(),
+    })
+    .optional(),
 });
+
+/** Reports a transcription call's tokens, when the provider returned any. */
+export type TranscriptionUsageReporter = (usage: {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  provider: string;
+  model: string;
+}) => void;
 
 export interface TranscribedSegment {
   startSeconds: number;
@@ -61,7 +79,7 @@ function buildHeaders(): Record<string, string> {
   return headers;
 }
 
-async function requestTranscription(filePath: string): Promise<TranscribedSegment[]> {
+async function requestTranscription(filePath: string, onUsage?: TranscriptionUsageReporter): Promise<TranscribedSegment[]> {
   if (!env.OPENROUTER_API_KEY) {
     throw new ExternalServiceError('openrouter', 'OPENROUTER_API_KEY is not configured', { retryable: false });
   }
@@ -110,6 +128,16 @@ async function requestTranscription(filePath: string): Promise<TranscribedSegmen
     throw new ExternalServiceError('openrouter', 'Unexpected transcription response shape', { retryable: false });
   }
 
+  const usage = parsed.data.usage;
+  if (usage && onUsage) {
+    const promptTokens = Math.max(0, Math.round(usage.prompt_tokens ?? 0));
+    const completionTokens = Math.max(0, Math.round(usage.completion_tokens ?? 0));
+    const totalTokens = Math.max(0, Math.round(usage.total_tokens ?? promptTokens + completionTokens));
+    if (totalTokens > 0) {
+      onUsage({ promptTokens, completionTokens, totalTokens, provider: 'openrouter.ai', model: env.OPENROUTER_STT_MODEL });
+    }
+  }
+
   const segments: TranscribedSegment[] = [];
   for (const raw of parsed.data.segments ?? []) {
     const segment = segmentSchema.safeParse(raw);
@@ -132,13 +160,16 @@ async function requestTranscription(filePath: string): Promise<TranscribedSegmen
 }
 
 /** Transcribes one audio file, retrying transient failures with backoff. */
-export async function transcribeAudioFile(filePath: string): Promise<TranscribedSegment[]> {
+export async function transcribeAudioFile(
+  filePath: string,
+  onUsage?: TranscriptionUsageReporter,
+): Promise<TranscribedSegment[]> {
   return limiter.run(async () => {
     let lastError: unknown;
 
     for (let attempt = 0; attempt <= env.OPENROUTER_MAX_RETRIES; attempt += 1) {
       try {
-        return await requestTranscription(filePath);
+        return await requestTranscription(filePath, onUsage);
       } catch (error) {
         lastError = error;
         const retryable = error instanceof ExternalServiceError ? error.retryable : false;

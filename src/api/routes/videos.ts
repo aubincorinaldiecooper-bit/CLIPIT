@@ -11,7 +11,7 @@ import { createClipRequest } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
 import { assertOwnership, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
-import { serializeClipRequest, serializeVideo } from '../serializers.js';
+import { serializeClipRequest, serializeVideo, serializeVideoWithPlayback } from '../serializers.js';
 import { parse } from '../validation.js';
 
 const uuidSchema = z.string().uuid('must be a UUID');
@@ -160,10 +160,13 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const key = originalKey(existing.id, filename);
-      await updateVideoMedia(existing.id, { originalStorageKey: key, originalFilename: filename });
+      // The new key's object does not exist until the client PUTs it, so the
+      // byte-confirmation marker is cleared — playback stays null until the
+      // replacement upload is confirmed.
+      await updateVideoMedia(existing.id, { originalStorageKey: key, originalFilename: filename, sizeBytes: null });
 
       return reply.send({
-        video: serializeVideo({ ...existing, originalStorageKey: key, originalFilename: filename }),
+        video: serializeVideo({ ...existing, originalStorageKey: key, originalFilename: filename, sizeBytes: null }),
         upload: await issueUploadUrl(existing.id, filename, contentType),
       });
     }
@@ -231,7 +234,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     assertOwnership(request, video, 'Video');
 
     const chunks = video.status === 'ready' ? await listChunks(videoId) : [];
-    return reply.send({ video: serializeVideo(video, chunks) });
+    return reply.send({ video: await serializeVideoWithPlayback(video, chunks) });
   });
 
   /**

@@ -8,7 +8,7 @@ import { withWorkDir } from '../../lib/workdir.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { chunkKey, proxyKey } from '../../services/storage/types.js';
 import { createAnalysisProxy, ffprobe, splitIntoChunks } from '../../services/media/ffmpeg.js';
-import { getVideo, replaceChunks, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
+import { getVideo, replaceChunks, setIndexStatus, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
 import { enqueueTranscription, type PreprocessingJob } from '../../queues/index.js';
 
 /**
@@ -149,6 +149,10 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
         await setTranscriptStatus(videoId, 'queued');
         await enqueueTranscription({ videoId, captionsStorageKey: video.captionsStorageKey });
       }
+
+      // Query-time Qwen searches the actual MP4 chunks. Scene indexing is not
+      // part of the single-model MVP.
+      await setIndexStatus(videoId, 'unavailable', { error: 'Scene indexing is not used' });
     });
   } catch (error) {
     const message = errorMessage(error);
