@@ -131,6 +131,20 @@ const envSchema = z.object({
   INDEXING_CONCURRENCY: int(2, 1, 16),
   /** How long a visual search waits for an in-flight index before falling back. */
   INDEX_WAIT_TIMEOUT_MS: int(900_000, 0, 3_600_000),
+  /**
+   * Verify index-search matches against the frames actually on screen before
+   * reporting them. The index is sampled at INDEX_FRAMES_PER_CHUNK
+   * granularity, so its timestamps carry that fuzz and a wrong pick is
+   * otherwise never checked; verification refines confirmed moments and
+   * demotes unconfirmed ones.
+   */
+  VERIFY_MATCHES: bool(true),
+  /** Frames sampled across each candidate window during verification. */
+  VERIFY_FRAMES: int(8, 2, 32),
+  /** At most this many matches are verified per search; the rest pass through. */
+  VERIFY_MAX_MATCHES: int(8, 1, 32),
+  /** Padding added around a candidate window before sampling it. */
+  VERIFY_PAD_SECONDS: num(3, 0, 30),
 
   // --- Transcription (OpenRouter speech-to-text) -------------------------
   TRANSCRIPTION_ENABLED: bool(true),

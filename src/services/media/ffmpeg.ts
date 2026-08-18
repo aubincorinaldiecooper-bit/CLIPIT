@@ -266,6 +266,53 @@ export async function extractFrames(
 }
 
 /**
+ * Samples frames from ONE window of a file, for verifying a candidate moment
+ * against what is actually on screen there. Same single-pass, slice-centre
+ * sampling as extractFrames, scoped to [startSeconds, endSeconds].
+ */
+export async function extractWindowFrames(
+  inputPath: string,
+  startSeconds: number,
+  endSeconds: number,
+  frameCount: number,
+  outputDir: string,
+): Promise<ExtractedFrame[]> {
+  const window = endSeconds - startSeconds;
+  if (!(window > 0) || frameCount < 1) return [];
+
+  const count = Math.max(1, Math.floor(frameCount));
+  const step = window / count;
+  const pattern = path.join(outputDir, 'vframe_%04d.jpg');
+
+  await run(
+    env.FFMPEG_PATH,
+    [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-y',
+      '-ss', (startSeconds + step / 2).toFixed(3),
+      '-i', inputPath,
+      '-vf', `fps=${(1 / step).toFixed(6)},scale='min(${env.MINICPM_FRAME_MAX_WIDTH},iw)':-2`,
+      '-frames:v', String(count),
+      '-q:v', String(env.MINICPM_FRAME_JPEG_QUALITY),
+      pattern,
+    ],
+    { timeoutMs: 5 * 60 * 1000 },
+  );
+
+  const frames: ExtractedFrame[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const seconds = startSeconds + step / 2 + index * step;
+    const filePath = path.join(outputDir, `vframe_${String(index + 1).padStart(4, '0')}.jpg`);
+    const info = await stat(filePath).catch(() => null);
+    if (!info || info.size === 0) continue;
+    frames.push({ localSeconds: Number(seconds.toFixed(3)), filePath });
+  }
+
+  return frames;
+}
+
+/**
  * Extracts the full audio track once, as mono 16 kHz — the format Whisper wants
  * — then splits it into upload-sized pieces. The split exists only to respect
  * the transcription API's request-size limit; it is unrelated to the analysis
