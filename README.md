@@ -75,6 +75,16 @@ friends route to the transcript; "score", "boss fight", "on screen" route to
 the scene index; anything ambiguous uses both. Callers can override it per
 request with `mode`, and the resolved choice is returned as `resolvedMode`.
 
+**Verification.** The index is sampled at `INDEX_FRAMES_PER_CHUNK` granularity,
+so its timestamps carry that fuzz — and a wrong pick would otherwise never be
+checked. Before matches are reported, each one (up to `VERIFY_MAX_MATCHES`) is
+verified agentically: `VERIFY_FRAMES` frames are sampled from the claimed
+window of the analysis proxy and shown to the model with the user's
+instruction. A confirmed moment gets its timestamps refined to what the
+footage shows; an unconfirmed one loses most of its confidence and drops below
+the reporting floor. A verification that itself fails keeps the original match
+— the check may not destroy information it could not improve.
+
 A visual search on a video whose index is still being built waits up to
 `INDEX_WAIT_TIMEOUT_MS`, then falls back to the legacy per-chunk frame search
 (`MINICPM_FRAMES_PER_CHUNK` stills per chunk, one request per chunk) — the

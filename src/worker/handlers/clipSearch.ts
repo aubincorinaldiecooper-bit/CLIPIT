@@ -6,9 +6,10 @@ import { errorMessage, ExternalServiceError } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
-import { extractFrames } from '../../services/media/ffmpeg.js';
+import { extractFrames, extractWindowFrames } from '../../services/media/ffmpeg.js';
 import { completeWithRetry, searchChunk } from '../../services/search/minicpm.js';
 import { parseModelMatches } from '../../services/search/modelResponse.js';
+import { buildVerifyMessages, parseVerifyResponse } from '../../services/search/verify.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
 import {
@@ -146,7 +147,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     await deleteMatches(clipRequestId);
 
     if (useIndexSearch) {
-      const found = await searchFromIndex({
+      let found = await searchFromIndex({
         video,
         chunks,
         instruction: request.instruction,
@@ -154,6 +155,22 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         indexReady,
         transcriptReady,
       });
+
+      // The agentic step: check each proposed moment against the frames
+      // actually on screen there before reporting it. Transcript-only
+      // answers quote the speech itself, which needs no visual check.
+      if (found.length > 0 && resolved.mode !== 'transcript' && env.VERIFY_MATCHES) {
+        await job.updateProgress({ stage: 'verifying', percent: 80, matches: found.length });
+        found = await withWorkDir(`verify-${clipRequestId}`, (dir) =>
+          verifyMatches({
+            matches: found,
+            chunks,
+            durationSeconds: video.durationSeconds ?? chunks.at(-1)!.globalEndSeconds,
+            instruction: request.instruction,
+            workDir: dir,
+          }),
+        );
+      }
 
       if (found.length > 0) await insertMatches(clipRequestId, found);
       await recordChunkCompleted(clipRequestId);
@@ -404,28 +421,183 @@ async function searchFromIndex(input: SearchFromIndexInput): Promise<NewClipMatc
 
   const deduped = mergeOverlappingRanges(mapped);
 
-  return deduped.flatMap((range) => {
-    // Anchor to the chunk containing the match's start, as aggregation does;
-    // the local range may honestly extend past that chunk's end.
-    const anchor =
-      chunks.find(
-        (chunk) => range.startSeconds >= chunk.globalStartSeconds && range.startSeconds < chunk.globalEndSeconds,
-      ) ?? chunks.at(-1)!;
-
-    return [
+  return deduped.map((range) =>
+    anchorToChunk(
       {
-        chunkId: anchor.id,
-        localStartSeconds: Number((range.startSeconds - anchor.globalStartSeconds).toFixed(3)),
-        localEndSeconds: Number((range.endSeconds - anchor.globalStartSeconds).toFixed(3)),
-        globalStartSeconds: Number(range.startSeconds.toFixed(3)),
-        globalEndSeconds: Number(range.endSeconds.toFixed(3)),
+        startSeconds: range.startSeconds,
+        endSeconds: range.endSeconds,
         description: range.description,
         confidence: range.confidence ?? 0,
-        source: MATCH_SOURCE[mode],
-        quote: range.quote,
-      } satisfies NewClipMatch,
-    ];
-  });
+        quote: range.quote ?? null,
+      },
+      chunks,
+      MATCH_SOURCE[mode],
+    ),
+  );
+}
+
+/**
+ * Anchors a global range to the chunk containing its start, as aggregation
+ * does; the local range may honestly extend past that chunk's end.
+ */
+function anchorToChunk(
+  range: { startSeconds: number; endSeconds: number; description: string; confidence: number; quote: string | null },
+  chunks: VideoChunk[],
+  source: MatchSource,
+): NewClipMatch {
+  const anchor =
+    chunks.find(
+      (chunk) => range.startSeconds >= chunk.globalStartSeconds && range.startSeconds < chunk.globalEndSeconds,
+    ) ?? chunks.at(-1)!;
+
+  return {
+    chunkId: anchor.id,
+    localStartSeconds: Number((range.startSeconds - anchor.globalStartSeconds).toFixed(3)),
+    localEndSeconds: Number((range.endSeconds - anchor.globalStartSeconds).toFixed(3)),
+    globalStartSeconds: Number(range.startSeconds.toFixed(3)),
+    globalEndSeconds: Number(range.endSeconds.toFixed(3)),
+    description: range.description,
+    confidence: range.confidence,
+    source,
+    quote: range.quote,
+  } satisfies NewClipMatch;
+}
+
+interface VerifyMatchesInput {
+  matches: NewClipMatch[];
+  chunks: VideoChunk[];
+  durationSeconds: number;
+  instruction: string;
+  workDir: string;
+}
+
+/**
+ * The agentic step: every proposed moment is checked against the frames
+ * actually on screen in its window before it is reported. Confirmed moments
+ * get their timestamps refined to what the footage shows; unconfirmed ones
+ * lose most of their confidence and are dropped below the reporting floor.
+ * A verification that itself fails keeps the original match — the check may
+ * not destroy information it could not improve.
+ */
+async function verifyMatches(input: VerifyMatchesInput): Promise<NewClipMatch[]> {
+  const chunkById = new Map(input.chunks.map((chunk) => [chunk.id, chunk]));
+  const chunkFiles = new Map<string, string>();
+  const kept: NewClipMatch[] = [];
+
+  for (const [index, match] of input.matches.entries()) {
+    if (index >= env.VERIFY_MAX_MATCHES) {
+      kept.push(match);
+      continue;
+    }
+
+    const anchor = chunkById.get(match.chunkId);
+    if (!anchor) {
+      kept.push(match);
+      continue;
+    }
+
+    try {
+      let chunkPath = chunkFiles.get(anchor.id);
+      if (!chunkPath) {
+        chunkPath = path.join(input.workDir, `chunk-${anchor.chunkIndex}.mp4`);
+        await getStorage().downloadToFile(anchor.storageKey, chunkPath);
+        chunkFiles.set(anchor.id, chunkPath);
+      }
+
+      // The window is sampled from the anchor chunk's proxy file, so it is
+      // clamped to that chunk; a match spilling past the boundary is verified
+      // by its opening, which is where the moment was claimed to start.
+      const localStart = Math.max(0, match.globalStartSeconds - env.VERIFY_PAD_SECONDS - anchor.globalStartSeconds);
+      const localEnd = Math.min(
+        anchor.durationSeconds,
+        match.globalEndSeconds + env.VERIFY_PAD_SECONDS - anchor.globalStartSeconds,
+      );
+
+      const matchDir = path.join(input.workDir, `match-${index}`);
+      const frames = await extractWindowFrames(chunkPath, localStart, localEnd, env.VERIFY_FRAMES, matchDir);
+      if (frames.length === 0) {
+        logger.warn('verification skipped: no frames in window', { matchIndex: index });
+        kept.push(match);
+        continue;
+      }
+
+      const messages = await buildVerifyMessages({
+        instruction: input.instruction,
+        claimDescription: match.description,
+        windowStartSeconds: anchor.globalStartSeconds + localStart,
+        windowEndSeconds: anchor.globalStartSeconds + localEnd,
+        frames: frames.map((frame) => ({
+          globalSeconds: Number((anchor.globalStartSeconds + frame.localSeconds).toFixed(3)),
+          filePath: frame.filePath,
+        })),
+      });
+
+      const raw = await completeWithRetry(messages, { stage: 'verify', matchIndex: index });
+      const verdict = parseVerifyResponse(raw);
+
+      if (!verdict) {
+        logger.warn('verification reply unreadable; keeping unverified match', { matchIndex: index });
+        kept.push(match);
+        continue;
+      }
+
+      if (!verdict.confirmed) {
+        // The verifier looked at the footage and said no. Reporting it anyway
+        // would defeat the point of looking.
+        logger.info('verification rejected match', {
+          matchIndex: index,
+          start: match.globalStartSeconds,
+          end: match.globalEndSeconds,
+        });
+        continue;
+      }
+
+      // Confirmed: refine to what the footage showed, when a range came back.
+      // The refinement is validated against the WINDOW the verifier was shown
+      // — it saw nothing outside it, so times outside it (or on the wrong
+      // clock) are discarded rather than relocating the match blind.
+      const windowGlobalStart = anchor.globalStartSeconds + localStart;
+      const windowGlobalEnd = anchor.globalStartSeconds + localEnd;
+      let refined = match;
+      if (verdict.startSeconds !== null && verdict.endSeconds !== null) {
+        const range = mapLocalRangeToGlobal(
+          { globalStartSeconds: windowGlobalStart, globalEndSeconds: windowGlobalEnd },
+          {
+            startSeconds: verdict.startSeconds - windowGlobalStart,
+            endSeconds: verdict.endSeconds - windowGlobalStart,
+          },
+          { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
+        );
+        if (range) {
+          refined = anchorToChunk(
+            {
+              startSeconds: range.globalStartSeconds,
+              endSeconds: range.globalEndSeconds,
+              description: match.description,
+              confidence: Math.max(match.confidence, verdict.confidence ?? 0),
+              quote: match.quote ?? null,
+            },
+            input.chunks,
+            match.source,
+          );
+        }
+      }
+
+      logger.info('verification confirmed match', {
+        matchIndex: index,
+        start: refined.globalStartSeconds,
+        end: refined.globalEndSeconds,
+      });
+      kept.push(refined);
+    } catch (error) {
+      // Verification is an accuracy upgrade, never a gate: on any failure the
+      // original match survives.
+      logger.warn('verification failed; keeping unverified match', { matchIndex: index, err: errorMessage(error) });
+      kept.push(match);
+    }
+  }
+
+  return kept;
 }
 
 interface SearchSingleChunkInput {

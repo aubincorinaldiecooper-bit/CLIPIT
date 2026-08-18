@@ -7,6 +7,7 @@ import {
   cutClip,
   extractAudioSegments,
   extractFrames,
+  extractWindowFrames,
   ffprobe,
   splitIntoChunks,
 } from '../src/services/media/ffmpeg.js';
@@ -99,6 +100,22 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
       expect(info.size).toBeGreaterThan(0);
       expect(frame.localSeconds).toBeGreaterThan(0);
       expect(frame.localSeconds).toBeLessThan(SOURCE_SECONDS);
+    }
+  }, 120_000);
+
+  it('samples a verification window inside its bounds', async () => {
+    // Deliberately not pre-created: extraction must make its own directory,
+    // since a lenient caller masks the failure as "verification skipped".
+    const windowDir = path.join(dir, 'window-frames');
+
+    const frames = await extractWindowFrames(source, 1, 3, 4, windowDir);
+
+    expect(frames.length).toBe(4);
+    for (const frame of frames) {
+      const info = await stat(frame.filePath);
+      expect(info.size).toBeGreaterThan(0);
+      expect(frame.localSeconds).toBeGreaterThan(1);
+      expect(frame.localSeconds).toBeLessThan(3);
     }
   }, 120_000);
 
