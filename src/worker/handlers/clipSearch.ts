@@ -2,31 +2,16 @@ import path from 'node:path';
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
-import { errorMessage, ExternalServiceError } from '../../lib/errors.js';
+import { errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
-import { extractFrames, extractWindowFrames } from '../../services/media/ffmpeg.js';
-import { completeWithRetry, searchChunk } from '../../services/search/minicpm.js';
-import { parseModelMatches, type ParsedMatch } from '../../services/search/modelResponse.js';
-import { buildVerifyMessages, parseVerifyResponse } from '../../services/search/verify.js';
-import {
-  estimateTokens,
-  itemsInWindow,
-  planSearchWindows,
-  planWindowCount,
-} from '../../services/search/searchWindows.js';
-import { recordModelUsage, type UsageStage } from '../../db/repositories/usage.js';
+import { searchVideoChunk } from '../../services/search/openrouterVideo.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
-import {
-  buildIndexSearchUserMessage,
-  INDEX_SEARCH_SYSTEM_PROMPT,
-  type TranscriptLine,
-} from '../../services/search/prompt.js';
+import type { TranscriptLine } from '../../services/search/prompt.js';
 import { mapGlobalRangeToChunk, mapLocalRangeToGlobal, mergeOverlappingRanges } from '../../services/timestamps.js';
 import { getVideo, listChunks } from '../../db/repositories/videos.js';
-import { listScenes } from '../../db/repositories/scenes.js';
 import { listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
 import {
   deleteMatches,
@@ -40,7 +25,7 @@ import {
   type NewClipMatch,
 } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, type ClipSearchJob } from '../../queues/index.js';
-import type { MatchSource, ResolvedSearchMode, Video, VideoChunk } from '../../domain/types.js';
+import type { MatchSource, ResolvedSearchMode, VideoChunk } from '../../domain/types.js';
 
 /**
  * Runs the user's instruction against every analysis chunk.
@@ -104,25 +89,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       return;
     }
 
-    // A visual search is worth waiting for the scene index for the same
-    // reason: answering from the index takes one small request, while the
-    // fallback re-sends frames per chunk. The wait budget is shared with the
-    // transcript wait above.
-    const indexPending =
-      video.indexStatus === 'pending' || video.indexStatus === 'queued' || video.indexStatus === 'running';
-
-    if (desired.mode !== 'transcript' && env.INDEXING_ENABLED && indexPending && waitedMs < env.INDEX_WAIT_TIMEOUT_MS) {
-      log.info('waiting for scene index before searching', {
-        waitedMs,
-        indexStatus: video.indexStatus,
-      });
-      await enqueueClipSearch(
-        { clipRequestId, waitedMs: waitedMs + env.TRANSCRIPT_WAIT_POLL_MS },
-        { delay: env.TRANSCRIPT_WAIT_POLL_MS },
-      );
-      return;
-    }
-
     // Re-resolve now that waiting is over: the transcript may have failed, or
     // never arrived, in which case we search visually rather than not at all.
     const resolved = resolveSearchMode({
@@ -131,72 +97,22 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       transcriptAvailable: transcriptReady,
     });
 
-    // Answer from the index whenever the evidence the resolved mode needs is
-    // already text: the whole video in ONE small request, instead of
-    // re-sending frames per chunk. The per-chunk frame path survives only as
-    // the fallback for visual searches on videos with no usable index.
-    const indexReady = video.indexStatus === 'ready' && video.sceneCount > 0;
-    const useIndexSearch = resolved.mode === 'transcript' ? transcriptReady : indexReady;
-
     log.info('starting clip search', {
       mode: resolved.mode,
       rationale: resolved.rationale,
-      evidence: useIndexSearch ? 'index' : 'chunk-frames',
       chunks: chunks.length,
       instruction: request.instruction,
     });
 
-    await startClipRequest(clipRequestId, {
-      chunksTotal: useIndexSearch ? 1 : chunks.length,
-      resolvedMode: resolved.mode,
-    });
+    await startClipRequest(clipRequestId, { chunksTotal: chunks.length, resolvedMode: resolved.mode });
     // Clear anything from a previous attempt so a retry cannot double-insert.
     await deleteMatches(clipRequestId);
-
-    if (useIndexSearch) {
-      let found = await searchFromIndex({
-        video,
-        chunks,
-        instruction: request.instruction,
-        mode: resolved.mode,
-        indexReady,
-        transcriptReady,
-        clipRequestId,
-      });
-
-      // The agentic step: check each proposed moment against the frames
-      // actually on screen there before reporting it. Transcript-only
-      // answers quote the speech itself, which needs no visual check.
-      if (found.length > 0 && resolved.mode !== 'transcript' && env.VERIFY_MATCHES) {
-        await job.updateProgress({ stage: 'verifying', percent: 80, matches: found.length });
-        found = await withWorkDir(`verify-${clipRequestId}`, (dir) =>
-          verifyMatches({
-            matches: found,
-            chunks,
-            durationSeconds: video.durationSeconds ?? chunks.at(-1)!.globalEndSeconds,
-            instruction: request.instruction,
-            workDir: dir,
-            clipRequestId,
-            videoId: video.id,
-          }),
-        );
-      }
-
-      if (found.length > 0) await insertMatches(clipRequestId, found);
-      await recordChunkCompleted(clipRequestId);
-      await job.updateProgress({ stage: 'searching', percent: 100, chunksCompleted: 1, chunksTotal: 1, matches: found.length });
-
-      const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
-      await finishClipRequest(clipRequestId, 'completed');
-      log.info('clip search complete', { matches: finalCount, evidence: 'index' });
-      return;
-    }
 
     let completed = 0;
     let totalMatches = 0;
 
     await withWorkDir(`search-${clipRequestId}`, async (dir) => {
-      const results = await mapWithConcurrency(chunks, env.MINICPM_CONCURRENCY, async (chunk) => {
+      const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
         const found = await searchSingleChunk({
           chunk,
           chunkCount: chunks.length,
@@ -204,7 +120,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           mode: resolved.mode,
           videoId: video.id,
           workDir: dir,
-          clipRequestId,
         });
 
         if (found.length > 0) await insertMatches(clipRequestId, found);
@@ -243,19 +158,10 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         });
       }
 
-      const rejected = results.filter((result) => result.status === 'rejected');
-      const failed = rejected.length;
+      const failed = results.filter((result) => result.status === 'rejected').length;
 
       if (failed === chunks.length) {
-        // If every chunk failed with an error its API called permanent — a
-        // rejected key, an over-limit prompt — the retry produces the same
-        // answer, so fail the job terminally instead of burning attempts.
-        const allTerminal = rejected.every(
-          (result) => result.reason instanceof ExternalServiceError && !result.reason.retryable,
-        );
-        const message = `Every chunk failed to search (${failed}/${chunks.length})`;
-        if (allTerminal) throw new ExternalServiceError('minicpm', message, { retryable: false });
-        throw new Error(message);
+        throw new Error(`Every chunk failed to search (${failed}/${chunks.length})`);
       }
 
       // Chunks were searched independently, so the same moment can appear
@@ -345,378 +251,6 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
   return rows.length;
 }
 
-interface SearchFromIndexInput {
-  video: Video;
-  chunks: VideoChunk[];
-  instruction: string;
-  mode: ResolvedSearchMode;
-  indexReady: boolean;
-  transcriptReady: boolean;
-  clipRequestId: string;
-}
-
-/**
- * Answers the instruction from what was written down at ingest — the scene
- * index and/or the transcript.
- *
- * Normally that is ONE text-only call carrying the whole video's evidence.
- * When the evidence is too large for a single request — a multi-hour
- * transcript will be — the timeline is split into ordered windows and each is
- * searched separately, because truncating would silently discard the part of
- * the video the answer might be in. Timestamps are global throughout, so the
- * results merge exactly like chunk-boundary duplicates.
- */
-async function searchFromIndex(input: SearchFromIndexInput): Promise<NewClipMatch[]> {
-  const { video, chunks, mode } = input;
-  const durationSeconds = video.durationSeconds ?? chunks.at(-1)!.globalEndSeconds;
-
-  const scenes =
-    mode !== 'transcript' && input.indexReady
-      ? (await listScenes(video.id)).map((scene) => ({
-          startSeconds: scene.startSeconds,
-          endSeconds: scene.endSeconds,
-          description: scene.description,
-        }))
-      : [];
-  const transcript =
-    mode !== 'visual' && input.transcriptReady
-      ? (await listTranscriptSegmentsInRange(video.id, 0, durationSeconds)).map((line) => ({
-          startSeconds: line.startSeconds,
-          endSeconds: line.endSeconds,
-          text: line.text,
-        }))
-      : [];
-
-  const buildMessage = (
-    windowScenes: typeof scenes,
-    windowTranscript: typeof transcript,
-    windowDurationSeconds: number,
-  ) =>
-    buildIndexSearchUserMessage({
-      instruction: input.instruction,
-      durationSeconds: windowDurationSeconds,
-      scenes: windowScenes,
-      transcript: windowTranscript,
-    });
-
-  const fullMessage = buildMessage(scenes, transcript, durationSeconds);
-  const estimated = estimateTokens(INDEX_SEARCH_SYSTEM_PROMPT) + estimateTokens(fullMessage);
-  const windowCount = planWindowCount(estimated, env.SEARCH_TOKEN_BUDGET);
-  const windows = windowCount === 1 ? null : planSearchWindows(durationSeconds, windowCount);
-
-  if (windows) {
-    logger.info('splitting search across windows to stay inside the prompt budget', {
-      estimatedTokens: estimated,
-      budgetTokens: env.SEARCH_TOKEN_BUDGET,
-      windows: windows.length,
-      scenes: scenes.length,
-      transcriptLines: transcript.length,
-    });
-  }
-
-  const requests = windows
-    ? windows.map((window) => ({
-        label: `window ${window.index + 1}/${windows.length}`,
-        // Timestamps stay global: the model is told the true bounds of the
-        // window it is looking at, so nothing needs rebasing on the way back.
-        message: buildMessage(itemsInWindow(scenes, window), itemsInWindow(transcript, window), durationSeconds),
-      }))
-    : [{ label: 'whole video', message: fullMessage }];
-
-  const collected: ParsedMatch[] = [];
-
-  for (const request of requests) {
-    const raw = await completeWithRetry(
-      [
-        { role: 'system', content: INDEX_SEARCH_SYSTEM_PROMPT },
-        { role: 'user', content: request.message },
-      ],
-      { stage: 'index-search', window: request.label },
-      usageReporter('search', video.id, input.clipRequestId),
-    );
-
-    const { matches, warnings } = parseModelMatches(raw);
-    if (warnings.length > 0) {
-      logger.warn('model output warnings', {
-        stage: 'index-search',
-        window: request.label,
-        warnings: warnings.slice(0, 5),
-      });
-    }
-    collected.push(...matches);
-  }
-
-  // The whole video is the mapping window: local time IS global time.
-  const wholeVideo = { globalStartSeconds: 0, globalEndSeconds: durationSeconds };
-
-  const mapped = collected
-    .filter((match) => match.confidence >= env.MIN_MATCH_CONFIDENCE)
-    .flatMap((match) => {
-      const range = mapLocalRangeToGlobal(
-        wholeVideo,
-        { startSeconds: match.startSeconds, endSeconds: match.endSeconds },
-        { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
-      );
-      if (!range) {
-        logger.warn('discarding out-of-range match', {
-          stage: 'index-search',
-          start: match.startSeconds,
-          end: match.endSeconds,
-          durationSeconds,
-        });
-        return [];
-      }
-      return [
-        {
-          startSeconds: range.globalStartSeconds,
-          endSeconds: range.globalEndSeconds,
-          confidence: match.confidence,
-          description: match.description,
-          quote: match.quote,
-        },
-      ];
-    });
-
-  // Merges duplicates within one answer and across window seams alike.
-  const deduped = mergeOverlappingRanges(mapped);
-
-  return deduped.map((range) =>
-    anchorToChunk(
-      {
-        startSeconds: range.startSeconds,
-        endSeconds: range.endSeconds,
-        description: range.description,
-        confidence: range.confidence ?? 0,
-        quote: range.quote ?? null,
-      },
-      chunks,
-      MATCH_SOURCE[mode],
-    ),
-  );
-}
-
-/** Records a model call's tokens against the work that caused it. */
-function usageReporter(stage: UsageStage, videoId: string, clipRequestId: string | null) {
-  return (usage: { promptTokens: number; completionTokens: number; totalTokens: number; provider: string; model: string }) => {
-    void recordModelUsage({ ...usage, stage, videoId, clipRequestId });
-  };
-}
-
-/**
- * Anchors a global range to the chunk containing its start, as aggregation
- * does; the local range may honestly extend past that chunk's end.
- */
-function anchorToChunk(
-  range: { startSeconds: number; endSeconds: number; description: string; confidence: number; quote: string | null },
-  chunks: VideoChunk[],
-  source: MatchSource,
-): NewClipMatch {
-  const anchor =
-    chunks.find(
-      (chunk) => range.startSeconds >= chunk.globalStartSeconds && range.startSeconds < chunk.globalEndSeconds,
-    ) ?? chunks.at(-1)!;
-
-  return {
-    chunkId: anchor.id,
-    localStartSeconds: Number((range.startSeconds - anchor.globalStartSeconds).toFixed(3)),
-    localEndSeconds: Number((range.endSeconds - anchor.globalStartSeconds).toFixed(3)),
-    globalStartSeconds: Number(range.startSeconds.toFixed(3)),
-    globalEndSeconds: Number(range.endSeconds.toFixed(3)),
-    description: range.description,
-    confidence: range.confidence,
-    source,
-    quote: range.quote,
-  } satisfies NewClipMatch;
-}
-
-interface VerifyMatchesInput {
-  matches: NewClipMatch[];
-  chunks: VideoChunk[];
-  durationSeconds: number;
-  instruction: string;
-  workDir: string;
-  clipRequestId: string;
-  videoId: string;
-}
-
-/**
- * Whether a match's claim rests on speech rather than on what is visible.
- *
- * Verification looks at frames and answers "is this VISIBLE here" — a question
- * a spoken moment can legitimately fail while being perfectly correct (someone
- * mentions the thing off-camera). Speech and visuals are independent signals,
- * so the visual check may never be the sole reason a spoken claim disappears.
- */
-export function hasSpokenEvidence(match: NewClipMatch): boolean {
-  return match.source === 'transcript' || (match.quote?.trim().length ?? 0) > 0;
-}
-
-/** Confidence retained by a rejected match whose spoken evidence still stands. */
-export const SPOKEN_EVIDENCE_DEMOTION = 0.6;
-
-/**
- * What becomes of a match the verifier could not see, given that speech and
- * visuals are independent signals:
- *
- * - purely visual claim → dropped; the footage is the only evidence it had
- * - claim with spoken evidence → demoted, never deleted by a visual check
- *
- * Returns null when the match should be dropped.
- */
-export function applyVisualRejection(match: NewClipMatch): NewClipMatch | null {
-  if (!hasSpokenEvidence(match)) return null;
-  return { ...match, confidence: Number((match.confidence * SPOKEN_EVIDENCE_DEMOTION).toFixed(4)) };
-}
-
-/**
- * The agentic step: every proposed moment is checked against the frames
- * actually on screen in its window before it is reported. Confirmed moments
- * get their timestamps refined to what the footage shows; unconfirmed ones
- * lose most of their confidence and are dropped below the reporting floor.
- * A verification that itself fails keeps the original match — the check may
- * not destroy information it could not improve.
- */
-async function verifyMatches(input: VerifyMatchesInput): Promise<NewClipMatch[]> {
-  const chunkById = new Map(input.chunks.map((chunk) => [chunk.id, chunk]));
-  const chunkFiles = new Map<string, string>();
-  const kept: NewClipMatch[] = [];
-
-  for (const [index, match] of input.matches.entries()) {
-    if (index >= env.VERIFY_MAX_MATCHES) {
-      kept.push(match);
-      continue;
-    }
-
-    // A purely spoken match has no visual claim to check. Sending it to a
-    // "is this visible?" verifier can only produce a wrong rejection.
-    if (match.source === 'transcript') {
-      kept.push(match);
-      continue;
-    }
-
-    const anchor = chunkById.get(match.chunkId);
-    if (!anchor) {
-      kept.push(match);
-      continue;
-    }
-
-    try {
-      let chunkPath = chunkFiles.get(anchor.id);
-      if (!chunkPath) {
-        chunkPath = path.join(input.workDir, `chunk-${anchor.chunkIndex}.mp4`);
-        await getStorage().downloadToFile(anchor.storageKey, chunkPath);
-        chunkFiles.set(anchor.id, chunkPath);
-      }
-
-      // The window is sampled from the anchor chunk's proxy file, so it is
-      // clamped to that chunk; a match spilling past the boundary is verified
-      // by its opening, which is where the moment was claimed to start.
-      const localStart = Math.max(0, match.globalStartSeconds - env.VERIFY_PAD_SECONDS - anchor.globalStartSeconds);
-      const localEnd = Math.min(
-        anchor.durationSeconds,
-        match.globalEndSeconds + env.VERIFY_PAD_SECONDS - anchor.globalStartSeconds,
-      );
-
-      const matchDir = path.join(input.workDir, `match-${index}`);
-      const frames = await extractWindowFrames(chunkPath, localStart, localEnd, env.VERIFY_FRAMES, matchDir);
-      if (frames.length === 0) {
-        logger.warn('verification skipped: no frames in window', { matchIndex: index });
-        kept.push(match);
-        continue;
-      }
-
-      const messages = await buildVerifyMessages({
-        instruction: input.instruction,
-        claimDescription: match.description,
-        windowStartSeconds: anchor.globalStartSeconds + localStart,
-        windowEndSeconds: anchor.globalStartSeconds + localEnd,
-        frames: frames.map((frame) => ({
-          globalSeconds: Number((anchor.globalStartSeconds + frame.localSeconds).toFixed(3)),
-          filePath: frame.filePath,
-        })),
-      });
-
-      const raw = await completeWithRetry(
-        messages,
-        { stage: 'verify', matchIndex: index },
-        usageReporter('verification', input.videoId, input.clipRequestId),
-      );
-      const verdict = parseVerifyResponse(raw);
-
-      if (!verdict) {
-        logger.warn('verification reply unreadable; keeping unverified match', { matchIndex: index });
-        kept.push(match);
-        continue;
-      }
-
-      if (!verdict.confirmed) {
-        const survivor = applyVisualRejection(match);
-        if (survivor) {
-          logger.info('verification did not see the claim, but spoken evidence stands', {
-            matchIndex: index,
-            start: match.globalStartSeconds,
-            end: match.globalEndSeconds,
-            demotedConfidence: survivor.confidence,
-          });
-          kept.push(survivor);
-        } else {
-          logger.info('verification rejected match', {
-            matchIndex: index,
-            start: match.globalStartSeconds,
-            end: match.globalEndSeconds,
-          });
-        }
-        continue;
-      }
-
-      // Confirmed: refine to what the footage showed, when a range came back.
-      // The refinement is validated against the WINDOW the verifier was shown
-      // — it saw nothing outside it, so times outside it (or on the wrong
-      // clock) are discarded rather than relocating the match blind.
-      const windowGlobalStart = anchor.globalStartSeconds + localStart;
-      const windowGlobalEnd = anchor.globalStartSeconds + localEnd;
-      let refined = match;
-      if (verdict.startSeconds !== null && verdict.endSeconds !== null) {
-        const range = mapLocalRangeToGlobal(
-          { globalStartSeconds: windowGlobalStart, globalEndSeconds: windowGlobalEnd },
-          {
-            startSeconds: verdict.startSeconds - windowGlobalStart,
-            endSeconds: verdict.endSeconds - windowGlobalStart,
-          },
-          { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
-        );
-        if (range) {
-          refined = anchorToChunk(
-            {
-              startSeconds: range.globalStartSeconds,
-              endSeconds: range.globalEndSeconds,
-              description: match.description,
-              confidence: Math.max(match.confidence, verdict.confidence ?? 0),
-              quote: match.quote ?? null,
-            },
-            input.chunks,
-            match.source,
-          );
-        }
-      }
-
-      logger.info('verification confirmed match', {
-        matchIndex: index,
-        start: refined.globalStartSeconds,
-        end: refined.globalEndSeconds,
-      });
-      kept.push(refined);
-    } catch (error) {
-      // Verification is an accuracy upgrade, never a gate: on any failure the
-      // original match survives.
-      logger.warn('verification failed; keeping unverified match', { matchIndex: index, err: errorMessage(error) });
-      kept.push(match);
-    }
-  }
-
-  return kept;
-}
-
 interface SearchSingleChunkInput {
   chunk: VideoChunk;
   chunkCount: number;
@@ -732,17 +266,15 @@ const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
   both: 'multimodal',
 };
 
-async function searchSingleChunk(input: SearchSingleChunkInput & { clipRequestId?: string }): Promise<NewClipMatch[]> {
+async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClipMatch[]> {
   const { chunk } = input;
   const chunkDir = path.join(input.workDir, `chunk-${chunk.chunkIndex}`);
 
-  // Evidence 1: frames, sampled from the chunk of the analysis proxy.
-  let frames: { localSeconds: number; filePath: string }[] = [];
+  // Visual evidence is the actual MP4 chunk, not sampled-frame summaries.
+  let chunkPath: string | undefined;
   if (input.mode !== 'transcript') {
-    const chunkPath = path.join(chunkDir, 'chunk.mp4');
+    chunkPath = path.join(chunkDir, 'chunk.mp4');
     await getStorage().downloadToFile(chunk.storageKey, chunkPath);
-    frames = await extractFrames(chunkPath, chunk.durationSeconds, env.MINICPM_FRAMES_PER_CHUNK, chunkDir);
-    if (frames.length === 0) throw new Error('No frames could be extracted from this chunk');
   }
 
   // Evidence 2: the slice of the (already global) transcript covering this chunk,
@@ -761,18 +293,15 @@ async function searchSingleChunk(input: SearchSingleChunkInput & { clipRequestId
     }));
   }
 
-  const response = await searchChunk(
-    {
-      instruction: input.instruction,
-      mode: input.mode,
-      chunkIndex: chunk.chunkIndex,
-      chunkCount: input.chunkCount,
-      chunkDurationSeconds: chunk.durationSeconds,
-      frames,
-      transcript,
-    },
-    usageReporter('search', input.videoId, input.clipRequestId ?? null),
-  );
+  const response = await searchVideoChunk({
+    instruction: input.instruction,
+    mode: input.mode,
+    chunkIndex: chunk.chunkIndex,
+    chunkCount: input.chunkCount,
+    chunkDurationSeconds: chunk.durationSeconds,
+    videoPath: chunkPath,
+    transcript,
+  });
 
   if (response.warnings.length > 0) {
     logger.warn('model output warnings', {

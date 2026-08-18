@@ -29,7 +29,7 @@ export class HttpError extends Error {
   }
 }
 
-/** Failure of an external dependency (MiniCPM, yt-dlp, ffmpeg, storage). */
+/** Failure of an external dependency (OpenRouter, yt-dlp, ffmpeg, storage). */
 export class ExternalServiceError extends Error {
   readonly service: string;
   readonly retryable: boolean;

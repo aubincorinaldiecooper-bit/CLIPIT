@@ -9,7 +9,7 @@ import { getStorage } from '../../services/storage/s3.js';
 import { chunkKey, proxyKey } from '../../services/storage/types.js';
 import { createAnalysisProxy, ffprobe, splitIntoChunks } from '../../services/media/ffmpeg.js';
 import { getVideo, replaceChunks, setIndexStatus, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
-import { enqueueIndexing, enqueueTranscription, type PreprocessingJob } from '../../queues/index.js';
+import { enqueueTranscription, type PreprocessingJob } from '../../queues/index.js';
 
 /**
  * Probes the source, builds the analysis proxy, and cuts it into the fixed
@@ -150,14 +150,9 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
         await enqueueTranscription({ videoId, captionsStorageKey: video.captionsStorageKey });
       }
 
-      // 6. The scene index — the model reads the video once, now, so that
-      //    queries answer from what it wrote down instead of re-watching.
-      if (!env.INDEXING_ENABLED) {
-        await setIndexStatus(videoId, 'unavailable', { error: 'Indexing is disabled' });
-      } else {
-        await setIndexStatus(videoId, 'queued');
-        await enqueueIndexing({ videoId });
-      }
+      // Query-time Qwen searches the actual MP4 chunks. Scene indexing is not
+      // part of the single-model MVP.
+      await setIndexStatus(videoId, 'unavailable', { error: 'Scene indexing is not used' });
     });
   } catch (error) {
     const message = errorMessage(error);

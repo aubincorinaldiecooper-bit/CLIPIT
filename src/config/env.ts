@@ -78,78 +78,17 @@ const envSchema = z.object({
   S3_FORCE_PATH_STYLE: bool(true),
   SIGNED_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
   UPLOAD_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
-  /**
-   * Browsers PUT straight to the bucket, which is a cross-origin request, so
-   * the bucket needs a CORS rule naming the frontend's origin or the upload is
-   * blocked before a byte moves. The API applies the rule on boot rather than
-   * leaving it as an undocumented manual step.
-   */
   BUCKET_CORS_AUTOCONFIGURE: bool(true),
-  /**
-   * Comma-separated origins allowed to upload. Defaults to API_CORS_ORIGIN,
-   * since anything permitted to call the API is what will be uploading.
-   */
   BUCKET_CORS_ORIGINS: z.string().trim().optional(),
 
-  // --- MiniCPM ------------------------------------------------------------
-  MINICPM_API_BASE_URL: z.string().trim().default('https://api.modelbest.cn/v1'),
-  MINICPM_API_KEY: nonEmpty('MINICPM_API_KEY'),
-  MINICPM_MODEL: z.string().trim().default('MiniCPM-V-4.6-1B'),
-  MINICPM_CONCURRENCY: int(2, 1, 32),
-  MINICPM_REQUEST_TIMEOUT_MS: int(180_000, 5_000, 900_000),
-  MINICPM_MAX_RETRIES: int(3, 0, 10),
-  MINICPM_MAX_TOKENS: int(1024, 128, 8192),
-  MINICPM_TEMPERATURE: num(0.1, 0, 2),
-  /**
-   * Frames per chunk for the FALLBACK query-time visual search — the path used
-   * only when a video has no scene index. 128 frames measured ~208k prompt
-   * tokens in production, past every current model's context window, so a
-   * request at that size can never succeed. Recall on brief moments is the
-   * index's job now (INDEX_FRAMES_PER_CHUNK); this stays sized to fit.
-   */
-  MINICPM_FRAMES_PER_CHUNK: int(32, 2, 64),
-  /** Longest edge of each sampled frame, in pixels. */
-  MINICPM_FRAME_MAX_WIDTH: int(448, 128, 1920),
-  MINICPM_FRAME_JPEG_QUALITY: int(4, 1, 31),
-
-  // --- Scene index (ingest-time visual understanding) ---------------------
-  /**
-   * Build a timestamped scene index of each video at ingest, the way an LLM
-   * ingests a book once and then answers questions about it. Queries run
-   * against this index as text — seconds and a few thousand tokens — instead
-   * of re-sending frames to the model on every search.
-   */
-  INDEXING_ENABLED: bool(true),
-  /** Frames sampled per analysis chunk while building the index. */
-  INDEX_FRAMES_PER_CHUNK: int(48, 8, 256),
-  /**
-   * Frames per model call during indexing. Batches stay small so one request
-   * is always far inside the context window; a chunk is indexed across
-   * ceil(INDEX_FRAMES_PER_CHUNK / this) calls.
-   */
-  INDEX_FRAMES_PER_CALL: int(16, 4, 32),
-  INDEXING_CONCURRENCY: int(2, 1, 16),
-  /** How long a visual search waits for an in-flight index before falling back. */
-  INDEX_WAIT_TIMEOUT_MS: int(900_000, 0, 3_600_000),
-  /**
-   * Verify index-search matches against the frames actually on screen before
-   * reporting them. The index is sampled at INDEX_FRAMES_PER_CHUNK
-   * granularity, so its timestamps carry that fuzz and a wrong pick is
-   * otherwise never checked; verification refines confirmed moments and
-   * demotes unconfirmed ones.
-   */
-  VERIFY_MATCHES: bool(true),
-  /** Frames sampled across each candidate window during verification. */
-  VERIFY_FRAMES: int(8, 2, 32),
-  /** At most this many matches are verified per search; the rest pass through. */
-  VERIFY_MAX_MATCHES: int(8, 1, 32),
-  /** Padding added around a candidate window before sampling it. */
-  VERIFY_PAD_SECONDS: num(3, 0, 30),
-
-  // --- Transcription (OpenRouter speech-to-text) -------------------------
+  // --- OpenRouter video understanding and speech-to-text -----------------
   TRANSCRIPTION_ENABLED: bool(true),
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
-  OPENROUTER_API_KEY: z.string().trim().optional(),
+  OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
+  OPENROUTER_VIDEO_MODEL: z.string().trim().default('qwen/qwen3-vl-32b-instruct'),
+  OPENROUTER_VIDEO_CONCURRENCY: int(2, 1, 16),
+  OPENROUTER_VIDEO_MAX_TOKENS: int(1024, 128, 8192),
+  OPENROUTER_VIDEO_TEMPERATURE: num(0.1, 0, 2),
   OPENROUTER_STT_MODEL: z.string().trim().default('openai/whisper-1'),
   /** Optional attribution headers OpenRouter uses for app ranking. */
   OPENROUTER_SITE_URL: z.string().trim().optional(),
@@ -185,7 +124,7 @@ const envSchema = z.object({
 
   // --- Media pipeline -----------------------------------------------------
   MAX_SOURCE_DURATION_SECONDS: int(21_600, 1, 360_000),
-  ANALYSIS_CHUNK_SECONDS: int(600, 30, 3_600),
+  ANALYSIS_CHUNK_SECONDS: int(120, 30, 3_600),
   PROXY_HEIGHT: int(360, 144, 1080),
   PROXY_FPS: num(2, 0.5, 30),
   PROXY_CRF: int(30, 0, 51),
@@ -203,15 +142,6 @@ const envSchema = z.object({
    */
   MATCH_MERGE_GAP_SECONDS: num(1.5, 0, 60),
   MATCH_MERGE_MIN_OVERLAP_RATIO: num(0.5, 0, 1),
-  /**
-   * Prompt-size ceiling for one index-backed search request.
-   *
-   * The search sends every scene and transcript line for the video at once,
-   * which is correct until the video is long enough that the evidence exceeds
-   * a context window. Past this estimate the timeline is split into ordered
-   * windows and searched in several requests — never truncated.
-   */
-  SEARCH_TOKEN_BUDGET: int(100_000, 5_000, 1_000_000),
   /** Default search modality when a request does not pin one. */
   CLIP_SEARCH_MODE: z.enum(['auto', 'visual', 'transcript', 'both']).default('auto'),
   /** How long a clip search waits for an in-flight transcript before searching without it. */
@@ -221,54 +151,13 @@ const envSchema = z.object({
   FFPROBE_PATH: z.string().default('ffprobe'),
   YTDLP_PATH: z.string().default('yt-dlp'),
   YTDLP_FORMAT: z.string().default('bv*[height<=1080]+ba/b[height<=1080]/b'),
-  YTDLP_COOKIES_FILE: z.string().trim().optional(),
-  /**
-   * Cookie jar contents (Netscape format) rather than a path.
-   *
-   * Hosted platforms block YouTube's bot check by IP, and cookies are the
-   * documented remedy — but a container has no persistent disk to keep a
-   * cookie file on. This is written to a file at startup so the deployment
-   * needs nothing but an environment variable.
-   */
-  YTDLP_COOKIES_CONTENT: z.string().optional(),
-  /**
-   * Passed through to `--extractor-args`. YouTube's bot checks vary by player
-   * client, so being able to try another one without a code change is the
-   * difference between a variable edit and a deploy.
-   */
-  YTDLP_EXTRACTOR_ARGS: z.string().trim().optional(),
-  /**
-   * Base URL of a bgutil PO-token provider server.
-   *
-   * YouTube demands a Proof-of-Origin token from IP ranges it has flagged —
-   * which is most of any cloud host — and refuses with "Sign in to confirm
-   * you're not a bot" when one is absent. The provider mints them; this points
-   * yt-dlp's plugin at it. Empty means no PO tokens, which on a hosted
-   * platform usually means no YouTube.
-   */
-  YTDLP_POT_BASE_URL: z.string().trim().optional(),
-  /**
-   * JavaScript runtimes yt-dlp may use to solve YouTube's signature
-   * challenges. These are opt-in, and YouTube extraction fails without one.
-   * The runtime image is Node-based, so `node` is always present.
-   */
   YTDLP_JS_RUNTIMES: z.string().trim().default('node'),
-  /**
-   * Optional `--proxy` for yt-dlp only. The block YouTube applies is on the
-   * source address, so routing just this traffic through a residential
-   * address sidesteps it where tokens and cookies fall short. Supports
-   * http(s) and socks5 (e.g. socks5://user:pass@host:1080).
-   */
+  YTDLP_POT_BASE_URL: z.string().trim().optional(),
+  YTDLP_COOKIES_FILE: z.string().trim().optional(),
+  YTDLP_COOKIES_CONTENT: z.string().optional(),
   YTDLP_PROXY: z.string().trim().optional(),
-  /**
-   * Runs yt-dlp with `--verbose` and logs its full stderr on failure.
-   *
-   * YouTube failures are otherwise opaque: the last few lines of output say
-   * the request was refused without saying which player clients were tried or
-   * whether the PO-token provider was ever consulted. Off by default because
-   * the output is large and includes the resolved configuration.
-   */
   YTDLP_VERBOSE: bool(false),
+  YTDLP_EXTRACTOR_ARGS: z.string().trim().optional(),
   /** Root for transient ffmpeg / yt-dlp scratch files. */
   WORK_DIR: z.string().default('/tmp/clipit'),
 

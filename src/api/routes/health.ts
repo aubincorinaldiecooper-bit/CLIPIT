@@ -34,7 +34,7 @@ export async function registerHealthRoutes(app: FastifyInstance): Promise<void> 
         maxSourceDurationSeconds: env.MAX_SOURCE_DURATION_SECONDS,
         analysisChunkSeconds: env.ANALYSIS_CHUNK_SECONDS,
         transcriptionEnabled: env.TRANSCRIPTION_ENABLED,
-        model: env.MINICPM_MODEL,
+        model: env.OPENROUTER_VIDEO_MODEL,
       },
       time: new Date().toISOString(),
     });
