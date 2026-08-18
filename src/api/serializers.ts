@@ -156,6 +156,30 @@ export function serializeClipRequest(
   };
 }
 
+/**
+ * The detail view adds a signed playback URL for the source, so the client
+ * can seat the video in a player and seek straight to matched moments. Reads
+ * stay side-effect free — this only signs a URL for bytes already in storage.
+ */
+export async function serializeVideoWithPlayback(video: Video, chunks?: VideoChunk[]) {
+  const base = serializeVideo(video, chunks);
+
+  // The original is playable as soon as its bytes are confirmed in storage:
+  // uploads from the moment ingestion confirms them, YouTube sources once the
+  // download landed. `pending_upload` has no bytes yet.
+  const playable = video.originalStorageKey !== null && video.status !== 'pending_upload';
+  if (!playable) return { ...base, playback: null };
+
+  const url = await getStorage().createDownloadUrl(video.originalStorageKey!);
+  return {
+    ...base,
+    playback: {
+      url,
+      expiresAt: new Date(Date.now() + env.SIGNED_URL_EXPIRY_SECONDS * 1000).toISOString(),
+    },
+  };
+}
+
 export async function serializeClip(clip: Clip, includeUrl = true) {
   let url: string | null = null;
   let urlExpiresAt: string | null = null;
