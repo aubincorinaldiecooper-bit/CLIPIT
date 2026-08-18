@@ -11,7 +11,7 @@ import { createClipRequest } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
 import { assertOwnership, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
-import { serializeClipRequest, serializeVideo } from '../serializers.js';
+import { serializeClipRequest, serializeVideo, serializeVideoWithPlayback } from '../serializers.js';
 import { parse } from '../validation.js';
 
 const uuidSchema = z.string().uuid('must be a UUID');
@@ -231,7 +231,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     assertOwnership(request, video, 'Video');
 
     const chunks = video.status === 'ready' ? await listChunks(videoId) : [];
-    return reply.send({ video: serializeVideo(video, chunks) });
+    return reply.send({ video: await serializeVideoWithPlayback(video, chunks) });
   });
 
   /**
