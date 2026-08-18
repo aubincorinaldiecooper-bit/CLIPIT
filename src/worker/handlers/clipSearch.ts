@@ -6,6 +6,7 @@ import { errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
+import { recordModelUsage } from '../../db/repositories/usage.js';
 import { searchVideoChunk } from '../../services/search/openrouterVideo.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
@@ -119,6 +120,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           instruction: request.instruction,
           mode: resolved.mode,
           videoId: video.id,
+          clipRequestId,
           workDir: dir,
         });
 
@@ -257,6 +259,7 @@ interface SearchSingleChunkInput {
   instruction: string;
   mode: ResolvedSearchMode;
   videoId: string;
+  clipRequestId: string;
   workDir: string;
 }
 
@@ -301,6 +304,14 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     chunkDurationSeconds: chunk.durationSeconds,
     videoPath: chunkPath,
     transcript,
+    onUsage: (usage) => {
+      void recordModelUsage({
+        ...usage,
+        stage: 'search',
+        videoId: input.videoId,
+        clipRequestId: input.clipRequestId,
+      });
+    },
   });
 
   if (response.warnings.length > 0) {

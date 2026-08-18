@@ -8,6 +8,10 @@ export interface ModelTokenUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /** Dollars for this call, when the provider reports it (OpenRouter does). */
+  costUsd?: number | null;
+  /** Wall-clock time for the request, when the caller measured it. */
+  latencyMs?: number | null;
 }
 
 export interface RecordUsageInput extends ModelTokenUsage {
@@ -28,8 +32,9 @@ export async function recordModelUsage(input: RecordUsageInput): Promise<void> {
   try {
     await queryOne(
       `INSERT INTO model_usage
-         (video_id, clip_request_id, provider, model, stage, prompt_tokens, completion_tokens, total_tokens)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         (video_id, clip_request_id, provider, model, stage,
+          prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         input.videoId ?? null,
         input.clipRequestId ?? null,
@@ -39,6 +44,8 @@ export async function recordModelUsage(input: RecordUsageInput): Promise<void> {
         input.promptTokens,
         input.completionTokens,
         input.totalTokens,
+        input.costUsd ?? null,
+        input.latencyMs ?? null,
       ],
     );
   } catch (error) {
@@ -52,6 +59,8 @@ export interface UsageTotals {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /** Null when no call in this stage reported a cost. */
+  costUsd: number | null;
 }
 
 interface TotalsRow {
@@ -60,6 +69,7 @@ interface TotalsRow {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cost_usd: string | null;
 }
 
 const totalsSelect = `
@@ -67,7 +77,8 @@ const totalsSelect = `
          COUNT(*)::int              AS calls,
          SUM(prompt_tokens)::int     AS prompt_tokens,
          SUM(completion_tokens)::int AS completion_tokens,
-         SUM(total_tokens)::int      AS total_tokens
+         SUM(total_tokens)::int      AS total_tokens,
+         SUM(cost_usd)               AS cost_usd
     FROM model_usage`;
 
 function mapTotals(rows: TotalsRow[]): UsageTotals[] {
@@ -77,6 +88,8 @@ function mapTotals(rows: TotalsRow[]): UsageTotals[] {
     promptTokens: row.prompt_tokens,
     completionTokens: row.completion_tokens,
     totalTokens: row.total_tokens,
+    // NUMERIC arrives as a string from pg; keep full precision until the end.
+    costUsd: row.cost_usd === null ? null : Number(row.cost_usd),
   }));
 }
 

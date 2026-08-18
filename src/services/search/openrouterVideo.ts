@@ -22,6 +22,20 @@ interface CompletionResponse {
   provider?: string;
 }
 
+/**
+ * Reports one call's cost. The caller decides where it goes, so this service
+ * keeps no dependency on the database.
+ */
+export type VideoUsageReporter = (usage: {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  costUsd: number | null;
+  latencyMs: number;
+  provider: string;
+  model: string;
+}) => void;
+
 export interface VideoSearchInput {
   instruction: string;
   mode: ResolvedSearchMode;
@@ -30,6 +44,8 @@ export interface VideoSearchInput {
   chunkDurationSeconds: number;
   videoPath?: string;
   transcript: TranscriptLine[];
+  /** Optional: called once per completed request with its tokens and cost. */
+  onUsage?: VideoUsageReporter;
 }
 
 export interface VideoSearchResult {
@@ -150,6 +166,27 @@ async function requestCompletion(input: VideoSearchInput): Promise<VideoSearchRe
     totalTokens: payload.usage?.total_tokens,
     costUsd: payload.usage?.cost,
   });
+
+  // Logs answer "what did this call cost"; the usage table answers "what did
+  // this video cost" and "what did this search cost", which is the question
+  // that actually shapes pricing. Reported after a successful response so a
+  // retried failure is not counted twice.
+  if (input.onUsage && payload.usage) {
+    const promptTokens = Math.max(0, Math.round(payload.usage.prompt_tokens ?? 0));
+    const completionTokens = Math.max(0, Math.round(payload.usage.completion_tokens ?? 0));
+    const totalTokens = Math.max(0, Math.round(payload.usage.total_tokens ?? promptTokens + completionTokens));
+    if (totalTokens > 0 || typeof payload.usage.cost === 'number') {
+      input.onUsage({
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        costUsd: typeof payload.usage.cost === 'number' ? payload.usage.cost : null,
+        latencyMs,
+        provider: payload.provider ?? 'openrouter.ai',
+        model: env.OPENROUTER_VIDEO_MODEL,
+      });
+    }
+  }
 
   const parsed = parseModelMatches(content);
   return { ...parsed, rawResponse: content };
