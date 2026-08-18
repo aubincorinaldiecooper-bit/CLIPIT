@@ -206,6 +206,15 @@ const envSchema = z.object({
    * http(s) and socks5 (e.g. socks5://user:pass@host:1080).
    */
   YTDLP_PROXY: z.string().trim().optional(),
+  /**
+   * Runs yt-dlp with `--verbose` and logs its full stderr on failure.
+   *
+   * YouTube failures are otherwise opaque: the last few lines of output say
+   * the request was refused without saying which player clients were tried or
+   * whether the PO-token provider was ever consulted. Off by default because
+   * the output is large and includes the resolved configuration.
+   */
+  YTDLP_VERBOSE: bool(false),
   /** Root for transient ffmpeg / yt-dlp scratch files. */
   WORK_DIR: z.string().default('/tmp/clipit'),
 
