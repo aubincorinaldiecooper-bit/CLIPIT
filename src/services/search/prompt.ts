@@ -1,4 +1,3 @@
-import { formatTimecode } from '../timestamps.js';
 import type { ResolvedSearchMode } from '../../domain/types.js';
 
 /**
@@ -18,8 +17,7 @@ export interface TranscriptLine {
 
 export const SYSTEM_PROMPT = [
   'You are a video analysis engine that locates moments in a video segment.',
-  'You are given a user instruction describing a moment they want to find, plus evidence from ONE segment of a longer video:',
-  'sampled frames labelled with their timestamp, and/or a timestamped transcript of the speech in that segment.',
+  'You are given a user instruction describing a moment they want to find, plus an actual MP4 segment of a longer video and, when available, its timestamped transcript.',
   '',
   'Rules:',
   '- Report ONLY moments that match the user instruction. Do not invent moments.',
@@ -27,7 +25,9 @@ export const SYSTEM_PROMPT = [
   '- A moment must have end_seconds greater than start_seconds.',
   '- Include the full moment: start slightly before it begins and end slightly after it resolves.',
   '- confidence is your certainty from 0 to 1.',
-  '- Read any text visible in the frames (captions, scoreboards, chat, overlays, name tags) as evidence.',
+  '- Inspect the full video over time, including actions, objects, people, scene changes, and spatial relationships.',
+  '- Read on-screen text (captions, signs, scoreboards, chat, overlays, and name tags) as evidence.',
+  '- For mixed queries, require all requested visual, on-screen-text, and speech conditions to be satisfied.',
   '- If the segment contains nothing matching the instruction, return an empty matches array. This is a normal and correct answer.',
   '',
   'Respond with ONLY a JSON object in exactly this shape, and no other text:',
@@ -45,8 +45,8 @@ export function buildInstructionBlock(input: {
     input.mode === 'transcript'
       ? 'You are given the transcript of this segment.'
       : input.mode === 'visual'
-        ? 'You are given frames sampled from this segment.'
-        : 'You are given frames sampled from this segment AND the transcript of its speech. Use both.';
+        ? 'You are given the actual MP4 video segment. Inspect it over time.'
+        : 'You are given the actual MP4 video segment AND the transcript of its speech. Use both.';
 
   return [
     `USER INSTRUCTION: ${input.instruction}`,
@@ -71,8 +71,4 @@ export function buildTranscriptBlock(lines: TranscriptLine[]): string {
     .join('\n');
 
   return `TRANSCRIPT (timestamps are seconds from the start of this segment):\n${body}`;
-}
-
-export function buildFrameLabel(localSeconds: number, index: number, total: number): string {
-  return `Frame ${index + 1}/${total} at ${localSeconds.toFixed(1)}s (${formatTimecode(localSeconds)} into this segment):`;
 }

@@ -6,10 +6,10 @@ want in plain language, and get back playable MP4 clips.
 ```
 upload / YouTube URL
   → ingest
-  → preprocess (probe, proxy, 10-minute analysis chunks)
+  → preprocess (probe, proxy, configurable 2-minute analysis chunks)
   → transcribe (once, over the whole source)
   → user enters a clip instruction
-  → MiniCPM-V searches each chunk (frames and/or transcript)
+  → video model searches each chunk (actual video and/or transcript)
   → map chunk-local timestamps to source timestamps
   → FFmpeg cuts the clips from the original
   → playable signed URLs
@@ -31,8 +31,15 @@ where I explain why I left", and "clip the boss fight" all take the same path.
 | Queues | Redis + BullMQ |
 | Media | FFmpeg / FFprobe, yt-dlp |
 | Storage | S3-compatible adapter (Railway bucket, S3, R2, MinIO) |
-| Vision search | MiniCPM-V 4.6 hosted API |
+| Video understanding | OpenRouter (`qwen/qwen3-vl-32b-instruct`), actual MP4 chunks |
 | Speech-to-text | OpenRouter (`openai/whisper-1`), YouTube captions preferred |
+
+Visual and mixed searches send each actual MP4 analysis chunk to one production
+model, Qwen3-VL 32B through OpenRouter. There is no fallback model, routing
+cascade, or sampled-frame summary stage. OpenRouter STT remains separate for
+timestamped speech. See
+[`docs/openrouter-video-investigation.md`](docs/openrouter-video-investigation.md)
+for the MVP decision and operating constraints.
 
 Two processes run from one image:
 
@@ -47,13 +54,13 @@ npm run start:worker   # ingestion, preprocessing, transcription, search, clip c
 
 A six-hour VOD is never sent to the model in one request. Preprocessing cuts a
 low-resolution **analysis proxy** into fixed **analysis chunks**
-(`ANALYSIS_CHUNK_SECONDS`, default 600s), each stored with its global start and
+(`ANALYSIS_CHUNK_SECONDS`, default 120s), each stored with its global start and
 end. A search fans out over those chunks.
 
 Each chunk is searched with one or both kinds of evidence:
 
-- **Frames** — `MINICPM_FRAMES_PER_CHUNK` evenly spaced stills sampled from the
-  chunk (128 by default, one every ~4.7s), sent to MiniCPM-V.
+- **Video** — the actual H.264 MP4 analysis chunk, sent to Qwen3-VL 32B as a
+  base64 video data URL so actions, OCR, and temporal context remain available.
 - **Transcript** — the slice of the video's transcript covering that chunk,
   rebased to chunk-local time.
 
@@ -284,7 +291,7 @@ Redis-backed fixed-window limits apply **per session and per IP** to session
 creation, video creation, searches, generation, and reads. Per-IP matters
 because anonymous sessions are free to mint.
 
-Provider credentials (MiniCPM, OpenRouter, storage, database) are read only in
+Provider credentials (OpenRouter, storage, and database) are read only in
 the server process and are never returned by any endpoint.
 
 ---
@@ -296,7 +303,7 @@ the server process and are never returned by any endpoint.
 | `video-ingestion` | confirm the upload, or download with yt-dlp (+ captions) |
 | `video-preprocessing` | ffprobe, build the proxy, cut analysis chunks |
 | `video-transcription` | parse captions, or extract audio once and run STT |
-| `clip-search` | fan out over chunks, call MiniCPM, store matches |
+| `clip-search` | fan out over chunks, call the configured video model, store matches |
 | `clip-generation` | cut the clip from the original, upload, sign |
 
 All long-running work happens in the worker. Job IDs are derived from the row
@@ -304,7 +311,7 @@ they act on, so a duplicate enqueue collapses into the existing job. Real
 progress is written to both the job and the database and is exposed on
 `GET /api/videos/:id` and `GET /api/clip-requests/:id`.
 
-`MINICPM_CONCURRENCY` is enforced by a process-wide semaphore, so it holds
+`OPENROUTER_VIDEO_CONCURRENCY` is enforced by a process-wide semaphore, so it holds
 regardless of how many searches run at once.
 
 ---
@@ -359,12 +366,11 @@ AWS_ENDPOINT_URL=…
 AWS_REGION=…
 BUCKET_NAME=…
 
-MINICPM_API_KEY=…
 OPENROUTER_API_KEY=…
 
 MAX_SOURCE_DURATION_SECONDS=21600
-ANALYSIS_CHUNK_SECONDS=600
-MINICPM_CONCURRENCY=2
+ANALYSIS_CHUNK_SECONDS=120
+OPENROUTER_VIDEO_CONCURRENCY=2
 ```
 
 `PORT` is injected by Railway. Everything else has a working default — see
@@ -382,11 +388,9 @@ raising it.
 
 ## Known limitations
 
-- Visual search sees `MINICPM_FRAMES_PER_CHUNK` stills per chunk (128 by
-  default, one every ~4.7s at the default chunk size), chosen so short events
-  are not missed between samples. An event briefer than the sampling interval
-  can still fall between frames; raising the count improves recall at
-  proportionally higher cost per request.
+- Visual search depends on the routed OpenRouter provider accepting the actual
+  base64 MP4 payload. Chunk duration is configurable and defaults to two
+  minutes; payload size and provider limits still need production observation.
 - Aggregation merges matches that overlap substantially or sit within
   `MATCH_MERGE_GAP_SECONDS` of each other, so a moment split across a chunk
   boundary is reported once. A merged match is anchored to the chunk of its

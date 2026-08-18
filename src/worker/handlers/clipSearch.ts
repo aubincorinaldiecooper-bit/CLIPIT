@@ -6,8 +6,7 @@ import { errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
-import { extractFrames } from '../../services/media/ffmpeg.js';
-import { searchChunk } from '../../services/search/minicpm.js';
+import { searchVideoChunk } from '../../services/search/openrouterVideo.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
 import type { TranscriptLine } from '../../services/search/prompt.js';
@@ -113,7 +112,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     let totalMatches = 0;
 
     await withWorkDir(`search-${clipRequestId}`, async (dir) => {
-      const results = await mapWithConcurrency(chunks, env.MINICPM_CONCURRENCY, async (chunk) => {
+      const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
         const found = await searchSingleChunk({
           chunk,
           chunkCount: chunks.length,
@@ -271,13 +270,11 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
   const { chunk } = input;
   const chunkDir = path.join(input.workDir, `chunk-${chunk.chunkIndex}`);
 
-  // Evidence 1: frames, sampled from the chunk of the analysis proxy.
-  let frames: { localSeconds: number; filePath: string }[] = [];
+  // Visual evidence is the actual MP4 chunk, not sampled-frame summaries.
+  let chunkPath: string | undefined;
   if (input.mode !== 'transcript') {
-    const chunkPath = path.join(chunkDir, 'chunk.mp4');
+    chunkPath = path.join(chunkDir, 'chunk.mp4');
     await getStorage().downloadToFile(chunk.storageKey, chunkPath);
-    frames = await extractFrames(chunkPath, chunk.durationSeconds, env.MINICPM_FRAMES_PER_CHUNK, chunkDir);
-    if (frames.length === 0) throw new Error('No frames could be extracted from this chunk');
   }
 
   // Evidence 2: the slice of the (already global) transcript covering this chunk,
@@ -296,13 +293,13 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     }));
   }
 
-  const response = await searchChunk({
+  const response = await searchVideoChunk({
     instruction: input.instruction,
     mode: input.mode,
     chunkIndex: chunk.chunkIndex,
     chunkCount: input.chunkCount,
     chunkDurationSeconds: chunk.durationSeconds,
-    frames,
+    videoPath: chunkPath,
     transcript,
   });
 

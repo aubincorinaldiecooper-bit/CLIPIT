@@ -215,6 +215,8 @@ export async function extractFrames(
   durationSeconds: number,
   frameCount: number,
   outputDir: string,
+  maxWidth = 448,
+  jpegQuality = 4,
 ): Promise<ExtractedFrame[]> {
   const timestamps = planFrameTimestamps(durationSeconds, frameCount);
 
@@ -229,8 +231,8 @@ export async function extractFrames(
         '-ss', seconds.toFixed(3),
         '-i', inputPath,
         '-frames:v', '1',
-        '-vf', `scale='min(${env.MINICPM_FRAME_MAX_WIDTH},iw)':-2`,
-        '-q:v', String(env.MINICPM_FRAME_JPEG_QUALITY),
+        '-vf', `scale='min(${maxWidth},iw)':-2`,
+        '-q:v', String(jpegQuality),
         filePath,
       ],
       { timeoutMs: 120_000 },

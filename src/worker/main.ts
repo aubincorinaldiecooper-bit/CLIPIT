@@ -71,8 +71,8 @@ async function main(): Promise<void> {
   logger.info('worker starting', {
     nodeEnv: env.NODE_ENV,
     transcription: env.TRANSCRIPTION_ENABLED,
-    minicpmModel: env.MINICPM_MODEL,
-    minicpmConcurrency: env.MINICPM_CONCURRENCY,
+    videoModel: env.OPENROUTER_VIDEO_MODEL,
+    videoConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
   });
 
   await checkBinaries();

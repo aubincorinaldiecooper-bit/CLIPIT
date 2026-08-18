@@ -79,32 +79,14 @@ const envSchema = z.object({
   SIGNED_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
   UPLOAD_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
 
-  // --- MiniCPM ------------------------------------------------------------
-  MINICPM_API_BASE_URL: z.string().trim().default('https://api.modelbest.cn/v1'),
-  MINICPM_API_KEY: nonEmpty('MINICPM_API_KEY'),
-  MINICPM_MODEL: z.string().trim().default('MiniCPM-V-4.6-1B'),
-  MINICPM_CONCURRENCY: int(2, 1, 32),
-  MINICPM_REQUEST_TIMEOUT_MS: int(180_000, 5_000, 900_000),
-  MINICPM_MAX_RETRIES: int(3, 0, 10),
-  MINICPM_MAX_TOKENS: int(1024, 128, 8192),
-  MINICPM_TEMPERATURE: num(0.1, 0, 2),
-  /**
-   * Frames sampled from each analysis chunk and sent to the model.
-   *
-   * At the default 600s chunk this is one frame roughly every 4.7s, chosen so
-   * short visual events (a goal, a headshot) are not missed between samples.
-   * That costs proportionally more per request than a sparser sample; lower it
-   * if inference volume matters more than recall on brief moments.
-   */
-  MINICPM_FRAMES_PER_CHUNK: int(128, 2, 512),
-  /** Longest edge of each sampled frame, in pixels. */
-  MINICPM_FRAME_MAX_WIDTH: int(448, 128, 1920),
-  MINICPM_FRAME_JPEG_QUALITY: int(4, 1, 31),
-
-  // --- Transcription (OpenRouter speech-to-text) -------------------------
+  // --- OpenRouter video understanding and speech-to-text -----------------
   TRANSCRIPTION_ENABLED: bool(true),
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
-  OPENROUTER_API_KEY: z.string().trim().optional(),
+  OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
+  OPENROUTER_VIDEO_MODEL: z.string().trim().default('qwen/qwen3-vl-32b-instruct'),
+  OPENROUTER_VIDEO_CONCURRENCY: int(2, 1, 16),
+  OPENROUTER_VIDEO_MAX_TOKENS: int(1024, 128, 8192),
+  OPENROUTER_VIDEO_TEMPERATURE: num(0.1, 0, 2),
   OPENROUTER_STT_MODEL: z.string().trim().default('openai/whisper-1'),
   /** Optional attribution headers OpenRouter uses for app ranking. */
   OPENROUTER_SITE_URL: z.string().trim().optional(),
@@ -140,7 +122,7 @@ const envSchema = z.object({
 
   // --- Media pipeline -----------------------------------------------------
   MAX_SOURCE_DURATION_SECONDS: int(21_600, 1, 360_000),
-  ANALYSIS_CHUNK_SECONDS: int(600, 30, 3_600),
+  ANALYSIS_CHUNK_SECONDS: int(120, 30, 3_600),
   PROXY_HEIGHT: int(360, 144, 1080),
   PROXY_FPS: num(2, 0.5, 30),
   PROXY_CRF: int(30, 0, 51),

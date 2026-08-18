@@ -10,7 +10,6 @@ const defaults: Record<string, string> = {
   AWS_ACCESS_KEY_ID: 'test-access-key',
   AWS_SECRET_ACCESS_KEY: 'test-secret-key',
   BUCKET_NAME: 'clipit-test',
-  MINICPM_API_KEY: 'test-minicpm-key',
   OPENROUTER_API_KEY: 'test-openrouter-key',
 };
 

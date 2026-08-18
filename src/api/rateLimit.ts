@@ -8,7 +8,7 @@ import { logger } from '../lib/logger.js';
  * Fixed-window rate limiting backed by Redis, applied per session and per IP.
  *
  * Both dimensions matter: per-session stops one client from burning the
- * MiniCPM and STT budget, per-IP stops someone from minting unlimited anonymous
+ * Video-model and STT budget, per-IP stops someone from minting unlimited anonymous
  * sessions to get around it.
  */
 

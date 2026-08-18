@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /**
- * Parsing and validation of MiniCPM output.
+ * Parsing and validation of untrusted video-model output.
  *
  * Model output is untrusted input. It arrives as free text that is *supposed*
  * to be JSON, and in practice can be wrapped in prose, fenced in markdown,
