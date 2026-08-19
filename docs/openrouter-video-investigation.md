@@ -31,6 +31,18 @@ A `modelCapabilities` preflight now sends one 814-byte MP4 before any fan-out,
 so a slug that will not route video fails in about a second instead of after ten
 multi-megabyte uploads.
 
+### Migrating an existing deployment
+
+`OPENROUTER_VIDEO_MODEL` is optional, and any environment that sets it
+explicitly overrides the default above — including with the 32B slug that
+refuses every video request. Check each environment and either clear the
+variable or set it to the model named above. The Railway `worker` service does
+not set it, so it takes the default.
+
+The preflight makes a missed environment loud rather than silent: the search
+fails immediately naming the configured slug, instead of returning "nothing
+matches" as though the video genuinely lacked the moment.
+
 OpenRouter STT remains a separate path that creates reusable timestamped speech.
 Mixed searches give Qwen both the actual MP4 and the chunk-local transcript.
 Visual searches give it the MP4. This preserves visual actions, OCR/on-screen
