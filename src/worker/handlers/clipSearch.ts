@@ -2,12 +2,13 @@ import path from 'node:path';
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
-import { errorMessage } from '../../lib/errors.js';
+import { ExternalServiceError, errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { searchVideoChunk } from '../../services/search/openrouterVideo.js';
+import { assertVideoInputSupported } from '../../services/search/modelCapabilities.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
 import type { TranscriptLine } from '../../services/search/prompt.js';
@@ -105,6 +106,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       instruction: request.instruction,
     });
 
+    // One cheap check before uploading megabytes per chunk: a model without
+    // video endpoints refuses every chunk identically, and finding that out
+    // once is worth more than finding it out N times.
+    if (resolved.mode !== 'transcript') await assertVideoInputSupported();
+
     await startClipRequest(clipRequestId, { chunksTotal: chunks.length, resolvedMode: resolved.mode });
     // Clear anything from a previous attempt so a retry cannot double-insert.
     await deleteMatches(clipRequestId);
@@ -160,10 +166,23 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         });
       }
 
-      const failed = results.filter((result) => result.status === 'rejected').length;
+      const rejections = results.flatMap((result) => (result.status === 'rejected' ? [result.reason] : []));
+      const failed = rejections.length;
 
       if (failed === chunks.length) {
-        throw new Error(`Every chunk failed to search (${failed}/${chunks.length})`);
+        // A bare count is unactionable: "10/10 failed" reads as a bug in the
+        // search when it is usually one dependency saying the same thing ten
+        // times. Carry the reason so it reaches the user's screen.
+        const detail = errorMessage(rejections[0]);
+        // Only worth another attempt if something in there could go differently.
+        const retryable = rejections.some(
+          (reason) => !(reason instanceof ExternalServiceError) || reason.retryable,
+        );
+        throw new ExternalServiceError(
+          'openrouter-video',
+          `Every chunk failed to search (${failed}/${chunks.length}): ${detail}`,
+          { retryable, cause: rejections[0] },
+        );
       }
 
       // Chunks were searched independently, so the same moment can appear
