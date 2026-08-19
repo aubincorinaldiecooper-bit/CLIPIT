@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { assertVideoInputSupported, resetVideoModelCapabilityCache } from '../src/services/search/modelCapabilities.js';
 
 /** The slug `env.OPENROUTER_VIDEO_MODEL` defaults to in test config. */
-const CONFIGURED_MODEL = 'qwen/qwen3-vl-32b-instruct';
+const CONFIGURED_MODEL = 'qwen/qwen3-vl-235b-a22b-instruct';
 
 /** Verbatim shape of the refusal seen in production. */
 const NO_VIDEO_ENDPOINT = JSON.stringify({

@@ -25,6 +25,8 @@ export const SYSTEM_PROMPT = [
   '- A moment must have end_seconds greater than start_seconds.',
   '- Include the full moment: start slightly before it begins and end slightly after it resolves.',
   '- confidence is your certainty from 0 to 1.',
+  '- description is a terse label of at most 12 words, not a sentence or explanation.',
+  '- Return only the JSON. Do not explain your reasoning, before or after it.',
   '- Inspect the full video over time, including actions, objects, people, scene changes, and spatial relationships.',
   '- Read on-screen text (captions, signs, scoreboards, chat, overlays, and name tags) as evidence.',
   '- For mixed queries, require all requested visual, on-screen-text, and speech conditions to be satisfied.',

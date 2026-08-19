@@ -85,8 +85,18 @@ const envSchema = z.object({
   TRANSCRIPTION_ENABLED: bool(true),
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
   OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
-  OPENROUTER_VIDEO_MODEL: z.string().trim().default('qwen/qwen3-vl-32b-instruct'),
-  OPENROUTER_VIDEO_CONCURRENCY: int(2, 1, 16),
+  /**
+   * The `-instruct` variant is deliberate: the `-thinking` sibling emits
+   * reasoning tokens that add latency and cost without helping a task whose
+   * output is a short JSON array of timestamps.
+   */
+  OPENROUTER_VIDEO_MODEL: z.string().trim().default('qwen/qwen3-vl-235b-a22b-instruct'),
+  /**
+   * Chunks are independent, so this sets how much of a search runs at once.
+   * Ten chunks at 2 was five sequential rounds; 4 halves that while staying
+   * well inside provider rate limits. Raise from measured latency, not guesses.
+   */
+  OPENROUTER_VIDEO_CONCURRENCY: int(4, 1, 16),
   OPENROUTER_VIDEO_MAX_TOKENS: int(1024, 128, 8192),
   OPENROUTER_VIDEO_TEMPERATURE: num(0.1, 0, 2),
   OPENROUTER_STT_MODEL: z.string().trim().default('openai/whisper-1'),

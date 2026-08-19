@@ -1,16 +1,35 @@
 # OpenRouter actual-video MVP
 
-Status: **implemented MVP decision**, reviewed 2026-08-18.
+Status: **implemented MVP decision**, reviewed 2026-08-19.
 
 ## One production path
 
 The MVP uses one visual-understanding model:
 
-`actual MP4 chunk + user's natural-language instruction → qwen/qwen3-vl-32b-instruct through OpenRouter → timestamp range(s)`
+`actual MP4 chunk + user's natural-language instruction → qwen/qwen3-vl-235b-a22b-instruct through OpenRouter → timestamp range(s)`
 
-Qwen3-VL 32B is the only production visual model. There is no model comparison,
-fallback, escalation, or routing cascade. Do not add another model or a
-cost-control behavior that reduces search coverage without asking first.
+Qwen3-VL 235B A22B Instruct is the only production visual model. There is no
+model comparison, fallback, escalation, or routing cascade. Do not add another
+model or a cost-control behavior that reduces search coverage without asking
+first.
+
+### Why 235B and not 32B
+
+The original choice was `qwen/qwen3-vl-32b-instruct`. In production every
+request against it was refused with `404 — No endpoints found that support
+input video`: the model advertises video, but no provider serving that slug on
+OpenRouter exposes a video endpoint. The family decision held; the size did not.
+235B A22B is served by several providers, and its stronger OCR is what the
+acceptance case below actually turns on.
+
+The `-instruct` variant is deliberate. Its `-thinking` sibling spends tokens and
+wall-clock on reasoning that a short JSON array of timestamps does not need, and
+that prose can reach the strict parser as output it has to reject. Reasoning is
+never requested — see the test in `test/openrouterVideo.test.ts`.
+
+A `modelCapabilities` preflight now sends one 814-byte MP4 before any fan-out,
+so a slug that will not route video fails in about a second instead of after ten
+multi-megabyte uploads.
 
 OpenRouter STT remains a separate path that creates reusable timestamped speech.
 Mixed searches give Qwen both the actual MP4 and the chunk-local transcript.
@@ -24,6 +43,13 @@ OpenRouter chat completions accepts video in a `video_url` content part whose
 value can be a base64 data URL. Private Railway chunks are downloaded by the
 worker and sent as `data:video/mp4;base64,...`; they do not need to be exposed by
 a public or presigned URL.
+
+Chunks are independent, so `OPENROUTER_VIDEO_CONCURRENCY` sets how much of a
+search runs at once; it defaults to 4. Ten chunks at the previous value of 2
+meant five sequential rounds of the slowest call in each pair. Change it from
+measured end-to-end latency — logged as `elapsedMs` on `clip search complete`,
+alongside the chunk count, chunk length, concurrency and model that produced it
+— rather than from an estimate, and before reaching for further architecture.
 
 Analysis chunk duration is controlled by `ANALYSIS_CHUNK_SECONDS` and defaults
 to 120 seconds. The existing low-resolution H.264 proxy remains the analysis

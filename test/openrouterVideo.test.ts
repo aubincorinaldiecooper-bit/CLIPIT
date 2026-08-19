@@ -39,7 +39,7 @@ describe('OpenRouter actual-video search', () => {
         model: string;
         messages: Array<{ content: Array<{ type: string; video_url?: { url: string } }> }>;
       };
-      expect(body.model).toBe('qwen/qwen3-vl-32b-instruct');
+      expect(body.model).toBe('qwen/qwen3-vl-235b-a22b-instruct');
       const userContent = body.messages[1]?.content ?? [];
       expect(userContent.some((part) => part.type === 'image_url')).toBe(false);
       expect(userContent.find((part) => part.type === 'video_url')?.video_url?.url)
@@ -73,6 +73,23 @@ describe('OpenRouter actual-video search', () => {
       .toContain('a black car pulls in');
   });
 
+  /**
+   * Thinking mode is off by choice, not by luck: reasoning tokens add latency
+   * and cost to a task whose whole output is a short JSON array, and they can
+   * arrive as prose the strict parser then has to reject. The `-instruct` slug
+   * has no thinking mode, so the guard is simply never asking for one.
+   */
+  it('never asks the model to reason', async () => {
+    const { fetchMock } = await runSearch({ mode: 'visual', withVideo: true });
+
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = JSON.parse(String(request.body)) as Record<string, unknown> & { model: string };
+
+    expect(body).not.toHaveProperty('reasoning');
+    expect(body).not.toHaveProperty('include_reasoning');
+    expect(body.model).not.toMatch(/thinking/);
+  });
+
   it('refuses a visual search with no video rather than answering without it', async () => {
     await expect(runSearch({ mode: 'visual', withVideo: false })).rejects.toThrow(/actual video is required/i);
   });
@@ -88,7 +105,7 @@ describe('OpenRouter actual-video search', () => {
       totalTokens: 120,
       costUsd: 0.001,
       provider: 'test-provider',
-      model: 'qwen/qwen3-vl-32b-instruct',
+      model: 'qwen/qwen3-vl-235b-a22b-instruct',
     });
     expect((usage[0] as { latencyMs: number }).latencyMs).toBeGreaterThanOrEqual(0);
   });

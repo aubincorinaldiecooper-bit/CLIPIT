@@ -117,6 +117,10 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
     let completed = 0;
     let totalMatches = 0;
+    // Per-request latency lives in model_usage; this is the number the user
+    // actually waits through, and the one that says whether chunk size and
+    // concurrency need changing before any further architecture does.
+    const searchStartedAt = performance.now();
 
     await withWorkDir(`search-${clipRequestId}`, async (dir) => {
       const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
@@ -191,10 +195,18 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
 
       await finishClipRequest(clipRequestId, 'completed');
+      const elapsedMs = Math.round(performance.now() - searchStartedAt);
       log.info('clip search complete', {
         matches: finalCount,
         mergedFrom: totalMatches,
         failedChunks: failed,
+        elapsedMs,
+        // The three inputs that set wall-clock, logged alongside it so a slow
+        // search can be read without correlating against config elsewhere.
+        chunks: chunks.length,
+        concurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
+        chunkSeconds: env.ANALYSIS_CHUNK_SECONDS,
+        model: env.OPENROUTER_VIDEO_MODEL,
       });
     });
   } catch (error) {
