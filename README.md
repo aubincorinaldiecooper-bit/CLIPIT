@@ -31,7 +31,7 @@ where I explain why I left", and "clip the boss fight" all take the same path.
 | Queues | Redis + BullMQ |
 | Media | FFmpeg / FFprobe, yt-dlp |
 | Storage | S3-compatible adapter (Railway bucket, S3, R2, MinIO) |
-| Video understanding | OpenRouter (`qwen/qwen3-vl-32b-instruct`), actual MP4 chunks |
+| Video understanding | OpenRouter (`qwen/qwen3-vl-235b-a22b-instruct`), actual MP4 chunks |
 | Speech-to-text | OpenRouter (`openai/whisper-1`), YouTube captions preferred |
 
 Visual and mixed searches send each actual MP4 analysis chunk to one production
