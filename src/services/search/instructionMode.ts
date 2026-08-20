@@ -29,30 +29,27 @@ const SPOKEN_PATTERNS: RegExp[] = [
 ];
 
 /**
+ * Whether the instruction quotes something.
+ *
  * A quoted phrase proves nothing about modality: it can be said aloud or
  * painted on a car hood. Counting it as speech routed `Find "SALE"` to a
  * transcript-only search, which is never sent the video and so can never
  * satisfy the phrase from what is on screen — a false negative on exactly the
  * instruction shape most likely to be about visible text.
  *
- * Curly quotes are included because instructions get pasted from anywhere.
+ * This detects a quotation rather than parsing one, because nothing here reads
+ * the quoted text — only whether a quotation is present. Matching delimiter
+ * pairs meant tracking what may appear between them, and an apostrophe inside
+ * the quote (`‘I’m done’`) closed it early and lost the match. Looking for a
+ * single opening mark has no interior to get wrong.
  *
- * The straight single quote is the awkward one: it is also the apostrophe, so
- * a naive alternative spans from `he's` to `isn't` and reports a quotation in
- * ordinary speech. Requiring its delimiters not to sit inside a word keeps
- * that from routing a plain transcript search into a full video upload. The
- * curly apostrophe (’) has the same double life, which is why the curly pair
- * is anchored on an explicit opening ‘ that no apostrophe produces.
+ * Apostrophes are the whole difficulty: `'` and `’` are also quote characters,
+ * so both are only counted when they do not sit inside a word, which keeps
+ * `he's` and `isn’t` from turning a plain transcript search into a full video
+ * upload. The unambiguous marks — `"`, `“`, `”`, `‘` — are never apostrophes
+ * and need no such guard.
  */
-const QUOTED_PHRASE = new RegExp(
-  [
-    '"[^"]{2,}"',
-    '“[^”]{2,}”',
-    '‘[^’]{2,}’',
-    "(?<![\\p{L}\\p{N}])'[^']{2,}'(?![\\p{L}\\p{N}])",
-  ].join('|'),
-  'u',
-);
+const QUOTATION = /["“”‘]|(?<![\p{L}\p{N}])['’]/u;
 
 const VISUAL_PATTERNS: RegExp[] = [
   /\b(show|shows|showed|showing|shown)\b/i,
@@ -106,7 +103,7 @@ export function classifyInstruction(instruction: string): ModeClassification {
     // matched is a quoted phrase, because that phrase may be on screen rather
     // than in the audio. Erring toward `both` costs one upload; erring toward
     // `transcript` cannot find visible text at all.
-    if (QUOTED_PHRASE.test(text)) {
+    if (QUOTATION.test(text)) {
       return {
         mode: 'both',
         spokenScore,

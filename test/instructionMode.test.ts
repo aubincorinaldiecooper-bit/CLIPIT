@@ -151,7 +151,11 @@ describe('resolveSearchMode', () => {
     ['curly single', 'where it says ‘SALE’'],
     ['straight single', "where it says 'SALE'"],
     ['straight double', 'where it says "SALE"'],
-  ])('treats a %s quoted phrase as ambiguous', (_label, instruction) => {
+    // An apostrophe inside the quotation used to close it early, losing the match.
+    ['curly single around a contraction', 'where it says ‘I’m done’'],
+    ['straight single around a contraction', "where it says 'I'm done'"],
+    ['quotation containing a possessive', 'the sign reading “Bob’s Diner”'],
+  ])('treats a %s as ambiguous', (_label, instruction) => {
     expect(classifyInstruction(instruction).mode).not.toBe('transcript');
   });
 
