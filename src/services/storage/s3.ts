@@ -16,6 +16,14 @@ import { env } from '../../config/env.js';
 import { ExternalServiceError } from '../../lib/errors.js';
 import type { StorageAdapter, StoredObject } from './types.js';
 
+/**
+ * Keeps a filename usable on every OS and safe inside a quoted header.
+ * Colons in particular are illegal on Windows, which rules out raw timecodes.
+ */
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^\w.-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 120) || 'clip.mp4';
+}
+
 function buildClient(): S3Client {
   return new S3Client({
     region: env.AWS_REGION,
@@ -71,9 +79,23 @@ export class S3StorageAdapter implements StorageAdapter {
     }
   }
 
-  async createDownloadUrl(key: string, expiresInSeconds = env.SIGNED_URL_EXPIRY_SECONDS): Promise<string> {
-    const command = new GetObjectCommand({ Bucket: this.bucket, Key: key });
-    return getSignedUrl(this.client, command, { expiresIn: expiresInSeconds });
+  async createDownloadUrl(
+    key: string,
+    options: { expiresInSeconds?: number; downloadFilename?: string } = {},
+  ): Promise<string> {
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+      // Signed into the URL because the browser cannot add it: the `download`
+      // attribute has no effect cross-origin, so without this the link
+      // navigates to the video rather than saving it.
+      ...(options.downloadFilename
+        ? { ResponseContentDisposition: `attachment; filename="${sanitizeFilename(options.downloadFilename)}"` }
+        : {}),
+    });
+    return getSignedUrl(this.client, command, {
+      expiresIn: options.expiresInSeconds ?? env.SIGNED_URL_EXPIRY_SECONDS,
+    });
   }
 
   async uploadFile(key: string, filePath: string, contentType: string): Promise<StoredObject> {

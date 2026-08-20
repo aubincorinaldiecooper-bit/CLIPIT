@@ -273,10 +273,22 @@ export async function serializeVideoWithPlayback(video: Video, chunks?: VideoChu
 
 export async function serializeClip(clip: Clip, includeUrl = true) {
   let url: string | null = null;
+  let downloadUrl: string | null = null;
   let urlExpiresAt: string | null = null;
 
   if (includeUrl && clip.status === 'ready' && clip.storageKey) {
-    url = await getStorage().createDownloadUrl(clip.storageKey);
+    // Two URLs for the same object, differing only in disposition. Inline
+    // playback needs the bytes served as video; saving needs them served as an
+    // attachment, and a single URL cannot do both — `attachment` can stop a
+    // <video> element playing it.
+    const [inline, attachment] = await Promise.all([
+      getStorage().createDownloadUrl(clip.storageKey),
+      getStorage().createDownloadUrl(clip.storageKey, {
+        downloadFilename: `clipit-${formatTimecode(clip.startSeconds)}-${formatTimecode(clip.endSeconds)}.mp4`,
+      }),
+    ]);
+    url = inline;
+    downloadUrl = attachment;
     urlExpiresAt = new Date(Date.now() + env.SIGNED_URL_EXPIRY_SECONDS * 1000).toISOString();
   }
 
@@ -293,6 +305,7 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
     durationSeconds: clip.durationSeconds,
     sizeBytes: clip.sizeBytes,
     url,
+    downloadUrl,
     urlExpiresAt,
     createdAt: clip.createdAt.toISOString(),
     updatedAt: clip.updatedAt.toISOString(),
