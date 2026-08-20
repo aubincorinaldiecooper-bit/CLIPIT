@@ -74,25 +74,48 @@ describe('OpenRouter actual-video search', () => {
   });
 
   /**
-   * Thinking mode is off by choice, not by luck: reasoning tokens add latency
-   * and cost to a task whose whole output is a short JSON array, and they can
-   * arrive as prose the strict parser then has to reject. Nothing in the
-   * request asks for reasoning, and this keeps it that way across model
-   * changes — including to a slug whose default might differ.
+   * This previously asserted the request carried NO reasoning field, on the
+   * theory that not asking for reasoning was the same as not getting it. It
+   * is not: the model thinks by default, and one production chunk billed
+   * 13,431 completion tokens against a 1,024 cap — the cap bounds visible
+   * content while thinking runs on its own budget. Silence is not a setting.
    */
-  it('never asks the model to reason', async () => {
+  it('explicitly turns reasoning off rather than declining to mention it', async () => {
     const { fetchMock } = await runSearch({ mode: 'visual', withVideo: true });
 
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
-    const body = JSON.parse(String(request.body)) as Record<string, unknown> & { model: string };
+    const body = JSON.parse(String(request.body)) as {
+      model: string;
+      reasoning?: { enabled?: boolean; exclude?: boolean };
+    };
 
-    expect(body).not.toHaveProperty('reasoning');
-    expect(body).not.toHaveProperty('include_reasoning');
+    expect(body.reasoning?.enabled).toBe(false);
+    // Suppressing generation is what saves money; excluding it from the
+    // response only hides it. Both are asked for, but `enabled` is the one
+    // that matters and a future edit must not drop it for `exclude` alone.
+    expect(body.reasoning?.exclude).toBe(true);
     expect(body.model).not.toMatch(/thinking/);
   });
 
   it('refuses a visual search with no video rather than answering without it', async () => {
     await expect(runSearch({ mode: 'visual', withVideo: false })).rejects.toThrow(/actual video is required/i);
+  });
+
+  /**
+   * `fetch` resolves on headers, while the model is still generating, so a
+   * single timer around it measured upload and time-to-first-byte and called
+   * it the request. That hid four minutes of a four-and-a-half-minute search
+   * and sent the investigation after the storage layer instead.
+   */
+  it('times the body read separately from the headers', async () => {
+    const { fetchMock } = await runSearch({ mode: 'visual', withVideo: true });
+
+    // The stub resolves both at once; the contract under test is that the
+    // response body is read as text and timed, not consumed by response.json()
+    // inside an untimed region.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(request.signal).toBeDefined();
   });
 
   it('reports tokens, cost and latency for the caller to record', async () => {
