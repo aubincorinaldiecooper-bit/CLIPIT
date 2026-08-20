@@ -5,6 +5,7 @@ import type {
   ClipMatch,
   ClipRequest,
   ClipRequestStatus,
+  MatchFeedback,
   MatchSource,
   ResolvedSearchMode,
   SearchMode,
@@ -151,6 +152,7 @@ interface ClipMatchRow {
   source: MatchSource;
   quote: string | null;
   thumbnail_key: string | null;
+  feedback: MatchFeedback | null;
   created_at: Date;
 }
 
@@ -168,6 +170,7 @@ function mapMatch(row: ClipMatchRow): ClipMatch {
     source: row.source,
     quote: row.quote,
     thumbnailKey: row.thumbnail_key ?? null,
+    feedback: row.feedback ?? null,
     createdAt: row.created_at,
   };
 }
@@ -278,6 +281,30 @@ export async function listMatchesMissingThumbnails(videoId: string): Promise<Cli
     [videoId],
   );
   return rows.map(mapMatch);
+}
+
+/**
+ * Records what a person thought of a match, or clears it.
+ *
+ * Scoped to the request as well as the match so a guessed match id cannot be
+ * marked from another user's search. The row is never deleted: a rejected
+ * moment is the only record of the model being wrong, which is the evidence
+ * this column exists to collect.
+ */
+export async function setMatchFeedback(
+  requestId: string,
+  matchId: string,
+  feedback: MatchFeedback | null,
+): Promise<ClipMatch | null> {
+  const row = await queryOne<ClipMatchRow>(
+    `UPDATE clip_matches
+        SET feedback = $3,
+            feedback_at = CASE WHEN $3::text IS NULL THEN NULL ELSE now() END
+      WHERE clip_request_id = $1 AND id = $2
+      RETURNING *`,
+    [requestId, matchId, feedback],
+  );
+  return row ? mapMatch(row) : null;
 }
 
 export async function listMatches(requestId: string): Promise<ClipMatch[]> {

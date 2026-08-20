@@ -21,6 +21,16 @@ export type ResolvedSearchMode = 'visual' | 'transcript' | 'both';
 
 export type MatchSource = 'visual' | 'transcript' | 'multimodal';
 
+/**
+ * What a person thought of a match.
+ *
+ * Confidence is the model's opinion of its own answer; this is the only thing
+ * in the system that disagrees with it. A rejected match is kept rather than
+ * deleted — it is hidden from the user, but it is also the only record of the
+ * model being wrong, which is what makes the confidence score checkable.
+ */
+export type MatchFeedback = 'approved' | 'rejected';
+
 export interface Session {
   id: string;
   userId: string | null;
@@ -180,6 +190,8 @@ export interface ClipMatch {
    * has not run — a match without a picture is still a match.
    */
   thumbnailKey: string | null;
+  /** Null until someone says. See `MatchFeedback`. */
+  feedback: MatchFeedback | null;
   createdAt: Date;
 }
 
