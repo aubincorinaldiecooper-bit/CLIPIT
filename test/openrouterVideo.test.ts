@@ -75,26 +75,31 @@ describe('OpenRouter actual-video search', () => {
   });
 
   /**
-   * This previously asserted the request carried NO reasoning field, on the
-   * theory that not asking for reasoning was the same as not getting it. It
-   * is not: the model thinks by default, and one production chunk billed
-   * 13,431 completion tokens against a 1,024 cap — the cap bounds visible
-   * content while thinking runs on its own budget. Silence is not a setting.
+   * This assertion has flipped twice, so it is worth stating what it now
+   * protects. Reasoning was disabled as a cost fix; the per-chunk numbers then
+   * showed that every chunk which found a match spent 2,486-3,887 completion
+   * tokens while every chunk that found nothing spent 468-1,595 — far more
+   * than the ~150 tokens two matches of JSON would add. Whatever consumes
+   * those tokens correlates with finding moments, and the chunk that located
+   * the acceptance case is near the top of it.
+   *
+   * So the request must NOT suppress reasoning while that is unmeasured: a
+   * cheaper search that finds less is the one trade this project does not make
+   * blind. If a cap is added later it belongs in `reasoning.max_tokens`, which
+   * bounds thinking without removing it — this test should then assert the cap,
+   * not a re-disable.
    */
-  it('explicitly turns reasoning off rather than declining to mention it', async () => {
+  it('does not suppress reasoning while its value is unmeasured', async () => {
     const { fetchMock } = await runSearch({ mode: 'visual', withVideo: true });
 
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
     const body = JSON.parse(String(request.body)) as {
       model: string;
-      reasoning?: { enabled?: boolean; exclude?: boolean };
+      reasoning?: { enabled?: boolean; exclude?: boolean; max_tokens?: number };
     };
 
-    expect(body.reasoning?.enabled).toBe(false);
-    // Suppressing generation is what saves money; excluding it from the
-    // response only hides it. Both are asked for, but `enabled` is the one
-    // that matters and a future edit must not drop it for `exclude` alone.
-    expect(body.reasoning?.exclude).toBe(true);
+    expect(body.reasoning?.enabled).not.toBe(false);
+    expect(body).not.toHaveProperty('include_reasoning');
     expect(body.model).not.toMatch(/thinking/);
   });
 
