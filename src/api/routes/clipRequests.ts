@@ -3,17 +3,39 @@ import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
+import { formatTimecode } from '../../services/timestamps.js';
 import { getClipRequest, listMatches, listMatchesByIds } from '../../db/repositories/clipRequests.js';
 import { listClipsForRequest, upsertClipForMatch } from '../../db/repositories/clips.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import { enqueueClipGeneration } from '../../queues/index.js';
 import { assertOwnership, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
-import { serializeClip, serializeClipRequest } from '../serializers.js';
+import { searchCoverage, serializeClip, serializeClipRequest, type SearchCoverage } from '../serializers.js';
 import { parse } from '../validation.js';
 import type { Clip } from '../../domain/types.js';
 
 const uuidSchema = z.string().uuid('must be a UUID');
+
+/**
+ * Says why nothing was found, without blaming the instruction for something
+ * the instruction did not cause.
+ *
+ * Telling a user to rephrase is only fair when the whole video was actually
+ * searched. When a provider refused part of it, rewording hits the same
+ * filter — so the advice cannot work, and the real answer is that a stretch of
+ * video was never looked at.
+ */
+function explainNoMatches(coverage: SearchCoverage): string {
+  if (coverage.complete) return 'No matches to generate. Try a different instruction.';
+
+  if (!coverage.locatable || coverage.unsearchedSeconds === 0) {
+    // The duration is unknown, not zero. Saying "00:00:00 could not be
+    // examined" would read as nothing having been missed at all.
+    return 'No matches to generate. Part of this video could not be examined, so the moment may be in a stretch that was never searched.';
+  }
+
+  return `No matches to generate. ${formatTimecode(coverage.unsearchedSeconds)} of this video could not be examined, so the moment may be in a stretch that was never searched.`;
+}
 
 const generateSchema = z
   .object({
@@ -87,7 +109,11 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       : await listMatches(requestId);
 
     if (matches.length === 0) {
-      throw HttpError.unprocessable('No matches to generate. Try a different instruction.');
+      // Blaming the instruction is only fair when the whole video was actually
+      // searched. If a provider refused part of it, telling the user to
+      // rephrase sends them to fix something that was never wrong.
+      const coverage = searchCoverage(clipRequest);
+      throw HttpError.unprocessable(explainNoMatches(coverage), { coverage });
     }
 
     if (body.matchIds?.length && matches.length !== body.matchIds.length) {

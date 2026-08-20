@@ -1,7 +1,15 @@
 import { env } from '../config/env.js';
 import { getStorage } from '../services/storage/s3.js';
 import { formatTimecode } from '../services/timestamps.js';
-import type { Clip, ClipMatch, ClipRequest, Video, VideoChunk } from '../domain/types.js';
+import type {
+  ChunkDegradation,
+  ChunkFailureCode,
+  Clip,
+  ClipMatch,
+  ClipRequest,
+  Video,
+  VideoChunk,
+} from '../domain/types.js';
 
 /** Shapes rows into the public API representation. Storage keys never leak. */
 
@@ -107,6 +115,78 @@ export interface ClipRequestProgress {
   message: string;
 }
 
+/**
+ * Which parts of the video were never examined, and why.
+ *
+ * A chunk the provider refused is not a failed search — the search completes
+ * and returns what the other chunks found. But it means a window of the video
+ * was never looked at, and a user asking about a moment inside that window is
+ * told "nothing matches", which is indistinguishable from the moment being
+ * absent. Naming the seconds is what makes that answer honest.
+ */
+export interface SearchCoverage {
+  /** True only when every chunk was searched with the evidence intended. */
+  complete: boolean;
+  /** False when something is known to be missing but cannot be located. */
+  locatable: boolean;
+  unsearchedSeconds: number;
+  gaps: Array<{
+    startSeconds: number;
+    endSeconds: number;
+    startTimecode: string;
+    endTimecode: string;
+    reason: ChunkFailureCode;
+  }>;
+  /**
+   * Windows that WERE searched, but without their transcript — recovered from
+   * a provider content filter. Not gaps: matches from them are real. What is
+   * missing there is the ability to have checked a spoken condition.
+   */
+  degraded: Array<{
+    startSeconds: number;
+    endSeconds: number;
+    startTimecode: string;
+    endTimecode: string;
+    reason: ChunkDegradation['reason'];
+  }>;
+}
+
+export function searchCoverage(request: ClipRequest): SearchCoverage {
+  const gaps = request.chunkErrors
+    // Rows written before failures carried a source window cannot describe
+    // one; they still count as failures, they just cannot be located.
+    .filter((error) => typeof error.globalStartSeconds === 'number' && typeof error.globalEndSeconds === 'number')
+    .map((error) => ({
+      startSeconds: error.globalStartSeconds,
+      endSeconds: error.globalEndSeconds,
+      startTimecode: formatTimecode(error.globalStartSeconds),
+      endTimecode: formatTimecode(error.globalEndSeconds),
+      reason: error.code ?? ('unknown' as ChunkFailureCode),
+    }))
+    .sort((a, b) => a.startSeconds - b.startSeconds);
+
+  const degraded = (request.chunkDegradations ?? []).map((entry) => ({
+    startSeconds: entry.globalStartSeconds,
+    endSeconds: entry.globalEndSeconds,
+    startTimecode: formatTimecode(entry.globalStartSeconds),
+    endTimecode: formatTimecode(entry.globalEndSeconds),
+    reason: entry.reason,
+  })).sort((a, b) => a.startSeconds - b.startSeconds);
+
+  return {
+    // A recovered chunk counts against completeness. Its matches are real, but
+    // the search that ran there is not the search that was asked for.
+    complete: request.chunksFailed === 0 && degraded.length === 0,
+    // A failure recorded before failures carried a window is still a failure;
+    // it just cannot say where. Callers must not read unsearchedSeconds: 0 as
+    // "nothing was missed".
+    locatable: gaps.length === request.chunksFailed,
+    unsearchedSeconds: Number(gaps.reduce((sum, gap) => sum + (gap.endSeconds - gap.startSeconds), 0).toFixed(3)),
+    gaps,
+    degraded,
+  };
+}
+
 function clipRequestProgress(request: ClipRequest): ClipRequestProgress {
   const total = request.chunksTotal;
   const done = request.chunksCompleted + request.chunksFailed;
@@ -118,7 +198,12 @@ function clipRequestProgress(request: ClipRequest): ClipRequestProgress {
       : request.status === 'searching'
         ? `Searched ${done} of ${total} segments`
         : request.status === 'completed'
-          ? `Search complete (${total} segments)`
+          ? // Never claim a whole video was searched when part of it was not.
+            // "Search complete (10 segments)" after searching nine is the line
+            // that turns a coverage gap into an apparent absence.
+            request.chunksFailed > 0
+            ? `Searched ${request.chunksCompleted} of ${total} segments — ${request.chunksFailed} could not be examined`
+            : `Search complete (${total} segments)`
           : (request.errorMessage ?? 'Search failed');
 
   return {
@@ -147,6 +232,9 @@ export function serializeClipRequest(
     progress: clipRequestProgress(request),
     // Surfaced so a partially failed search is visible rather than silent.
     failedChunks: request.chunkErrors.slice(0, 20),
+    // The same facts as failedChunks, expressed as what the user actually
+    // needs to know: which seconds of their video went unexamined.
+    coverage: searchCoverage(request),
     matchCount: matches?.length ?? undefined,
     createdAt: request.createdAt.toISOString(),
     updatedAt: request.updatedAt.toISOString(),
