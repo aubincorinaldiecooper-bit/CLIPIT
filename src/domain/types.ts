@@ -175,6 +175,11 @@ export interface ClipMatch {
   confidence: number;
   source: MatchSource;
   quote: string | null;
+  /**
+   * Storage key of a still from this moment. Null when extraction failed or
+   * has not run — a match without a picture is still a match.
+   */
+  thumbnailKey: string | null;
   createdAt: Date;
 }
 

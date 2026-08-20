@@ -150,6 +150,7 @@ interface ClipMatchRow {
   confidence: number;
   source: MatchSource;
   quote: string | null;
+  thumbnail_key: string | null;
   created_at: Date;
 }
 
@@ -166,6 +167,7 @@ function mapMatch(row: ClipMatchRow): ClipMatch {
     confidence: row.confidence,
     source: row.source,
     quote: row.quote,
+    thumbnailKey: row.thumbnail_key ?? null,
     createdAt: row.created_at,
   };
 }
@@ -215,6 +217,26 @@ export async function insertMatches(requestId: string, matches: NewClipMatch[]):
     params,
   );
   return rows.map(mapMatch);
+}
+
+/**
+ * Attaches stills to matches, one statement rather than one per match.
+ *
+ * Thumbnails are decoration: a failure here must not disturb a search that has
+ * already found and stored its results, so the caller treats this as
+ * best-effort.
+ */
+export async function setMatchThumbnails(
+  thumbnails: Array<{ matchId: string; thumbnailKey: string }>,
+): Promise<void> {
+  if (thumbnails.length === 0) return;
+  await queryOne(
+    `UPDATE clip_matches AS m
+        SET thumbnail_key = v.thumbnail_key
+       FROM (SELECT * FROM unnest($1::uuid[], $2::text[]) AS t(id, thumbnail_key)) AS v
+      WHERE m.id = v.id`,
+    [thumbnails.map((t) => t.matchId), thumbnails.map((t) => t.thumbnailKey)],
+  );
 }
 
 export async function listMatches(requestId: string): Promise<ClipMatch[]> {

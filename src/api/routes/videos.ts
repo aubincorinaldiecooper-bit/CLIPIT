@@ -276,6 +276,6 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     await enqueueClipSearch({ clipRequestId: clipRequest.id });
     logger.info('clip search queued', { clipRequestId: clipRequest.id, videoId });
 
-    return reply.code(202).send({ clipRequest: serializeClipRequest(clipRequest, []) });
+    return reply.code(202).send({ clipRequest: await serializeClipRequest(clipRequest, []) });
   });
 }

@@ -369,6 +369,44 @@ export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: num
 }
 
 /**
+ * Grabs one frame at a given moment, for a match thumbnail.
+ *
+ * `-ss` before `-i` seeks by keyframe before decoding, which is fast enough to
+ * run per match, and imprecise by at most a keyframe interval — irrelevant for
+ * a preview still, and the reason this is not reused for anything that needs
+ * an exact frame.
+ *
+ * Returns false when nothing was written. Seeking past the last decodable
+ * frame exits 0 without producing a file, so the result has to be confirmed
+ * rather than assumed.
+ */
+export async function extractFrameAt(
+  inputPath: string,
+  seconds: number,
+  outputPath: string,
+  maxWidth = 320,
+): Promise<boolean> {
+  await run(
+    env.FFMPEG_PATH,
+    [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-y',
+      '-ss', Math.max(0, seconds).toFixed(3),
+      '-i', inputPath,
+      '-frames:v', '1',
+      '-vf', `scale='min(${maxWidth},iw)':-2`,
+      '-q:v', '5',
+      outputPath,
+    ],
+    { timeoutMs: 60_000 },
+  );
+
+  const info = await stat(outputPath).catch(() => null);
+  return info !== null && info.size > 0;
+}
+
+/**
  * Builds the smallest clip a provider will still accept as video.
  *
  * Used by the routing preflight, which needs a throwaway MP4 rather than any
