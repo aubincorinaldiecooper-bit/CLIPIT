@@ -120,12 +120,24 @@ async function requestCompletion(input: VideoSearchInput): Promise<VideoSearchRe
     max_tokens: env.OPENROUTER_VIDEO_MAX_TOKENS,
     temperature: env.OPENROUTER_VIDEO_TEMPERATURE,
     stream: false,
-    // Locating a moment is not a reasoning task: the answer is a short JSON
-    // array of timestamps. Thinking tokens are billed as output and are
-    // generated one at a time, so they cost money AND wall clock — one chunk
-    // spent 13,431 completion tokens against a 1,024 cap, because the cap
-    // bounds visible content while thinking runs on its own budget.
-    reasoning: { enabled: false, exclude: true },
+    // Reasoning is deliberately left at the model's default, which is on.
+    //
+    // It was briefly disabled as a cost and latency fix, on the assumption
+    // that locating a moment is not a reasoning task. The per-chunk numbers
+    // say otherwise: every chunk that found a match spent 2,486-3,887
+    // completion tokens, while every chunk that found nothing spent 468-1,595.
+    // Two matches of JSON is roughly 150 tokens, so the difference is not
+    // output length — something correlated with finding moments is consuming
+    // them, and the chunk that located the acceptance case is near the top of
+    // that spend.
+    //
+    // Turning it off to save money could therefore have bought a cheaper
+    // search that finds less, which is the one trade this project does not
+    // make without measuring. `reasoning_tokens` is recorded below; once a run
+    // shows what thinking actually buys, the choice is between capping it
+    // (`reasoning: { max_tokens: N }`, which Qwen maps to a thinking budget)
+    // and leaving it alone. Capping is the likely answer — one chunk spent
+    // 13,431 tokens and found nothing — but not before the measurement.
   });
   const payloadBytes = Buffer.byteLength(body);
   const startedAt = performance.now();
