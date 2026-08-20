@@ -191,3 +191,31 @@ must return a range covering that scene. Also exercise:
 For each case, verify the returned range maps to source time and produces a
 playable clip. Capture the request metrics above so chunk size and concurrency
 can later be optimized from real usage without prematurely reducing coverage.
+
+### The known-good result
+
+First search that reached the model at all, 2026-08-20 04:12 UTC, clip request
+`0623cbe3-79ea-4e94-be2d-14a8dd5c58b5`. Instruction: *find the part where they
+show the car that says "bought with investor money"*.
+
+| | |
+|---|---|
+| Source | 1179.272s, 10 chunks of 120s |
+| Mode | `both` (transcript available) |
+| Model | `qwen/qwen3.6-flash` via Alibaba, reasoning at model default |
+| Matches | **4**, including chunk 0 (`0-121s`) — the window holding `00:54` |
+| Failed | 1 — chunk 7 (`841-961s`), provider content filter |
+| Cost | **$0.07718**, $0.003927 per source minute |
+| Wall clock | **277,408ms** |
+
+**This is the accuracy floor.** Every later change that saves money or time —
+a reasoning cap, the retrieval index, fewer frames per second, longer chunks —
+must be re-run against this instruction and still return a match covering
+`00:54`. A change that loses it is wrong regardless of what it saves, and the
+saving is not a reason to keep it.
+
+Note the cost and wall clock were measured before the request timers were
+split, so `latencyMs` in that run covered upload and time-to-first-byte only;
+generation was invisible. Later runs report `headersMs`, `bodyMs` and
+`downloadMs` separately and are not directly comparable on latency, only on
+total elapsed. Matches and cost compare cleanly.
