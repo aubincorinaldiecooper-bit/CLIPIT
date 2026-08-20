@@ -86,11 +86,13 @@ const envSchema = z.object({
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
   OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
   /**
-   * The `-instruct` variant is deliberate: the `-thinking` sibling emits
-   * reasoning tokens that add latency and cost without helping a task whose
-   * output is a short JSON array of timestamps.
+   * Must be a slug OpenRouter will ROUTE video to, which is not the same as a
+   * model that understands video: no Qwen3-VL size has a video endpoint there,
+   * and every request against one is refused before reaching a provider.
+   * Qwen3.6 Flash takes native `video_url` input. `google/gemini-2.5-flash` is
+   * the comparison point if this proves weak at on-screen text.
    */
-  OPENROUTER_VIDEO_MODEL: z.string().trim().default('qwen/qwen3-vl-235b-a22b-instruct'),
+  OPENROUTER_VIDEO_MODEL: z.string().trim().default('qwen/qwen3.6-flash'),
   /**
    * Chunks are independent, so this sets how much of a search runs at once.
    * Ten chunks at 2 was five sequential rounds; 4 halves that while staying

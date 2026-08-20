@@ -39,7 +39,7 @@ describe('OpenRouter actual-video search', () => {
         model: string;
         messages: Array<{ content: Array<{ type: string; video_url?: { url: string } }> }>;
       };
-      expect(body.model).toBe('qwen/qwen3-vl-235b-a22b-instruct');
+      expect(body.model).toBe('qwen/qwen3.6-flash');
       const userContent = body.messages[1]?.content ?? [];
       expect(userContent.some((part) => part.type === 'image_url')).toBe(false);
       expect(userContent.find((part) => part.type === 'video_url')?.video_url?.url)
@@ -76,8 +76,9 @@ describe('OpenRouter actual-video search', () => {
   /**
    * Thinking mode is off by choice, not by luck: reasoning tokens add latency
    * and cost to a task whose whole output is a short JSON array, and they can
-   * arrive as prose the strict parser then has to reject. The `-instruct` slug
-   * has no thinking mode, so the guard is simply never asking for one.
+   * arrive as prose the strict parser then has to reject. Nothing in the
+   * request asks for reasoning, and this keeps it that way across model
+   * changes — including to a slug whose default might differ.
    */
   it('never asks the model to reason', async () => {
     const { fetchMock } = await runSearch({ mode: 'visual', withVideo: true });
@@ -105,7 +106,7 @@ describe('OpenRouter actual-video search', () => {
       totalTokens: 120,
       costUsd: 0.001,
       provider: 'test-provider',
-      model: 'qwen/qwen3-vl-235b-a22b-instruct',
+      model: 'qwen/qwen3.6-flash',
     });
     expect((usage[0] as { latencyMs: number }).latencyMs).toBeGreaterThanOrEqual(0);
   });

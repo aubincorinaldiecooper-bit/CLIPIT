@@ -41,7 +41,7 @@ const CACHE_TTL_MS = 10 * 60 * 1000;
 const PROBE_TIMEOUT_MS = 30_000;
 const CATALOGUE_TIMEOUT_MS = 15_000;
 /** Enough to choose from without turning an error message into a model dump. */
-const SUGGESTION_LIMIT = 12;
+const SUGGESTION_LIMIT = 16;
 
 /**
  * `inconclusive` means the probe told us nothing about video support — the
@@ -184,6 +184,26 @@ async function videoCapableCandidates(): Promise<string[]> {
 }
 
 /**
+ * Orders replacements by how likely they are to be the one wanted.
+ *
+ * Sorted alphabetically and cut at a limit, this list opens with whichever
+ * vendors sort first and buries the rest — so configuring a Qwen model that
+ * cannot route video printed Amazon, ByteDance and Google, and hid every other
+ * Qwen behind "+55 more". The list read as the available options when it was
+ * only the alphabetically-first few. Same vendor first fixes that: someone who
+ * chose a vendor deliberately is most likely replacing it with its sibling.
+ */
+function rankForReplacing(configured: string, candidates: string[]): string[] {
+  const vendor = configured.split('/')[0];
+  if (!vendor) return candidates;
+  const prefix = `${vendor}/`;
+  return [
+    ...candidates.filter((slug) => slug.startsWith(prefix)),
+    ...candidates.filter((slug) => !slug.startsWith(prefix)),
+  ];
+}
+
+/**
  * Fails fast when `OPENROUTER_VIDEO_MODEL` will not accept video.
  *
  * A probe that cannot reach a verdict lets the search through: a diagnostic
@@ -194,11 +214,11 @@ export async function assertVideoInputSupported(): Promise<void> {
   if ((await cachedVerdict()) !== 'no-video-endpoint') return;
 
   const model = env.OPENROUTER_VIDEO_MODEL;
-  const candidates = await videoCapableCandidates();
+  const candidates = rankForReplacing(model, await videoCapableCandidates());
   const shown = candidates.slice(0, SUGGESTION_LIMIT).join(', ');
   const extra = candidates.length > SUGGESTION_LIMIT ? ` (+${candidates.length - SUGGESTION_LIMIT} more)` : '';
   const suggestion = shown
-    ? ` Models advertising video input: ${shown}${extra}.`
+    ? ` Models advertising video input, closest first: ${shown}${extra}.`
     : '';
 
   throw new ExternalServiceError(
