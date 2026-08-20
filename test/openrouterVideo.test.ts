@@ -2,7 +2,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { searchVideoChunk } from '../src/services/search/openrouterVideo.js';
+import { isContentFilterRejection, searchVideoChunk } from '../src/services/search/openrouterVideo.js';
+import { ExternalServiceError } from '../src/lib/errors.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -180,3 +181,33 @@ async function runSearch(options: {
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+describe('content-filter classification', () => {
+  /**
+   * Alibaba refused one chunk of an ordinary business podcast with
+   * `data_inspection_failed`. It arrives as a 400 like any malformed request,
+   * but unlike those it is worth retrying WITHOUT the transcript text the
+   * provider objected to — so it has to be told apart from the rest.
+   */
+  it.each([
+    'Video request failed with status 400: {"error":{"code":"data_inspection_failed"}}',
+    'Video request failed with status 400: Input text data may contain inappropriate content.',
+    'Video request failed with status 400: blocked by content policy',
+  ])('recognises a provider content refusal: %s', (message) => {
+    expect(isContentFilterRejection(new ExternalServiceError('openrouter-video', message))).toBe(true);
+  });
+
+  it('does not mistake other failures for a content refusal', () => {
+    const others = [
+      'Video request failed with status 400: invalid_parameter_error',
+      'Video request failed with status 404: No endpoints found that support input video',
+      'Video request failed with status 429: rate limited',
+      'Video request timed out',
+    ];
+    for (const message of others) {
+      expect(isContentFilterRejection(new ExternalServiceError('openrouter-video', message))).toBe(false);
+    }
+    // A non-ExternalServiceError must never be classified as one.
+    expect(isContentFilterRejection(new Error('data_inspection_failed'))).toBe(false);
+  });
+});

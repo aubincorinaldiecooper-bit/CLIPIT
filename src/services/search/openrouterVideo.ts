@@ -63,6 +63,19 @@ export interface VideoSearchResult {
 const limiter = new Semaphore(env.OPENROUTER_VIDEO_CONCURRENCY);
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
+/**
+ * Recognises a provider refusing the input on content-policy grounds.
+ *
+ * Alibaba answers `data_inspection_failed` / "Input text data may contain
+ * inappropriate content" — on an ordinary business podcast transcript. It is a
+ * 400 like any other, but unlike a malformed request it is worth retrying
+ * WITHOUT the text, so it has to be told apart from the rest.
+ */
+export function isContentFilterRejection(error: unknown): boolean {
+  if (!(error instanceof ExternalServiceError)) return false;
+  return /data_inspection_failed|inappropriate content|content[_ ]?(policy|filter)/i.test(error.message);
+}
+
 function headers(): Record<string, string> {
   return {
     Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,

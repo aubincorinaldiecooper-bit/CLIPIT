@@ -8,7 +8,7 @@ import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { UsageTally } from '../../services/usageTally.js';
-import { searchVideoChunk } from '../../services/search/openrouterVideo.js';
+import { isContentFilterRejection, searchVideoChunk } from '../../services/search/openrouterVideo.js';
 import { assertVideoInputSupported } from '../../services/search/modelCapabilities.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
@@ -28,7 +28,31 @@ import {
   type NewClipMatch,
 } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, type ClipSearchJob } from '../../queues/index.js';
-import type { MatchSource, ResolvedSearchMode, VideoChunk } from '../../domain/types.js';
+import type {
+  ChunkDegradation,
+  ChunkFailureCode,
+  MatchSource,
+  ResolvedSearchMode,
+  VideoChunk,
+} from '../../domain/types.js';
+
+/**
+ * Names why a chunk went unsearched.
+ *
+ * The distinction that matters is between a provider refusing this input on
+ * policy grounds — which will happen again identically, and means a window of
+ * the video is simply unavailable to this provider — and an ordinary transient
+ * failure, which is worth another attempt. Reporting both as "failed" left the
+ * user with no way to tell a bad moment from a bad minute.
+ */
+function classifyChunkFailure(reason: unknown): ChunkFailureCode {
+  if (isContentFilterRejection(reason)) return 'provider_content_filter';
+  if (!(reason instanceof ExternalServiceError)) return 'unknown';
+  if (/timed out/i.test(reason.message)) return 'timeout';
+  if (/request failed:/i.test(reason.message)) return 'transport';
+  if (/status \d{3}/i.test(reason.message)) return 'provider_error';
+  return 'unknown';
+}
 
 /**
  * Runs the user's instruction against every analysis chunk.
@@ -132,6 +156,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
     let completed = 0;
     let totalMatches = 0;
+    const degradations: ChunkDegradation[] = [];
 
     await withWorkDir(`search-${clipRequestId}`, async (dir) => {
       const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
@@ -145,6 +170,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           workDir: dir,
           tally,
           log,
+          onDegraded: (degradation) => {
+            degradations.push(degradation);
+          },
         });
 
         if (found.length > 0) await insertMatches(clipRequestId, found);
@@ -167,11 +195,23 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         if (result.status !== 'rejected') continue;
         const chunk = chunks[index]!;
         const message = errorMessage(result.reason);
-        log.warn('chunk search failed', { chunkIndex: chunk.chunkIndex, err: result.reason });
+        const code = classifyChunkFailure(result.reason);
+        log.warn('chunk search failed', {
+          chunkIndex: chunk.chunkIndex,
+          covers: `${chunk.globalStartSeconds.toFixed(0)}-${chunk.globalEndSeconds.toFixed(0)}s`,
+          code,
+          err: result.reason,
+        });
         await recordChunkFailure(clipRequestId, {
           chunkIndex: chunk.chunkIndex,
           chunkId: chunk.id,
           message,
+          code,
+          // Carried so the client can say WHICH seconds went unsearched. Without
+          // it "chunk 7 failed" cannot tell a user whether the moment they asked
+          // about was inside the gap.
+          globalStartSeconds: chunk.globalStartSeconds,
+          globalEndSeconds: chunk.globalEndSeconds,
         });
         completed += 1;
         await job.updateProgress({
@@ -214,6 +254,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         matches: finalCount,
         mergedFrom: totalMatches,
         failedChunks: failed,
+        // Coverage, not just outcome: how much of the video was actually
+        // examined, and how much of it with less than the intended evidence.
+        chunksSearchedWithoutTranscript: degradations.length,
         elapsedMs,
         // The three inputs that set wall-clock, logged alongside it so a slow
         // search can be read without correlating against config elsewhere.
@@ -329,6 +372,8 @@ interface SearchSingleChunkInput {
   clipRequestId: string;
   workDir: string;
   tally: UsageTally;
+  /** Records that a chunk was searched with less evidence than intended. */
+  onDegraded: (degradation: ChunkDegradation) => void;
   /**
    * The request-scoped logger, not the root one. Searches run concurrently
    * (`CLIP_SEARCH_CONCURRENCY`), so two of them emit chunk 0 of the same
@@ -376,24 +421,53 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     }));
   }
 
-  const response = await searchVideoChunk({
-    instruction: input.instruction,
-    mode: input.mode,
-    chunkIndex: chunk.chunkIndex,
-    chunkCount: input.chunkCount,
-    chunkDurationSeconds: chunk.durationSeconds,
-    videoPath: chunkPath,
-    transcript,
-    onUsage: (usage) => {
-      input.tally.add(usage);
-      void recordModelUsage({
-        ...usage,
-        stage: 'search',
-        videoId: input.videoId,
-        clipRequestId: input.clipRequestId,
-      });
-    },
-  });
+  const call = (withTranscript: boolean) =>
+    searchVideoChunk({
+      instruction: input.instruction,
+      // Dropping the transcript makes this a visual search of the same chunk.
+      mode: withTranscript ? input.mode : 'visual',
+      chunkIndex: chunk.chunkIndex,
+      chunkCount: input.chunkCount,
+      chunkDurationSeconds: chunk.durationSeconds,
+      videoPath: chunkPath,
+      transcript: withTranscript ? transcript : [],
+      onUsage: (usage) => {
+        // Both attempts are billed, so both are tallied. A retry that recovers
+        // a chunk is cheaper than losing it, but it is not free.
+        input.tally.add(usage);
+        void recordModelUsage({
+          ...usage,
+          stage: 'search',
+          videoId: input.videoId,
+          clipRequestId: input.clipRequestId,
+        });
+      },
+    });
+
+  let response: Awaited<ReturnType<typeof searchVideoChunk>>;
+  let degraded = false;
+  try {
+    response = await call(true);
+  } catch (error) {
+    // The provider objected to the TEXT, so the video is still searchable.
+    // Retrying without the transcript recovers the window rather than losing
+    // it — with weaker evidence, which the caller records rather than hides.
+    if (!chunkPath || transcript.length === 0 || !isContentFilterRejection(error)) throw error;
+
+    input.log.warn('retrying chunk without its transcript after a content-filter rejection', {
+      chunkIndex: chunk.chunkIndex,
+      covers: `${chunk.globalStartSeconds.toFixed(0)}-${chunk.globalEndSeconds.toFixed(0)}s`,
+      transcriptLines: transcript.length,
+    });
+    response = await call(false);
+    degraded = true;
+    input.onDegraded({
+      chunkIndex: chunk.chunkIndex,
+      globalStartSeconds: chunk.globalStartSeconds,
+      globalEndSeconds: chunk.globalEndSeconds,
+      reason: 'transcript_omitted',
+    });
+  }
 
   if (response.warnings.length > 0) {
     input.log.warn('model output warnings', {

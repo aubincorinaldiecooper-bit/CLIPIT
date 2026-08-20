@@ -122,10 +122,44 @@ export interface ClipRequest {
   updatedAt: Date;
 }
 
+/**
+ * Why a chunk was not searched. Distinguished because the answers differ: a
+ * provider content filter will reject the same input every time, while a
+ * timeout or transport failure is worth another attempt.
+ */
+export type ChunkFailureCode =
+  | 'provider_content_filter'
+  | 'provider_error'
+  | 'timeout'
+  | 'transport'
+  | 'unknown';
+
 export interface ChunkError {
   chunkIndex: number;
   chunkId: string;
   message: string;
+  code: ChunkFailureCode;
+  /**
+   * The source window this chunk covered. Without it the client can say that
+   * something was missed but not *what* — and "chunk 7 failed" tells a user
+   * nothing about whether the moment they asked for was inside it.
+   */
+  globalStartSeconds: number;
+  globalEndSeconds: number;
+}
+
+/**
+ * A chunk searched with less evidence than intended.
+ *
+ * A chunk recovered by dropping its transcript is not a failure, but it is not
+ * full coverage either, and reporting it as clean would hide that a spoken
+ * condition could not be checked there.
+ */
+export interface ChunkDegradation {
+  chunkIndex: number;
+  globalStartSeconds: number;
+  globalEndSeconds: number;
+  reason: 'transcript_omitted';
 }
 
 export interface ClipMatch {
