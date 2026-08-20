@@ -181,8 +181,13 @@ describe('video routing preflight', () => {
     expect(body.max_tokens).toBe(1);
     const video = body.messages[0]?.content.find((part) => part.type === 'video_url');
     expect(video?.video_url?.url).toMatch(/^data:video\/mp4;base64,/);
-    // Small enough that the check costs nothing meaningful per worker.
-    expect(video?.video_url?.url.length).toBeLessThan(4_000);
+    // Two bounds, and the run that motivated them. Too small and the provider
+    // refuses it as video at all, which left the guard permanently
+    // inconclusive; too large and a check that runs before every search starts
+    // costing real money. A real chunk is 1.7-4.1MB, so this must stay orders
+    // of magnitude under that.
+    expect(video?.video_url?.url.length).toBeGreaterThan(8_000);
+    expect(video?.video_url?.url.length).toBeLessThan(200_000);
   });
 
   /**

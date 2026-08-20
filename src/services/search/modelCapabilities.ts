@@ -1,4 +1,8 @@
+import { mkdtemp, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { env } from '../../config/env.js';
+import { createProbeClip } from '../media/ffmpeg.js';
 import { ExternalServiceError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 
@@ -20,22 +24,31 @@ import { logger } from '../../lib/logger.js';
  */
 
 /**
- * One 32x32 black H.264 frame in an MP4 container: 814 bytes, small enough to
- * be free in practice and real enough that routing treats it as video.
+ * A throwaway MP4 for the probe, built once per process.
+ *
+ * It was an 814-byte 32x32 single frame embedded as a base64 literal, chosen
+ * to be free. Alibaba refused it — "The video modality input does not meet the
+ * requirements" — so every probe came back inconclusive and the preflight
+ * quietly stopped deciding anything while still looking like it worked.
+ * Generated now, so the size can be raised for the next provider with a floor
+ * without regenerating kilobytes of base64 by hand.
  */
-const PROBE_MP4_BASE64 =
-  'AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAALqbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAA' +
-  'AQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' +
-  'AAAAAgAAAjl0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAA' +
-  'AAAAAAABAAAAAAAAAAAAAAAAAABAAAAAACAAAAAgAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAAAAABAAAAAAGx' +
-  'bWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAQABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRl' +
-  'b0hhbmRsZXIAAAABXG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAA' +
-  'AQAAARxzdGJsAAAAuHN0c2QAAAAAAAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAACAAIABIAAAASAAAAAAA' +
-  'AAABDExhdmMgbGlieDI2NAAAAAAAAAAAAAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBQsAK/+EAFmdCwArZCWwEQAAAAwBAAAAD' +
-  'AIPEiZIBAAVoy4PLIAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAAACgAAAAoAAAABhzdHRzAAAAAAAAAAEAAAABAABA' +
-  'AAAAABxzdHNjAAAAAAAAAAEAAAABAAAAAQAAAAEAAAAUc3RzegAAAAAAAAAUAAAAAQAAABRzdGNvAAAAAAAAAAEAAAMaAAAA' +
-  'PXVkdGEAAAA1bWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAIaWxzdAAAAAhmcmVlAAAAHG1k' +
-  'YXQAAAAQZYiEBX///w9FAAFC3yddeA==';
+let probeClip: Promise<string> | null = null;
+
+function probeClipPath(): Promise<string> {
+  probeClip ??= (async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'clipit-probe-'));
+    const file = path.join(dir, 'probe.mp4');
+    await createProbeClip(file);
+    return file;
+  })().catch((error: unknown) => {
+    // Never cache a failure: ffmpeg being briefly unavailable must not disable
+    // the guard for the remaining life of the process.
+    probeClip = null;
+    throw error;
+  });
+  return probeClip;
+}
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const PROBE_TIMEOUT_MS = 30_000;
@@ -79,6 +92,17 @@ async function withTimeout<T>(ms: number, run: (signal: AbortSignal) => Promise<
 /** Asks OpenRouter to route one minimal video request and reads the verdict off the result. */
 async function probeVideoRouting(): Promise<ProbeVerdict> {
   const model = env.OPENROUTER_VIDEO_MODEL;
+
+  let clip: Buffer;
+  try {
+    clip = await readFile(await probeClipPath());
+  } catch (error) {
+    // No clip, no probe. The guard yields rather than blocking a search that
+    // would otherwise have worked.
+    logger.warn('could not build the video routing probe clip', { model, err: error });
+    return 'inconclusive';
+  }
+
   const body = JSON.stringify({
     model,
     messages: [
@@ -86,12 +110,15 @@ async function probeVideoRouting(): Promise<ProbeVerdict> {
         role: 'user',
         content: [
           { type: 'text', text: 'ok' },
-          { type: 'video_url', video_url: { url: `data:video/mp4;base64,${PROBE_MP4_BASE64}` } },
+          { type: 'video_url', video_url: { url: `data:video/mp4;base64,${clip.toString('base64')}` } },
         ],
       },
     ],
     max_tokens: 1,
     stream: false,
+    // Matches the real search path: a probe that reasons would bill for
+    // thinking about a test pattern.
+    reasoning: { enabled: false, exclude: true },
   });
 
   let response: Response;
