@@ -26,8 +26,18 @@ const SPOKEN_PATTERNS: RegExp[] = [
   /\breason(s)? (why|for|behind)\b/i,
   /\b(why|because)\b/i,
   /\b(topic|subject) of\b/i,
-  /"[^"]{2,}"/,
 ];
+
+/**
+ * A quoted phrase proves nothing about modality: it can be said aloud or
+ * painted on a car hood. Counting it as speech routed `Find "SALE"` to a
+ * transcript-only search, which is never sent the video and so can never
+ * satisfy the phrase from what is on screen — a false negative on exactly the
+ * instruction shape most likely to be about visible text.
+ *
+ * Curly quotes are included because instructions get pasted from anywhere.
+ */
+const QUOTED_PHRASE = /"[^"]{2,}"|“[^”]{2,}”|'[^']{4,}'/;
 
 const VISUAL_PATTERNS: RegExp[] = [
   /\b(show|shows|showed|showing|shown)\b/i,
@@ -42,6 +52,13 @@ const VISUAL_PATTERNS: RegExp[] = [
   /\b(wear|wearing|wears|holding|holds|picks? up)\b/i,
   /\b(scene|shot|frame|footage|camera|screen|gameplay)\b/i,
   /\b(level|stage|map|menu|scoreboard|hud|replay)\b/i,
+  // Things text is written ON. Without these, "the sign that says EXIT" reads
+  // as pure speech and never gets the video that the sign is visible in.
+  /\b(sign|signs|label|labels|banner|poster|billboard|placard)\b/i,
+  /\b(shirt|jersey|hoodie|cap|hat|badge|name ?tag|sticker|decal)\b/i,
+  /\b(caption|captions|subtitle|subtitles|headline|logo|licen[cs]e plate)\b/i,
+  /\b(hood|bumper|windshield|door|wall|board|title card|lower third)\b/i,
+  /\b(text|writing|written|printed|says on|reads)\b/i,
   /\b(red|blue|green|yellow|black|white|orange|purple)\b/i,
   /\b(dog|cat|car|ball|door|whiteboard|slide|chart|graph)\b/i,
   /\b(celebrat\w+|dance|dancing|laugh\w*|smile|smiling|cry\w*)\b/i,
@@ -70,6 +87,18 @@ export function classifyInstruction(instruction: string): ModeClassification {
   }
 
   if (spokenScore > 0 && visualScore === 0) {
+    // Speech words alone are not enough to drop the video when the thing being
+    // matched is a quoted phrase, because that phrase may be on screen rather
+    // than in the audio. Erring toward `both` costs one upload; erring toward
+    // `transcript` cannot find visible text at all.
+    if (QUOTED_PHRASE.test(text)) {
+      return {
+        mode: 'both',
+        spokenScore,
+        visualScore,
+        rationale: 'quoted phrase may be spoken or visible on screen; searching video and transcript',
+      };
+    }
     return { mode: 'transcript', spokenScore, visualScore, rationale: 'instruction refers to spoken content' };
   }
 

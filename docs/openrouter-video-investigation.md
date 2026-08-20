@@ -105,6 +105,17 @@ on-screen text or by speech unless the instruction says which, and that "say"
 applied to an object means text visible on it. Do not tighten this back into
 "require all modalities" without a case showing it over-matches.
 
+The prompt alone is not enough, because `transcript` mode sends no video at
+all. `Find "SALE"` once scored as pure speech and routed there, so the phrase
+could never be matched against what was on screen — the routing decided the
+outcome before the model saw anything. A quoted phrase is therefore no longer
+counted as a spoken signal; on its own it resolves to `both`. Words naming
+things text is written on — sign, banner, jersey, licence plate, hood, caption
+— are visual signals for the same reason.
+
+Unquoted spoken instructions still resolve to `transcript` and still skip the
+upload, and an explicitly requested `transcript` search is always honoured.
+
 ## Functional acceptance
 
 Use the known black-car scene around source time `00:54` as an acceptance case,
