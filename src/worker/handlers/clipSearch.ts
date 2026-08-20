@@ -161,6 +161,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
     let completed = 0;
     let totalMatches = 0;
+    let answeredWithoutThinking = 0;
     const degradations: ChunkDegradation[] = [];
 
     await withWorkDir(`search-${clipRequestId}`, async (dir) => {
@@ -175,6 +176,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           workDir: dir,
           tally,
           log,
+          onAnsweredWithoutThinking: () => {
+            answeredWithoutThinking += 1;
+          },
           onDegraded: async (degradation) => {
             degradations.push(degradation);
             // Persisted, not just tallied for the log line: the API derives
@@ -270,7 +274,12 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         // Coverage, not just outcome: how much of the video was actually
         // examined, and how much of it with less than the intended evidence.
         chunksSearchedWithoutTranscript: degradations.length,
+        // Chunks that returned nothing until thinking was switched off. Zero is
+        // the expected value; anything else says the reasoning budget is too
+        // tight for this material, and it is the number to raise it from.
+        chunksAnsweredWithoutThinking: answeredWithoutThinking,
         elapsedMs,
+        reasoningMaxTokens: env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS,
         // The three inputs that set wall-clock, logged alongside it so a slow
         // search can be read without correlating against config elsewhere.
         chunks: chunks.length,
@@ -447,6 +456,13 @@ interface SearchSingleChunkInput {
   /** Records that a chunk was searched with less evidence than intended. */
   onDegraded: (degradation: ChunkDegradation) => Promise<void>;
   /**
+   * Records that a chunk answered only after thinking was switched off. Not a
+   * coverage degradation — the model still saw the whole chunk and its
+   * transcript — but the signal that the thinking budget is too tight, which
+   * is only readable if it is counted per search rather than per chunk.
+   */
+  onAnsweredWithoutThinking: () => void;
+  /**
    * The request-scoped logger, not the root one. Searches run concurrently
    * (`CLIP_SEARCH_CONCURRENCY`), so two of them emit chunk 0 of the same
    * source window at the same time; without the request on every line, a
@@ -541,6 +557,11 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     });
   }
 
+  // The chunk was recovered by the client asking again without thinking. It
+  // was searched with everything it should have been; only the deliberation
+  // was cut, so this is counted rather than reported as a coverage gap.
+  if (response.reasoningDisabled) input.onAnsweredWithoutThinking();
+
   if (response.warnings.length > 0) {
     input.log.warn('model output warnings', {
       chunkIndex: chunk.chunkIndex,
@@ -609,6 +630,10 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     reported: response.matches.length,
     belowConfidence: belowConfidence.length,
     kept: deduped.length,
+    // Present only when the first attempt answered nothing and the chunk was
+    // recovered by asking again without thinking. Worth a per-chunk record:
+    // if this starts appearing often, the thinking budget is too tight.
+    ...(response.reasoningDisabled ? { recoveredWithoutThinking: true } : {}),
     // Completes the per-chunk time budget: fetching the evidence, versus the
     // model working on it. Together with headersMs/bodyMs nothing is untimed.
     downloadMs,

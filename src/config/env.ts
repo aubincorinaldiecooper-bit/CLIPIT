@@ -99,7 +99,27 @@ const envSchema = z.object({
    * well inside provider rate limits. Raise from measured latency, not guesses.
    */
   OPENROUTER_VIDEO_CONCURRENCY: int(4, 1, 16),
+  /**
+   * Room for the ANSWER, not for the answer plus the thinking that precedes
+   * it. The reasoning budget below is added on top when the request is built,
+   * because whether a provider charges reasoning against `max_tokens` varies —
+   * and if it does, a bare 1024 is a budget the model can spend entirely on
+   * thinking, returning a 200 with no answer in it. Two matches of JSON is
+   * roughly 150 tokens, so this is already generous for its actual job.
+   */
   OPENROUTER_VIDEO_MAX_TOKENS: int(1024, 128, 8192),
+  /**
+   * How long the model may think before answering.
+   *
+   * Measured, not guessed. Across a full ten-chunk run every chunk that found
+   * a moment spent 438-1,700 reasoning tokens; the two that ran past that
+   * found nothing and cost the run its wall clock — one spent 7,692 tokens
+   * over 142 seconds and returned zero matches, which was 89% of the entire
+   * search. 2500 keeps the whole productive band with headroom and ends the
+   * runaways. Raise it from a measurement showing matches above the band, not
+   * from a hunch that more thinking must be better.
+   */
+  OPENROUTER_VIDEO_REASONING_MAX_TOKENS: int(2500, 256, 32_000),
   OPENROUTER_VIDEO_TEMPERATURE: num(0.1, 0, 2),
   OPENROUTER_STT_MODEL: z.string().trim().default('openai/whisper-1'),
   /** Optional attribution headers OpenRouter uses for app ranking. */

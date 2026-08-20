@@ -75,32 +75,138 @@ describe('OpenRouter actual-video search', () => {
   });
 
   /**
-   * This assertion has flipped twice, so it is worth stating what it now
-   * protects. Reasoning was disabled as a cost fix; the per-chunk numbers then
-   * showed that every chunk which found a match spent 2,486-3,887 completion
-   * tokens while every chunk that found nothing spent 468-1,595 — far more
-   * than the ~150 tokens two matches of JSON would add. Whatever consumes
-   * those tokens correlates with finding moments, and the chunk that located
-   * the acceptance case is near the top of it.
+   * This assertion has flipped twice and has now landed where the previous
+   * version said it should. Reasoning was disabled as a cost fix, then put
+   * back when the numbers showed the chunks that found moments were the ones
+   * spending tokens to think. A full run then measured the rest of the curve:
+   * the productive spend is a band (438-1,700 tokens) and everything above it
+   * found nothing while consuming the search's wall clock.
    *
-   * So the request must NOT suppress reasoning while that is unmeasured: a
-   * cheaper search that finds less is the one trade this project does not make
-   * blind. If a cap is added later it belongs in `reasoning.max_tokens`, which
-   * bounds thinking without removing it — this test should then assert the cap,
-   * not a re-disable.
+   * So the request must BOUND thinking without removing it. `enabled: false`
+   * would be the re-disable this project already rejected on the evidence;
+   * `max_tokens` keeps the band and ends the runaways.
    */
-  it('does not suppress reasoning while its value is unmeasured', async () => {
+  it('budgets reasoning rather than disabling it', async () => {
     const { fetchMock } = await runSearch({ mode: 'visual', withVideo: true });
 
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
     const body = JSON.parse(String(request.body)) as {
       model: string;
+      max_tokens: number;
       reasoning?: { enabled?: boolean; exclude?: boolean; max_tokens?: number };
     };
 
     expect(body.reasoning?.enabled).not.toBe(false);
+    expect(body.reasoning?.max_tokens).toBe(2500);
+    // The budget is the ANSWER's, plus room to think — not one ceiling for
+    // both. Sending 1024 alone lets a provider that charges reasoning against
+    // max_tokens spend the entire allowance before answering.
+    expect(body.max_tokens).toBe(1024 + 2500);
     expect(body).not.toHaveProperty('include_reasoning');
     expect(body.model).not.toMatch(/thinking/);
+  });
+
+  /**
+   * The rule, and the reason it exists: on one run a chunk came back 200 with
+   * reasoning tokens and no answer, and the two minutes of video it covered
+   * were reported to the user as containing nothing. A retry of the same
+   * request would have thought its way to the same silence at the same price,
+   * so the retry has to be a different request.
+   */
+  it('recovers a chunk that answered nothing by asking again without thinking', async () => {
+    const bodies: string[] = [];
+    const fetchMock = vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+      bodies.push(String(init.body));
+      const empty = bodies.length === 1;
+      return Promise.resolve(new Response(JSON.stringify({
+        choices: [{
+          message: { content: empty ? '' : '{"matches":[{"start_seconds":5,"end_seconds":9,"description":"a car","confidence":0.8}]}' },
+          finish_reason: empty ? 'length' : 'stop',
+        }],
+        provider: 'test-provider',
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: empty ? 3000 : 40,
+          total_tokens: empty ? 3100 : 140,
+          cost: empty ? 0.004 : 0.001,
+          completion_tokens_details: { reasoning_tokens: empty ? 3000 : 0 },
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const usage: Array<{ costUsd: number | null }> = [];
+    const dir = await mkdtemp(path.join(tmpdir(), 'clipit-openrouter-video-'));
+    const videoPath = path.join(dir, 'chunk.mp4');
+    await writeFile(videoPath, Buffer.from('test-mp4-bytes'));
+
+    try {
+      const result = await searchVideoChunk({
+        instruction: 'find the car',
+        mode: 'visual',
+        chunkIndex: 0,
+        chunkCount: 1,
+        chunkDurationSeconds: 120,
+        videoPath,
+        transcript: [],
+        onUsage: (value) => usage.push(value),
+      });
+
+      // The chunk is answered, not lost.
+      expect(result.matches[0]).toMatchObject({ startSeconds: 5, endSeconds: 9 });
+      // And the caller can tell it was answered without deliberation.
+      expect(result.reasoningDisabled).toBe(true);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const second = JSON.parse(bodies[1]!) as { reasoning?: { enabled?: boolean } };
+      expect(second.reasoning?.enabled).toBe(false);
+
+      // Both calls were billed, so both are reported. Counting only the one
+      // that answered understates the cost of exactly the calls worth knowing
+      // about — a chunk that thought for 3,000 tokens and said nothing.
+      expect(usage.map((entry) => entry.costUsd)).toEqual([0.004, 0.001]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * A blank answer is not "no matches here". `""` parses to zero matches and
+   * would be stored as a considered negative result, which is how a lost chunk
+   * disappears without leaving a trace.
+   */
+  it('does not read a blank answer as a considered no-matches result', async () => {
+    // A new Response per call: a single instance can only be read once, and
+    // the second read failing would be a transport error, not the blank answer
+    // this is about.
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
+      choices: [{ message: { content: '   ' }, finish_reason: 'length' }],
+      provider: 'test-provider',
+      usage: { prompt_tokens: 100, completion_tokens: 3000, total_tokens: 3100 },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'clipit-openrouter-video-'));
+    const videoPath = path.join(dir, 'chunk.mp4');
+    await writeFile(videoPath, Buffer.from('test-mp4-bytes'));
+
+    try {
+      await expect(searchVideoChunk({
+        instruction: 'find the car',
+        mode: 'visual',
+        chunkIndex: 0,
+        chunkCount: 1,
+        chunkDurationSeconds: 120,
+        videoPath,
+        transcript: [],
+        // Both attempts answer nothing, so the chunk genuinely fails — and the
+        // error carries why, rather than a bare "no message content".
+      })).rejects.toThrow(/no answer.*finish_reason=length/i);
+      // One budgeted attempt, one without thinking. Not a ladder.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('refuses a visual search with no video rather than answering without it', async () => {
