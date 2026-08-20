@@ -118,6 +118,7 @@ export interface ClipRequest {
   chunksCompleted: number;
   chunksFailed: number;
   chunkErrors: ChunkError[];
+  chunkDegradations: ChunkDegradation[];
   createdAt: Date;
   updatedAt: Date;
 }

@@ -1,7 +1,15 @@
 import { env } from '../config/env.js';
 import { getStorage } from '../services/storage/s3.js';
 import { formatTimecode } from '../services/timestamps.js';
-import type { ChunkFailureCode, Clip, ClipMatch, ClipRequest, Video, VideoChunk } from '../domain/types.js';
+import type {
+  ChunkDegradation,
+  ChunkFailureCode,
+  Clip,
+  ClipMatch,
+  ClipRequest,
+  Video,
+  VideoChunk,
+} from '../domain/types.js';
 
 /** Shapes rows into the public API representation. Storage keys never leak. */
 
@@ -117,7 +125,10 @@ export interface ClipRequestProgress {
  * absent. Naming the seconds is what makes that answer honest.
  */
 export interface SearchCoverage {
+  /** True only when every chunk was searched with the evidence intended. */
   complete: boolean;
+  /** False when something is known to be missing but cannot be located. */
+  locatable: boolean;
   unsearchedSeconds: number;
   gaps: Array<{
     startSeconds: number;
@@ -125,6 +136,18 @@ export interface SearchCoverage {
     startTimecode: string;
     endTimecode: string;
     reason: ChunkFailureCode;
+  }>;
+  /**
+   * Windows that WERE searched, but without their transcript — recovered from
+   * a provider content filter. Not gaps: matches from them are real. What is
+   * missing there is the ability to have checked a spoken condition.
+   */
+  degraded: Array<{
+    startSeconds: number;
+    endSeconds: number;
+    startTimecode: string;
+    endTimecode: string;
+    reason: ChunkDegradation['reason'];
   }>;
 }
 
@@ -142,10 +165,25 @@ export function searchCoverage(request: ClipRequest): SearchCoverage {
     }))
     .sort((a, b) => a.startSeconds - b.startSeconds);
 
+  const degraded = (request.chunkDegradations ?? []).map((entry) => ({
+    startSeconds: entry.globalStartSeconds,
+    endSeconds: entry.globalEndSeconds,
+    startTimecode: formatTimecode(entry.globalStartSeconds),
+    endTimecode: formatTimecode(entry.globalEndSeconds),
+    reason: entry.reason,
+  })).sort((a, b) => a.startSeconds - b.startSeconds);
+
   return {
-    complete: request.chunksFailed === 0,
+    // A recovered chunk counts against completeness. Its matches are real, but
+    // the search that ran there is not the search that was asked for.
+    complete: request.chunksFailed === 0 && degraded.length === 0,
+    // A failure recorded before failures carried a window is still a failure;
+    // it just cannot say where. Callers must not read unsearchedSeconds: 0 as
+    // "nothing was missed".
+    locatable: gaps.length === request.chunksFailed,
     unsearchedSeconds: Number(gaps.reduce((sum, gap) => sum + (gap.endSeconds - gap.startSeconds), 0).toFixed(3)),
     gaps,
+    degraded,
   };
 }
 

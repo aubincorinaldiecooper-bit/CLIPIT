@@ -1,5 +1,6 @@
 import { queryOne, queryRows } from '../pool.js';
 import type {
+  ChunkDegradation,
   ChunkError,
   ClipMatch,
   ClipRequest,
@@ -23,6 +24,7 @@ interface ClipRequestRow {
   chunks_completed: number;
   chunks_failed: number;
   chunk_errors: ChunkError[];
+  chunk_degradations: ChunkDegradation[] | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -41,6 +43,7 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     chunksTotal: row.chunks_total,
     chunksCompleted: row.chunks_completed,
     chunksFailed: row.chunks_failed,
+    chunkDegradations: row.chunk_degradations ?? [],
     chunkErrors: row.chunk_errors ?? [],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -103,6 +106,24 @@ export async function recordChunkFailure(requestId: string, error: ChunkError): 
             updated_at = now()
       WHERE id = $1`,
     [requestId, JSON.stringify([error])],
+  );
+}
+
+/**
+ * Records that a chunk was searched, but with less evidence than intended.
+ *
+ * Deliberately does not touch chunks_failed: the chunk completed and its
+ * matches are real. What is lost is the ability to check a spoken condition
+ * inside that window, which the response reports as a caveat rather than a
+ * gap.
+ */
+export async function recordChunkDegraded(requestId: string, degradation: ChunkDegradation): Promise<void> {
+  await queryOne(
+    `UPDATE clip_requests
+        SET chunk_degradations = chunk_degradations || $2::jsonb,
+            updated_at = now()
+      WHERE id = $1`,
+    [requestId, JSON.stringify([degradation])],
   );
 }
 

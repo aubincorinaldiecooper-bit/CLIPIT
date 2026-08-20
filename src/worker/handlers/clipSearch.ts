@@ -23,6 +23,7 @@ import {
   insertMatches,
   listMatches,
   recordChunkCompleted,
+  recordChunkDegraded,
   recordChunkFailure,
   startClipRequest,
   type NewClipMatch,
@@ -170,8 +171,13 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           workDir: dir,
           tally,
           log,
-          onDegraded: (degradation) => {
+          onDegraded: async (degradation) => {
             degradations.push(degradation);
+            // Persisted, not just tallied for the log line: the API derives
+            // coverage from the row, so a degradation left in memory would
+            // report a recovered chunk as clean once the worker moved on —
+            // the exact silent coverage loss this work exists to remove.
+            await recordChunkDegraded(clipRequestId, degradation);
           },
         });
 
@@ -373,7 +379,7 @@ interface SearchSingleChunkInput {
   workDir: string;
   tally: UsageTally;
   /** Records that a chunk was searched with less evidence than intended. */
-  onDegraded: (degradation: ChunkDegradation) => void;
+  onDegraded: (degradation: ChunkDegradation) => Promise<void>;
   /**
    * The request-scoped logger, not the root one. Searches run concurrently
    * (`CLIP_SEARCH_CONCURRENCY`), so two of them emit chunk 0 of the same
@@ -461,7 +467,7 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     });
     response = await call(false);
     degraded = true;
-    input.onDegraded({
+    await input.onDegraded({
       chunkIndex: chunk.chunkIndex,
       globalStartSeconds: chunk.globalStartSeconds,
       globalEndSeconds: chunk.globalEndSeconds,
@@ -562,7 +568,9 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
         globalEndSeconds: local.globalEndSeconds,
         description: range.description,
         confidence: range.confidence ?? 0,
-        source: MATCH_SOURCE[input.mode],
+        // The retry that recovered this chunk saw no transcript, so labelling
+        // its matches "multimodal" would claim evidence the model never had.
+        source: MATCH_SOURCE[degraded ? 'visual' : input.mode],
         quote: range.quote,
       } satisfies NewClipMatch,
     ];

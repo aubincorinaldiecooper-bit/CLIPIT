@@ -24,6 +24,7 @@ function request(overrides: Partial<ClipRequest> = {}): ClipRequest {
     chunksCompleted: 10,
     chunksFailed: 0,
     chunkErrors: [],
+    chunkDegradations: [],
     createdAt: new Date(0),
     updatedAt: new Date(0),
     ...overrides,
@@ -67,6 +68,33 @@ describe('search coverage', () => {
     expect(coverage.gaps[0]?.endTimecode).toBe('00:16:01');
   });
 
+  /**
+   * A chunk recovered by dropping its transcript is not a gap — its matches
+   * are real — but it is not clean coverage either. Reporting it as complete
+   * would hide that a spoken condition could not be checked in that window,
+   * which is the same silent loss this whole block exists to prevent.
+   */
+  it('counts a transcript-omitted recovery against completeness', () => {
+    const coverage = searchCoverage(
+      request({
+        chunkDegradations: [
+          { chunkIndex: 7, globalStartSeconds: 841, globalEndSeconds: 961, reason: 'transcript_omitted' },
+        ],
+      }),
+    );
+
+    expect(coverage.complete).toBe(false);
+    // Not a gap: the window WAS searched, so nothing is unsearched.
+    expect(coverage.unsearchedSeconds).toBe(0);
+    expect(coverage.gaps).toEqual([]);
+    expect(coverage.degraded).toHaveLength(1);
+    expect(coverage.degraded[0]).toMatchObject({
+      startTimecode: '00:14:01',
+      endTimecode: '00:16:01',
+      reason: 'transcript_omitted',
+    });
+  });
+
   it('orders gaps by position in the video, not by when they failed', () => {
     const coverage = searchCoverage(
       request({
@@ -94,9 +122,20 @@ describe('search coverage', () => {
       request({ chunksCompleted: 9, chunksFailed: 1, chunkErrors: [legacy] }),
     );
 
-    // Still known to be incomplete — it just cannot say where.
+    // Still known to be incomplete — it just cannot say where. `locatable`
+    // is what stops a caller reading unsearchedSeconds: 0 as "nothing missed"
+    // and telling the user 00:00:00 of their video was skipped.
     expect(coverage.complete).toBe(false);
+    expect(coverage.locatable).toBe(false);
     expect(coverage.gaps).toEqual([]);
     expect(coverage.unsearchedSeconds).toBe(0);
+  });
+
+  it('is locatable when every failure carries its window', () => {
+    const coverage = searchCoverage(
+      request({ chunksCompleted: 9, chunksFailed: 1, chunkErrors: [filtered] }),
+    );
+
+    expect(coverage.locatable).toBe(true);
   });
 });
