@@ -46,10 +46,10 @@ slug that will not route video fails in about a second instead of after ten
 multi-megabyte uploads. It is what caught both dead ends for the price of one
 probe each.
 
-## Reasoning: left on, under measurement
+## Reasoning: budgeted, measured
 
-**Reasoning is currently left at the model's default, which is on.** Do not
-disable it without reading this section first.
+**Reasoning is on, with a 2,500-token budget** (`OPENROUTER_VIDEO_REASONING_MAX_TOKENS`).
+Do not disable it, and do not raise the budget, without reading this section.
 
 It was briefly disabled, on the reasonable-sounding argument that locating a
 moment is not a reasoning task and thinking tokens spend money and wall-clock
@@ -75,20 +75,61 @@ Disabling it would therefore have been a cost-control change that reduces
 search coverage, which the rule at the top of this document forbids without
 asking. It was shipped as a latency fix and never examined as a coverage one.
 
-`reasoning_tokens` is recorded on every request. One run separates three
-readings that currently look identical:
+### What the measurement said
 
-- reasoning tokens are most of the completion → the model is thinking, and the
-  correlation above suggests it is earning it;
-- reasoning tokens are near zero → it is verbose prose the parser strips, and
-  the fix is the prompt rather than any reasoning flag;
-- matches drop when it is off → settled, it was load-bearing.
+A full run with `reasoning_tokens` recorded per chunk (clipRequestId
+`6884a9c6-5225-49ff-ae26-8419b8561b17`, "clip every time a cybertruck is seen",
+visual mode) settled it. Reasoning was 87–99% of every completion, so the
+tokens are thinking, not verbose prose the parser strips. But the productive
+spend is a **band**, not a slope:
 
-**The likely landing point is a cap, not a disable.** `reasoning:
-{ max_tokens: N }` — which Qwen maps to Alibaba's thinking budget — bounds
-thinking without removing it, and one chunk spending 13,431 tokens to find
-nothing is the case for bounding it. Around 2,000 would keep chunk 0's 3,887
-mostly intact. After the measurement, not before.
+| reasoning tokens | outcome |
+|------------------|---------|
+| 438–1,700 | every chunk that found a moment |
+| 7,692 | 0 matches, 142s of body time — 89% of the run's wall clock |
+| exhausted | **no answer at all**; the chunk covering `00:16:01–00:18:01` was lost |
+
+Above the band, more thinking bought nothing and cost coverage. That is not
+the "cheaper versus better" trade this document forbids taking blind — at the
+top of the range it was neither.
+
+**So: budget it, do not disable it.** 2,500 keeps the entire productive band
+with headroom. Raise it from a measurement showing matches found above 2,500,
+not from the intuition that more thinking must be better.
+
+### The rule: a chunk is never lost to thinking
+
+The chunk that returned no answer is the failure this section exists to
+prevent. It was a 200, it was billed, and the two minutes of video it covered
+were reported to the user as containing nothing — indistinguishable from the
+moment being absent.
+
+Three things now stand between that and a user:
+
+1. **`max_tokens` is the answer budget plus the thinking budget**, not one
+   ceiling for both. Providers differ on whether reasoning is charged against
+   `max_tokens`; on the ones that charge it, sending the answer budget alone
+   hands the model a ceiling it can exhaust before answering.
+2. **Neither a blank answer nor a half-written one is "no matches".** `""`
+   parses to zero matches, and so does `{"matches":[{...` — `parseModelMatches`
+   never throws, by design, so a truncated answer becomes a chunk that was
+   "searched and found nothing". `finish_reason: "length"` is the only thing
+   that tells those apart from a considered negative result, and it is now
+   checked. The truncated case is the more dangerous of the two precisely
+   because the response is not empty.
+3. **An exhausted answer is retried without thinking** — once, not as a ladder.
+   Retrying identically would think its way to the same place at the same
+   price, so the retry has to differ. The token ceiling is held constant across
+   both attempts, which is what makes the second one an improvement rather than
+   a smaller second chance: with thinking off, the whole allowance belongs to
+   the answer. If that one is *also* truncated, whatever parsed is kept — half
+   an answer beats none, and no third call could do better.
+   `chunksAnsweredWithoutThinking` in the completion log counts recoveries;
+   anything above zero means the budget is too tight for that material.
+
+Both attempts are billed and both are recorded. Usage is now reported before
+the answer is validated, because counting only calls that answered understated
+the cost of exactly the calls worth knowing about.
 
 The probe in `modelCapabilities` does disable reasoning, and should: it asks
 whether a route exists, using a test pattern there is nothing to think about.

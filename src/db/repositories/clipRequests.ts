@@ -5,6 +5,7 @@ import type {
   ClipMatch,
   ClipRequest,
   ClipRequestStatus,
+  MatchFeedback,
   MatchSource,
   ResolvedSearchMode,
   SearchMode,
@@ -151,6 +152,7 @@ interface ClipMatchRow {
   source: MatchSource;
   quote: string | null;
   thumbnail_key: string | null;
+  feedback: MatchFeedback | null;
   created_at: Date;
 }
 
@@ -168,6 +170,7 @@ function mapMatch(row: ClipMatchRow): ClipMatch {
     source: row.source,
     quote: row.quote,
     thumbnailKey: row.thumbnail_key ?? null,
+    feedback: row.feedback ?? null,
     createdAt: row.created_at,
   };
 }
@@ -237,6 +240,71 @@ export async function setMatchThumbnails(
       WHERE m.id = v.id`,
     [thumbnails.map((t) => t.matchId), thumbnails.map((t) => t.thumbnailKey)],
   );
+}
+
+/**
+ * Videos holding matches that were found before stills existed.
+ *
+ * Grouped by video because the frames all come from one proxy: doing this per
+ * match would download the same file once per row. Videos whose proxy is gone
+ * are excluded — there is nothing left to extract from, and reporting them as
+ * pending work would never converge.
+ */
+export async function listVideosMissingThumbnails(
+  limit: number,
+): Promise<Array<{ videoId: string; proxyStorageKey: string; missing: number }>> {
+  const rows = await queryRows<{ video_id: string; proxy_storage_key: string; missing: number }>(
+    `SELECT v.id AS video_id, v.proxy_storage_key, COUNT(m.id)::int AS missing
+       FROM clip_matches m
+       JOIN clip_requests r ON r.id = m.clip_request_id
+       JOIN videos v ON v.id = r.video_id
+      WHERE m.thumbnail_key IS NULL AND v.proxy_storage_key IS NOT NULL
+      GROUP BY v.id, v.proxy_storage_key
+      ORDER BY MAX(m.created_at) DESC
+      LIMIT $1`,
+    [limit],
+  );
+  return rows.map((row) => ({
+    videoId: row.video_id,
+    proxyStorageKey: row.proxy_storage_key,
+    missing: row.missing,
+  }));
+}
+
+/** Every match of a video still waiting for a still, across all its searches. */
+export async function listMatchesMissingThumbnails(videoId: string): Promise<ClipMatch[]> {
+  const rows = await queryRows<ClipMatchRow>(
+    `SELECT m.* FROM clip_matches m
+       JOIN clip_requests r ON r.id = m.clip_request_id
+      WHERE r.video_id = $1 AND m.thumbnail_key IS NULL
+      ORDER BY m.global_start_seconds ASC`,
+    [videoId],
+  );
+  return rows.map(mapMatch);
+}
+
+/**
+ * Records what a person thought of a match, or clears it.
+ *
+ * Scoped to the request as well as the match so a guessed match id cannot be
+ * marked from another user's search. The row is never deleted: a rejected
+ * moment is the only record of the model being wrong, which is the evidence
+ * this column exists to collect.
+ */
+export async function setMatchFeedback(
+  requestId: string,
+  matchId: string,
+  feedback: MatchFeedback | null,
+): Promise<ClipMatch | null> {
+  const row = await queryOne<ClipMatchRow>(
+    `UPDATE clip_matches
+        SET feedback = $3,
+            feedback_at = CASE WHEN $3::text IS NULL THEN NULL ELSE now() END
+      WHERE clip_request_id = $1 AND id = $2
+      RETURNING *`,
+    [requestId, matchId, feedback],
+  );
+  return row ? mapMatch(row) : null;
 }
 
 export async function listMatches(requestId: string): Promise<ClipMatch[]> {

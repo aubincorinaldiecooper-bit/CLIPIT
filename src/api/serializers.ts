@@ -109,6 +109,10 @@ export async function serializeMatch(match: ClipMatch, clip?: Clip | null) {
     source: match.source,
     quote: match.quote,
     thumbnailUrl,
+    // The client hides a rejected match rather than the server withholding it:
+    // a reload should put the moment back exactly where the user left it, and
+    // an approval that vanished on refresh would read as not having registered.
+    feedback: match.feedback,
     clip: clip ? { id: clip.id, status: clip.status } : null,
   };
 }

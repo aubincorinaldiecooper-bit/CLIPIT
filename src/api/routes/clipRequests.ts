@@ -4,13 +4,24 @@ import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { formatTimecode } from '../../services/timestamps.js';
-import { getClipRequest, listMatches, listMatchesByIds } from '../../db/repositories/clipRequests.js';
+import {
+  getClipRequest,
+  listMatches,
+  listMatchesByIds,
+  setMatchFeedback,
+} from '../../db/repositories/clipRequests.js';
 import { listClipsForRequest, upsertClipForMatch } from '../../db/repositories/clips.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import { enqueueClipGeneration } from '../../queues/index.js';
 import { assertOwnership, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
-import { searchCoverage, serializeClip, serializeClipRequest, type SearchCoverage } from '../serializers.js';
+import {
+  searchCoverage,
+  serializeClip,
+  serializeClipRequest,
+  serializeMatch,
+  type SearchCoverage,
+} from '../serializers.js';
 import { parse } from '../validation.js';
 import type { Clip } from '../../domain/types.js';
 
@@ -36,6 +47,11 @@ function explainNoMatches(coverage: SearchCoverage): string {
 
   return `No matches to generate. ${formatTimecode(coverage.unsearchedSeconds)} of this video could not be examined, so the moment may be in a stretch that was never searched.`;
 }
+
+const feedbackSchema = z.object({
+  /** `null` clears an earlier verdict rather than recording a third state. */
+  verdict: z.enum(['approved', 'rejected']).nullable(),
+});
 
 const generateSchema = z
   .object({
@@ -65,6 +81,37 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       clipRequest: await serializeClipRequest(clipRequest, matches, clipsByMatchId),
       clips: await Promise.all(clips.map((clip) => serializeClip(clip))),
     });
+  });
+
+  /**
+   * Records what a person thought of one match.
+   *
+   * The only judgement in the system that is not the model's own. `null`
+   * clears it, so a mis-tap is recoverable — a thumbs-down takes a moment off
+   * the user's screen, and nothing that easy to hit should be permanent.
+   */
+  app.post('/api/clip-requests/:requestId/matches/:matchId/feedback', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+
+    const { requestId, matchId } = parse(
+      z.object({ requestId: uuidSchema, matchId: uuidSchema }),
+      request.params,
+      'path parameters',
+    );
+    const { verdict } = parse(feedbackSchema, request.body ?? {});
+
+    const clipRequest = await getClipRequest(requestId);
+    if (!clipRequest) throw HttpError.notFound('Clip request not found');
+    assertOwnership(request, clipRequest, 'Clip request');
+
+    // Scoped to the request as well as the match, so a guessed id cannot mark
+    // a moment belonging to someone else's search.
+    const match = await setMatchFeedback(requestId, matchId, verdict);
+    if (!match) throw HttpError.notFound('Match not found');
+
+    return reply.send({ match: await serializeMatch(match) });
   });
 
   /**
@@ -104,9 +151,22 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
     const video = await getVideo(clipRequest.videoId);
     if (!video) throw HttpError.notFound('Video not found');
 
-    const matches = body.matchIds?.length
+    // An explicit list is taken at its word — asking for a match by id is a
+    // deliberate act, even one previously waved off. Generating "everything",
+    // though, must not spend a render on a moment the user has already said is
+    // wrong; on their screen it is gone.
+    const all = body.matchIds?.length
       ? await listMatchesByIds(requestId, body.matchIds)
       : await listMatches(requestId);
+    const matches = body.matchIds?.length ? all : all.filter((match) => match.feedback !== 'rejected');
+
+    // Telling someone to rephrase when the search worked and they simply waved
+    // every result away would send them to fix the one thing that was fine.
+    if (matches.length === 0 && all.length > 0) {
+      throw HttpError.unprocessable(
+        'Every match here was marked as wrong. Undo a thumbs-down, or try a different instruction.',
+      );
+    }
 
     if (matches.length === 0) {
       // Blaming the instruction is only fair when the whole video was actually

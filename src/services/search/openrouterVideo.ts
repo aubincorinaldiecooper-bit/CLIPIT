@@ -12,7 +12,15 @@ type ContentPart =
   | { type: 'video_url'; video_url: { url: string } };
 
 interface CompletionResponse {
-  choices?: Array<{ message?: { content?: string | null } }>;
+  choices?: Array<{
+    message?: { content?: string | null };
+    /**
+     * `length` here is the tell that the model was cut off rather than done.
+     * Without it an empty answer and a deliberate "no matches" look identical.
+     */
+    finish_reason?: string | null;
+    native_finish_reason?: string | null;
+  }>;
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
@@ -58,7 +66,22 @@ export interface VideoSearchResult {
   matches: ParsedMatch[];
   warnings: string[];
   rawResponse: string;
+  /**
+   * True when the first attempt returned no answer and the chunk was recovered
+   * by asking again with thinking switched off. The matches are real; what is
+   * worth knowing is that this chunk was answered without deliberation.
+   */
+  reasoningDisabled?: boolean;
 }
+
+/**
+ * How much thinking this attempt is allowed.
+ *
+ * `off` exists for exactly one situation: a model that spent its whole budget
+ * reasoning and returned an empty answer. Retrying identically would spend the
+ * same budget the same way, so the retry has to differ.
+ */
+type ReasoningPolicy = 'budgeted' | 'off';
 
 const limiter = new Semaphore(env.OPENROUTER_VIDEO_CONCURRENCY);
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
@@ -74,6 +97,24 @@ const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 export function isContentFilterRejection(error: unknown): boolean {
   if (!(error instanceof ExternalServiceError)) return false;
   return /data_inspection_failed|inappropriate content|content[_ ]?(policy|filter)/i.test(error.message);
+}
+
+/** Prefix of the error raised when a billed 200 ran out of room to answer. */
+const EXHAUSTED_ANSWER = 'Video response ran out of room';
+
+/**
+ * Recognises a request that succeeded, was billed, and did not finish saying
+ * what it saw.
+ *
+ * Two shapes, one cause. The model can stop before writing anything, or stop
+ * partway through the JSON — and the truncated one is the more dangerous,
+ * because `parseModelMatches` never throws: a half-written object yields zero
+ * matches and warnings, which downstream is indistinguishable from a
+ * considered "there is nothing here". On the run that exposed this, the chunk
+ * covering 00:16:01-00:18:01 was lost exactly that quietly.
+ */
+export function isExhaustedAnswer(error: unknown): boolean {
+  return error instanceof ExternalServiceError && error.message.startsWith(EXHAUSTED_ANSWER);
 }
 
 function headers(): Record<string, string> {
@@ -109,35 +150,43 @@ async function buildContent(input: VideoSearchInput): Promise<{ parts: ContentPa
   return { parts, videoBytes };
 }
 
-async function requestCompletion(input: VideoSearchInput): Promise<VideoSearchResult> {
+async function requestCompletion(
+  input: VideoSearchInput,
+  policy: ReasoningPolicy = 'budgeted',
+): Promise<VideoSearchResult> {
   const { parts, videoBytes } = await buildContent(input);
+  const reasoningBudget = policy === 'off' ? 0 : env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS;
   const body = JSON.stringify({
     model: env.OPENROUTER_VIDEO_MODEL,
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: parts },
     ],
-    max_tokens: env.OPENROUTER_VIDEO_MAX_TOKENS,
+    // Deliberately the sum, not the answer budget alone, and the same ceiling
+    // under both policies. Providers differ on whether reasoning is charged
+    // against `max_tokens`; on the ones that charge it, sending the answer
+    // budget by itself hands the model a ceiling it can exhaust before
+    // answering at all. Holding the ceiling fixed is also what makes the
+    // no-thinking retry an improvement rather than a smaller second chance:
+    // the whole allowance becomes available to the answer.
+    max_tokens: env.OPENROUTER_VIDEO_MAX_TOKENS + env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS,
     temperature: env.OPENROUTER_VIDEO_TEMPERATURE,
     stream: false,
-    // Reasoning is deliberately left at the model's default, which is on.
+    // Bounded, not disabled.
     //
-    // It was briefly disabled as a cost and latency fix, on the assumption
-    // that locating a moment is not a reasoning task. The per-chunk numbers
-    // say otherwise: every chunk that found a match spent 2,486-3,887
-    // completion tokens, while every chunk that found nothing spent 468-1,595.
-    // Two matches of JSON is roughly 150 tokens, so the difference is not
-    // output length — something correlated with finding moments is consuming
-    // them, and the chunk that located the acceptance case is near the top of
-    // that spend.
+    // Reasoning was briefly turned off as a cost fix and put back when the
+    // numbers showed it was doing real work: the chunks that found moments
+    // were the ones that spent tokens thinking. A full run then showed the
+    // other half of the picture — the spend that finds things sits in a band
+    // (438-1,700 tokens), and past it are only runaways. One chunk thought for
+    // 7,692 tokens across 142 seconds and found nothing; another never
+    // produced an answer at all and cost the search two minutes of the video.
     //
-    // Turning it off to save money could therefore have bought a cheaper
-    // search that finds less, which is the one trade this project does not
-    // make without measuring. `reasoning_tokens` is recorded below; once a run
-    // shows what thinking actually buys, the choice is between capping it
-    // (`reasoning: { max_tokens: N }`, which Qwen maps to a thinking budget)
-    // and leaving it alone. Capping is the likely answer — one chunk spent
-    // 13,431 tokens and found nothing — but not before the measurement.
+    // So the trade is not "cheaper versus better". Above the band, more
+    // thinking bought nothing and lost coverage, and a budget is what keeps
+    // both. `exclude` drops the reasoning text from the response — it is
+    // billed either way, and we have never read it.
+    reasoning: policy === 'off' ? { enabled: false, exclude: true } : { max_tokens: reasoningBudget, exclude: true },
   });
   const payloadBytes = Buffer.byteLength(body);
   const startedAt = performance.now();
@@ -215,13 +264,9 @@ async function requestCompletion(input: VideoSearchInput): Promise<VideoSearchRe
       });
     }
 
-    const content = payload.choices?.[0]?.message?.content;
-    if (typeof content !== 'string') {
-      throw new ExternalServiceError('openrouter-video', 'Video response contained no message content', {
-        retryable: false,
-      });
-    }
-
+    const choice = payload.choices?.[0];
+    const content = choice?.message?.content;
+    const finishReason = choice?.finish_reason ?? choice?.native_finish_reason ?? null;
     const reasoningTokens = payload.usage?.completion_tokens_details?.reasoning_tokens;
 
     logger.info('OpenRouter video request complete', {
@@ -243,12 +288,18 @@ async function requestCompletion(input: VideoSearchInput): Promise<VideoSearchRe
       reasoningTokens,
       totalTokens: payload.usage?.total_tokens,
       costUsd: payload.usage?.cost,
+      // The two facts that separate "found nothing" from "never answered".
+      finishReason,
+      answerChars: typeof content === 'string' ? content.length : 0,
+      reasoningPolicy: policy,
     });
 
     // Logs answer "what did this call cost"; the usage table answers "what did
     // this video cost" and "what did this search cost", which is the question
-    // that actually shapes pricing. Reported after a successful response so a
-    // retried failure is not counted twice.
+    // that actually shapes pricing. Recorded before the answer is validated,
+    // because a 200 that thought for 7,000 tokens and returned nothing was
+    // still billed — accounting for it only on success understated the true
+    // cost of exactly the calls worth knowing about.
     if (input.onUsage && payload.usage) {
       const promptTokens = Math.max(0, Math.round(payload.usage.prompt_tokens ?? 0));
       const completionTokens = Math.max(0, Math.round(payload.usage.completion_tokens ?? 0));
@@ -266,6 +317,38 @@ async function requestCompletion(input: VideoSearchInput): Promise<VideoSearchRe
       }
     }
 
+    // Validated last, so a billed call is always accounted for even when it
+    // answered nothing.
+    const where = `finish_reason=${finishReason ?? 'none'}, reasoning_tokens=${reasoningTokens ?? 0}`;
+
+    // A blank string is not "no moments here": `""` parses to zero matches and
+    // would be stored as a considered negative result.
+    if (typeof content !== 'string' || content.trim() === '') {
+      throw new ExternalServiceError('openrouter-video', `${EXHAUSTED_ANSWER}: nothing was written (${where})`, {
+        retryable: false,
+      });
+    }
+
+    // Nor is a half-written one. `length` means the model was cut off, and a
+    // truncated `{"matches":[{...` has no balanced closing brace — the parser
+    // shrugs and returns zero matches, so the chunk records as searched and
+    // found nothing. Worth a second call while thinking can still be traded
+    // for room; on the retry there is nothing left to trade, so partial
+    // matches are kept rather than thrown away.
+    if (finishReason === 'length') {
+      if (policy !== 'off') {
+        throw new ExternalServiceError('openrouter-video', `${EXHAUSTED_ANSWER}: answer cut off (${where})`, {
+          retryable: false,
+        });
+      }
+      logger.warn('answer was cut off even with thinking disabled; keeping what parsed', {
+        model: env.OPENROUTER_VIDEO_MODEL,
+        chunkIndex: input.chunkIndex,
+        answerChars: content.length,
+        maxTokens: env.OPENROUTER_VIDEO_MAX_TOKENS + env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS,
+      });
+    }
+
     const parsed = parseModelMatches(content);
     return { ...parsed, rawResponse: content };
   } finally {
@@ -277,13 +360,41 @@ async function requestCompletion(input: VideoSearchInput): Promise<VideoSearchRe
   }
 }
 
+/**
+ * The rule: a chunk is never lost because the model spent its budget thinking.
+ *
+ * A 200 that ran out of room is not a failure the outer retry loop can help
+ * with — the same request would think its way to the same place, at the same
+ * price. The only retry worth making is a different one, so this asks again
+ * with thinking off, where the whole ceiling belongs to the answer.
+ *
+ * Deliberately one extra call, not a ladder. If a chunk cannot answer with its
+ * entire budget available for answering, the problem is not the budget.
+ */
+async function completeOrAnswerWithoutThinking(input: VideoSearchInput): Promise<VideoSearchResult> {
+  try {
+    return await requestCompletion(input, 'budgeted');
+  } catch (error) {
+    if (!isExhaustedAnswer(error)) throw error;
+
+    logger.warn('chunk ran out of room to answer; asking again without thinking', {
+      model: env.OPENROUTER_VIDEO_MODEL,
+      chunkIndex: input.chunkIndex,
+      reason: (error as Error).message,
+    });
+
+    const result = await requestCompletion(input, 'off');
+    return { ...result, reasoningDisabled: true };
+  }
+}
+
 /** Searches one chunk with the single configured Qwen model; no fallback or escalation. */
 export async function searchVideoChunk(input: VideoSearchInput): Promise<VideoSearchResult> {
   return limiter.run(async () => {
     let lastError: unknown;
     for (let attempt = 0; attempt <= env.OPENROUTER_MAX_RETRIES; attempt += 1) {
       try {
-        return await requestCompletion(input);
+        return await completeOrAnswerWithoutThinking(input);
       } catch (error) {
         lastError = error;
         const retryable = error instanceof ExternalServiceError && error.retryable;
