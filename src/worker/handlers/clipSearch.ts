@@ -350,9 +350,14 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
 
   // Visual evidence is the actual MP4 chunk, not sampled-frame summaries.
   let chunkPath: string | undefined;
+  let downloadMs = 0;
   if (input.mode !== 'transcript') {
     chunkPath = path.join(chunkDir, 'chunk.mp4');
+    // Timed because it was the leading suspect for a four-minute search and
+    // could not be ruled out from the logs — every other stage was measured.
+    const startedAt = performance.now();
     await getStorage().downloadToFile(chunk.storageKey, chunkPath);
+    downloadMs = Math.round(performance.now() - startedAt);
   }
 
   // Evidence 2: the slice of the (already global) transcript covering this chunk,
@@ -458,6 +463,9 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     reported: response.matches.length,
     belowConfidence: belowConfidence.length,
     kept: deduped.length,
+    // Completes the per-chunk time budget: fetching the evidence, versus the
+    // model working on it. Together with headersMs/bodyMs nothing is untimed.
+    downloadMs,
     ...(response.matches.length === 0
       ? { rawResponse: response.rawResponse.slice(0, 500) }
       : {}),
