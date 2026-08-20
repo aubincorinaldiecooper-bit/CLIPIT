@@ -87,6 +87,24 @@ chunk failure is recorded by the existing job flow; it does not invoke another
 model. Model output continues through the existing untrusted-JSON parser,
 timestamp clamps, source-time mapping, and overlap aggregation.
 
+## Quoted phrases are not necessarily speech
+
+A quoted phrase in an instruction may be spoken, or it may be text visible in
+the frame. `find the scene where it shows the car that say "bought with
+investor money"` scores on both sides of the classifier — `say` and the quotes
+read as speech, `shows`/`scene`/`car` read as visual — so it resolves to `both`
+once a transcript exists.
+
+`both` is the correct mode: it gives the model more evidence, not less. The
+hazard is downstream. Told to require every requested condition, a model can
+find the car, fail to find the phrase in the transcript, and discard a correct
+match — a false negative indistinguishable from the moment not being there.
+
+`SYSTEM_PROMPT` therefore states that a quoted phrase may be satisfied by
+on-screen text or by speech unless the instruction says which, and that "say"
+applied to an object means text visible on it. Do not tighten this back into
+"require all modalities" without a case showing it over-matches.
+
 ## Functional acceptance
 
 Use the known black-car scene around source time `00:54` as an acceptance case,
