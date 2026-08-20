@@ -368,6 +368,42 @@ export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: num
   return { sizeBytes: info.size, durationSeconds: probe.durationSeconds };
 }
 
+/**
+ * Builds the smallest clip a provider will still accept as video.
+ *
+ * Used by the routing preflight, which needs a throwaway MP4 rather than any
+ * particular content. It was a 32x32 single frame embedded as a base64
+ * literal, which Alibaba rejected outright — "The video modality input does
+ * not meet the requirements" — leaving the preflight permanently inconclusive
+ * and therefore useless. Generating it means the dimensions can be raised
+ * again for the next provider that has a floor, without regenerating and
+ * re-pasting kilobytes of base64.
+ */
+export async function createProbeClip(outputPath: string): Promise<void> {
+  await run(
+    env.FFMPEG_PATH,
+    [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-f', 'lavfi',
+      // A moving test pattern rather than a flat colour: some providers reject
+      // or specially handle a video with no change between frames.
+      '-i', `testsrc=size=${PROBE_CLIP_SIZE}x${PROBE_CLIP_SIZE}:rate=${PROBE_CLIP_FPS}:duration=${PROBE_CLIP_SECONDS}`,
+      '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p',
+      '-profile:v', 'baseline',
+      '-movflags', '+faststart',
+      '-y', outputPath,
+    ],
+    { timeoutMs: 30_000 },
+  );
+}
+
+/** Comfortably above the smallest input Alibaba accepted, and still ~11KB. */
+const PROBE_CLIP_SIZE = 256;
+const PROBE_CLIP_FPS = 8;
+const PROBE_CLIP_SECONDS = 2;
+
 /** Verifies ffmpeg/ffprobe are present; called at worker startup. */
 export async function assertFfmpegAvailable(): Promise<void> {
   await run(env.FFMPEG_PATH, ['-version'], { timeoutMs: 15_000 });
