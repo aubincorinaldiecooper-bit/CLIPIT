@@ -87,7 +87,13 @@ export function serializeVideo(video: Video, chunks?: VideoChunk[]) {
   };
 }
 
-export function serializeMatch(match: ClipMatch, clip?: Clip | null) {
+export async function serializeMatch(match: ClipMatch, clip?: Clip | null) {
+  // Signed like any other private object: the still lives in the same bucket
+  // as the media it came from and must not be publicly readable.
+  const thumbnailUrl = match.thumbnailKey
+    ? await getStorage().createDownloadUrl(match.thumbnailKey)
+    : null;
+
   return {
     id: match.id,
     chunkId: match.chunkId,
@@ -102,6 +108,7 @@ export function serializeMatch(match: ClipMatch, clip?: Clip | null) {
     confidence: match.confidence,
     source: match.source,
     quote: match.quote,
+    thumbnailUrl,
     clip: clip ? { id: clip.id, status: clip.status } : null,
   };
 }
@@ -216,7 +223,7 @@ function clipRequestProgress(request: ClipRequest): ClipRequestProgress {
   };
 }
 
-export function serializeClipRequest(
+export async function serializeClipRequest(
   request: ClipRequest,
   matches?: ClipMatch[],
   clipsByMatchId?: Map<string, Clip>,
@@ -239,7 +246,7 @@ export function serializeClipRequest(
     createdAt: request.createdAt.toISOString(),
     updatedAt: request.updatedAt.toISOString(),
     ...(matches
-      ? { matches: matches.map((match) => serializeMatch(match, clipsByMatchId?.get(match.id) ?? null)) }
+      ? { matches: await Promise.all(matches.map((match) => serializeMatch(match, clipsByMatchId?.get(match.id) ?? null))) }
       : {}),
   };
 }

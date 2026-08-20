@@ -62,7 +62,7 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
     const clipsByMatchId = new Map<string, Clip>(clips.map((clip) => [clip.clipMatchId, clip]));
 
     return reply.send({
-      clipRequest: serializeClipRequest(clipRequest, matches, clipsByMatchId),
+      clipRequest: await serializeClipRequest(clipRequest, matches, clipsByMatchId),
       clips: await Promise.all(clips.map((clip) => serializeClip(clip))),
     });
   });

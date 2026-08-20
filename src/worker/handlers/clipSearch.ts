@@ -1,3 +1,4 @@
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
@@ -6,6 +7,7 @@ import { ExternalServiceError, errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
+import { extractFrameAt } from '../../services/media/ffmpeg.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { UsageTally } from '../../services/usageTally.js';
 import { isContentFilterRejection, searchVideoChunk } from '../../services/search/openrouterVideo.js';
@@ -25,6 +27,7 @@ import {
   recordChunkCompleted,
   recordChunkDegraded,
   recordChunkFailure,
+  setMatchThumbnails,
   startClipRequest,
   type NewClipMatch,
 } from '../../db/repositories/clipRequests.js';
@@ -34,6 +37,7 @@ import type {
   ChunkFailureCode,
   MatchSource,
   ResolvedSearchMode,
+  Video,
   VideoChunk,
 } from '../../domain/types.js';
 
@@ -253,6 +257,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // duplicates together before the search is reported complete.
       const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
 
+      // After aggregation, because merging rewrites match rows and their ids.
+      await attachThumbnails({ clipRequestId, video, workDir: dir, log });
+
       await finishClipRequest(clipRequestId, 'completed');
       const elapsedMs = Math.round(performance.now() - searchStartedAt);
 
@@ -367,6 +374,65 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
   });
 
   return rows.length;
+}
+
+/**
+ * Gives every match a still from its own moment.
+ *
+ * A list of timecodes and sentences asks the reader to picture each one and
+ * then select it to find out; a frame answers that directly. Extracted from
+ * the low-resolution proxy already in storage rather than the original, and
+ * from a single download rather than one per match.
+ *
+ * Best-effort throughout. The search has already found and stored its results
+ * by this point, and a missing picture must never cost a real match — every
+ * failure here is logged and swallowed.
+ */
+async function attachThumbnails(input: {
+  clipRequestId: string;
+  video: Video;
+  workDir: string;
+  log: Logger;
+}): Promise<void> {
+  const { clipRequestId, video, workDir, log } = input;
+  if (!video.proxyStorageKey) return;
+
+  try {
+    const matches = await listMatches(clipRequestId);
+    if (matches.length === 0) return;
+
+    const proxyPath = path.join(workDir, 'thumbs-source.mp4');
+    await getStorage().downloadToFile(video.proxyStorageKey, proxyPath);
+
+    const startedAt = performance.now();
+    const dir = path.join(workDir, 'thumbs');
+    await mkdir(dir, { recursive: true });
+
+    const results = await mapWithConcurrency(matches, 4, async (match) => {
+      const file = path.join(dir, `${match.id}.jpg`);
+      // A shade after the start: the first frame of a cut often lands on a
+      // transition, and a black frame is a worse preview than no preview.
+      const at = Math.min(match.globalStartSeconds + 0.5, match.globalEndSeconds);
+      if (!(await extractFrameAt(proxyPath, at, file))) return null;
+
+      const key = `thumbnails/${video.id}/${match.id}.jpg`;
+      await getStorage().uploadFile(key, file, 'image/jpeg');
+      return { matchId: match.id, thumbnailKey: key };
+    });
+
+    const attached = results.flatMap((result) =>
+      result.status === 'fulfilled' && result.value ? [result.value] : [],
+    );
+    await setMatchThumbnails(attached);
+
+    log.info('match thumbnails attached', {
+      attached: attached.length,
+      matches: matches.length,
+      elapsedMs: Math.round(performance.now() - startedAt),
+    });
+  } catch (error) {
+    log.warn('could not attach match thumbnails', { err: error });
+  }
 }
 
 interface SearchSingleChunkInput {
