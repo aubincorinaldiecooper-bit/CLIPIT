@@ -36,8 +36,23 @@ const SPOKEN_PATTERNS: RegExp[] = [
  * instruction shape most likely to be about visible text.
  *
  * Curly quotes are included because instructions get pasted from anywhere.
+ *
+ * The straight single quote is the awkward one: it is also the apostrophe, so
+ * a naive alternative spans from `he's` to `isn't` and reports a quotation in
+ * ordinary speech. Requiring its delimiters not to sit inside a word keeps
+ * that from routing a plain transcript search into a full video upload. The
+ * curly apostrophe (’) has the same double life, which is why the curly pair
+ * is anchored on an explicit opening ‘ that no apostrophe produces.
  */
-const QUOTED_PHRASE = /"[^"]{2,}"|“[^”]{2,}”|'[^']{4,}'/;
+const QUOTED_PHRASE = new RegExp(
+  [
+    '"[^"]{2,}"',
+    '“[^”]{2,}”',
+    '‘[^’]{2,}’',
+    "(?<![\\p{L}\\p{N}])'[^']{2,}'(?![\\p{L}\\p{N}])",
+  ].join('|'),
+  'u',
+);
 
 const VISUAL_PATTERNS: RegExp[] = [
   /\b(show|shows|showed|showing|shown)\b/i,
