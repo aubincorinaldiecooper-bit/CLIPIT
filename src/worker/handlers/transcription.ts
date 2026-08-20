@@ -14,6 +14,7 @@ import { getVideo, setTranscriptStatus } from '../../db/repositories/videos.js';
 import { replaceTranscript, type NewTranscriptSegment } from '../../db/repositories/transcripts.js';
 import type { TranscriptSource } from '../../domain/types.js';
 import type { TranscriptionJob } from '../../queues/index.js';
+import { UsageTally } from '../../services/usageTally.js';
 
 /**
  * Produces one timestamped transcript per video.
@@ -63,7 +64,19 @@ export async function handleTranscription(job: Job<TranscriptionJob>): Promise<v
 
     if (!video.originalStorageKey) throw new Error('No source file available to transcribe');
 
-    const segments = await transcribeWithStt(job, videoId, video.originalStorageKey);
+    // Paid once per video, unlike search. Logged separately so the one-time
+    // ingestion cost is never mistaken for the recurring per-query cost.
+    const tally = new UsageTally();
+    const segments = await transcribeWithStt(job, videoId, video.originalStorageKey, tally);
+
+    if (tally.calls > 0) {
+      log.info('transcription cost', {
+        ...tally.summary(),
+        usdPerSourceMinute: tally.perSourceMinute(video.durationSeconds),
+        videoDurationSeconds: video.durationSeconds,
+        model: env.OPENROUTER_STT_MODEL,
+      });
+    }
     if (segments.length === 0) {
       await setTranscriptStatus(videoId, 'unavailable', {
         error: 'No speech detected in the source',
@@ -108,6 +121,7 @@ async function transcribeWithStt(
   job: Job<TranscriptionJob>,
   videoId: string,
   originalStorageKey: string,
+  tally: UsageTally,
 ): Promise<NewTranscriptSegment[]> {
   return withWorkDir(`transcribe-${videoId}`, async (dir) => {
     const sourcePath = path.join(dir, `source${path.extname(originalStorageKey) || '.mp4'}`);
@@ -122,6 +136,7 @@ async function transcribeWithStt(
     // Sequential over pieces; the OpenRouter client caps real concurrency itself.
     for (const [index, audio] of audioSegments.entries()) {
       const transcribed = await transcribeAudioFile(audio.filePath, (usage) => {
+        tally.add(usage);
         void recordModelUsage({ ...usage, stage: 'transcription', videoId, clipRequestId: null });
       });
 

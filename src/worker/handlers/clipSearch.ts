@@ -7,6 +7,7 @@ import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
+import { UsageTally } from '../../services/usageTally.js';
 import { searchVideoChunk } from '../../services/search/openrouterVideo.js';
 import { assertVideoInputSupported } from '../../services/search/modelCapabilities.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
@@ -117,6 +118,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
     let completed = 0;
     let totalMatches = 0;
+    const tally = new UsageTally();
     // Per-request latency lives in model_usage; this is the number the user
     // actually waits through, and the one that says whether chunk size and
     // concurrency need changing before any further architecture does.
@@ -132,6 +134,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           videoId: video.id,
           clipRequestId,
           workDir: dir,
+          tally,
         });
 
         if (found.length > 0) await insertMatches(clipRequestId, found);
@@ -196,6 +199,19 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
       await finishClipRequest(clipRequestId, 'completed');
       const elapsedMs = Math.round(performance.now() - searchStartedAt);
+
+      // Cost of one search, on its own line and complete enough to price from:
+      // the recurring per-query cost, next to the video length it scales with.
+      log.info('clip search cost', {
+        ...tally.summary(),
+        usdPerSourceMinute: tally.perSourceMinute(video.durationSeconds),
+        videoDurationSeconds: video.durationSeconds,
+        chunks: chunks.length,
+        mode: resolved.mode,
+        model: env.OPENROUTER_VIDEO_MODEL,
+        elapsedMs,
+      });
+
       log.info('clip search complete', {
         matches: finalCount,
         mergedFrom: totalMatches,
@@ -292,6 +308,7 @@ interface SearchSingleChunkInput {
   videoId: string;
   clipRequestId: string;
   workDir: string;
+  tally: UsageTally;
 }
 
 const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
@@ -336,6 +353,7 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     videoPath: chunkPath,
     transcript,
     onUsage: (usage) => {
+      input.tally.add(usage);
       void recordModelUsage({
         ...usage,
         stage: 'search',
