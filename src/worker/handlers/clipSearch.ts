@@ -1,7 +1,7 @@
 import path from 'node:path';
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
-import { logger } from '../../lib/logger.js';
+import { logger, type Logger } from '../../lib/logger.js';
 import { ExternalServiceError, errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
@@ -144,6 +144,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           clipRequestId,
           workDir: dir,
           tally,
+          log,
         });
 
         if (found.length > 0) await insertMatches(clipRequestId, found);
@@ -328,6 +329,13 @@ interface SearchSingleChunkInput {
   clipRequestId: string;
   workDir: string;
   tally: UsageTally;
+  /**
+   * The request-scoped logger, not the root one. Searches run concurrently
+   * (`CLIP_SEARCH_CONCURRENCY`), so two of them emit chunk 0 of the same
+   * source window at the same time; without the request on every line, a
+   * diagnostic cannot be attributed to the search being diagnosed.
+   */
+  log: Logger;
 }
 
 const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
@@ -383,7 +391,7 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
   });
 
   if (response.warnings.length > 0) {
-    logger.warn('model output warnings', {
+    input.log.warn('model output warnings', {
       chunkIndex: chunk.chunkIndex,
       warnings: response.warnings.slice(0, 5),
     });
@@ -396,7 +404,7 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
   // a model problem.
   const belowConfidence = response.matches.filter((match) => match.confidence < env.MIN_MATCH_CONFIDENCE);
   if (belowConfidence.length > 0) {
-    logger.warn('discarded low-confidence matches', {
+    input.log.warn('discarded low-confidence matches', {
       chunkIndex: chunk.chunkIndex,
       threshold: env.MIN_MATCH_CONFIDENCE,
       dropped: belowConfidence.slice(0, 5).map((match) => ({
@@ -418,7 +426,7 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
         { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
       );
       if (!range) {
-        logger.warn('discarding out-of-range match', {
+        input.log.warn('discarding out-of-range match', {
           chunkIndex: chunk.chunkIndex,
           start: match.startSeconds,
           end: match.endSeconds,
@@ -444,7 +452,7 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
   // moment can be looked up directly. "Nothing found" is the answer that needs
   // explaining, so the model's own words are attached only in that case —
   // otherwise an empty result is indistinguishable from a broken one.
-  logger.info('chunk searched', {
+  input.log.info('chunk searched', {
     chunkIndex: chunk.chunkIndex,
     covers: `${chunk.globalStartSeconds.toFixed(0)}-${chunk.globalEndSeconds.toFixed(0)}s`,
     reported: response.matches.length,
