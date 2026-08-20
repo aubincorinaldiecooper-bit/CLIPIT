@@ -12,7 +12,16 @@ export interface StorageAdapter {
   /** Presigned PUT URL handed to the client so uploads bypass the API server. */
   createUploadUrl(key: string, contentType: string, expiresInSeconds?: number): Promise<string>;
   /** Presigned GET URL for playback / download. */
-  createDownloadUrl(key: string, expiresInSeconds?: number): Promise<string>;
+  /**
+   * `downloadFilename` makes the object arrive as a save rather than a
+   * navigation. The HTML `download` attribute is ignored cross-origin, so a
+   * link to a plain presigned URL opens the video in a tab instead of saving
+   * it — the disposition has to be signed into the URL itself.
+   */
+  createDownloadUrl(
+    key: string,
+    options?: { expiresInSeconds?: number; downloadFilename?: string },
+  ): Promise<string>;
   uploadFile(key: string, filePath: string, contentType: string): Promise<StoredObject>;
   downloadToFile(key: string, destinationPath: string): Promise<void>;
   head(key: string): Promise<StoredObject | null>;
