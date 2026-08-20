@@ -145,6 +145,34 @@ describe('resolveSearchMode', () => {
     expect(classifyInstruction('the part where they discuss hiring').mode).toBe('transcript');
   });
 
+  /** Instructions are pasted from editors that rewrite quotes as they are typed. */
+  it.each([
+    ['curly double', 'where it says “SALE”'],
+    ['curly single', 'where it says ‘SALE’'],
+    ['straight single', "where it says 'SALE'"],
+    ['straight double', 'where it says "SALE"'],
+    // An apostrophe inside the quotation used to close it early, losing the match.
+    ['curly single around a contraction', 'where it says ‘I’m done’'],
+    ['straight single around a contraction', "where it says 'I'm done'"],
+    ['quotation containing a possessive', 'the sign reading “Bob’s Diner”'],
+  ])('treats a %s as ambiguous', (_label, instruction) => {
+    expect(classifyInstruction(instruction).mode).not.toBe('transcript');
+  });
+
+  /**
+   * The apostrophe is the same character as the straight closing quote, and
+   * the curly apostrophe (’) the same as the curly one. Ordinary contractions
+   * must not read as a quotation, or every plain speech search pays for a
+   * full video upload it cannot use.
+   */
+  it.each([
+    "find where he's explaining why it isn't available",
+    'find where he’s explaining why it isn’t available',
+    "the part where they don't answer the question",
+  ])('does not read contractions as a quoted phrase: %s', (instruction) => {
+    expect(classifyInstruction(instruction).mode).toBe('transcript');
+  });
+
   it('reads text written on an object as something to look at', () => {
     expect(classifyInstruction('the writing on his shirt').visualScore).toBeGreaterThan(0);
     expect(classifyInstruction('the licence plate').visualScore).toBeGreaterThan(0);
