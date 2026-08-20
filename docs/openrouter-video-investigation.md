@@ -1,40 +1,61 @@
 # OpenRouter actual-video MVP
 
-Status: **implemented MVP decision**, reviewed 2026-08-19.
+Status: **implemented MVP decision**, reviewed 2026-08-20.
 
 ## One production path
 
 The MVP uses one visual-understanding model:
 
-`actual MP4 chunk + user's natural-language instruction → qwen/qwen3-vl-235b-a22b-instruct through OpenRouter → timestamp range(s)`
+`actual MP4 chunk + user's natural-language instruction → qwen/qwen3.6-flash through OpenRouter → timestamp range(s)`
 
-Qwen3-VL 235B A22B Instruct is the only production visual model. There is no
+Qwen3.6 Flash is the only production visual model. There is no
 model comparison, fallback, escalation, or routing cascade. Do not add another
 model or a cost-control behavior that reduces search coverage without asking
 first.
 
-### Why 235B and not 32B
+### Why Qwen3.6 Flash and not Qwen3-VL
 
-The original choice was `qwen/qwen3-vl-32b-instruct`. In production every
-request against it was refused with `404 — No endpoints found that support
-input video`: the model advertises video, but no provider serving that slug on
-OpenRouter exposes a video endpoint. The family decision held; the size did not.
-235B A22B is served by several providers, and its stronger OCR is what the
-acceptance case below actually turns on.
+Neither Qwen3-VL size works. **No Qwen3-VL model has a video endpoint on
+OpenRouter** — 32B and 235B A22B were both refused with `404 — No endpoints
+found that support input video` before reaching a provider. The family
+understands video; OpenRouter does not serve it that way. Qwen3.6 Flash takes
+native `video_url` input and is the production model.
 
-The `-instruct` variant is deliberate. Its `-thinking` sibling spends tokens and
-wall-clock on reasoning that a short JSON array of timestamps does not need, and
-that prose can reach the strict parser as output it has to reject. Reasoning is
-never requested — see the test in `test/openrouterVideo.test.ts`.
+`google/gemini-2.5-flash` is kept as a comparison point only. It is not a
+fallback the code selects: there is still exactly one production model, and no
+cascade.
 
-A `modelCapabilities` preflight now sends one 814-byte MP4 before any fan-out,
-so a slug that will not route video fails in about a second instead of after ten
-multi-megabyte uploads.
+The failure that cost two rounds was in the error message rather than the
+code. Its replacement list was sorted alphabetically and cut at a limit, so a
+Qwen model that could not route video suggested Amazon, ByteDance and Google
+and hid every other Qwen behind "+55 more" — reading as "no Qwen model can do
+this" when the answer was in the part not shown. Suggestions are now ordered
+same-vendor first: someone who chose a vendor deliberately is most likely
+replacing it with its sibling.
+
+### The dead end, recorded so it is not retried
+
+The original choice was `qwen/qwen3-vl-32b-instruct`, then
+`qwen/qwen3-vl-235b-a22b-instruct` on the theory that 32B's single provider was
+the problem and a multi-provider sibling would route. It did not. Both were
+refused identically. The lesson is the general one above: a model card listing
+video says nothing about whether OpenRouter has an endpoint serving it that way.
+
+Reasoning is never requested, whatever the model. Reasoning tokens spend money
+and wall-clock on a task whose entire output is a short JSON array, and the
+prose can reach the strict parser as output it must reject. See the test in
+`test/openrouterVideo.test.ts`, which asserts the request carries no
+`reasoning` or `include_reasoning` field and no `thinking` slug.
+
+A `modelCapabilities` preflight sends one 814-byte MP4 before any fan-out, so a
+slug that will not route video fails in about a second instead of after ten
+multi-megabyte uploads. It is what caught both dead ends for the price of one
+probe each.
 
 ### Migrating an existing deployment
 
 `OPENROUTER_VIDEO_MODEL` is optional, and any environment that sets it
-explicitly overrides the default above — including with the 32B slug that
+explicitly overrides the default above — including with a Qwen3-VL slug that
 refuses every video request. Check each environment and either clear the
 variable or set it to the model named above. The Railway `worker` service does
 not set it, so it takes the default.
@@ -44,7 +65,7 @@ fails immediately naming the configured slug, instead of returning "nothing
 matches" as though the video genuinely lacked the moment.
 
 OpenRouter STT remains a separate path that creates reusable timestamped speech.
-Mixed searches give Qwen both the actual MP4 and the chunk-local transcript.
+Mixed searches give the model both the actual MP4 and the chunk-local transcript.
 Visual searches give it the MP4. This preserves visual actions, OCR/on-screen
 text, and temporal context instead of reducing the video to sampled-frame text
 summaries.
@@ -73,7 +94,7 @@ Reference: [OpenRouter video inputs](https://openrouter.ai/docs/guides/overview/
 
 ## Reliability and observability
 
-Every Qwen request records:
+Every video request records:
 
 - selected model and routed provider (when returned);
 - total request latency;

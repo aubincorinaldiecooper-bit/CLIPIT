@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { assertVideoInputSupported, resetVideoModelCapabilityCache } from '../src/services/search/modelCapabilities.js';
 
 /** The slug `env.OPENROUTER_VIDEO_MODEL` defaults to in test config. */
-const CONFIGURED_MODEL = 'qwen/qwen3-vl-235b-a22b-instruct';
+const CONFIGURED_MODEL = 'qwen/qwen3.6-flash';
 
 /** Verbatim shape of the refusal seen in production. */
 const NO_VIDEO_ENDPOINT = JSON.stringify({
@@ -112,6 +112,32 @@ describe('video routing preflight', () => {
     stubOpenRouter({ probe: new Error('network down') });
 
     await expect(assertVideoInputSupported()).resolves.toBeUndefined();
+  });
+
+  /**
+   * The list is truncated, so its order decides what a reader actually sees.
+   * Sorted alphabetically it opened with whichever vendors sort first and hid
+   * the rest — a Qwen model that could not route video suggested Amazon,
+   * ByteDance and Google while burying every other Qwen behind "+55 more",
+   * which reads as "no Qwen model can do this" rather than "here are twelve of
+   * sixty-seven".
+   */
+  it('suggests same-vendor replacements before anything else', async () => {
+    stubOpenRouter({
+      probe: new Response(NO_VIDEO_ENDPOINT, { status: 404 }),
+      candidates: [
+        { id: 'amazon/nova-2-lite-v1', modalities: ['video'] },
+        { id: 'bytedance-seed/seed-1.6', modalities: ['video'] },
+        { id: 'google/gemini-2.5-flash', modalities: ['video'] },
+        { id: 'qwen/qwen3.6-flash', modalities: ['video'] },
+      ],
+    });
+
+    const error = await assertVideoInputSupported().catch((cause: Error) => cause);
+    const message = (error as Error).message;
+
+    expect(message).toMatch(/closest first: qwen\/qwen3\.6-flash/);
+    expect(message.indexOf('qwen/qwen3.6-flash')).toBeLessThan(message.indexOf('amazon/nova-2-lite-v1'));
   });
 
   it('still reports the failure when no replacement candidates can be listed', async () => {
