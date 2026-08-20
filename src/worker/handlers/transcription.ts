@@ -48,6 +48,10 @@ export async function handleTranscription(job: Job<TranscriptionJob>): Promise<v
   await setTranscriptStatus(videoId, 'running');
   await job.updateProgress({ stage: 'transcribing', percent: 5 });
 
+  // Paid once per video, unlike search. Logged separately so the one-time
+  // ingestion cost is never mistaken for the recurring per-query cost.
+  const tally = new UsageTally();
+
   try {
     const captionsKey = job.data.captionsStorageKey ?? video.captionsStorageKey;
 
@@ -64,19 +68,8 @@ export async function handleTranscription(job: Job<TranscriptionJob>): Promise<v
 
     if (!video.originalStorageKey) throw new Error('No source file available to transcribe');
 
-    // Paid once per video, unlike search. Logged separately so the one-time
-    // ingestion cost is never mistaken for the recurring per-query cost.
-    const tally = new UsageTally();
     const segments = await transcribeWithStt(job, videoId, video.originalStorageKey, tally);
 
-    if (tally.calls > 0) {
-      log.info('transcription cost', {
-        ...tally.summary(),
-        usdPerSourceMinute: tally.perSourceMinute(video.durationSeconds),
-        videoDurationSeconds: video.durationSeconds,
-        model: env.OPENROUTER_STT_MODEL,
-      });
-    }
     if (segments.length === 0) {
       await setTranscriptStatus(videoId, 'unavailable', {
         error: 'No speech detected in the source',
@@ -95,6 +88,20 @@ export async function handleTranscription(job: Job<TranscriptionJob>): Promise<v
     // A failed transcript degrades search to visual-only; it never fails the video.
     await setTranscriptStatus(videoId, 'failed', { error: message });
     throw error;
+  } finally {
+    // Audio pieces are transcribed one after another, so a failure on a later
+    // piece leaves the earlier ones already paid for. BullMQ then retries the
+    // whole job with a fresh tally, and a cost logged only on success reports
+    // the last attempt as though it were the only one.
+    if (tally.calls > 0) {
+      log.info('transcription cost', {
+        attempt: job.attemptsMade + 1,
+        ...tally.summary(),
+        usdPerSourceMinute: tally.perSourceMinute(video.durationSeconds),
+        videoDurationSeconds: video.durationSeconds,
+        model: env.OPENROUTER_STT_MODEL,
+      });
+    }
   }
 }
 

@@ -57,6 +57,17 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     return;
   }
 
+  const tally = new UsageTally();
+  // Per-request latency lives in model_usage; this is the number the user
+  // actually waits through, and the one that says whether chunk size and
+  // concurrency need changing before any further architecture does.
+  const searchStartedAt = performance.now();
+  // Captured as they are decided so the cost line can be emitted from the
+  // failure path too, where neither is in scope.
+  let chunkCount = 0;
+  let searchMode: ResolvedSearchMode | null = null;
+  let outcome: 'completed' | 'failed' = 'failed';
+
   try {
     if (video.status !== 'ready') {
       // The API blocks this, but a request can still race preprocessing.
@@ -116,13 +127,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // Clear anything from a previous attempt so a retry cannot double-insert.
     await deleteMatches(clipRequestId);
 
+    chunkCount = chunks.length;
+    searchMode = resolved.mode;
+
     let completed = 0;
     let totalMatches = 0;
-    const tally = new UsageTally();
-    // Per-request latency lives in model_usage; this is the number the user
-    // actually waits through, and the one that says whether chunk size and
-    // concurrency need changing before any further architecture does.
-    const searchStartedAt = performance.now();
 
     await withWorkDir(`search-${clipRequestId}`, async (dir) => {
       const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
@@ -200,18 +209,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       await finishClipRequest(clipRequestId, 'completed');
       const elapsedMs = Math.round(performance.now() - searchStartedAt);
 
-      // Cost of one search, on its own line and complete enough to price from:
-      // the recurring per-query cost, next to the video length it scales with.
-      log.info('clip search cost', {
-        ...tally.summary(),
-        usdPerSourceMinute: tally.perSourceMinute(video.durationSeconds),
-        videoDurationSeconds: video.durationSeconds,
-        chunks: chunks.length,
-        mode: resolved.mode,
-        model: env.OPENROUTER_VIDEO_MODEL,
-        elapsedMs,
-      });
-
       log.info('clip search complete', {
         matches: finalCount,
         mergedFrom: totalMatches,
@@ -225,11 +222,33 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         model: env.OPENROUTER_VIDEO_MODEL,
       });
     });
+    outcome = 'completed';
   } catch (error) {
     const message = errorMessage(error);
     log.error('clip search failed', { err: error });
     await finishClipRequest(clipRequestId, 'failed', message);
     throw error;
+  } finally {
+    // A failed attempt still paid for whatever it managed to call, and BullMQ
+    // retries with a fresh tally — so a cost logged only on success omits every
+    // attempt that came before it, and the surviving number reads as the whole
+    // cost of the request. Emitted from here so no exit skips it.
+    if (tally.calls > 0) {
+      // Cost of one search attempt, complete enough to price from on its own:
+      // the recurring per-query cost, next to the video length it scales with.
+      log.info('clip search cost', {
+        outcome,
+        // Sum across attempts for what the request truly cost.
+        attempt: job.attemptsMade + 1,
+        ...tally.summary(),
+        usdPerSourceMinute: tally.perSourceMinute(video.durationSeconds),
+        videoDurationSeconds: video.durationSeconds,
+        chunks: chunkCount,
+        mode: searchMode,
+        model: env.OPENROUTER_VIDEO_MODEL,
+        elapsedMs: Math.round(performance.now() - searchStartedAt),
+      });
+    }
   }
 }
 
