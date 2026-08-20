@@ -6,6 +6,7 @@ import {
   createAnalysisProxy,
   cutClip,
   extractAudioSegments,
+  extractFrameAt,
   extractFrames,
   ffprobe,
   splitIntoChunks,
@@ -100,6 +101,25 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
       expect(frame.localSeconds).toBeGreaterThan(0);
       expect(frame.localSeconds).toBeLessThan(SOURCE_SECONDS);
     }
+  }, 120_000);
+
+  /**
+   * A still stands in for a moment before its clip is cut, and both the search
+   * and the backfill store the key only when a frame was really written. A
+   * seek past the end exits 0 without producing a file, so a bare exit code
+   * would attach a key to an object that does not exist — the picture would
+   * 404 in the browser instead of simply being absent.
+   */
+  it('reports a still only when it actually wrote one', async () => {
+    const stillDir = path.join(dir, 'stills');
+    await mkdir(stillDir, { recursive: true });
+
+    const inside = path.join(stillDir, 'inside.jpg');
+    expect(await extractFrameAt(source, 4, inside)).toBe(true);
+    expect((await stat(inside)).size).toBeGreaterThan(0);
+
+    const past = path.join(stillDir, 'past.jpg');
+    expect(await extractFrameAt(source, SOURCE_SECONDS + 30, past)).toBe(false);
   }, 120_000);
 
   it('reports audio piece offsets on the nominal grid', async () => {

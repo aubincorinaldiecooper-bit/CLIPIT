@@ -5,7 +5,7 @@ import { logger } from '../lib/logger.js';
 import { closePool } from '../db/pool.js';
 import { runMigrations } from '../db/migrate.js';
 import { closeRedis, getWorkerConnection } from '../queues/connection.js';
-import { closeQueues, QUEUE_NAMES } from '../queues/index.js';
+import { closeQueues, enqueueThumbnailBackfill, QUEUE_NAMES } from '../queues/index.js';
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
 import { handleIngestion } from './handlers/ingestion.js';
@@ -13,6 +13,7 @@ import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
 import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
+import { handleThumbnailBackfill } from './handlers/thumbnailBackfill.js';
 
 /**
  * Worker entrypoint. All long-running work — downloading, transcoding,
@@ -102,8 +103,21 @@ async function main(): Promise<void> {
   startWorker(QUEUE_NAMES.transcription, handleTranscription, env.TRANSCRIPTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.clipSearch, handleClipSearch, env.CLIP_SEARCH_CONCURRENCY);
   startWorker(QUEUE_NAMES.clipGeneration, handleClipGeneration, env.CLIP_GENERATION_CONCURRENCY);
+  // One at a time: the sweep is background work and must never take a slot
+  // from a search or a clip someone is waiting on.
+  startWorker(QUEUE_NAMES.thumbnailBackfill, handleThumbnailBackfill, 1);
 
   logger.info('worker ready', { queues: Object.values(QUEUE_NAMES) });
+
+  // Queued rather than run inline: the sweep goes through the same retention,
+  // logging and shutdown handling as everything else, and a fixed job id keeps
+  // a redeploy or a second replica from sweeping twice. Failing to queue it is
+  // not a reason to fail the worker — nothing else depends on it.
+  if (env.THUMBNAIL_BACKFILL_ON_START) {
+    await enqueueThumbnailBackfill(new Date().toISOString()).catch((error: unknown) => {
+      logger.warn('could not queue the thumbnail backfill', { err: error });
+    });
+  }
 }
 
 async function shutdown(signal: string): Promise<void> {

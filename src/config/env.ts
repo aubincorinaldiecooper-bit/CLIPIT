@@ -157,6 +157,15 @@ const envSchema = z.object({
   // --- Media pipeline -----------------------------------------------------
   MAX_SOURCE_DURATION_SECONDS: int(21_600, 1, 360_000),
   ANALYSIS_CHUNK_SECONDS: int(120, 30, 3_600),
+  /**
+   * On start, the worker sweeps videos whose matches predate stills and gives
+   * them one, so results already on a user's screen do not stay text-only
+   * forever. Bounded per start because each video decodes a whole proxy, and
+   * this must never compete with a search someone is waiting on. Set false to
+   * stop the sweep entirely.
+   */
+  THUMBNAIL_BACKFILL_ON_START: bool(true),
+  THUMBNAIL_BACKFILL_VIDEO_LIMIT: int(25, 1, 500),
   PROXY_HEIGHT: int(360, 144, 1080),
   PROXY_FPS: num(2, 0.5, 30),
   PROXY_CRF: int(30, 0, 51),

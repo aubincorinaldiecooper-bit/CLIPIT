@@ -8,6 +8,7 @@ export const QUEUE_NAMES = {
   transcription: 'video-transcription',
   clipSearch: 'clip-search',
   clipGeneration: 'clip-generation',
+  thumbnailBackfill: 'thumbnail-backfill',
 } as const;
 
 export interface IngestionJob {
@@ -34,6 +35,15 @@ export interface ClipGenerationJob {
   clipId: string;
 }
 
+/**
+ * Gives stills to matches found before stills existed. Carries no payload: the
+ * work it does is defined entirely by what the database is still missing.
+ */
+export interface ThumbnailBackfillJob {
+  /** Present only so the job data is not an empty object. */
+  requestedAt: string;
+}
+
 const defaultJobOptions: JobsOptions = {
   attempts: env.JOB_ATTEMPTS,
   backoff: { type: 'exponential', delay: env.JOB_BACKOFF_MS },
@@ -47,6 +57,7 @@ let queues: {
   transcription: Queue<TranscriptionJob>;
   clipSearch: Queue<ClipSearchJob>;
   clipGeneration: Queue<ClipGenerationJob>;
+  thumbnailBackfill: Queue<ThumbnailBackfillJob>;
 } | null = null;
 
 export function getQueues() {
@@ -58,6 +69,10 @@ export function getQueues() {
       transcription: new Queue<TranscriptionJob>(QUEUE_NAMES.transcription, { connection, defaultJobOptions }),
       clipSearch: new Queue<ClipSearchJob>(QUEUE_NAMES.clipSearch, { connection, defaultJobOptions }),
       clipGeneration: new Queue<ClipGenerationJob>(QUEUE_NAMES.clipGeneration, { connection, defaultJobOptions }),
+      thumbnailBackfill: new Queue<ThumbnailBackfillJob>(QUEUE_NAMES.thumbnailBackfill, {
+        connection,
+        defaultJobOptions,
+      }),
     };
   }
   return queues;
@@ -132,6 +147,27 @@ export async function enqueueClipSearch(data: ClipSearchJob, options: JobsOption
 
 export async function enqueueClipGeneration(data: ClipGenerationJob): Promise<void> {
   await addWithStableId(getQueues().clipGeneration, 'generate', data, `generate-${data.clipId}`);
+}
+
+/**
+ * Queued once per worker start, under a fixed id.
+ *
+ * The id is what keeps a redeploy — or a second worker replica — from running
+ * the same sweep twice: BullMQ refuses an add whose id already exists, and
+ * `addWithStableId` only clears a terminal one, so a completed sweep is
+ * re-runnable on the next start while a running one is left alone.
+ */
+export async function enqueueThumbnailBackfill(requestedAt: string): Promise<void> {
+  await addWithStableId(
+    getQueues().thumbnailBackfill,
+    'backfill',
+    { requestedAt },
+    'thumbnail-backfill',
+    // One attempt. Every failure inside is already swallowed per video, so a
+    // job that fails outright failed at the database, and retrying a sweep
+    // that cannot read its own work list just burns the queue.
+    { attempts: 1 },
+  );
 }
 
 export async function closeQueues(): Promise<void> {
