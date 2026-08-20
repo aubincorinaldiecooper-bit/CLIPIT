@@ -389,6 +389,25 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
     });
   }
 
+  // A match the model DID report, thrown away by our own threshold, reads
+  // downstream as "the video does not contain that" — the one failure the user
+  // cannot tell apart from a real absence. Say so explicitly, with the
+  // confidence that was too low, so a threshold problem is never mistaken for
+  // a model problem.
+  const belowConfidence = response.matches.filter((match) => match.confidence < env.MIN_MATCH_CONFIDENCE);
+  if (belowConfidence.length > 0) {
+    logger.warn('discarded low-confidence matches', {
+      chunkIndex: chunk.chunkIndex,
+      threshold: env.MIN_MATCH_CONFIDENCE,
+      dropped: belowConfidence.slice(0, 5).map((match) => ({
+        globalStart: Number((chunk.globalStartSeconds + match.startSeconds).toFixed(1)),
+        globalEnd: Number((chunk.globalStartSeconds + match.endSeconds).toFixed(1)),
+        confidence: match.confidence,
+        description: match.description,
+      })),
+    });
+  }
+
   // Validate, then map chunk-local timestamps onto the source timeline.
   const mapped = response.matches
     .filter((match) => match.confidence >= env.MIN_MATCH_CONFIDENCE)
@@ -420,6 +439,21 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
 
   // A model often reports the same moment twice within one chunk.
   const deduped = mergeOverlappingRanges(mapped);
+
+  // One line per chunk, carrying the source window it covers so a specific
+  // moment can be looked up directly. "Nothing found" is the answer that needs
+  // explaining, so the model's own words are attached only in that case —
+  // otherwise an empty result is indistinguishable from a broken one.
+  logger.info('chunk searched', {
+    chunkIndex: chunk.chunkIndex,
+    covers: `${chunk.globalStartSeconds.toFixed(0)}-${chunk.globalEndSeconds.toFixed(0)}s`,
+    reported: response.matches.length,
+    belowConfidence: belowConfidence.length,
+    kept: deduped.length,
+    ...(response.matches.length === 0
+      ? { rawResponse: response.rawResponse.slice(0, 500) }
+      : {}),
+  });
 
   return deduped.flatMap((range) => {
     const local = mapGlobalRangeToChunk(
