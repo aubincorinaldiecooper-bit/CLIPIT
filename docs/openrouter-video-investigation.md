@@ -41,16 +41,57 @@ the problem and a multi-provider sibling would route. It did not. Both were
 refused identically. The lesson is the general one above: a model card listing
 video says nothing about whether OpenRouter has an endpoint serving it that way.
 
-Reasoning is never requested, whatever the model. Reasoning tokens spend money
-and wall-clock on a task whose entire output is a short JSON array, and the
-prose can reach the strict parser as output it must reject. See the test in
-`test/openrouterVideo.test.ts`, which asserts the request carries no
-`reasoning` or `include_reasoning` field and no `thinking` slug.
-
-A `modelCapabilities` preflight sends one 814-byte MP4 before any fan-out, so a
+A `modelCapabilities` preflight sends one small MP4 before any fan-out, so a
 slug that will not route video fails in about a second instead of after ten
 multi-megabyte uploads. It is what caught both dead ends for the price of one
 probe each.
+
+## Reasoning: left on, under measurement
+
+**Reasoning is currently left at the model's default, which is on.** Do not
+disable it without reading this section first.
+
+It was briefly disabled, on the reasonable-sounding argument that locating a
+moment is not a reasoning task and thinking tokens spend money and wall-clock
+on an answer that is a short JSON array. The per-chunk numbers from the first
+successful production run contradict that:
+
+| chunk | completion tokens | matches |
+|-------|-------------------|---------|
+| 9, 5, 8, 2 | 468–943 | 0 |
+| 3 | 1,595 | 0 |
+| 6 | 2,486 | 1 |
+| 1 | 3,074 | 2 |
+| 0 | 3,887 | 1 |
+| 4 | 13,431 | 0 |
+
+Every chunk that found a match spent more than every chunk that found nothing,
+and the gap is far too large to be output length — two matches of JSON is
+roughly 150 tokens, not 3,000. Whatever consumes those tokens correlates with
+*finding moments*, and chunk 0, which located the acceptance case at `00:54`,
+sits near the top of the spend.
+
+Disabling it would therefore have been a cost-control change that reduces
+search coverage, which the rule at the top of this document forbids without
+asking. It was shipped as a latency fix and never examined as a coverage one.
+
+`reasoning_tokens` is recorded on every request. One run separates three
+readings that currently look identical:
+
+- reasoning tokens are most of the completion → the model is thinking, and the
+  correlation above suggests it is earning it;
+- reasoning tokens are near zero → it is verbose prose the parser strips, and
+  the fix is the prompt rather than any reasoning flag;
+- matches drop when it is off → settled, it was load-bearing.
+
+**The likely landing point is a cap, not a disable.** `reasoning:
+{ max_tokens: N }` — which Qwen maps to Alibaba's thinking budget — bounds
+thinking without removing it, and one chunk spending 13,431 tokens to find
+nothing is the case for bounding it. Around 2,000 would keep chunk 0's 3,887
+mostly intact. After the measurement, not before.
+
+The probe in `modelCapabilities` does disable reasoning, and should: it asks
+whether a route exists, using a test pattern there is nothing to think about.
 
 ### Migrating an existing deployment
 
