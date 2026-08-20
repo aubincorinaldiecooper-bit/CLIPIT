@@ -87,4 +87,29 @@ describe('resolveSearchMode', () => {
     expect(result.mode).toBe('visual');
     expect(result.rationale).not.toContain('falling back');
   });
+
+  /**
+   * The standing acceptance case. The phrase is painted on a car, but "say"
+   * and the quotes both read as speech signals, so this scores on both sides
+   * and resolves to `both` once a transcript exists.
+   *
+   * That is the right mode — it hands the model more evidence, not less. The
+   * hazard lives downstream in the prompt: told to require every condition,
+   * a model can find the car, fail to find the phrase in the transcript, and
+   * discard a correct match. `prompt.ts` answers that by saying a quoted
+   * phrase may be satisfied by on-screen text, so this pins the input that
+   * makes the rule necessary.
+   */
+  it('sends the on-screen-text acceptance case to both, not transcript', () => {
+    const instruction = 'find the scene where it shows the car that say "bought with investor money"';
+
+    const classification = classifyInstruction(instruction);
+    expect(classification.spokenScore).toBeGreaterThan(0);
+    expect(classification.visualScore).toBeGreaterThan(0);
+    expect(classification.mode).toBe('both');
+
+    expect(resolveSearchMode({ instruction, requested: 'auto', transcriptAvailable: true }).mode).toBe('both');
+    // Without a transcript it must still search, visually rather than not at all.
+    expect(resolveSearchMode({ instruction, requested: 'auto', transcriptAvailable: false }).mode).toBe('visual');
+  });
 });
