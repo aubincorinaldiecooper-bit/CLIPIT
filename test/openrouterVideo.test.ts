@@ -171,6 +171,96 @@ describe('OpenRouter actual-video search', () => {
   });
 
   /**
+   * The quieter half of the same failure, and the more dangerous one. A model
+   * cut off mid-JSON returns *something*, so a blank-content check waves it
+   * through — and `parseModelMatches` never throws, so `{"matches":[{...`
+   * becomes zero matches and the chunk is recorded as searched and empty.
+   * Downstream that is indistinguishable from the video not containing it.
+   */
+  it('retries an answer cut off mid-JSON instead of reading it as no matches', async () => {
+    const bodies: string[] = [];
+    const fetchMock = vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+      bodies.push(String(init.body));
+      const truncated = bodies.length === 1;
+      return Promise.resolve(new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: truncated
+              ? '{"matches":[{"start_seconds":12,"end_seconds":18,"desc'
+              : '{"matches":[{"start_seconds":12,"end_seconds":18,"description":"a car","confidence":0.9}]}',
+          },
+          finish_reason: truncated ? 'length' : 'stop',
+        }],
+        provider: 'test-provider',
+        usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, cost: 0.001 },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'clipit-openrouter-video-'));
+    const videoPath = path.join(dir, 'chunk.mp4');
+    await writeFile(videoPath, Buffer.from('test-mp4-bytes'));
+
+    try {
+      const result = await searchVideoChunk({
+        instruction: 'find the car',
+        mode: 'visual',
+        chunkIndex: 0,
+        chunkCount: 1,
+        chunkDurationSeconds: 120,
+        videoPath,
+        transcript: [],
+      });
+
+      // The moment survives, instead of the chunk reporting nothing at 00:12.
+      expect(result.matches[0]).toMatchObject({ startSeconds: 12, endSeconds: 18 });
+      expect(result.reasoningDisabled).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The retry has nothing left to trade, so a second truncation is kept rather
+   * than discarded — half an answer beats none, and there is no third call
+   * that could do better.
+   */
+  it('keeps what parsed when even the no-thinking answer is cut off', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
+      choices: [{
+        message: { content: '{"matches":[{"start_seconds":3,"end_seconds":7,"description":"a car","confidence":0.9}]}' },
+        finish_reason: 'length',
+      }],
+      provider: 'test-provider',
+      usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'clipit-openrouter-video-'));
+    const videoPath = path.join(dir, 'chunk.mp4');
+    await writeFile(videoPath, Buffer.from('test-mp4-bytes'));
+
+    try {
+      const result = await searchVideoChunk({
+        instruction: 'find the car',
+        mode: 'visual',
+        chunkIndex: 0,
+        chunkCount: 1,
+        chunkDurationSeconds: 120,
+        videoPath,
+        transcript: [],
+      });
+
+      expect(result.matches[0]).toMatchObject({ startSeconds: 3, endSeconds: 7 });
+      // Two calls, not a ladder of them.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
    * A blank answer is not "no matches here". `""` parses to zero matches and
    * would be stored as a considered negative result, which is how a lost chunk
    * disappears without leaving a trace.
@@ -201,7 +291,7 @@ describe('OpenRouter actual-video search', () => {
         transcript: [],
         // Both attempts answer nothing, so the chunk genuinely fails — and the
         // error carries why, rather than a bare "no message content".
-      })).rejects.toThrow(/no answer.*finish_reason=length/i);
+      })).rejects.toThrow(/ran out of room.*nothing was written.*finish_reason=length/i);
       // One budgeted attempt, one without thinking. Not a ladder.
       expect(fetchMock).toHaveBeenCalledTimes(2);
     } finally {

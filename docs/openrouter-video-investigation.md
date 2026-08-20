@@ -110,13 +110,22 @@ Three things now stand between that and a user:
    ceiling for both. Providers differ on whether reasoning is charged against
    `max_tokens`; on the ones that charge it, sending the answer budget alone
    hands the model a ceiling it can exhaust before answering.
-2. **A blank answer is not "no matches".** `""` parses to zero matches and
-   would otherwise be stored as a considered negative result.
-3. **An empty answer is retried without thinking** — once, not as a ladder.
-   Retrying identically would think its way to the same silence at the same
-   price, so the retry has to differ. `chunksAnsweredWithoutThinking` in the
-   completion log counts it; anything above zero means the budget is too tight
-   for that material.
+2. **Neither a blank answer nor a half-written one is "no matches".** `""`
+   parses to zero matches, and so does `{"matches":[{...` — `parseModelMatches`
+   never throws, by design, so a truncated answer becomes a chunk that was
+   "searched and found nothing". `finish_reason: "length"` is the only thing
+   that tells those apart from a considered negative result, and it is now
+   checked. The truncated case is the more dangerous of the two precisely
+   because the response is not empty.
+3. **An exhausted answer is retried without thinking** — once, not as a ladder.
+   Retrying identically would think its way to the same place at the same
+   price, so the retry has to differ. The token ceiling is held constant across
+   both attempts, which is what makes the second one an improvement rather than
+   a smaller second chance: with thinking off, the whole allowance belongs to
+   the answer. If that one is *also* truncated, whatever parsed is kept — half
+   an answer beats none, and no third call could do better.
+   `chunksAnsweredWithoutThinking` in the completion log counts recoveries;
+   anything above zero means the budget is too tight for that material.
 
 Both attempts are billed and both are recorded. Usage is now reported before
 the answer is validated, because counting only calls that answered understated

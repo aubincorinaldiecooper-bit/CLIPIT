@@ -99,20 +99,22 @@ export function isContentFilterRejection(error: unknown): boolean {
   return /data_inspection_failed|inappropriate content|content[_ ]?(policy|filter)/i.test(error.message);
 }
 
-/** Prefix of the error raised when a billed 200 carried no answer. */
-const EMPTY_ANSWER = 'Video response contained no answer';
+/** Prefix of the error raised when a billed 200 ran out of room to answer. */
+const EXHAUSTED_ANSWER = 'Video response ran out of room';
 
 /**
- * Recognises a request that succeeded, was billed, and answered nothing.
+ * Recognises a request that succeeded, was billed, and did not finish saying
+ * what it saw.
  *
- * This is not a transport failure and not a refusal — the model replied, it
- * just never got to the part where it says what it saw. On the run that
- * exposed it the chunk covering 00:16:01-00:18:01 was simply lost, and the
- * user was told nothing matched there. That is the failure mode this whole
- * path exists to make impossible.
+ * Two shapes, one cause. The model can stop before writing anything, or stop
+ * partway through the JSON — and the truncated one is the more dangerous,
+ * because `parseModelMatches` never throws: a half-written object yields zero
+ * matches and warnings, which downstream is indistinguishable from a
+ * considered "there is nothing here". On the run that exposed this, the chunk
+ * covering 00:16:01-00:18:01 was lost exactly that quietly.
  */
-export function isEmptyAnswer(error: unknown): boolean {
-  return error instanceof ExternalServiceError && error.message.startsWith(EMPTY_ANSWER);
+export function isExhaustedAnswer(error: unknown): boolean {
+  return error instanceof ExternalServiceError && error.message.startsWith(EXHAUSTED_ANSWER);
 }
 
 function headers(): Record<string, string> {
@@ -160,11 +162,14 @@ async function requestCompletion(
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: parts },
     ],
-    // Deliberately the sum, not the answer budget alone. Providers differ on
-    // whether reasoning is charged against `max_tokens`; on the ones that
-    // charge it, sending the answer budget by itself hands the model a
-    // ceiling it can exhaust before answering at all.
-    max_tokens: env.OPENROUTER_VIDEO_MAX_TOKENS + reasoningBudget,
+    // Deliberately the sum, not the answer budget alone, and the same ceiling
+    // under both policies. Providers differ on whether reasoning is charged
+    // against `max_tokens`; on the ones that charge it, sending the answer
+    // budget by itself hands the model a ceiling it can exhaust before
+    // answering at all. Holding the ceiling fixed is also what makes the
+    // no-thinking retry an improvement rather than a smaller second chance:
+    // the whole allowance becomes available to the answer.
+    max_tokens: env.OPENROUTER_VIDEO_MAX_TOKENS + env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS,
     temperature: env.OPENROUTER_VIDEO_TEMPERATURE,
     stream: false,
     // Bounded, not disabled.
@@ -313,15 +318,35 @@ async function requestCompletion(
     }
 
     // Validated last, so a billed call is always accounted for even when it
-    // answered nothing. A blank string counts as nothing: `""` parses to zero
-    // matches and would be indistinguishable from a considered "no moments
-    // here", which is the reading that lost a chunk silently.
+    // answered nothing.
+    const where = `finish_reason=${finishReason ?? 'none'}, reasoning_tokens=${reasoningTokens ?? 0}`;
+
+    // A blank string is not "no moments here": `""` parses to zero matches and
+    // would be stored as a considered negative result.
     if (typeof content !== 'string' || content.trim() === '') {
-      throw new ExternalServiceError(
-        'openrouter-video',
-        `${EMPTY_ANSWER} (finish_reason=${finishReason ?? 'none'}, reasoning_tokens=${reasoningTokens ?? 0})`,
-        { retryable: false },
-      );
+      throw new ExternalServiceError('openrouter-video', `${EXHAUSTED_ANSWER}: nothing was written (${where})`, {
+        retryable: false,
+      });
+    }
+
+    // Nor is a half-written one. `length` means the model was cut off, and a
+    // truncated `{"matches":[{...` has no balanced closing brace — the parser
+    // shrugs and returns zero matches, so the chunk records as searched and
+    // found nothing. Worth a second call while thinking can still be traded
+    // for room; on the retry there is nothing left to trade, so partial
+    // matches are kept rather than thrown away.
+    if (finishReason === 'length') {
+      if (policy !== 'off') {
+        throw new ExternalServiceError('openrouter-video', `${EXHAUSTED_ANSWER}: answer cut off (${where})`, {
+          retryable: false,
+        });
+      }
+      logger.warn('answer was cut off even with thinking disabled; keeping what parsed', {
+        model: env.OPENROUTER_VIDEO_MODEL,
+        chunkIndex: input.chunkIndex,
+        answerChars: content.length,
+        maxTokens: env.OPENROUTER_VIDEO_MAX_TOKENS + env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS,
+      });
     }
 
     const parsed = parseModelMatches(content);
@@ -338,21 +363,21 @@ async function requestCompletion(
 /**
  * The rule: a chunk is never lost because the model spent its budget thinking.
  *
- * A 200 with no answer in it is not a failure the outer retry loop can help
- * with — the same request would think its way to the same silence, at the same
+ * A 200 that ran out of room is not a failure the outer retry loop can help
+ * with — the same request would think its way to the same place, at the same
  * price. The only retry worth making is a different one, so this asks again
- * with thinking off, where the entire budget must go to the answer.
+ * with thinking off, where the whole ceiling belongs to the answer.
  *
  * Deliberately one extra call, not a ladder. If a chunk cannot answer with its
- * whole budget available for answering, the problem is not the budget.
+ * entire budget available for answering, the problem is not the budget.
  */
 async function completeOrAnswerWithoutThinking(input: VideoSearchInput): Promise<VideoSearchResult> {
   try {
     return await requestCompletion(input, 'budgeted');
   } catch (error) {
-    if (!isEmptyAnswer(error)) throw error;
+    if (!isExhaustedAnswer(error)) throw error;
 
-    logger.warn('chunk spent its budget thinking and answered nothing; asking again without thinking', {
+    logger.warn('chunk ran out of room to answer; asking again without thinking', {
       model: env.OPENROUTER_VIDEO_MODEL,
       chunkIndex: input.chunkIndex,
       reason: (error as Error).message,
