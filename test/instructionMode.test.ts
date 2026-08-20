@@ -25,8 +25,17 @@ describe('classifyInstruction', () => {
     expect(result.rationale).toContain('no strong');
   });
 
-  it('treats a quoted phrase as spoken content', () => {
-    expect(classifyInstruction('Find "we are shutting it down"').mode).toBe('transcript');
+  /**
+   * This previously asserted `transcript`, which encoded the assumption that
+   * quoting something proves it was said. It does not: the phrase may be a
+   * chyron, a slide, or paint on a car. Routing to `transcript` sends no
+   * video, so that assumption made visible text unfindable.
+   */
+  it('treats a quoted phrase as ambiguous, not as proof of speech', () => {
+    const result = classifyInstruction('Find "we are shutting it down"');
+
+    expect(result.mode).toBe('both');
+    expect(result.spokenScore).toBe(0);
   });
 
   it('handles an empty instruction without throwing', () => {
@@ -111,5 +120,45 @@ describe('resolveSearchMode', () => {
     expect(resolveSearchMode({ instruction, requested: 'auto', transcriptAvailable: true }).mode).toBe('both');
     // Without a transcript it must still search, visually rather than not at all.
     expect(resolveSearchMode({ instruction, requested: 'auto', transcriptAvailable: false }).mode).toBe('visual');
+  });
+
+  /**
+   * `transcript` mode sends no video at all, so routing there decides the
+   * outcome before the model sees anything: a phrase that is only ever on
+   * screen becomes unfindable. A quoted phrase alone must never make that
+   * choice.
+   */
+  it.each([
+    'Find "SALE"',
+    'the sign that says "EXIT"',
+    'clip the moment with “bought with investor money”',
+    'where it says "SOLD OUT"',
+  ])('keeps the video for the ambiguous quoted instruction: %s', (instruction) => {
+    expect(classifyInstruction(instruction).mode).not.toBe('transcript');
+    expect(resolveSearchMode({ instruction, requested: 'auto', transcriptAvailable: true }).mode)
+      .not.toBe('transcript');
+  });
+
+  it('still routes unquoted spoken instructions to the transcript alone', () => {
+    // The cheap path has to survive: this is speech with nothing to look at.
+    expect(classifyInstruction('find where he explains the pricing model').mode).toBe('transcript');
+    expect(classifyInstruction('the part where they discuss hiring').mode).toBe('transcript');
+  });
+
+  it('reads text written on an object as something to look at', () => {
+    expect(classifyInstruction('the writing on his shirt').visualScore).toBeGreaterThan(0);
+    expect(classifyInstruction('the licence plate').visualScore).toBeGreaterThan(0);
+    expect(classifyInstruction('what the banner reads').visualScore).toBeGreaterThan(0);
+  });
+
+  /** An explicit request is the caller's call and stays honoured. */
+  it('does not upgrade an explicitly requested transcript search', () => {
+    const result = resolveSearchMode({
+      instruction: 'Find "SALE"',
+      requested: 'transcript',
+      transcriptAvailable: true,
+    });
+
+    expect(result.mode).toBe('transcript');
   });
 });
