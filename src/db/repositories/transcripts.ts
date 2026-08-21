@@ -79,6 +79,11 @@ export async function listTranscriptSegmentsInRange(
 }
 
 /** Every segment, in order. Used when the whole transcript is the evidence. */
+/** Drops the speech for a video whose footage is gone. */
+export async function deleteTranscript(videoId: string): Promise<void> {
+  await queryOne('DELETE FROM transcript_segments WHERE video_id = $1', [videoId]);
+}
+
 export async function listTranscriptSegments(videoId: string): Promise<TranscriptSegment[]> {
   const rows = await queryRows<SegmentRow>(
     'SELECT * FROM transcript_segments WHERE video_id = $1 ORDER BY start_seconds ASC',

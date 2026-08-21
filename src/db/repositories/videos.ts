@@ -37,6 +37,7 @@ interface VideoRow {
   transcript_source: TranscriptSource | null;
   transcript_error: string | null;
   transcript_segment_count: number;
+  footage_expired_at: Date | null;
   index_status: IndexStatus;
   index_error: string | null;
   scene_count: number;
@@ -73,6 +74,7 @@ function mapVideo(row: VideoRow): Video {
     transcriptSource: row.transcript_source,
     transcriptError: row.transcript_error,
     transcriptSegmentCount: row.transcript_segment_count,
+    footageExpiredAt: row.footage_expired_at ?? null,
     indexStatus: row.index_status,
     indexError: row.index_error,
     sceneCount: row.scene_count,
@@ -196,6 +198,60 @@ export async function setTranscriptStatus(
             updated_at = now()
       WHERE id = $1`,
     [videoId, status, options.source ?? null, options.error ?? null, options.segmentCount ?? null],
+  );
+}
+
+/**
+ * Videos whose session has gone quiet, and whose footage is therefore
+ * unreachable by anyone.
+ *
+ * A guest token lives in the browser tab, so a closed browser means the
+ * session can never be used again. `last_seen_at` is how that looks from the
+ * server: no requests since. The idle window is generous on purpose — a tab
+ * left open overnight is still someone's session, and deleting their video out
+ * from under them would be far worse than paying for another day of storage.
+ */
+export async function listVideosWithUnreachableFootage(
+  idleSeconds: number,
+  limit: number,
+): Promise<Array<{ videoId: string; sessionId: string | null }>> {
+  const rows = await queryRows<{ id: string; session_id: string | null }>(
+    `SELECT v.id, v.session_id
+       FROM videos v
+       LEFT JOIN sessions s ON s.id = v.session_id
+      WHERE v.footage_expired_at IS NULL
+        AND (
+          v.session_id IS NULL
+          OR s.id IS NULL
+          OR s.expires_at <= now()
+          OR s.last_seen_at < now() - ($1 || ' seconds')::interval
+        )
+      ORDER BY v.created_at ASC
+      LIMIT $2`,
+    [String(Math.floor(idleSeconds)), limit],
+  );
+  return rows.map((row) => ({ videoId: row.id, sessionId: row.session_id }));
+}
+
+/**
+ * Records that the footage is gone and forgets where it was.
+ *
+ * The keys are nulled rather than left pointing at deleted objects: a key that
+ * resolves to nothing is a lie the rest of the system would act on, signing
+ * URLs for bytes that are not there. Chunk rows keep theirs, because deleting
+ * them would cascade to the matches and take the feedback with it — the video
+ * being flagged is what tells everything else the footage is gone.
+ */
+export async function markFootageExpired(videoId: string): Promise<void> {
+  await queryOne(
+    `UPDATE videos
+        SET footage_expired_at = now(),
+            original_storage_key = NULL,
+            proxy_storage_key = NULL,
+            captions_storage_key = NULL,
+            updated_at = now()
+      WHERE id = $1`,
+    [videoId],
   );
 }
 

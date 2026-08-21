@@ -378,6 +378,34 @@ export async function setMatchFeedback(
   return row ? mapMatch(row) : null;
 }
 
+/** Every still cut from this video, across all its searches. */
+export async function listThumbnailKeysForVideo(videoId: string): Promise<string[]> {
+  const rows = await queryRows<{ thumbnail_key: string }>(
+    `SELECT m.thumbnail_key
+       FROM clip_matches m
+       JOIN clip_requests r ON r.id = m.clip_request_id
+      WHERE r.video_id = $1 AND m.thumbnail_key IS NOT NULL`,
+    [videoId],
+  );
+  return rows.map((row) => row.thumbnail_key);
+}
+
+/**
+ * Forgets the stills while keeping the matches.
+ *
+ * The matches carry the human verdict on each moment, which is the whole point
+ * of keeping anything after the footage goes.
+ */
+export async function clearThumbnailsForVideo(videoId: string): Promise<void> {
+  await queryOne(
+    `UPDATE clip_matches AS m
+        SET thumbnail_key = NULL
+       FROM clip_requests r
+      WHERE r.id = m.clip_request_id AND r.video_id = $1`,
+    [videoId],
+  );
+}
+
 export async function listMatches(requestId: string): Promise<ClipMatch[]> {
   const rows = await queryRows<ClipMatchRow>(
     'SELECT * FROM clip_matches WHERE clip_request_id = $1 ORDER BY global_start_seconds ASC',

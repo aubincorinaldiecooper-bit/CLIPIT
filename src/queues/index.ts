@@ -10,6 +10,7 @@ export const QUEUE_NAMES = {
   clipSearch: 'clip-search',
   clipGeneration: 'clip-generation',
   thumbnailBackfill: 'thumbnail-backfill',
+  retention: 'footage-retention',
 } as const;
 
 export interface IngestionJob {
@@ -45,6 +46,11 @@ export interface ClipGenerationJob {
  * Gives stills to matches found before stills existed. Carries no payload: the
  * work it does is defined entirely by what the database is still missing.
  */
+/** Remove footage whose session has ended. Carries no payload. */
+export interface RetentionJob {
+  requestedAt: string;
+}
+
 export interface ThumbnailBackfillJob {
   /** Present only so the job data is not an empty object. */
   requestedAt: string;
@@ -65,6 +71,7 @@ let queues: {
   clipSearch: Queue<ClipSearchJob>;
   clipGeneration: Queue<ClipGenerationJob>;
   thumbnailBackfill: Queue<ThumbnailBackfillJob>;
+  retention: Queue<RetentionJob>;
 } | null = null;
 
 export function getQueues() {
@@ -81,6 +88,7 @@ export function getQueues() {
         connection,
         defaultJobOptions,
       }),
+      retention: new Queue<RetentionJob>(QUEUE_NAMES.retention, { connection, defaultJobOptions }),
     };
   }
   return queues;
@@ -178,6 +186,22 @@ export async function enqueueThumbnailBackfill(requestedAt: string): Promise<voi
     // One attempt. Every failure inside is already swallowed per video, so a
     // job that fails outright failed at the database, and retrying a sweep
     // that cannot read its own work list just burns the queue.
+    { attempts: 1 },
+  );
+}
+
+/**
+ * Queues a footage sweep. The id changes with the hour, so a sweep queued
+ * every few minutes by a restarting worker collapses into one per hour rather
+ * than stacking, while still running again next hour.
+ */
+export async function enqueueRetentionSweep(requestedAt: string): Promise<void> {
+  const hour = requestedAt.slice(0, 13);
+  await addWithStableId(
+    getQueues().retention,
+    'sweep',
+    { requestedAt },
+    `retention-${hour}`,
     { attempts: 1 },
   );
 }

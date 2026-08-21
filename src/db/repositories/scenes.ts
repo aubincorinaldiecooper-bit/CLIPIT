@@ -59,6 +59,11 @@ export async function replaceScenes(videoId: string, scenes: NewVideoScene[]): P
   return inserted;
 }
 
+/** Drops the notes for a video whose footage is gone. */
+export async function deleteScenes(videoId: string): Promise<void> {
+  await queryOne('DELETE FROM video_scenes WHERE video_id = $1', [videoId]);
+}
+
 export async function listScenes(videoId: string): Promise<VideoScene[]> {
   const rows = await queryRows<SceneRow>(
     'SELECT * FROM video_scenes WHERE video_id = $1 ORDER BY start_seconds ASC, scene_index ASC',

@@ -83,6 +83,11 @@ export interface Video {
   transcriptSource: TranscriptSource | null;
   transcriptError: string | null;
   transcriptSegmentCount: number;
+  /**
+   * When the footage was removed because the session that uploaded it ended.
+   * Null while the video is still whole. See `services/retention.ts`.
+   */
+  footageExpiredAt: Date | null;
   indexStatus: IndexStatus;
   indexError: string | null;
   sceneCount: number;
