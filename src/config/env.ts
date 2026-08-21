@@ -130,6 +130,18 @@ const envSchema = z.object({
    */
   INDEXING_ENABLED: bool(true),
   /**
+   * How long a question waits for the video to finish being read.
+   *
+   * Measured: reading a 20-minute video takes about 130 seconds, and searching
+   * the same video's footage takes about the same. So waiting costs the person
+   * nothing in time and saves fifty times the money — a question answered from
+   * notes cost $0.0013 against $0.06 for the same question against footage.
+   * Past the timeout we stop waiting and read the footage, because a person
+   * waiting on a stuck index must still get an answer.
+   */
+  INDEX_WAIT_TIMEOUT_MS: int(240_000, 0, 900_000),
+  INDEX_WAIT_POLL_MS: int(4_000, 500, 60_000),
+  /**
    * Room for a description of everything in one chunk, which runs far longer
    * than a list of matching moments. An answer cut off mid-scene leaves a hole
    * in the notes that nothing downstream can see.

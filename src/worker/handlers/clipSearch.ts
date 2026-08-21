@@ -172,6 +172,35 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
     const waitedMs = job.data.waitedMs ?? 0;
 
+    /**
+     * Waiting for the video to finish being read.
+     *
+     * A question asked while indexing is still running used to fall straight
+     * through to the footage: ten calls carrying MP4 bytes, two minutes, and
+     * fifty times the cost of the same question asked ninety seconds later.
+     * Nobody chose that — it was just what happened when the notes were not
+     * ready yet, and the screen told the user we would wait.
+     *
+     * So we wait, which is what it already said. The wall clock is no worse —
+     * reading the footage takes about as long as finishing the notes — and it
+     * costs a fraction. A correction skips this: it is going to the footage
+     * anyway, so the notes finishing changes nothing for it.
+     */
+    const indexPending =
+      video.indexStatus === 'pending' || video.indexStatus === 'queued' || video.indexStatus === 'running';
+
+    if (!correcting && indexPending && waitedMs < env.INDEX_WAIT_TIMEOUT_MS) {
+      log.info('waiting for the video to finish being read', {
+        waitedMs,
+        indexStatus: video.indexStatus,
+      });
+      await enqueueClipSearch(
+        { clipRequestId, waitedMs: waitedMs + env.INDEX_WAIT_POLL_MS },
+        { delay: env.INDEX_WAIT_POLL_MS },
+      );
+      return;
+    }
+
     if (desired.mode !== 'visual' && transcriptPending && waitedMs < env.TRANSCRIPT_WAIT_TIMEOUT_MS) {
       log.info('waiting for transcript before searching', {
         waitedMs,
