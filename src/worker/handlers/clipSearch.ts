@@ -609,29 +609,33 @@ async function answerFromNotes(input: {
   const uncertain: UncertainMatch[] = [];
 
   for (const match of result.matches) {
-    if (match.confidence < env.MIN_MATCH_CONFIDENCE) {
-      // Same rule as the footage path: a moment we found and discarded is
-      // mentioned, never silently turned into an absence.
-      uncertain.push({
-        globalStartSeconds: match.startSeconds,
-        globalEndSeconds: match.endSeconds,
-        confidence: match.confidence,
-        description: match.description,
-      });
-      continue;
-    }
-
     const chunk = chunks.find(
       (candidate) => match.startSeconds >= candidate.globalStartSeconds && match.startSeconds < candidate.globalEndSeconds,
     ) ?? chunks.at(-1);
     if (!chunk) continue;
 
+    // Every timestamp the model reports goes through the same validation,
+    // whether it becomes a result or a maybe. A reversed, negative or
+    // past-the-end range is not a moment, and showing one as "I saw something
+    // at -00:12" is worse than not mentioning it at all.
     const local = mapGlobalRangeToChunk(
       chunk,
       { startSeconds: match.startSeconds, endSeconds: match.endSeconds },
       { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
     );
     if (!local) continue;
+
+    if (match.confidence < env.MIN_MATCH_CONFIDENCE) {
+      // Same rule as the footage path: a moment we found and discarded is
+      // mentioned, never silently turned into an absence.
+      uncertain.push({
+        globalStartSeconds: local.globalStartSeconds,
+        globalEndSeconds: local.globalEndSeconds,
+        confidence: match.confidence,
+        description: match.description,
+      });
+      continue;
+    }
 
     found.push({
       chunkId: chunk.id,

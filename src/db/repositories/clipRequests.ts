@@ -90,6 +90,11 @@ export async function startClipRequest(
             chunks_completed = 0,
             chunks_failed = 0,
             chunk_errors = '[]'::jsonb,
+            -- Cleared with everything else. A retry re-observes the same
+            -- borderline moments, and without this they accumulate: the same
+            -- maybe listed twice, eventually filling the cap and crowding out
+            -- the distinct ones the successful attempt found.
+            uncertain_matches = '[]'::jsonb,
             error_message = NULL,
             updated_at = now()
       WHERE id = $1`,
