@@ -5,6 +5,7 @@ import { HttpError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { isSupportedYoutubeUrl } from '../../services/media/ytdlp.js';
 import { getStorage } from '../../services/storage/s3.js';
+import { expireVideoFootage } from '../../services/retention.js';
 import { originalKey, sanitizeFilename } from '../../services/storage/types.js';
 import { createVideo, getVideo, listChunks, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
 import { createClipRequest } from '../../db/repositories/clipRequests.js';
@@ -216,6 +217,39 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const updated = await getVideo(videoId);
     return reply.send({ video: serializeVideo(updated!) });
+  });
+
+  /**
+   * Removes a video's footage on request.
+   *
+   * The same removal the hourly sweep performs when a session goes quiet, done
+   * now because someone asked. Deliberately not a row delete: the question they
+   * asked, the moments found and their thumbs up or down are kept, because
+   * those are how we learn whether our reading of a video is any good. The
+   * bytes — original, small copy, segments, clips, stills, notes and transcript
+   * — are gone.
+   */
+  app.delete('/api/videos/:videoId', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+
+    const { videoId } = parse(z.object({ videoId: uuidSchema }), request.params, 'path parameters');
+
+    const video = await getVideo(videoId);
+    if (!video) throw HttpError.notFound('Video not found');
+    assertOwnership(request, video, 'Video');
+
+    const result = await expireVideoFootage(videoId, logger.child({ route: 'delete-video', videoId }));
+
+    return reply.send({
+      videoId,
+      removed: true,
+      objectsDeleted: result.objectsDeleted,
+      // Named rather than hidden: a file we could not delete is one the person
+      // was told was gone.
+      objectsFailed: result.objectsFailed,
+    });
   });
 
   /** Status, metadata, and the analysis chunk grid. */

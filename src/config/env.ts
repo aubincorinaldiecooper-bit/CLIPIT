@@ -193,6 +193,25 @@ const envSchema = z.object({
    * this must never compete with a search someone is waiting on. Set false to
    * stop the sweep entirely.
    */
+  /**
+   * How long a session may go quiet before its footage is considered
+   * unreachable and removed. Generous on purpose: a guest token lives in the
+   * browser tab, so silence usually means the browser closed — but a tab left
+   * open overnight is still someone's session, and deleting their video out
+   * from under them is far worse than another day of storage.
+   */
+  FOOTAGE_IDLE_SECONDS: int(86_400, 300, 2_592_000),
+  RETENTION_SWEEP_ENABLED: bool(true),
+  RETENTION_SWEEP_INTERVAL_MS: int(3_600_000, 60_000, 86_400_000),
+  RETENTION_VIDEO_LIMIT: int(50, 1, 500),
+  /**
+   * The daily summary of what people asked and whether we could answer it.
+   * Footage is deleted when a session ends, so this is the form the learning
+   * takes — see docs/learning-loop.md.
+   */
+  LEARNING_REPORT_ENABLED: bool(true),
+  LEARNING_REPORT_INTERVAL_MS: int(86_400_000, 60_000, 604_800_000),
+  LEARNING_REPORT_HOURS: int(24, 1, 720),
   THUMBNAIL_BACKFILL_ON_START: bool(true),
   THUMBNAIL_BACKFILL_VIDEO_LIMIT: int(25, 1, 500),
   PROXY_HEIGHT: int(360, 144, 1080),

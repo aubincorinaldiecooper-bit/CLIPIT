@@ -10,6 +10,7 @@ import type {
   MatchSource,
   ResolvedSearchMode,
   SearchMode,
+  UncertainMatch,
 } from '../../domain/types.js';
 
 interface ClipRequestRow {
@@ -28,6 +29,7 @@ interface ClipRequestRow {
   chunk_errors: ChunkError[];
   chunk_degradations: ChunkDegradation[] | null;
   answered_from: AnsweredFrom | null;
+  uncertain_matches: UncertainMatch[] | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -49,6 +51,7 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     chunkDegradations: row.chunk_degradations ?? [],
     chunkErrors: row.chunk_errors ?? [],
     answeredFrom: row.answered_from ?? null,
+    uncertainMatches: row.uncertain_matches ?? [],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -87,6 +90,11 @@ export async function startClipRequest(
             chunks_completed = 0,
             chunks_failed = 0,
             chunk_errors = '[]'::jsonb,
+            -- Cleared with everything else. A retry re-observes the same
+            -- borderline moments, and without this they accumulate: the same
+            -- maybe listed twice, eventually filling the cap and crowding out
+            -- the distinct ones the successful attempt found.
+            uncertain_matches = '[]'::jsonb,
             error_message = NULL,
             updated_at = now()
       WHERE id = $1`,
@@ -128,6 +136,56 @@ export async function recordChunkDegraded(requestId: string, degradation: ChunkD
             updated_at = now()
       WHERE id = $1`,
     [requestId, JSON.stringify([degradation])],
+  );
+}
+
+/**
+ * Records moments the threshold discarded, so the answer can mention them.
+ *
+ * Capped, and the cap is deliberate: this is a footnote to an answer, not a
+ * second result list. Five borderline moments is already more than anyone
+ * reads, and the log carries the full count.
+ */
+export async function recordUncertainMatches(
+  requestId: string,
+  matches: UncertainMatch[],
+): Promise<void> {
+  if (matches.length === 0) return;
+  await queryOne(
+    `UPDATE clip_requests
+        SET uncertain_matches = (
+              SELECT jsonb_agg(entry)
+                FROM (
+                  SELECT entry
+                    FROM jsonb_array_elements(uncertain_matches || $2::jsonb) AS entry
+                   ORDER BY (entry->>'confidence')::numeric DESC
+                   LIMIT 5
+                ) AS kept
+            ),
+            updated_at = now()
+      WHERE id = $1`,
+    [requestId, JSON.stringify(matches)],
+  );
+}
+
+/**
+ * Records what this question can teach us, before the footage goes.
+ *
+ * `notesConsulted` separates two answers that otherwise look identical: the
+ * notes were read and had nothing, versus there were no notes to read. Only
+ * the first says anything about whether reading at upload is working.
+ */
+export async function recordSearchApproach(
+  requestId: string,
+  input: { notesConsulted: boolean; correctionOf?: string | null },
+): Promise<void> {
+  await queryOne(
+    `UPDATE clip_requests
+        SET notes_consulted = $2,
+            corrected_request_id = COALESCE($3, corrected_request_id),
+            updated_at = now()
+      WHERE id = $1`,
+    [requestId, input.notesConsulted, input.correctionOf ?? null],
   );
 }
 
@@ -341,6 +399,34 @@ export async function setMatchFeedback(
   return row ? mapMatch(row) : null;
 }
 
+/** Every still cut from this video, across all its searches. */
+export async function listThumbnailKeysForVideo(videoId: string): Promise<string[]> {
+  const rows = await queryRows<{ thumbnail_key: string }>(
+    `SELECT m.thumbnail_key
+       FROM clip_matches m
+       JOIN clip_requests r ON r.id = m.clip_request_id
+      WHERE r.video_id = $1 AND m.thumbnail_key IS NOT NULL`,
+    [videoId],
+  );
+  return rows.map((row) => row.thumbnail_key);
+}
+
+/**
+ * Forgets the stills while keeping the matches.
+ *
+ * The matches carry the human verdict on each moment, which is the whole point
+ * of keeping anything after the footage goes.
+ */
+export async function clearThumbnailsForVideo(videoId: string): Promise<void> {
+  await queryOne(
+    `UPDATE clip_matches AS m
+        SET thumbnail_key = NULL
+       FROM clip_requests r
+      WHERE r.id = m.clip_request_id AND r.video_id = $1`,
+    [videoId],
+  );
+}
+
 export async function listMatches(requestId: string): Promise<ClipMatch[]> {
   const rows = await queryRows<ClipMatchRow>(
     'SELECT * FROM clip_matches WHERE clip_request_id = $1 ORDER BY global_start_seconds ASC',
@@ -362,4 +448,92 @@ export async function listMatchesByIds(requestId: string, matchIds: string[]): P
 
 export async function deleteMatches(requestId: string): Promise<void> {
   await queryOne('DELETE FROM clip_matches WHERE clip_request_id = $1', [requestId]);
+}
+
+/**
+ * What the last day of use taught us. See docs/learning-loop.md.
+ *
+ * Deliberately an aggregate plus a verbatim list. The numbers say whether
+ * reading at upload is paying off; the list of questions the notes could not
+ * answer is the part worth actually reading, because each one is something a
+ * person wanted from their video that nobody thought to write down.
+ */
+export interface LearningSummary {
+  answeredFromNotes: number;
+  answeredFromFootage: number;
+  corrections: number;
+  notesSilent: number;
+  approved: number;
+  rejected: number;
+  averageConfidenceApproved: number | null;
+  averageConfidenceRejected: number | null;
+  questionsNotesCouldNotAnswer: string[];
+}
+
+export async function summariseLearning(sinceHours: number): Promise<LearningSummary> {
+  const interval = `${Math.max(1, Math.floor(sinceHours))} hours`;
+
+  const requests = await queryOne<{
+    from_notes: number;
+    from_footage: number;
+    corrections: number;
+    notes_silent: number;
+  }>(
+    `SELECT
+       count(*) FILTER (WHERE answered_from = 'notes')::int AS from_notes,
+       count(*) FILTER (WHERE answered_from = 'footage')::int AS from_footage,
+       count(*) FILTER (WHERE corrected_request_id IS NOT NULL)::int AS corrections,
+       -- The notes were read and had nothing. Not the same as having no notes.
+       count(*) FILTER (
+         WHERE notes_consulted AND answered_from = 'footage' AND corrected_request_id IS NULL
+       )::int AS notes_silent
+     FROM clip_requests
+     WHERE status = 'completed' AND created_at >= now() - $1::interval`,
+    [interval],
+  );
+
+  const verdicts = await queryOne<{
+    approved: number;
+    rejected: number;
+    avg_approved: number | null;
+    avg_rejected: number | null;
+  }>(
+    `SELECT
+       count(*) FILTER (WHERE feedback = 'approved')::int AS approved,
+       count(*) FILTER (WHERE feedback = 'rejected')::int AS rejected,
+       avg(confidence) FILTER (WHERE feedback = 'approved') AS avg_approved,
+       avg(confidence) FILTER (WHERE feedback = 'rejected') AS avg_rejected
+     FROM clip_matches
+     WHERE feedback IS NOT NULL AND feedback_at >= now() - $1::interval`,
+    [interval],
+  );
+
+  const silent = await queryRows<{ instruction: string }>(
+    `SELECT instruction
+       FROM clip_requests
+      WHERE status = 'completed'
+        AND notes_consulted
+        AND answered_from = 'footage'
+        AND corrected_request_id IS NULL
+        AND created_at >= now() - $1::interval
+      ORDER BY created_at DESC
+      LIMIT 20`,
+    [interval],
+  );
+
+  return {
+    answeredFromNotes: requests?.from_notes ?? 0,
+    answeredFromFootage: requests?.from_footage ?? 0,
+    corrections: requests?.corrections ?? 0,
+    notesSilent: requests?.notes_silent ?? 0,
+    approved: verdicts?.approved ?? 0,
+    rejected: verdicts?.rejected ?? 0,
+    averageConfidenceApproved: verdicts?.avg_approved === null || verdicts?.avg_approved === undefined
+      ? null
+      : Number(Number(verdicts.avg_approved).toFixed(3)),
+    averageConfidenceRejected: verdicts?.avg_rejected === null || verdicts?.avg_rejected === undefined
+      ? null
+      : Number(Number(verdicts.avg_rejected).toFixed(3)),
+    questionsNotesCouldNotAnswer: silent.map((row) => row.instruction),
+  };
 }

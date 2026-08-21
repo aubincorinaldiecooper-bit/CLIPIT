@@ -213,21 +213,6 @@ export function planChunkWindows(durationSeconds: number, chunkSeconds: number):
   return windows;
 }
 
-/** Evenly spaced sample points inside a chunk, in chunk-local seconds. */
-export function planFrameTimestamps(durationSeconds: number, frameCount: number): number[] {
-  if (!isFiniteNumber(durationSeconds) || durationSeconds <= 0) return [];
-  const count = Math.max(1, Math.floor(frameCount));
-  if (count === 1) return [round(durationSeconds / 2)];
-
-  // Sample at the centre of `count` equal slices so the first and last frames
-  // are not exactly on the (often black) chunk boundaries.
-  const step = durationSeconds / count;
-  const timestamps: number[] = [];
-  for (let index = 0; index < count; index += 1) {
-    timestamps.push(round(Math.min(durationSeconds - EPSILON, step * (index + 0.5))));
-  }
-  return timestamps;
-}
 
 export function formatTimecode(totalSeconds: number): string {
   const clamped = Math.max(0, isFiniteNumber(totalSeconds) ? totalSeconds : 0);

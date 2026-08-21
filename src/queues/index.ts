@@ -10,6 +10,8 @@ export const QUEUE_NAMES = {
   clipSearch: 'clip-search',
   clipGeneration: 'clip-generation',
   thumbnailBackfill: 'thumbnail-backfill',
+  retention: 'footage-retention',
+  learningReport: 'learning-report',
 } as const;
 
 export interface IngestionJob {
@@ -45,6 +47,16 @@ export interface ClipGenerationJob {
  * Gives stills to matches found before stills existed. Carries no payload: the
  * work it does is defined entirely by what the database is still missing.
  */
+/** Remove footage whose session has ended. Carries no payload. */
+export interface RetentionJob {
+  requestedAt: string;
+}
+
+/** Summarise what the last day of use taught us. Carries no payload. */
+export interface LearningReportJob {
+  requestedAt: string;
+}
+
 export interface ThumbnailBackfillJob {
   /** Present only so the job data is not an empty object. */
   requestedAt: string;
@@ -65,6 +77,8 @@ let queues: {
   clipSearch: Queue<ClipSearchJob>;
   clipGeneration: Queue<ClipGenerationJob>;
   thumbnailBackfill: Queue<ThumbnailBackfillJob>;
+  retention: Queue<RetentionJob>;
+  learningReport: Queue<LearningReportJob>;
 } | null = null;
 
 export function getQueues() {
@@ -78,6 +92,11 @@ export function getQueues() {
       clipSearch: new Queue<ClipSearchJob>(QUEUE_NAMES.clipSearch, { connection, defaultJobOptions }),
       clipGeneration: new Queue<ClipGenerationJob>(QUEUE_NAMES.clipGeneration, { connection, defaultJobOptions }),
       thumbnailBackfill: new Queue<ThumbnailBackfillJob>(QUEUE_NAMES.thumbnailBackfill, {
+        connection,
+        defaultJobOptions,
+      }),
+      retention: new Queue<RetentionJob>(QUEUE_NAMES.retention, { connection, defaultJobOptions }),
+      learningReport: new Queue<LearningReportJob>(QUEUE_NAMES.learningReport, {
         connection,
         defaultJobOptions,
       }),
@@ -178,6 +197,37 @@ export async function enqueueThumbnailBackfill(requestedAt: string): Promise<voi
     // One attempt. Every failure inside is already swallowed per video, so a
     // job that fails outright failed at the database, and retrying a sweep
     // that cannot read its own work list just burns the queue.
+    { attempts: 1 },
+  );
+}
+
+/**
+ * Queues a footage sweep. The id changes with the hour, so a sweep queued
+ * every few minutes by a restarting worker collapses into one per hour rather
+ * than stacking, while still running again next hour.
+ */
+export async function enqueueRetentionSweep(requestedAt: string): Promise<void> {
+  const hour = requestedAt.slice(0, 13);
+  await addWithStableId(
+    getQueues().retention,
+    'sweep',
+    { requestedAt },
+    `retention-${hour}`,
+    { attempts: 1 },
+  );
+}
+
+/**
+ * Queues the daily summary. The id carries the date, so a worker restarting
+ * six times in a day still produces one report rather than six.
+ */
+export async function enqueueLearningReport(requestedAt: string): Promise<void> {
+  const day = requestedAt.slice(0, 10);
+  await addWithStableId(
+    getQueues().learningReport,
+    'report',
+    { requestedAt },
+    `learning-${day}`,
     { attempts: 1 },
   );
 }

@@ -66,6 +66,20 @@ export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> 
   return mapClip(row!);
 }
 
+/** Every clip file cut from this video, so they can be deleted with it. */
+export async function listClipKeysForVideo(videoId: string): Promise<string[]> {
+  const rows = await queryRows<{ storage_key: string }>(
+    'SELECT storage_key FROM clips WHERE video_id = $1 AND storage_key IS NOT NULL',
+    [videoId],
+  );
+  return rows.map((row) => row.storage_key);
+}
+
+/** Forgets where the clips were, once their bytes are gone. */
+export async function clearClipKeysForVideo(videoId: string): Promise<void> {
+  await queryOne('UPDATE clips SET storage_key = NULL, updated_at = now() WHERE video_id = $1', [videoId]);
+}
+
 export async function getClip(clipId: string): Promise<Clip | null> {
   const row = await queryOne<ClipRow>('SELECT * FROM clips WHERE id = $1', [clipId]);
   return row ? mapClip(row) : null;

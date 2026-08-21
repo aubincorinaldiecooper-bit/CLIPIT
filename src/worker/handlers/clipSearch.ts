@@ -35,6 +35,8 @@ import {
   recordChunkCompleted,
   recordChunkDegraded,
   recordChunkFailure,
+  recordSearchApproach,
+  recordUncertainMatches,
   startClipRequest,
   type NewClipMatch,
 } from '../../db/repositories/clipRequests.js';
@@ -44,6 +46,7 @@ import type {
   ChunkFailureCode,
   MatchSource,
   ResolvedSearchMode,
+  UncertainMatch,
   Video,
   VideoChunk,
 } from '../../domain/types.js';
@@ -146,6 +149,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
       instruction = previous.instruction;
       correcting = true;
+      // The strongest signal there is — a person saying our answer was wrong.
+      // Stored so it survives the footage and can be counted later.
+      await recordSearchApproach(clipRequestId, { notesConsulted: false, correctionOf: previous.id });
       log.info('treating this as a correction rather than a new question', {
         said: request.instruction,
         lookingAgainFor: instruction,
@@ -206,7 +212,14 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
      * "not present" — and the search falls through to the footage rather than
      * reporting an absence it cannot vouch for.
      */
-    if (!correcting && video.indexStatus === 'ready') {
+    // Recorded whether or not the notes are consulted, because the two cases
+    // answer different questions later: notes read and silent says reading at
+    // upload is not covering what people ask, while no notes at all says
+    // nothing about the reading and everything about the video's age.
+    const notesAvailable = !correcting && video.indexStatus === 'ready';
+    if (!correcting) await recordSearchApproach(clipRequestId, { notesConsulted: notesAvailable });
+
+    if (notesAvailable) {
       const answered = await answerFromNotes({
         clipRequestId,
         video,
@@ -604,20 +617,36 @@ async function answerFromNotes(input: {
   // Notes carry source timestamps, so a match has to be placed back on the
   // chunk grid the rest of the system stores matches against.
   const found: NewClipMatch[] = [];
-  for (const match of result.matches) {
-    if (match.confidence < env.MIN_MATCH_CONFIDENCE) continue;
+  const uncertain: UncertainMatch[] = [];
 
+  for (const match of result.matches) {
     const chunk = chunks.find(
       (candidate) => match.startSeconds >= candidate.globalStartSeconds && match.startSeconds < candidate.globalEndSeconds,
     ) ?? chunks.at(-1);
     if (!chunk) continue;
 
+    // Every timestamp the model reports goes through the same validation,
+    // whether it becomes a result or a maybe. A reversed, negative or
+    // past-the-end range is not a moment, and showing one as "I saw something
+    // at -00:12" is worse than not mentioning it at all.
     const local = mapGlobalRangeToChunk(
       chunk,
       { startSeconds: match.startSeconds, endSeconds: match.endSeconds },
       { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
     );
     if (!local) continue;
+
+    if (match.confidence < env.MIN_MATCH_CONFIDENCE) {
+      // Same rule as the footage path: a moment we found and discarded is
+      // mentioned, never silently turned into an absence.
+      uncertain.push({
+        globalStartSeconds: local.globalStartSeconds,
+        globalEndSeconds: local.globalEndSeconds,
+        confidence: match.confidence,
+        description: match.description,
+      });
+      continue;
+    }
 
     found.push({
       chunkId: chunk.id,
@@ -631,6 +660,8 @@ async function answerFromNotes(input: {
       quote: match.quote,
     });
   }
+
+  if (uncertain.length > 0) await recordUncertainMatches(clipRequestId, uncertain);
 
   log.info('notes consulted', {
     notes: notes.length,
@@ -810,6 +841,26 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
   // a model problem.
   const belowConfidence = response.matches.filter((match) => match.confidence < env.MIN_MATCH_CONFIDENCE);
   if (belowConfidence.length > 0) {
+    // Recorded, not just logged. The log told US; the user was told nothing
+    // matched, which is indistinguishable from their video not containing it.
+    await recordUncertainMatches(
+      input.clipRequestId,
+      belowConfidence.flatMap((match) => {
+        const range = mapLocalRangeToGlobal(
+          chunk,
+          { startSeconds: match.startSeconds, endSeconds: match.endSeconds },
+          { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
+        );
+        if (!range) return [];
+        return [{
+          globalStartSeconds: range.globalStartSeconds,
+          globalEndSeconds: range.globalEndSeconds,
+          confidence: match.confidence,
+          description: match.description,
+        }];
+      }),
+    );
+
     input.log.warn('discarded low-confidence matches', {
       chunkIndex: chunk.chunkIndex,
       threshold: env.MIN_MATCH_CONFIDENCE,
