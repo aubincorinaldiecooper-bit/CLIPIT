@@ -101,8 +101,12 @@ async function main(): Promise<void> {
     nodeEnv: env.NODE_ENV,
     transcription: env.TRANSCRIPTION_ENABLED,
     videoModel: env.OPENROUTER_VIDEO_MODEL,
-    videoConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
+    // Both, named for what they do. One line saying "videoConcurrency: 4"
+    // reads as the whole story, and after the reading was moved onto its own
+    // setting it stopped being true of the reading.
+    searchConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
     indexing: env.INDEXING_ENABLED,
+    indexingConcurrency: env.INDEXING_CONCURRENCY,
   });
 
   await checkBinaries();
