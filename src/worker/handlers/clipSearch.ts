@@ -24,7 +24,7 @@ import {
 } from '../../services/timestamps.js';
 import { getVideo, listChunks } from '../../db/repositories/videos.js';
 import { listTranscriptSegments, listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
-import { listScenes } from '../../db/repositories/scenes.js';
+import { listScenes, sceneProgress } from '../../db/repositories/scenes.js';
 import {
   deleteMatches,
   finishClipRequest,
@@ -172,6 +172,73 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
     const waitedMs = job.data.waitedMs ?? 0;
 
+    /**
+     * Waiting for the video to finish being read.
+     *
+     * A question asked while indexing is still running used to fall straight
+     * through to the footage: ten calls carrying MP4 bytes, two minutes, and
+     * fifty times the cost of the same question asked ninety seconds later.
+     * Nobody chose that — it was just what happened when the notes were not
+     * ready yet, and the screen told the user we would wait.
+     *
+     * So we wait, which is what it already said. The wall clock is no worse —
+     * reading the footage takes about as long as finishing the notes — and it
+     * costs a fraction. A correction skips this: it is going to the footage
+     * anyway, so the notes finishing changes nothing for it.
+     */
+    const indexPending =
+      video.indexStatus === 'pending' || video.indexStatus === 'queued' || video.indexStatus === 'running';
+
+    /**
+     * Notes are written chunk by chunk, so a read in progress still has some.
+     * Try them: a question about the first five minutes can be answered while
+     * the last five are still being read, and the part not yet read is named
+     * in the answer rather than passed off as searched.
+     *
+     * Only if that finds nothing do we wait — and waiting beats falling
+     * through to the footage, which costs about the same time and fifty times
+     * the money for an answer the notes are about to be able to give.
+     */
+    if (!correcting && indexPending && waitedMs < env.INDEX_WAIT_TIMEOUT_MS) {
+      const readSoFar = await sceneProgress(video.id);
+
+      if (readSoFar.count > 0) {
+        const answered = await answerFromNotes({
+          clipRequestId,
+          video,
+          chunks,
+          instruction,
+          mode: desired.mode,
+          tally,
+          log,
+          readComplete: false,
+        });
+
+        if (answered > 0) {
+          log.info('answered from the part read so far', {
+            readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
+            ofSeconds: Math.round(video.durationSeconds ?? 0),
+          });
+          outcome = 'completed';
+          searchMode = desired.mode;
+          chunkCount = 0;
+          return;
+        }
+      }
+
+      log.info('waiting for the video to finish being read', {
+        waitedMs,
+        indexStatus: video.indexStatus,
+        readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
+        scenesSoFar: readSoFar.count,
+      });
+      await enqueueClipSearch(
+        { clipRequestId, waitedMs: waitedMs + env.INDEX_WAIT_POLL_MS },
+        { delay: env.INDEX_WAIT_POLL_MS },
+      );
+      return;
+    }
+
     if (desired.mode !== 'visual' && transcriptPending && waitedMs < env.TRANSCRIPT_WAIT_TIMEOUT_MS) {
       log.info('waiting for transcript before searching', {
         waitedMs,
@@ -228,6 +295,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         mode: resolved.mode,
         tally,
         log,
+        readComplete: true,
       });
 
       if (answered > 0) {
@@ -570,8 +638,14 @@ async function answerFromNotes(input: {
   mode: ResolvedSearchMode;
   tally: UsageTally;
   log: Logger;
+  /**
+   * False while the video is still being read. What is missing from the notes
+   * is then a stretch not reached yet, not a stretch that failed — and the two
+   * must not be reported in the same words.
+   */
+  readComplete: boolean;
 }): Promise<number> {
-  const { clipRequestId, video, chunks, instruction, mode, tally, log } = input;
+  const { clipRequestId, video, chunks, instruction, mode, tally, log, readComplete } = input;
   const startedAt = performance.now();
 
   // Memory is both halves: what was seen, and what was said. A spoken question
@@ -710,8 +784,10 @@ async function answerFromNotes(input: {
     await recordChunkFailure(clipRequestId, {
       chunkIndex: where.chunkIndex,
       chunkId: where.id,
-      message: 'This stretch is not described in the notes taken at upload',
-      code: 'not_in_notes',
+      message: readComplete
+        ? 'This stretch is not described in the notes taken at upload'
+        : 'This stretch had not been watched yet when the question was asked',
+      code: readComplete ? 'not_in_notes' : 'not_read_yet',
       globalStartSeconds: gap.startSeconds,
       globalEndSeconds: gap.endSeconds,
     });

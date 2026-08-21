@@ -7,7 +7,14 @@ import { isSupportedYoutubeUrl } from '../../services/media/ytdlp.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { expireVideoFootage } from '../../services/retention.js';
 import { originalKey, sanitizeFilename } from '../../services/storage/types.js';
-import { createVideo, getVideo, listChunks, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
+import {
+  createVideo,
+  getVideo,
+  getVideoWithReadProgress,
+  listChunks,
+  setVideoStatus,
+  updateVideoMedia,
+} from '../../db/repositories/videos.js';
 import { createClipRequest } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
 import { assertOwnership, requireSession } from '../auth.js';
@@ -263,7 +270,11 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     // This route is a pure read. Ingestion starts only through the explicit
     // POST /api/videos/:videoId/uploaded, so polling for status never has a
     // side effect and there is exactly one path into the pipeline.
-    const video = await getVideo(videoId);
+    //
+    // Read with the note progress: this is the route the client polls, and how
+    // far the notes reach is the one honest thing it can show while a video is
+    // being read.
+    const video = await getVideoWithReadProgress(videoId);
     if (!video) throw HttpError.notFound('Video not found');
     assertOwnership(request, video, 'Video');
 

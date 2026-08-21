@@ -9,7 +9,7 @@ import { getStorage } from '../../services/storage/s3.js';
 import { describeVideoChunk } from '../../services/search/sceneIndex.js';
 import { UsageTally } from '../../services/usageTally.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
-import { replaceScenes, type NewVideoScene } from '../../db/repositories/scenes.js';
+import { appendScenes, clearScenes, type NewVideoScene } from '../../db/repositories/scenes.js';
 import { findUncoveredRanges } from '../../services/timestamps.js';
 import { getVideo, listChunks, setIndexStatus } from '../../db/repositories/videos.js';
 import type { IndexingJob } from '../../queues/index.js';
@@ -46,15 +46,18 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
 
   const tally = new UsageTally();
   const startedAt = performance.now();
-  await setIndexStatus(videoId, 'running');
+  await setIndexStatus(videoId, 'running', { sceneCount: 0 });
+  // A previous attempt's notes go before this one starts, so a retry never
+  // leaves half of one read mixed with half of another.
+  await clearScenes(videoId);
 
   try {
-    const scenes: NewVideoScene[] = [];
+    let storedScenes = 0;
     let failedChunks = 0;
     let partialChunks = 0;
 
     await withWorkDir(`index-${videoId}`, async (dir) => {
-      const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
+      const results = await mapWithConcurrency(chunks, env.INDEXING_CONCURRENCY, async (chunk) => {
         const chunkPath = path.join(dir, `chunk-${chunk.chunkIndex}.mp4`);
         await getStorage().downloadToFile(chunk.storageKey, chunkPath);
 
@@ -90,13 +93,19 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
 
         // Chunk-local seconds become source seconds here, once, so nothing
         // downstream has to know a chunk grid ever existed.
-        for (const scene of result.scenes) {
-          scenes.push({
-            startSeconds: Number((chunk.globalStartSeconds + scene.startSeconds).toFixed(3)),
-            endSeconds: Number((chunk.globalStartSeconds + scene.endSeconds).toFixed(3)),
-            description: scene.description,
-          });
-        }
+        const readScenes: NewVideoScene[] = result.scenes.map((scene) => ({
+          startSeconds: Number((chunk.globalStartSeconds + scene.startSeconds).toFixed(3)),
+          endSeconds: Number((chunk.globalStartSeconds + scene.endSeconds).toFixed(3)),
+          description: scene.description,
+        }));
+
+        // Written now, not at the end. A question asked a minute after upload
+        // can then be answered from the part already read, with the unread
+        // part named — which beats two minutes of nothing. The offset keeps
+        // the stored order stable while chunks finish out of order.
+        await appendScenes(videoId, readScenes, chunk.chunkIndex * 1000);
+        storedScenes += readScenes.length;
+        await setIndexStatus(videoId, 'running', { sceneCount: storedScenes });
 
         // A valid scene list can still leave most of a chunk undescribed — one
         // 0-10s scene for a 120 second chunk parses perfectly. Left unsaid,
@@ -135,7 +144,7 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
       }
     });
 
-    if (scenes.length === 0) {
+    if (storedScenes === 0) {
       // Nothing was read at all. Recording this as a ready, empty index would
       // tell every later search that the video contains nothing.
       await setIndexStatus(videoId, 'failed', {
@@ -146,11 +155,6 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
       return;
     }
 
-    const stored = await replaceScenes(videoId, scenes);
-
-    // Partial notes are still notes, but the gap is recorded rather than
-    // implied: a search must be able to tell "the notes say nothing about
-    // that" from "part of this video was never read".
     // Partial notes are still notes, but what is missing is named rather than
     // implied. The search recomputes the holes from the scenes themselves, so
     // this string is for a human reading the row, not a machine.
@@ -160,14 +164,14 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
     ].filter(Boolean).join('; ');
 
     await setIndexStatus(videoId, 'ready', {
-      sceneCount: stored,
+      sceneCount: storedScenes,
       error: unread || null,
     });
 
     // What reading this video cost, once, against what it saves every question
     // asked of it afterwards.
     log.info('video read into notes', {
-      scenes: stored,
+      scenes: storedScenes,
       chunks: chunks.length,
       failedChunks,
       partialChunks,

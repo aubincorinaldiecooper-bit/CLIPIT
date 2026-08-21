@@ -27,9 +27,50 @@ export interface NewVideoScene {
   description: string;
 }
 
-/** Replaces the whole scene index for a video; batched like the transcript. */
-export async function replaceScenes(videoId: string, scenes: NewVideoScene[]): Promise<number> {
+/**
+ * Adds notes for one chunk, as soon as that chunk has been read.
+ *
+ * Written per chunk rather than all at the end so the notes are usable while
+ * the rest of the video is still being read. A question asked a minute after
+ * upload can be answered from the part that has been read, with the unread
+ * part named — which is far better than two minutes of nothing.
+ *
+ * `sceneIndexOffset` keeps the stored order stable while chunks finish out of
+ * order, which they do: they run four at a time and the short ones land first.
+ */
+export async function appendScenes(
+  videoId: string,
+  scenes: NewVideoScene[],
+  sceneIndexOffset: number,
+): Promise<number> {
+  if (scenes.length === 0) return 0;
+  return insertScenes(videoId, scenes, sceneIndexOffset);
+}
+
+/** Clears a video's notes. Used at the start of a read, so a retry is clean. */
+export async function clearScenes(videoId: string): Promise<void> {
   await queryOne('DELETE FROM video_scenes WHERE video_id = $1', [videoId]);
+}
+
+/**
+ * How far into the video the notes actually reach.
+ *
+ * Real, measured, and it moves — it is the furthest second any note describes.
+ * A screen can say "read 8 of 20 minutes" from this without anybody inventing
+ * a percentage.
+ */
+export async function sceneProgress(videoId: string): Promise<{ count: number; readThroughSeconds: number }> {
+  const row = await queryOne<{ count: number; read_through: number | null }>(
+    'SELECT COUNT(*)::int AS count, MAX(end_seconds) AS read_through FROM video_scenes WHERE video_id = $1',
+    [videoId],
+  );
+  return {
+    count: row?.count ?? 0,
+    readThroughSeconds: row?.read_through === null || row?.read_through === undefined ? 0 : Number(row.read_through),
+  };
+}
+
+async function insertScenes(videoId: string, scenes: NewVideoScene[], sceneIndexOffset: number): Promise<number> {
   if (scenes.length === 0) return 0;
 
   const ordered = [...scenes].sort((a, b) => a.startSeconds - b.startSeconds);
@@ -44,7 +85,7 @@ export async function replaceScenes(videoId: string, scenes: NewVideoScene[]): P
 
     batch.forEach((scene, index) => {
       const base = params.length;
-      params.push(offset + index, scene.startSeconds, scene.endSeconds, scene.description);
+      params.push(sceneIndexOffset + offset + index, scene.startSeconds, scene.endSeconds, scene.description);
       values.push(`($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4})`);
     });
 
