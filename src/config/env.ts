@@ -120,6 +120,21 @@ const envSchema = z.object({
    * from a hunch that more thinking must be better.
    */
   OPENROUTER_VIDEO_REASONING_MAX_TOKENS: int(2500, 256, 32_000),
+  /**
+   * Reading a video into notes at upload, so a question can be answered from
+   * text instead of re-watching the whole video every time it is asked.
+   *
+   * This was built, then switched off as a side effect of merging the
+   * actual-video search — see CLAUDE.md. It is back on the model that watches
+   * video rather than the sampled stills it originally used.
+   */
+  INDEXING_ENABLED: bool(true),
+  /**
+   * Room for a description of everything in one chunk, which runs far longer
+   * than a list of matching moments. An answer cut off mid-scene leaves a hole
+   * in the notes that nothing downstream can see.
+   */
+  INDEX_ANSWER_MAX_TOKENS: int(3000, 512, 16_000),
   OPENROUTER_VIDEO_TEMPERATURE: num(0.1, 0, 2),
   OPENROUTER_STT_MODEL: z.string().trim().default('openai/whisper-1'),
   /** Optional attribution headers OpenRouter uses for app ranking. */

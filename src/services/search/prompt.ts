@@ -76,3 +76,44 @@ export function buildTranscriptBlock(lines: TranscriptLine[]): string {
 
   return `TRANSCRIPT (timestamps are seconds from the start of this segment):\n${body}`;
 }
+
+/**
+ * The prompt for reading a video at upload, before anyone has asked anything.
+ *
+ * Deliberately open: at index time there is no question to look for, so the
+ * only useful instruction is to write down what is there. What gets omitted
+ * here can never be recalled later without going back to the footage, and the
+ * things users ask about — text on a sign, a make of car, who is on screen —
+ * are exactly the details a summary drops first.
+ */
+export const INDEX_SYSTEM_PROMPT = [
+  'You are a video indexer. You are given an actual MP4 segment of a longer video.',
+  'Write down what happens in it, as a series of scenes, so that someone who cannot watch the video can later find moments in it from your notes alone.',
+  '',
+  'Rules:',
+  '- Cover the WHOLE segment. Every second should fall inside some scene.',
+  '- A scene is a stretch where the same thing is happening. Start a new one when the subject, location, or action changes.',
+  '- Timestamps are in SECONDS FROM THE START OF THIS SEGMENT, not from the start of the video.',
+  '- Be concrete and specific. Name what is visible: objects, vehicles, people and what they are doing, places, actions, and any change on screen.',
+  '- Transcribe on-screen text exactly — signs, captions, overlays, labels, screens, clothing, number plates. Quote it.',
+  '- Prefer plain nouns over categories: "red pickup truck", not "a vehicle".',
+  '- Do not editorialise, rate, or summarise the video as a whole. Describe what is there.',
+  '- Return only the JSON. Do not explain your reasoning, before or after it.',
+  '',
+  'Respond with ONLY a JSON object in exactly this shape, and no other text:',
+  '{"scenes":[{"start_seconds":0,"end_seconds":14.5,"description":"what is happening and what is visible"}]}',
+].join('\n');
+
+export function buildIndexInstruction(input: {
+  chunkDurationSeconds: number;
+  chunkIndex: number;
+  chunkCount: number;
+}): string {
+  return [
+    `This is segment ${input.chunkIndex + 1} of ${input.chunkCount} from a longer video.`,
+    `The segment is ${input.chunkDurationSeconds.toFixed(1)} seconds long.`,
+    `Valid timestamps for this segment are between 0 and ${input.chunkDurationSeconds.toFixed(1)} seconds.`,
+    '',
+    'Describe this segment as scenes.',
+  ].join('\n');
+}

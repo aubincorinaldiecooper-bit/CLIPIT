@@ -11,6 +11,7 @@ import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
 import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
+import { handleIndexing } from './handlers/indexing.js';
 import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
 import { handleThumbnailBackfill } from './handlers/thumbnailBackfill.js';
@@ -93,6 +94,7 @@ async function main(): Promise<void> {
     transcription: env.TRANSCRIPTION_ENABLED,
     videoModel: env.OPENROUTER_VIDEO_MODEL,
     videoConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
+    indexing: env.INDEXING_ENABLED,
   });
 
   await checkBinaries();
@@ -101,6 +103,11 @@ async function main(): Promise<void> {
   startWorker(QUEUE_NAMES.ingestion, handleIngestion, env.INGESTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.preprocessing, handlePreprocessing, env.PREPROCESS_CONCURRENCY);
   startWorker(QUEUE_NAMES.transcription, handleTranscription, env.TRANSCRIPTION_CONCURRENCY);
+  // One video at a time. Reading a video is many model calls, and the shared
+  // semaphore in the video client already bounds how many run at once — a
+  // second video indexing in parallel would only queue behind it while making
+  // a search someone is waiting on wait longer.
+  startWorker(QUEUE_NAMES.indexing, handleIndexing, 1);
   startWorker(QUEUE_NAMES.clipSearch, handleClipSearch, env.CLIP_SEARCH_CONCURRENCY);
   startWorker(QUEUE_NAMES.clipGeneration, handleClipGeneration, env.CLIP_GENERATION_CONCURRENCY);
   // One at a time: the sweep is background work and must never take a slot

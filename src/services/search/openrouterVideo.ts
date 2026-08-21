@@ -7,9 +7,41 @@ import type { ResolvedSearchMode } from '../../domain/types.js';
 import { parseModelMatches, type ParsedMatch } from './modelResponse.js';
 import { SYSTEM_PROMPT, buildInstructionBlock, buildTranscriptBlock, type TranscriptLine } from './prompt.js';
 
-type ContentPart =
+export type ContentPart =
   | { type: 'text'; text: string }
   | { type: 'video_url'; video_url: { url: string } };
+
+/**
+ * One call to the video model, whatever it is being asked.
+ *
+ * Search and indexing send the same kind of request — a system prompt, some
+ * text, and a chunk of MP4 — and both need the timeout split, the usage
+ * accounting, and above all the rule that an answer which ran out of room is
+ * never read as an empty one. That rule is the reason this is shared rather
+ * than copied: a second implementation would be a second place for a chunk to
+ * go quietly missing.
+ */
+export interface VideoModelRequest {
+  chunkIndex: number;
+  chunkDurationSeconds: number;
+  systemPrompt: string;
+  parts: ContentPart[];
+  videoBytes: number;
+  /**
+   * Room for the answer. Describing everything in two minutes of video needs
+   * more of it than naming a few matching moments does.
+   */
+  answerMaxTokens?: number;
+  /** What the call is for, so a slow index is not read as a slow search. */
+  purpose: 'search' | 'index';
+  onUsage?: VideoUsageReporter;
+}
+
+export interface VideoModelAnswer {
+  content: string;
+  /** True when the answer only arrived after thinking was switched off. */
+  reasoningDisabled: boolean;
+}
 
 interface CompletionResponse {
   choices?: Array<{
@@ -126,6 +158,19 @@ function headers(): Record<string, string> {
   };
 }
 
+/**
+ * The MP4 itself, as OpenRouter's native video input. Not sampled frames: the
+ * whole point of this model is that it watches the video, so anything that
+ * reduces a chunk to stills before sending belongs to an older design.
+ */
+export async function videoPartFromFile(filePath: string): Promise<{ part: ContentPart; bytes: number }> {
+  const [video, info] = await Promise.all([readFile(filePath), stat(filePath)]);
+  return {
+    part: { type: 'video_url', video_url: { url: `data:video/mp4;base64,${video.toString('base64')}` } },
+    bytes: info.size,
+  };
+}
+
 async function buildContent(input: VideoSearchInput): Promise<{ parts: ContentPart[]; videoBytes: number }> {
   const parts: ContentPart[] = [{
     type: 'text',
@@ -135,12 +180,9 @@ async function buildContent(input: VideoSearchInput): Promise<{ parts: ContentPa
   let videoBytes = 0;
   if (input.mode !== 'transcript') {
     if (!input.videoPath) throw new Error('Actual video is required for visual search');
-    const [video, info] = await Promise.all([readFile(input.videoPath), stat(input.videoPath)]);
-    videoBytes = info.size;
-    parts.push({
-      type: 'video_url',
-      video_url: { url: `data:video/mp4;base64,${video.toString('base64')}` },
-    });
+    const video = await videoPartFromFile(input.videoPath);
+    videoBytes = video.bytes;
+    parts.push(video.part);
   }
 
   if (input.mode !== 'visual') {
@@ -151,15 +193,16 @@ async function buildContent(input: VideoSearchInput): Promise<{ parts: ContentPa
 }
 
 async function requestCompletion(
-  input: VideoSearchInput,
+  input: VideoModelRequest,
   policy: ReasoningPolicy = 'budgeted',
-): Promise<VideoSearchResult> {
-  const { parts, videoBytes } = await buildContent(input);
+): Promise<string> {
+  const { parts, videoBytes } = input;
+  const answerBudget = input.answerMaxTokens ?? env.OPENROUTER_VIDEO_MAX_TOKENS;
   const reasoningBudget = policy === 'off' ? 0 : env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS;
   const body = JSON.stringify({
     model: env.OPENROUTER_VIDEO_MODEL,
     messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: input.systemPrompt },
       { role: 'user', content: parts },
     ],
     // Deliberately the sum, not the answer budget alone, and the same ceiling
@@ -169,7 +212,7 @@ async function requestCompletion(
     // answering at all. Holding the ceiling fixed is also what makes the
     // no-thinking retry an improvement rather than a smaller second chance:
     // the whole allowance becomes available to the answer.
-    max_tokens: env.OPENROUTER_VIDEO_MAX_TOKENS + env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS,
+    max_tokens: answerBudget + env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS,
     temperature: env.OPENROUTER_VIDEO_TEMPERATURE,
     stream: false,
     // Bounded, not disabled.
@@ -223,6 +266,7 @@ async function requestCompletion(
       const responseBody = await response.text().catch(() => '');
       logger.warn('OpenRouter video request failed', {
         model: env.OPENROUTER_VIDEO_MODEL,
+        purpose: input.purpose,
         chunkIndex: input.chunkIndex,
         videoDurationSeconds: input.chunkDurationSeconds,
         videoBytes,
@@ -271,6 +315,7 @@ async function requestCompletion(
 
     logger.info('OpenRouter video request complete', {
       model: env.OPENROUTER_VIDEO_MODEL,
+      purpose: input.purpose,
       provider: payload.provider,
       chunkIndex: input.chunkIndex,
       videoDurationSeconds: input.chunkDurationSeconds,
@@ -345,12 +390,11 @@ async function requestCompletion(
         model: env.OPENROUTER_VIDEO_MODEL,
         chunkIndex: input.chunkIndex,
         answerChars: content.length,
-        maxTokens: env.OPENROUTER_VIDEO_MAX_TOKENS + env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS,
+        maxTokens: answerBudget + env.OPENROUTER_VIDEO_REASONING_MAX_TOKENS,
       });
     }
 
-    const parsed = parseModelMatches(content);
-    return { ...parsed, rawResponse: content };
+    return content;
   } finally {
     // Cleared only once the body has been read. Clearing it when headers
     // arrived left generation uncancellable: a model that never stopped
@@ -371,25 +415,30 @@ async function requestCompletion(
  * Deliberately one extra call, not a ladder. If a chunk cannot answer with its
  * entire budget available for answering, the problem is not the budget.
  */
-async function completeOrAnswerWithoutThinking(input: VideoSearchInput): Promise<VideoSearchResult> {
+async function completeOrAnswerWithoutThinking(input: VideoModelRequest): Promise<VideoModelAnswer> {
   try {
-    return await requestCompletion(input, 'budgeted');
+    return { content: await requestCompletion(input, 'budgeted'), reasoningDisabled: false };
   } catch (error) {
     if (!isExhaustedAnswer(error)) throw error;
 
     logger.warn('chunk ran out of room to answer; asking again without thinking', {
       model: env.OPENROUTER_VIDEO_MODEL,
+      purpose: input.purpose,
       chunkIndex: input.chunkIndex,
       reason: (error as Error).message,
     });
 
-    const result = await requestCompletion(input, 'off');
-    return { ...result, reasoningDisabled: true };
+    return { content: await requestCompletion(input, 'off'), reasoningDisabled: true };
   }
 }
 
-/** Searches one chunk with the single configured Qwen model; no fallback or escalation. */
-export async function searchVideoChunk(input: VideoSearchInput): Promise<VideoSearchResult> {
+/**
+ * Asks the single configured Qwen model one question about one chunk; no
+ * fallback and no escalation to another model. The semaphore is shared across
+ * every caller, so indexing a video cannot crowd out a search someone is
+ * waiting on beyond the configured concurrency.
+ */
+export async function askVideoModel(input: VideoModelRequest): Promise<VideoModelAnswer> {
   return limiter.run(async () => {
     let lastError: unknown;
     for (let attempt = 0; attempt <= env.OPENROUTER_MAX_RETRIES; attempt += 1) {
@@ -402,6 +451,7 @@ export async function searchVideoChunk(input: VideoSearchInput): Promise<VideoSe
         const delayMs = Math.min(30_000, 1_000 * 2 ** attempt);
         logger.warn('retrying OpenRouter video request', {
           model: env.OPENROUTER_VIDEO_MODEL,
+          purpose: input.purpose,
           chunkIndex: input.chunkIndex,
           attempt: attempt + 1,
           delayMs,
@@ -411,4 +461,26 @@ export async function searchVideoChunk(input: VideoSearchInput): Promise<VideoSe
     }
     throw lastError;
   });
+}
+
+/** Searches one chunk: builds the evidence, asks, then validates what came back. */
+export async function searchVideoChunk(input: VideoSearchInput): Promise<VideoSearchResult> {
+  const { parts, videoBytes } = await buildContent(input);
+
+  const answer = await askVideoModel({
+    chunkIndex: input.chunkIndex,
+    chunkDurationSeconds: input.chunkDurationSeconds,
+    systemPrompt: SYSTEM_PROMPT,
+    parts,
+    videoBytes,
+    purpose: 'search',
+    ...(input.onUsage ? { onUsage: input.onUsage } : {}),
+  });
+
+  const parsed = parseModelMatches(answer.content);
+  return {
+    ...parsed,
+    rawResponse: answer.content,
+    ...(answer.reasoningDisabled ? { reasoningDisabled: true } : {}),
+  };
 }
