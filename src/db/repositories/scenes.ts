@@ -70,12 +70,6 @@ export async function sceneProgress(videoId: string): Promise<{ count: number; r
   };
 }
 
-/** Replaces the whole scene index for a video; batched like the transcript. */
-export async function replaceScenes(videoId: string, scenes: NewVideoScene[]): Promise<number> {
-  await clearScenes(videoId);
-  return insertScenes(videoId, scenes, 0);
-}
-
 async function insertScenes(videoId: string, scenes: NewVideoScene[], sceneIndexOffset: number): Promise<number> {
   if (scenes.length === 0) return 0;
 
