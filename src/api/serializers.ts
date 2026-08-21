@@ -187,6 +187,14 @@ export function searchCoverage(request: ClipRequest): SearchCoverage {
   return {
     // A recovered chunk counts against completeness. Its matches are real, but
     // the search that ran there is not the search that was asked for.
+    //
+    // Deliberately about the FOOTAGE that was examined, not about how the
+    // question was answered. An answer from memory examined none, but it also
+    // has no gap to point at — and reporting it as incomplete would make the
+    // client offer to explain a stretch of unexamined video that does not
+    // exist. `answeredFrom` carries that distinction instead, which is the
+    // honest place for it: recalled and read are different acts, not different
+    // amounts of coverage.
     complete: request.chunksFailed === 0 && degraded.length === 0,
     // A failure recorded before failures carried a window is still a failure;
     // it just cannot say where. Callers must not read unsearchedSeconds: 0 as
@@ -207,14 +215,22 @@ function clipRequestProgress(request: ClipRequest): ClipRequestProgress {
     request.status === 'pending'
       ? 'Queued'
       : request.status === 'searching'
-        ? `Searched ${done} of ${total} segments`
+        ? // A question answered from memory reads no segments at all, so
+          // counting them would report 0 of 0 while it works.
+          total === 0
+          ? 'Checking what I remember about this video'
+          : `Searched ${done} of ${total} segments`
         : request.status === 'completed'
           ? // Never claim a whole video was searched when part of it was not.
             // "Search complete (10 segments)" after searching nine is the line
-            // that turns a coverage gap into an apparent absence.
-            request.chunksFailed > 0
-            ? `Searched ${request.chunksCompleted} of ${total} segments — ${request.chunksFailed} could not be examined`
-            : `Search complete (${total} segments)`
+            // that turns a coverage gap into an apparent absence. The same
+            // applies to answering from memory: no segment was read, and
+            // saying otherwise would dress a recollection up as a search.
+            request.answeredFrom === 'notes'
+            ? 'Answered from what I remember of this video'
+            : request.chunksFailed > 0
+              ? `Searched ${request.chunksCompleted} of ${total} segments — ${request.chunksFailed} could not be examined`
+              : `Search complete (${total} segments)`
           : (request.errorMessage ?? 'Search failed');
 
   return {
@@ -240,6 +256,13 @@ export async function serializeClipRequest(
     resolvedMode: request.resolvedMode,
     status: request.status,
     error: request.errorMessage,
+    /**
+     * Whether this was recalled or read. The notes are a summary written at
+     * upload, so an answer from them carries less weight than one from the
+     * footage — and a user who is about to conclude their video lacks
+     * something deserves to know which kind of answer they got.
+     */
+    answeredFrom: request.answeredFrom,
     progress: clipRequestProgress(request),
     // Surfaced so a partially failed search is visible rather than silent.
     failedChunks: request.chunkErrors.slice(0, 20),

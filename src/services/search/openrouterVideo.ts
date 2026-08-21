@@ -32,8 +32,12 @@ export interface VideoModelRequest {
    * more of it than naming a few matching moments does.
    */
   answerMaxTokens?: number;
-  /** What the call is for, so a slow index is not read as a slow search. */
-  purpose: 'search' | 'index';
+  /**
+   * What the call is for. Also picks the queue: a `notes` call carries no
+   * video and returns in seconds, so it must not wait behind an indexing run
+   * — the whole point of the notes is that answering from them is immediate.
+   */
+  purpose: 'search' | 'index' | 'notes';
   onUsage?: VideoUsageReporter;
 }
 
@@ -115,7 +119,13 @@ export interface VideoSearchResult {
  */
 type ReasoningPolicy = 'budgeted' | 'off';
 
-const limiter = new Semaphore(env.OPENROUTER_VIDEO_CONCURRENCY);
+const videoLimiter = new Semaphore(env.OPENROUTER_VIDEO_CONCURRENCY);
+/**
+ * Text-only calls get their own lane. They cost a fraction of a video call and
+ * finish in seconds; queueing them behind ten chunks of indexing would put the
+ * fast path behind the slow one and undo the reason for having notes at all.
+ */
+const textLimiter = new Semaphore(env.OPENROUTER_TEXT_CONCURRENCY);
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
 /**
@@ -439,6 +449,7 @@ async function completeOrAnswerWithoutThinking(input: VideoModelRequest): Promis
  * waiting on beyond the configured concurrency.
  */
 export async function askVideoModel(input: VideoModelRequest): Promise<VideoModelAnswer> {
+  const limiter = input.purpose === 'notes' ? textLimiter : videoLimiter;
   return limiter.run(async () => {
     let lastError: unknown;
     for (let attempt = 0; attempt <= env.OPENROUTER_MAX_RETRIES; attempt += 1) {

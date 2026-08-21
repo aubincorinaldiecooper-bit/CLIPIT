@@ -1,5 +1,6 @@
 import { queryOne, queryRows } from '../pool.js';
 import type {
+  AnsweredFrom,
   ChunkDegradation,
   ChunkError,
   ClipMatch,
@@ -26,6 +27,7 @@ interface ClipRequestRow {
   chunks_failed: number;
   chunk_errors: ChunkError[];
   chunk_degradations: ChunkDegradation[] | null;
+  answered_from: AnsweredFrom | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -46,6 +48,7 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     chunksFailed: row.chunks_failed,
     chunkDegradations: row.chunk_degradations ?? [],
     chunkErrors: row.chunk_errors ?? [],
+    answeredFrom: row.answered_from ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -132,11 +135,42 @@ export async function finishClipRequest(
   requestId: string,
   status: ClipRequestStatus,
   errorMessage: string | null = null,
+  answeredFrom: AnsweredFrom | null = null,
 ): Promise<void> {
   await queryOne(
-    `UPDATE clip_requests SET status = $2, error_message = $3, updated_at = now() WHERE id = $1`,
-    [requestId, status, errorMessage],
+    `UPDATE clip_requests
+        SET status = $2,
+            error_message = $3,
+            answered_from = COALESCE($4, answered_from),
+            updated_at = now()
+      WHERE id = $1`,
+    [requestId, status, errorMessage, answeredFrom],
   );
+}
+
+/**
+ * The question a correction refers to: the last one this person asked about
+ * this video before the correction itself.
+ *
+ * Scoped to the session, not just the video, because "are you sure?" refers to
+ * the answer THIS person was given — picking up someone else's question about
+ * the same video would silently search for something they never asked.
+ */
+export async function getPreviousClipRequest(input: {
+  videoId: string;
+  sessionId: string | null;
+  before: Date;
+}): Promise<ClipRequest | null> {
+  const row = await queryOne<ClipRequestRow>(
+    `SELECT * FROM clip_requests
+      WHERE video_id = $1
+        AND session_id IS NOT DISTINCT FROM $2
+        AND created_at < $3
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [input.videoId, input.sessionId, input.before],
+  );
+  return row ? mapRequest(row) : null;
 }
 
 interface ClipMatchRow {

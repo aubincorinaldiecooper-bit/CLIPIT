@@ -135,6 +135,20 @@ const envSchema = z.object({
    * in the notes that nothing downstream can see.
    */
   INDEX_ANSWER_MAX_TOKENS: int(3000, 512, 16_000),
+  /**
+   * How many notes lookups run at once. Higher than the video concurrency
+   * because these carry no video: they are a text prompt and a short answer.
+   */
+  OPENROUTER_TEXT_CONCURRENCY: int(8, 1, 32),
+  /**
+   * Notes sent to the model in one request. A long video's notes do not fit
+   * comfortably in a single prompt, and splitting them keeps every note in
+   * front of the model rather than truncating the tail of a long video —
+   * which would silently make the end of it unsearchable.
+   */
+  NOTES_PER_LOOKUP: int(250, 20, 2000),
+  /** Room for the answer to a notes lookup: a list of moments, nothing more. */
+  NOTES_ANSWER_MAX_TOKENS: int(1500, 256, 8192),
   OPENROUTER_VIDEO_TEMPERATURE: num(0.1, 0, 2),
   OPENROUTER_STT_MODEL: z.string().trim().default('openai/whisper-1'),
   /** Optional attribution headers OpenRouter uses for app ranking. */

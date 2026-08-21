@@ -10,17 +10,21 @@ import { attachThumbnails } from '../../services/media/thumbnails.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { UsageTally } from '../../services/usageTally.js';
 import { isContentFilterRejection, searchVideoChunk } from '../../services/search/openrouterVideo.js';
+import { searchNotes } from '../../services/search/noteSearch.js';
+import { isCorrection } from '../../services/search/rescanPolicy.js';
 import { assertVideoInputSupported } from '../../services/search/modelCapabilities.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
-import type { TranscriptLine } from '../../services/search/prompt.js';
+import type { NoteLine, TranscriptLine } from '../../services/search/prompt.js';
 import { mapGlobalRangeToChunk, mapLocalRangeToGlobal, mergeOverlappingRanges } from '../../services/timestamps.js';
 import { getVideo, listChunks } from '../../db/repositories/videos.js';
-import { listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
+import { listTranscriptSegments, listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
+import { listScenes } from '../../db/repositories/scenes.js';
 import {
   deleteMatches,
   finishClipRequest,
   getClipRequest,
+  getPreviousClipRequest,
   insertMatches,
   listMatches,
   recordChunkCompleted,
@@ -104,6 +108,45 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     const chunks = await listChunks(video.id);
     if (chunks.length === 0) throw new Error('Video has no analysis chunks');
 
+    /**
+     * A correction is not a new question.
+     *
+     * "Are you sure?" describes no moment, so searching it literally can only
+     * fail — and the failure is indistinguishable from the app ignoring the
+     * user. What it means is: your last answer was wrong. So the previous
+     * question is re-run, and it goes straight to the footage, because the
+     * notes have already had their turn and did not settle it.
+     */
+    let instruction = request.instruction;
+    let correcting = false;
+
+    if (isCorrection(instruction)) {
+      const previous = await getPreviousClipRequest({
+        videoId: request.videoId,
+        sessionId: request.sessionId,
+        before: request.createdAt,
+      });
+
+      if (!previous) {
+        // Nothing to look at again. Saying so is better than searching the
+        // video for the words "are you sure" and reporting an absence.
+        await finishClipRequest(
+          clipRequestId,
+          'failed',
+          'There is nothing to look at again yet — ask about a moment first.',
+        );
+        outcome = 'completed';
+        return;
+      }
+
+      instruction = previous.instruction;
+      correcting = true;
+      log.info('treating this as a correction rather than a new question', {
+        said: request.instruction,
+        lookingAgainFor: instruction,
+      });
+    }
+
     // Decide what to search. A transcript that is still being built is worth a
     // bounded wait, because falling back to visual-only silently would give the
     // user a worse answer for a spoken-word instruction.
@@ -111,7 +154,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     const transcriptReady = video.transcriptStatus === 'ready' && video.transcriptSegmentCount > 0;
 
     const desired = resolveSearchMode({
-      instruction: request.instruction,
+      instruction,
       requested: request.mode,
       transcriptAvailable: transcriptReady || transcriptPending,
     });
@@ -133,7 +176,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // Re-resolve now that waiting is over: the transcript may have failed, or
     // never arrived, in which case we search visually rather than not at all.
     const resolved = resolveSearchMode({
-      instruction: request.instruction,
+      instruction,
       requested: request.mode,
       transcriptAvailable: transcriptReady,
     });
@@ -142,8 +185,40 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       mode: resolved.mode,
       rationale: resolved.rationale,
       chunks: chunks.length,
-      instruction: request.instruction,
+      instruction,
+      ...(correcting ? { correctionOf: request.instruction } : {}),
     });
+
+    /**
+     * Memory first.
+     *
+     * The video was read once at upload; a question it can answer costs a
+     * second and a fraction of a cent instead of re-reading the whole video.
+     * Skipped when correcting, because the notes are what was just disputed.
+     *
+     * Finding nothing here is NOT an answer. The notes are what the indexer
+     * thought worth writing down, so their silence means "not mentioned", not
+     * "not present" — and the search falls through to the footage rather than
+     * reporting an absence it cannot vouch for.
+     */
+    if (!correcting && video.indexStatus === 'ready') {
+      const answered = await answerFromNotes({
+        clipRequestId,
+        video,
+        chunks,
+        instruction,
+        mode: resolved.mode,
+        tally,
+        log,
+      });
+
+      if (answered > 0) {
+        outcome = 'completed';
+        searchMode = resolved.mode;
+        chunkCount = 0;
+        return;
+      }
+    }
 
     // One cheap check before uploading megabytes per chunk: a model without
     // video endpoints refuses every chunk identically, and finding that out
@@ -151,6 +226,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     if (resolved.mode !== 'transcript') await assertVideoInputSupported();
 
     await startClipRequest(clipRequestId, { chunksTotal: chunks.length, resolvedMode: resolved.mode });
+    // Reading the footage is the only path that can report a real absence, so
+    // it is the only one that runs when the notes came up empty.
     // Clear anything from a previous attempt so a retry cannot double-insert.
     await deleteMatches(clipRequestId);
 
@@ -167,7 +244,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         const found = await searchSingleChunk({
           chunk,
           chunkCount: chunks.length,
-          instruction: request.instruction,
+          instruction,
           mode: resolved.mode,
           videoId: video.id,
           clipRequestId,
@@ -262,7 +339,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // After aggregation, because merging rewrites match rows and their ids.
       await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
 
-      await finishClipRequest(clipRequestId, 'completed');
+      await finishClipRequest(clipRequestId, 'completed', null, 'footage');
       const elapsedMs = Math.round(performance.now() - searchStartedAt);
 
       log.info('clip search complete', {
@@ -451,6 +528,130 @@ const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
   transcript: 'transcript',
   both: 'multimodal',
 };
+
+
+/**
+ * Answers from what was written down at upload, or reports that it cannot.
+ *
+ * Returns the number of moments found. Zero means the notes do not mention it
+ * — NOT that the video lacks it — and the caller must go to the footage before
+ * telling anyone otherwise.
+ */
+async function answerFromNotes(input: {
+  clipRequestId: string;
+  video: Video;
+  chunks: VideoChunk[];
+  instruction: string;
+  mode: ResolvedSearchMode;
+  tally: UsageTally;
+  log: Logger;
+}): Promise<number> {
+  const { clipRequestId, video, chunks, instruction, mode, tally, log } = input;
+  const startedAt = performance.now();
+
+  // Memory is both halves: what was seen, and what was said. A spoken question
+  // answered only from scene descriptions would be answered from the wrong
+  // evidence, so the transcript joins the notes whenever the question involves
+  // speech at all.
+  const scenes = await listScenes(video.id);
+  const speech = mode === 'visual' ? [] : await listTranscriptSegments(video.id);
+
+  const notes: NoteLine[] = [
+    ...scenes.map((scene) => ({
+      startSeconds: scene.startSeconds,
+      endSeconds: scene.endSeconds,
+      description: scene.description,
+      kind: 'seen' as const,
+    })),
+    ...speech.map((segment) => ({
+      startSeconds: segment.startSeconds,
+      endSeconds: segment.endSeconds,
+      description: `"${segment.text}"`,
+      kind: 'said' as const,
+    })),
+  ].sort((a, b) => a.startSeconds - b.startSeconds);
+
+  if (notes.length === 0) return 0;
+
+  await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
+  await deleteMatches(clipRequestId);
+
+  const result = await searchNotes({
+    instruction,
+    notes,
+    onUsage: (usage) => {
+      tally.add(usage);
+      void recordModelUsage({ ...usage, stage: 'search', videoId: video.id, clipRequestId });
+    },
+  });
+
+  if (result.warnings.length > 0) {
+    log.warn('notes lookup warnings', { warnings: result.warnings.slice(0, 5) });
+  }
+
+  // Notes carry source timestamps, so a match has to be placed back on the
+  // chunk grid the rest of the system stores matches against.
+  const found: NewClipMatch[] = [];
+  for (const match of result.matches) {
+    if (match.confidence < env.MIN_MATCH_CONFIDENCE) continue;
+
+    const chunk = chunks.find(
+      (candidate) => match.startSeconds >= candidate.globalStartSeconds && match.startSeconds < candidate.globalEndSeconds,
+    ) ?? chunks.at(-1);
+    if (!chunk) continue;
+
+    const local = mapGlobalRangeToChunk(
+      chunk,
+      { startSeconds: match.startSeconds, endSeconds: match.endSeconds },
+      { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
+    );
+    if (!local) continue;
+
+    found.push({
+      chunkId: chunk.id,
+      localStartSeconds: local.localStartSeconds,
+      localEndSeconds: local.localEndSeconds,
+      globalStartSeconds: local.globalStartSeconds,
+      globalEndSeconds: local.globalEndSeconds,
+      description: match.description,
+      confidence: match.confidence,
+      source: MATCH_SOURCE[mode],
+      quote: match.quote,
+    });
+  }
+
+  log.info('notes consulted', {
+    notes: notes.length,
+    scenes: scenes.length,
+    speech: speech.length,
+    lookups: result.lookups,
+    reported: result.matches.length,
+    kept: found.length,
+    elapsedMs: Math.round(performance.now() - startedAt),
+  });
+
+  // Nothing remembered. Left unfinished on purpose: the caller reads the video
+  // itself before anyone is told this video does not contain what they asked
+  // for.
+  if (found.length === 0) return 0;
+
+  await insertMatches(clipRequestId, found);
+  const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
+
+  await withWorkDir(`notes-${clipRequestId}`, async (dir) => {
+    await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
+  });
+
+  await finishClipRequest(clipRequestId, 'completed', null, 'notes');
+
+  log.info('answered from memory', {
+    matches: finalCount,
+    elapsedMs: Math.round(performance.now() - startedAt),
+    ...tally.summary(),
+  });
+
+  return finalCount;
+}
 
 async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClipMatch[]> {
   const { chunk } = input;

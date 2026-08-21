@@ -117,3 +117,59 @@ export function buildIndexInstruction(input: {
     'Describe this segment as scenes.',
   ].join('\n');
 }
+
+/**
+ * The prompt for answering from the notes rather than the footage.
+ *
+ * The notes are what the indexer thought worth writing down while watching,
+ * not a complete account of the video. Saying so in the prompt is the whole
+ * difference between "the notes do not mention it" and "the video does not
+ * contain it" — and only the first of those is something these notes can
+ * actually support.
+ */
+export const NOTES_SYSTEM_PROMPT = [
+  'You are answering a question about a video from notes taken while watching it.',
+  'You cannot see the video itself. Each note is timestamped, and marked either "seen" for what was on screen or "said" for what was spoken aloud.',
+  '',
+  'Rules:',
+  '- A "seen" note is a description of the picture. A "said" note is speech, quoted from the transcript. Match the instruction against whichever kind it is actually about.',
+  '- Timestamps are in SECONDS FROM THE START OF THE VIDEO. Report them on that same timeline.',
+  '- Report ONLY moments the notes actually support. Do not infer a moment from what would plausibly happen nearby.',
+  '- A moment must have end_seconds greater than start_seconds.',
+  '- confidence is how well the notes support this moment, from 0 to 1. Use a low number when a note is suggestive but not explicit.',
+  '- description is a terse label of at most 12 words, taken from what the notes say.',
+  '- If the notes do not describe anything matching the instruction, return an empty matches array.',
+  '- Returning nothing is a correct answer. The notes are a summary, and something present in the video may simply not have been written down — that is not your problem to solve by guessing.',
+  '- Return only the JSON. Do not explain your reasoning, before or after it.',
+  '',
+  'Respond with ONLY a JSON object in exactly this shape, and no other text:',
+  '{"matches":[{"start_seconds":812.5,"end_seconds":830.0,"description":"what happens","confidence":0.8}]}',
+].join('\n');
+
+export interface NoteLine {
+  /** Seconds from the start of the VIDEO, not of a chunk. */
+  startSeconds: number;
+  endSeconds: number;
+  description: string;
+  /**
+   * Where the note came from. Speech and picture are different evidence, and a
+   * question about one must not be answered from the other — "where do they
+   * say the price" cannot be settled by a description of the room.
+   */
+  kind: 'seen' | 'said';
+}
+
+export function buildNotesBlock(input: { instruction: string; notes: NoteLine[] }): string {
+  const lines = input.notes.map(
+    (note) => `[${note.startSeconds.toFixed(1)}-${note.endSeconds.toFixed(1)}] (${note.kind}) ${note.description}`,
+  );
+
+  return [
+    `USER INSTRUCTION: ${input.instruction}`,
+    '',
+    'NOTES FROM THE VIDEO:',
+    ...lines,
+    '',
+    'Which of these moments match the instruction?',
+  ].join('\n');
+}
