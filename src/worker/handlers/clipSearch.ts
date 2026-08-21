@@ -35,6 +35,7 @@ import {
   recordChunkCompleted,
   recordChunkDegraded,
   recordChunkFailure,
+  recordUncertainMatches,
   startClipRequest,
   type NewClipMatch,
 } from '../../db/repositories/clipRequests.js';
@@ -44,6 +45,7 @@ import type {
   ChunkFailureCode,
   MatchSource,
   ResolvedSearchMode,
+  UncertainMatch,
   Video,
   VideoChunk,
 } from '../../domain/types.js';
@@ -604,8 +606,20 @@ async function answerFromNotes(input: {
   // Notes carry source timestamps, so a match has to be placed back on the
   // chunk grid the rest of the system stores matches against.
   const found: NewClipMatch[] = [];
+  const uncertain: UncertainMatch[] = [];
+
   for (const match of result.matches) {
-    if (match.confidence < env.MIN_MATCH_CONFIDENCE) continue;
+    if (match.confidence < env.MIN_MATCH_CONFIDENCE) {
+      // Same rule as the footage path: a moment we found and discarded is
+      // mentioned, never silently turned into an absence.
+      uncertain.push({
+        globalStartSeconds: match.startSeconds,
+        globalEndSeconds: match.endSeconds,
+        confidence: match.confidence,
+        description: match.description,
+      });
+      continue;
+    }
 
     const chunk = chunks.find(
       (candidate) => match.startSeconds >= candidate.globalStartSeconds && match.startSeconds < candidate.globalEndSeconds,
@@ -631,6 +645,8 @@ async function answerFromNotes(input: {
       quote: match.quote,
     });
   }
+
+  if (uncertain.length > 0) await recordUncertainMatches(clipRequestId, uncertain);
 
   log.info('notes consulted', {
     notes: notes.length,
@@ -810,6 +826,26 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
   // a model problem.
   const belowConfidence = response.matches.filter((match) => match.confidence < env.MIN_MATCH_CONFIDENCE);
   if (belowConfidence.length > 0) {
+    // Recorded, not just logged. The log told US; the user was told nothing
+    // matched, which is indistinguishable from their video not containing it.
+    await recordUncertainMatches(
+      input.clipRequestId,
+      belowConfidence.flatMap((match) => {
+        const range = mapLocalRangeToGlobal(
+          chunk,
+          { startSeconds: match.startSeconds, endSeconds: match.endSeconds },
+          { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
+        );
+        if (!range) return [];
+        return [{
+          globalStartSeconds: range.globalStartSeconds,
+          globalEndSeconds: range.globalEndSeconds,
+          confidence: match.confidence,
+          description: match.description,
+        }];
+      }),
+    );
+
     input.log.warn('discarded low-confidence matches', {
       chunkIndex: chunk.chunkIndex,
       threshold: env.MIN_MATCH_CONFIDENCE,

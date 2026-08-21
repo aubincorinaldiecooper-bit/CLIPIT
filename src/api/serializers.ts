@@ -15,26 +15,39 @@ import type {
 
 export interface VideoProgress {
   stage: string;
-  percent: number;
   message: string;
 }
 
+/**
+ * What is happening to this video, in words.
+ *
+ * There is deliberately no percentage. Each stage used to carry one — 5, 20,
+ * 60, 100 — and not one of them was measured: the number jumped to 60 the
+ * instant the stage began and sat there for the whole job, however long the
+ * video was, which read as stuck rather than busy. Removing it rather than
+ * hiding it, because a client that trusts a made-up number is a client we
+ * misled, and the browser was not the only one that could read this.
+ *
+ * The wording is what a person would say. "Building the analysis proxy and
+ * chunks" describes our plumbing; nobody uploading a video knows or cares what
+ * a proxy is.
+ */
 function videoProgress(video: Video): VideoProgress {
   switch (video.status) {
     case 'pending_upload':
-      return { stage: 'pending_upload', percent: 0, message: 'Waiting for the upload to complete' };
+      return { stage: 'pending_upload', message: 'Waiting for the upload to finish' };
     case 'queued':
-      return { stage: 'queued', percent: 5, message: 'Queued for ingestion' };
+      return { stage: 'queued', message: 'Waiting to start' };
     case 'ingesting':
-      return { stage: 'ingesting', percent: 20, message: 'Fetching the source media' };
+      return { stage: 'ingesting', message: 'Fetching the video' };
     case 'preprocessing':
-      return { stage: 'preprocessing', percent: 60, message: 'Building the analysis proxy and chunks' };
+      return { stage: 'preprocessing', message: 'Getting the video ready' };
     case 'ready':
-      return { stage: 'ready', percent: 100, message: 'Ready for clip searches' };
+      return { stage: 'ready', message: 'Ready' };
     case 'failed':
-      return { stage: 'failed', percent: 0, message: video.errorMessage ?? 'Processing failed' };
+      return { stage: 'failed', message: video.errorMessage ?? 'Something went wrong with this video' };
     default:
-      return { stage: video.status, percent: 0, message: '' };
+      return { stage: video.status, message: '' };
   }
 }
 
@@ -263,6 +276,22 @@ export async function serializeClipRequest(
      * something deserves to know which kind of answer they got.
      */
     answeredFrom: request.answeredFrom,
+    /**
+     * Moments the model reported and our threshold discarded. Not results —
+     * they cannot be turned into clips and are not counted. They are here so
+     * an answer can say "I saw something at 04:12 I wasn't sure about" instead
+     * of reporting an absence we know to be untrue.
+     */
+    uncertain: request.uncertainMatches
+      .map((match) => ({
+        startSeconds: match.globalStartSeconds,
+        endSeconds: match.globalEndSeconds,
+        startTimecode: formatTimecode(match.globalStartSeconds),
+        endTimecode: formatTimecode(match.globalEndSeconds),
+        confidence: match.confidence,
+        description: match.description,
+      }))
+      .sort((a, b) => a.startSeconds - b.startSeconds),
     progress: clipRequestProgress(request),
     // Surfaced so a partially failed search is visible rather than silent.
     failedChunks: request.chunkErrors.slice(0, 20),

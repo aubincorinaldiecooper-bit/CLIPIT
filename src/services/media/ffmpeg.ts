@@ -4,7 +4,6 @@ import { env } from '../../config/env.js';
 import { run } from '../../lib/exec.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { logger } from '../../lib/logger.js';
-import { planFrameTimestamps } from '../timestamps.js';
 
 export interface ProbeResult {
   durationSeconds: number;
@@ -198,63 +197,6 @@ export async function splitIntoChunks(
   }
 
   return segments;
-}
-
-export interface ExtractedFrame {
-  /** Seconds from the start of the file the frame was taken from. */
-  localSeconds: number;
-  filePath: string;
-}
-
-/**
- * Samples evenly spaced frames from a chunk. Input seeking (`-ss` before `-i`)
- * keeps each extraction near-instant even late in a file.
- */
-export async function extractFrames(
-  inputPath: string,
-  durationSeconds: number,
-  frameCount: number,
-  outputDir: string,
-  maxWidth = 448,
-  jpegQuality = 4,
-): Promise<ExtractedFrame[]> {
-  const timestamps = planFrameTimestamps(durationSeconds, frameCount);
-
-  const results = await mapWithConcurrency(timestamps, 4, async (seconds, index) => {
-    const filePath = path.join(outputDir, `frame_${String(index).padStart(4, '0')}.jpg`);
-    await run(
-      env.FFMPEG_PATH,
-      [
-        '-hide_banner',
-        '-loglevel', 'error',
-        '-y',
-        '-ss', seconds.toFixed(3),
-        '-i', inputPath,
-        '-frames:v', '1',
-        '-vf', `scale='min(${maxWidth},iw)':-2`,
-        '-q:v', String(jpegQuality),
-        filePath,
-      ],
-      { timeoutMs: 120_000 },
-    );
-
-    // Seeking past the last decodable frame exits 0 without writing anything,
-    // so the file has to be confirmed rather than assumed — a missing frame
-    // would otherwise fail the whole chunk when it is read back for upload.
-    const info = await stat(filePath).catch(() => null);
-    if (!info || info.size === 0) {
-      throw new Error(`no frame was written at ${seconds.toFixed(3)}s`);
-    }
-
-    return { localSeconds: seconds, filePath } satisfies ExtractedFrame;
-  });
-
-  const frames: ExtractedFrame[] = [];
-  for (const [index, result] of results.entries()) {
-    if (result.status === 'fulfilled') frames.push(result.value);
-    else logger.warn('frame extraction failed', { index, seconds: timestamps[index], err: result.reason });
-  }
-  return frames;
 }
 
 /**

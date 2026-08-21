@@ -1,4 +1,4 @@
-import { mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { mkdir, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { run } from '../src/lib/exec.js';
@@ -7,7 +7,6 @@ import {
   cutClip,
   extractAudioSegments,
   extractFrameAt,
-  extractFrames,
   ffprobe,
   splitIntoChunks,
 } from '../src/services/media/ffmpeg.js';
@@ -83,25 +82,6 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(segments.at(-1)?.globalEndSeconds).toBeGreaterThanOrEqual(SOURCE_SECONDS - 1);
   }, 180_000);
 
-  it('writes every frame it reports', async () => {
-    // extractFrames must never report a frame it did not actually write:
-    // seeking past the last decodable frame exits 0 without producing a file.
-    const frameDir = path.join(dir, 'frames');
-    await mkdir(frameDir, { recursive: true });
-
-    const frames = await extractFrames(source, SOURCE_SECONDS, 6, frameDir);
-    const files = (await readdir(frameDir)).filter((file) => file.endsWith('.jpg'));
-
-    expect(frames.length).toBe(6);
-    expect(files).toHaveLength(frames.length);
-
-    for (const frame of frames) {
-      const info = await stat(frame.filePath);
-      expect(info.size).toBeGreaterThan(0);
-      expect(frame.localSeconds).toBeGreaterThan(0);
-      expect(frame.localSeconds).toBeLessThan(SOURCE_SECONDS);
-    }
-  }, 120_000);
 
   /**
    * A still stands in for a moment before its clip is cut, and both the search

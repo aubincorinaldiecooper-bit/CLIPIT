@@ -10,6 +10,7 @@ import type {
   MatchSource,
   ResolvedSearchMode,
   SearchMode,
+  UncertainMatch,
 } from '../../domain/types.js';
 
 interface ClipRequestRow {
@@ -28,6 +29,7 @@ interface ClipRequestRow {
   chunk_errors: ChunkError[];
   chunk_degradations: ChunkDegradation[] | null;
   answered_from: AnsweredFrom | null;
+  uncertain_matches: UncertainMatch[] | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -49,6 +51,7 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     chunkDegradations: row.chunk_degradations ?? [],
     chunkErrors: row.chunk_errors ?? [],
     answeredFrom: row.answered_from ?? null,
+    uncertainMatches: row.uncertain_matches ?? [],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -128,6 +131,35 @@ export async function recordChunkDegraded(requestId: string, degradation: ChunkD
             updated_at = now()
       WHERE id = $1`,
     [requestId, JSON.stringify([degradation])],
+  );
+}
+
+/**
+ * Records moments the threshold discarded, so the answer can mention them.
+ *
+ * Capped, and the cap is deliberate: this is a footnote to an answer, not a
+ * second result list. Five borderline moments is already more than anyone
+ * reads, and the log carries the full count.
+ */
+export async function recordUncertainMatches(
+  requestId: string,
+  matches: UncertainMatch[],
+): Promise<void> {
+  if (matches.length === 0) return;
+  await queryOne(
+    `UPDATE clip_requests
+        SET uncertain_matches = (
+              SELECT jsonb_agg(entry)
+                FROM (
+                  SELECT entry
+                    FROM jsonb_array_elements(uncertain_matches || $2::jsonb) AS entry
+                   ORDER BY (entry->>'confidence')::numeric DESC
+                   LIMIT 5
+                ) AS kept
+            ),
+            updated_at = now()
+      WHERE id = $1`,
+    [requestId, JSON.stringify(matches)],
   );
 }
 
