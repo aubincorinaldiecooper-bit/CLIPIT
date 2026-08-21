@@ -10,6 +10,7 @@ import { describeVideoChunk } from '../../services/search/sceneIndex.js';
 import { UsageTally } from '../../services/usageTally.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { replaceScenes, type NewVideoScene } from '../../db/repositories/scenes.js';
+import { findUncoveredRanges } from '../../services/timestamps.js';
 import { getVideo, listChunks, setIndexStatus } from '../../db/repositories/videos.js';
 import type { IndexingJob } from '../../queues/index.js';
 
@@ -50,6 +51,7 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
   try {
     const scenes: NewVideoScene[] = [];
     let failedChunks = 0;
+    let partialChunks = 0;
 
     await withWorkDir(`index-${videoId}`, async (dir) => {
       const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
@@ -96,10 +98,28 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
           });
         }
 
+        // A valid scene list can still leave most of a chunk undescribed — one
+        // 0-10s scene for a 120 second chunk parses perfectly. Left unsaid,
+        // those 110 seconds are indistinguishable from a stretch where nothing
+        // happened, and every later question about them would be answered from
+        // notes that never covered them.
+        const uncovered = findUncoveredRanges(result.scenes, chunk.durationSeconds);
+        const uncoveredSeconds = uncovered.reduce((sum, gap) => sum + (gap.endSeconds - gap.startSeconds), 0);
+        if (uncoveredSeconds > 0) {
+          partialChunks += 1;
+          log.warn('chunk was only partly described', {
+            chunkIndex: chunk.chunkIndex,
+            covers: `${chunk.globalStartSeconds.toFixed(0)}-${chunk.globalEndSeconds.toFixed(0)}s`,
+            uncoveredSeconds: Number(uncoveredSeconds.toFixed(1)),
+            ofSeconds: Number(chunk.durationSeconds.toFixed(1)),
+          });
+        }
+
         log.info('chunk read', {
           chunkIndex: chunk.chunkIndex,
           covers: `${chunk.globalStartSeconds.toFixed(0)}-${chunk.globalEndSeconds.toFixed(0)}s`,
           scenes: result.scenes.length,
+          uncoveredSeconds: Number(uncoveredSeconds.toFixed(1)),
         });
 
         return result.scenes.length;
@@ -131,9 +151,17 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
     // Partial notes are still notes, but the gap is recorded rather than
     // implied: a search must be able to tell "the notes say nothing about
     // that" from "part of this video was never read".
+    // Partial notes are still notes, but what is missing is named rather than
+    // implied. The search recomputes the holes from the scenes themselves, so
+    // this string is for a human reading the row, not a machine.
+    const unread = [
+      failedChunks > 0 ? `${failedChunks} of ${chunks.length} segments could not be read` : null,
+      partialChunks > 0 ? `${partialChunks} were only partly described` : null,
+    ].filter(Boolean).join('; ');
+
     await setIndexStatus(videoId, 'ready', {
       sceneCount: stored,
-      error: failedChunks > 0 ? `${failedChunks} of ${chunks.length} segments could not be read` : null,
+      error: unread || null,
     });
 
     // What reading this video cost, once, against what it saves every question
@@ -142,6 +170,7 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
       scenes: stored,
       chunks: chunks.length,
       failedChunks,
+      partialChunks,
       elapsedMs: Math.round(performance.now() - startedAt),
       ...tally.summary(),
     });

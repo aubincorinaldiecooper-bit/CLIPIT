@@ -146,8 +146,19 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       } else if (!probe.hasAudio) {
         await setTranscriptStatus(videoId, 'unavailable', { error: 'Source has no audio track' });
       } else {
-        await setTranscriptStatus(videoId, 'queued');
-        await enqueueTranscription({ videoId, captionsStorageKey: video.captionsStorageKey });
+        // Both follow-ups run AFTER the video is already searchable, so a queue
+        // that is momentarily unreachable must not reach the catch below and
+        // mark a fully processed video failed. Each records its own failure and
+        // leaves the video exactly as usable as it already is.
+        try {
+          await setTranscriptStatus(videoId, 'queued');
+          await enqueueTranscription({ videoId, captionsStorageKey: video.captionsStorageKey });
+        } catch (error) {
+          log.error('could not queue transcription', { err: error });
+          await setTranscriptStatus(videoId, 'failed', {
+            error: `Could not queue transcription: ${errorMessage(error)}`,
+          });
+        }
       }
 
       // 6. Read the video into notes, once, so questions can be answered from
@@ -157,8 +168,17 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       if (!env.INDEXING_ENABLED) {
         await setIndexStatus(videoId, 'unavailable', { error: 'Indexing is disabled' });
       } else {
-        await setIndexStatus(videoId, 'queued');
-        await enqueueIndexing({ videoId });
+        try {
+          await setIndexStatus(videoId, 'queued');
+          await enqueueIndexing({ videoId });
+        } catch (error) {
+          // The video stays searchable; questions simply read the footage
+          // until something queues this again.
+          log.error('could not queue indexing', { err: error });
+          await setIndexStatus(videoId, 'failed', {
+            error: `Could not queue indexing: ${errorMessage(error)}`,
+          });
+        }
       }
     });
   } catch (error) {

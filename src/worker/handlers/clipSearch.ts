@@ -16,7 +16,12 @@ import { assertVideoInputSupported } from '../../services/search/modelCapabiliti
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
 import type { NoteLine, TranscriptLine } from '../../services/search/prompt.js';
-import { mapGlobalRangeToChunk, mapLocalRangeToGlobal, mergeOverlappingRanges } from '../../services/timestamps.js';
+import {
+  findUncoveredRanges,
+  mapGlobalRangeToChunk,
+  mapLocalRangeToGlobal,
+  mergeOverlappingRanges,
+} from '../../services/timestamps.js';
 import { getVideo, listChunks } from '../../db/repositories/videos.js';
 import { listTranscriptSegments, listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
 import { listScenes } from '../../db/repositories/scenes.js';
@@ -523,6 +528,13 @@ interface SearchSingleChunkInput {
   log: Logger;
 }
 
+/**
+ * A hole in the notes shorter than this is not worth telling anyone about —
+ * it is the rounding between one scene ending and the next beginning, not a
+ * stretch of video nobody described.
+ */
+const NOTES_GAP_TOLERANCE_SECONDS = 5;
+
 const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
   visual: 'visual',
   transcript: 'transcript',
@@ -634,6 +646,52 @@ async function answerFromNotes(input: {
   // itself before anyone is told this video does not contain what they asked
   // for.
   if (found.length === 0) return 0;
+
+  /**
+   * Name the stretches the notes never covered.
+   *
+   * A scene list can be perfectly valid and still leave a chunk half
+   * described, and a chunk that failed at index time leaves its whole window
+   * missing. Answering from notes with holes in them, and presenting the
+   * result as the complete set of moments, is the same untruth as reporting an
+   * unsearched chunk as searched — the user cannot tell a stretch nobody read
+   * from a stretch containing nothing.
+   *
+   * These are reported through the existing coverage channel, so they appear
+   * on screen exactly like any other unexamined window, and "look again"
+   * escalates to reading the footage.
+   */
+  const duration = video.durationSeconds ?? chunks.at(-1)?.globalEndSeconds ?? 0;
+  const unread = findUncoveredRanges(
+    scenes.map((scene) => ({ startSeconds: scene.startSeconds, endSeconds: scene.endSeconds })),
+    duration,
+    NOTES_GAP_TOLERANCE_SECONDS,
+  );
+
+  for (const gap of unread) {
+    // The chunk the gap starts in, only so the record has the same shape as a
+    // failed chunk. A gap can span several; the window is what matters, and it
+    // is carried whole.
+    const where =
+      chunks.find((chunk) => gap.startSeconds >= chunk.globalStartSeconds && gap.startSeconds < chunk.globalEndSeconds)
+      ?? chunks.at(-1)!;
+
+    await recordChunkFailure(clipRequestId, {
+      chunkIndex: where.chunkIndex,
+      chunkId: where.id,
+      message: 'This stretch is not described in the notes taken at upload',
+      code: 'not_in_notes',
+      globalStartSeconds: gap.startSeconds,
+      globalEndSeconds: gap.endSeconds,
+    });
+  }
+
+  if (unread.length > 0) {
+    log.warn('answered from notes that do not cover the whole video', {
+      gaps: unread.length,
+      unreadSeconds: Number(unread.reduce((sum, gap) => sum + (gap.endSeconds - gap.startSeconds), 0).toFixed(1)),
+    });
+  }
 
   await insertMatches(clipRequestId, found);
   const finalCount = await aggregateStoredMatches(clipRequestId, chunks);

@@ -150,6 +150,13 @@ export interface ClipRequest {
  * timeout or transport failure is worth another attempt.
  */
 export type ChunkFailureCode =
+  /**
+   * Not a failure of this search at all: the stretch was never described when
+   * the video was read at upload, so an answer from the notes cannot speak for
+   * it. Reported the same way as an unsearched chunk because it means the same
+   * thing to the person reading it — nobody looked there.
+   */
+  | 'not_in_notes'
   | 'provider_content_filter'
   | 'provider_error'
   | 'timeout'

@@ -237,3 +237,48 @@ export function formatTimecode(totalSeconds: number): string {
   const pad = (value: number) => String(value).padStart(2, '0');
   return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
 }
+
+/**
+ * The stretches of [0, totalSeconds) that no range covers.
+ *
+ * Written for the notes: a scene list can be perfectly valid and still leave
+ * ninety seconds of a chunk undescribed, and nothing downstream could tell
+ * that hole apart from a stretch where nothing relevant happened. Naming the
+ * uncovered seconds is what turns "the notes do not mention it" into a
+ * statement about the notes rather than about the video.
+ *
+ * `toleranceSeconds` absorbs the rounding between adjacent ranges; a gap
+ * shorter than it is not worth reporting to anyone.
+ */
+export function findUncoveredRanges(
+  covered: TimeRange[],
+  totalSeconds: number,
+  toleranceSeconds = 1,
+): TimeRange[] {
+  if (totalSeconds <= 0) return [];
+  if (covered.length === 0) return [{ startSeconds: 0, endSeconds: round(totalSeconds) }];
+
+  const merged = mergeOverlappingRanges(
+    covered.map((range) => ({
+      startSeconds: Math.max(0, range.startSeconds),
+      endSeconds: Math.min(totalSeconds, range.endSeconds),
+    })),
+    toleranceSeconds,
+  );
+
+  const gaps: TimeRange[] = [];
+  let cursor = 0;
+
+  for (const range of merged) {
+    if (range.startSeconds - cursor > toleranceSeconds) {
+      gaps.push({ startSeconds: round(cursor), endSeconds: round(range.startSeconds) });
+    }
+    cursor = Math.max(cursor, range.endSeconds);
+  }
+
+  if (totalSeconds - cursor > toleranceSeconds) {
+    gaps.push({ startSeconds: round(cursor), endSeconds: round(totalSeconds) });
+  }
+
+  return gaps;
+}
