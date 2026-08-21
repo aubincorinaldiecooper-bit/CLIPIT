@@ -89,6 +89,11 @@ export interface Video {
    */
   footageExpiredAt: Date | null;
   indexStatus: IndexStatus;
+  /**
+   * How far into the video the notes reach, in seconds. Zero unless the video
+   * was loaded with `getVideoWithReadProgress`.
+   */
+  indexReadThroughSeconds: number;
   indexError: string | null;
   sceneCount: number;
   createdAt: Date;

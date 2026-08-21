@@ -130,6 +130,17 @@ const envSchema = z.object({
    */
   INDEXING_ENABLED: bool(true),
   /**
+   * How many chunks are read at once at upload. Separate from the search
+   * concurrency because the two are answering different questions: a search is
+   * someone waiting, an upload read is work nobody is watching yet.
+   *
+   * Measured: ten chunks at four took 130 seconds — three rounds of about
+   * forty-five. At eight it is two rounds. Raise further only against a real
+   * upload; the ceiling is the provider's rate limit, and hitting it turns
+   * into retries that make the read slower, not faster.
+   */
+  INDEXING_CONCURRENCY: int(8, 1, 24),
+  /**
    * How long a question waits for the video to finish being read.
    *
    * Measured: reading a 20-minute video takes about 130 seconds, and searching

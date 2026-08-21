@@ -76,6 +76,8 @@ function mapVideo(row: VideoRow): Video {
     transcriptSegmentCount: row.transcript_segment_count,
     footageExpiredAt: row.footage_expired_at ?? null,
     indexStatus: row.index_status,
+    // Filled by getVideoWithReadProgress; zero unless it was asked for.
+    indexReadThroughSeconds: 0,
     indexError: row.index_error,
     sceneCount: row.scene_count,
     createdAt: row.created_at,
@@ -111,6 +113,29 @@ export async function createVideo(input: CreateVideoInput): Promise<Video> {
     ],
   );
   return mapVideo(row!);
+}
+
+/**
+ * A video with how far its notes reach.
+ *
+ * Kept as a separate read rather than a column: the furthest second the notes
+ * describe is derivable from the notes themselves, and a duplicate of it in
+ * `videos` is one more thing that can disagree with the truth.
+ */
+export async function getVideoWithReadProgress(videoId: string): Promise<Video | null> {
+  const video = await getVideo(videoId);
+  if (!video) return null;
+
+  const row = await queryOne<{ read_through: number | null }>(
+    'SELECT MAX(end_seconds) AS read_through FROM video_scenes WHERE video_id = $1',
+    [videoId],
+  );
+  return {
+    ...video,
+    indexReadThroughSeconds: row?.read_through === null || row?.read_through === undefined
+      ? 0
+      : Number(row.read_through),
+  };
 }
 
 export async function getVideo(videoId: string): Promise<Video | null> {

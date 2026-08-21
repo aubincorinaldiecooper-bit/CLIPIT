@@ -82,6 +82,15 @@ export function serializeVideo(video: Video, chunks?: VideoChunk[]) {
     index: {
       status: video.indexStatus,
       sceneCount: video.sceneCount,
+      /**
+       * How far into the video the notes reach, in seconds. Measured, and it
+       * moves: notes are written chunk by chunk, so this climbs while the read
+       * is running. It is what lets a screen say "read 8 of 20 minutes"
+       * without anybody inventing a percentage.
+       */
+      readThroughSeconds: video.indexReadThroughSeconds,
+      readThroughTimecode:
+        video.indexReadThroughSeconds > 0 ? formatTimecode(video.indexReadThroughSeconds) : null,
       error: video.indexError,
     },
     createdAt: video.createdAt.toISOString(),

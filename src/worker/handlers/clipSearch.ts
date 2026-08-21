@@ -24,7 +24,7 @@ import {
 } from '../../services/timestamps.js';
 import { getVideo, listChunks } from '../../db/repositories/videos.js';
 import { listTranscriptSegments, listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
-import { listScenes } from '../../db/repositories/scenes.js';
+import { listScenes, sceneProgress } from '../../db/repositories/scenes.js';
 import {
   deleteMatches,
   finishClipRequest,
@@ -189,10 +189,47 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     const indexPending =
       video.indexStatus === 'pending' || video.indexStatus === 'queued' || video.indexStatus === 'running';
 
+    /**
+     * Notes are written chunk by chunk, so a read in progress still has some.
+     * Try them: a question about the first five minutes can be answered while
+     * the last five are still being read, and the part not yet read is named
+     * in the answer rather than passed off as searched.
+     *
+     * Only if that finds nothing do we wait — and waiting beats falling
+     * through to the footage, which costs about the same time and fifty times
+     * the money for an answer the notes are about to be able to give.
+     */
     if (!correcting && indexPending && waitedMs < env.INDEX_WAIT_TIMEOUT_MS) {
+      const readSoFar = await sceneProgress(video.id);
+
+      if (readSoFar.count > 0) {
+        const answered = await answerFromNotes({
+          clipRequestId,
+          video,
+          chunks,
+          instruction,
+          mode: desired.mode,
+          tally,
+          log,
+        });
+
+        if (answered > 0) {
+          log.info('answered from the part read so far', {
+            readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
+            ofSeconds: Math.round(video.durationSeconds ?? 0),
+          });
+          outcome = 'completed';
+          searchMode = desired.mode;
+          chunkCount = 0;
+          return;
+        }
+      }
+
       log.info('waiting for the video to finish being read', {
         waitedMs,
         indexStatus: video.indexStatus,
+        readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
+        scenesSoFar: readSoFar.count,
       });
       await enqueueClipSearch(
         { clipRequestId, waitedMs: waitedMs + env.INDEX_WAIT_POLL_MS },
