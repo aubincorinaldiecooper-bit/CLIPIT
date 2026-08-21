@@ -57,7 +57,10 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
     let partialChunks = 0;
 
     await withWorkDir(`index-${videoId}`, async (dir) => {
-      const results = await mapWithConcurrency(chunks, env.INDEXING_CONCURRENCY, async (chunk) => {
+      // The real gate is the semaphore inside the video client, which every
+      // call carrying video passes through. Matching it here just avoids
+      // spawning workers that would only queue behind it.
+      const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
         const chunkPath = path.join(dir, `chunk-${chunk.chunkIndex}.mp4`);
         await getStorage().downloadToFile(chunk.storageKey, chunkPath);
 
