@@ -204,6 +204,14 @@ const envSchema = z.object({
   RETENTION_SWEEP_ENABLED: bool(true),
   RETENTION_SWEEP_INTERVAL_MS: int(3_600_000, 60_000, 86_400_000),
   RETENTION_VIDEO_LIMIT: int(50, 1, 500),
+  /**
+   * The daily summary of what people asked and whether we could answer it.
+   * Footage is deleted when a session ends, so this is the form the learning
+   * takes — see docs/learning-loop.md.
+   */
+  LEARNING_REPORT_ENABLED: bool(true),
+  LEARNING_REPORT_INTERVAL_MS: int(86_400_000, 60_000, 604_800_000),
+  LEARNING_REPORT_HOURS: int(24, 1, 720),
   THUMBNAIL_BACKFILL_ON_START: bool(true),
   THUMBNAIL_BACKFILL_VIDEO_LIMIT: int(25, 1, 500),
   PROXY_HEIGHT: int(360, 144, 1080),

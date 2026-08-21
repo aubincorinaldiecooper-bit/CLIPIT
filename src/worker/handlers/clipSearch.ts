@@ -35,6 +35,7 @@ import {
   recordChunkCompleted,
   recordChunkDegraded,
   recordChunkFailure,
+  recordSearchApproach,
   recordUncertainMatches,
   startClipRequest,
   type NewClipMatch,
@@ -148,6 +149,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
       instruction = previous.instruction;
       correcting = true;
+      // The strongest signal there is — a person saying our answer was wrong.
+      // Stored so it survives the footage and can be counted later.
+      await recordSearchApproach(clipRequestId, { notesConsulted: false, correctionOf: previous.id });
       log.info('treating this as a correction rather than a new question', {
         said: request.instruction,
         lookingAgainFor: instruction,
@@ -208,7 +212,14 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
      * "not present" — and the search falls through to the footage rather than
      * reporting an absence it cannot vouch for.
      */
-    if (!correcting && video.indexStatus === 'ready') {
+    // Recorded whether or not the notes are consulted, because the two cases
+    // answer different questions later: notes read and silent says reading at
+    // upload is not covering what people ask, while no notes at all says
+    // nothing about the reading and everything about the video's age.
+    const notesAvailable = !correcting && video.indexStatus === 'ready';
+    if (!correcting) await recordSearchApproach(clipRequestId, { notesConsulted: notesAvailable });
+
+    if (notesAvailable) {
       const answered = await answerFromNotes({
         clipRequestId,
         video,

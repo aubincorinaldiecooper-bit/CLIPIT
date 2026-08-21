@@ -5,7 +5,13 @@ import { logger } from '../lib/logger.js';
 import { closePool } from '../db/pool.js';
 import { runMigrations } from '../db/migrate.js';
 import { closeRedis, getWorkerConnection } from '../queues/connection.js';
-import { closeQueues, enqueueRetentionSweep, enqueueThumbnailBackfill, QUEUE_NAMES } from '../queues/index.js';
+import {
+  closeQueues,
+  enqueueLearningReport,
+  enqueueRetentionSweep,
+  enqueueThumbnailBackfill,
+  QUEUE_NAMES,
+} from '../queues/index.js';
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
 import { handleIngestion } from './handlers/ingestion.js';
@@ -16,6 +22,7 @@ import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
 import { handleThumbnailBackfill } from './handlers/thumbnailBackfill.js';
 import { handleRetention } from './handlers/retention.js';
+import { handleLearningReport } from './handlers/learningReport.js';
 
 /**
  * Worker entrypoint. All long-running work — downloading, transcoding,
@@ -115,6 +122,7 @@ async function main(): Promise<void> {
   // from a search or a clip someone is waiting on.
   startWorker(QUEUE_NAMES.thumbnailBackfill, handleThumbnailBackfill, 1);
   startWorker(QUEUE_NAMES.retention, handleRetention, 1);
+  startWorker(QUEUE_NAMES.learningReport, handleLearningReport, 1);
 
   logger.info('worker ready', { queues: Object.values(QUEUE_NAMES) });
 
@@ -144,6 +152,21 @@ async function main(): Promise<void> {
     sweep();
     const timer = setInterval(sweep, env.RETENTION_SWEEP_INTERVAL_MS);
     // Never hold the process open for a sweep that can run after a restart.
+    timer.unref();
+  }
+
+  /**
+   * What the last day taught us, once a day. Footage is deleted when a session
+   * ends, so this is the form the learning takes — see docs/learning-loop.md.
+   */
+  if (env.LEARNING_REPORT_ENABLED) {
+    const report = () => {
+      void enqueueLearningReport(new Date().toISOString()).catch((error: unknown) => {
+        logger.warn('could not queue the learning report', { err: error });
+      });
+    };
+    report();
+    const timer = setInterval(report, env.LEARNING_REPORT_INTERVAL_MS);
     timer.unref();
   }
 }
