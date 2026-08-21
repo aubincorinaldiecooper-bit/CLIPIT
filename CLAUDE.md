@@ -1,5 +1,30 @@
 # Working rules for this repository
 
+## Explain in plain English, always
+
+Every summary, explanation, and status update is written for someone who is
+not reading the code. This is a standing rule, not a per-message request — it
+was asked for three times before it was written down here.
+
+What that means in practice:
+
+- **Say what it means for the person using the app**, before anything about
+  how the code does it. "Ask a question and it answers in a second instead of
+  two minutes" comes before any mention of a cache, a queue, or a schema.
+- **Short sentences. Ordinary words.** If a term only makes sense to someone
+  who has read this repository — coverage channel, serializer, escalate,
+  P1, chunk grid, fall through — either replace it or explain it in the same
+  breath, once.
+- **Name the problem in the world, not in the file.** "It said your video had
+  nothing at 16 minutes when it had never looked there" is the point.
+  "`chunkErrors` was not persisted" is the mechanism, and it comes second, if
+  at all.
+- **No status-report voice.** Do not list what was touched. Say what changed
+  and what it fixes.
+
+Commit messages, pull request descriptions, and code comments are the place
+for precision and detail. Chat is the place for being understood.
+
 ## Ask before changing direction
 
 **Never change the product's direction as a side effect of another change.** If
