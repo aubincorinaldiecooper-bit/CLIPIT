@@ -22,6 +22,16 @@ export type ResolvedSearchMode = 'visual' | 'transcript' | 'both';
 export type MatchSource = 'visual' | 'transcript' | 'multimodal';
 
 /**
+ * Whether a question was answered from the notes taken at upload, or by
+ * reading the footage again.
+ *
+ * Not a performance detail. The notes are a summary, so "the notes do not
+ * mention it" is a weaker statement than "the video does not contain it", and
+ * only one of the two paths can make the stronger claim.
+ */
+export type AnsweredFrom = 'notes' | 'footage';
+
+/**
  * What a person thought of a match.
  *
  * Confidence is the model's opinion of its own answer; this is the only thing
@@ -129,6 +139,7 @@ export interface ClipRequest {
   chunksFailed: number;
   chunkErrors: ChunkError[];
   chunkDegradations: ChunkDegradation[];
+  answeredFrom: AnsweredFrom | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -139,6 +150,13 @@ export interface ClipRequest {
  * timeout or transport failure is worth another attempt.
  */
 export type ChunkFailureCode =
+  /**
+   * Not a failure of this search at all: the stretch was never described when
+   * the video was read at upload, so an answer from the notes cannot speak for
+   * it. Reported the same way as an unsearched chunk because it means the same
+   * thing to the person reading it — nobody looked there.
+   */
+  | 'not_in_notes'
   | 'provider_content_filter'
   | 'provider_error'
   | 'timeout'

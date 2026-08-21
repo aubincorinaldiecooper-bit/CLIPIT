@@ -78,6 +78,15 @@ export async function listTranscriptSegmentsInRange(
   return rows.map(mapSegment);
 }
 
+/** Every segment, in order. Used when the whole transcript is the evidence. */
+export async function listTranscriptSegments(videoId: string): Promise<TranscriptSegment[]> {
+  const rows = await queryRows<SegmentRow>(
+    'SELECT * FROM transcript_segments WHERE video_id = $1 ORDER BY start_seconds ASC',
+    [videoId],
+  );
+  return rows.map(mapSegment);
+}
+
 export async function countTranscriptSegments(videoId: string): Promise<number> {
   const row = await queryOne<{ count: number }>(
     'SELECT COUNT(*)::int AS count FROM transcript_segments WHERE video_id = $1',

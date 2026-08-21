@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applyClipPadding,
   chunkDuration,
+  findUncoveredRanges,
   formatTimecode,
   mapGlobalRangeToChunk,
   mapLocalRangeToGlobal,
@@ -317,5 +318,81 @@ describe('chunkDuration and formatTimecode', () => {
     expect(formatTimecode(61.9)).toBe('00:01:01');
     expect(formatTimecode(3661)).toBe('01:01:01');
     expect(formatTimecode(-5)).toBe('00:00:00');
+  });
+});
+
+/**
+ * A scene list can be perfectly valid and still leave most of a chunk
+ * undescribed — one 0-10s scene for a 120 second chunk parses without a
+ * complaint. Those 110 seconds are then indistinguishable from a stretch
+ * where nothing happened, and every question answered from the notes speaks
+ * for a video it only partly read.
+ */
+describe('finding what the notes never covered', () => {
+  it('reports nothing when the ranges cover the whole span', () => {
+    expect(
+      findUncoveredRanges([
+        { startSeconds: 0, endSeconds: 60 },
+        { startSeconds: 60, endSeconds: 120 },
+      ], 120),
+    ).toEqual([]);
+  });
+
+  it('finds the stretch after a scene list that stops early', () => {
+    expect(findUncoveredRanges([{ startSeconds: 0, endSeconds: 10 }], 120)).toEqual([
+      { startSeconds: 10, endSeconds: 120 },
+    ]);
+  });
+
+  it('finds a hole in the middle', () => {
+    expect(
+      findUncoveredRanges([
+        { startSeconds: 0, endSeconds: 30 },
+        { startSeconds: 90, endSeconds: 120 },
+      ], 120),
+    ).toEqual([{ startSeconds: 30, endSeconds: 90 }]);
+  });
+
+  it('finds a stretch before the first scene', () => {
+    expect(findUncoveredRanges([{ startSeconds: 45, endSeconds: 120 }], 120)).toEqual([
+      { startSeconds: 0, endSeconds: 45 },
+    ]);
+  });
+
+  it('treats no ranges at all as nothing covered', () => {
+    expect(findUncoveredRanges([], 120)).toEqual([{ startSeconds: 0, endSeconds: 120 }]);
+  });
+
+  /**
+   * Scenes butt up against each other with a rounding error between them. A
+   * half-second seam is not a stretch of video nobody described, and reporting
+   * it would bury a real gap in noise.
+   */
+  it('ignores a seam between adjacent scenes', () => {
+    expect(
+      findUncoveredRanges([
+        { startSeconds: 0, endSeconds: 59.6 },
+        { startSeconds: 60.1, endSeconds: 120 },
+      ], 120, 1),
+    ).toEqual([]);
+  });
+
+  it('still reports a gap larger than the tolerance', () => {
+    expect(
+      findUncoveredRanges([
+        { startSeconds: 0, endSeconds: 50 },
+        { startSeconds: 62, endSeconds: 120 },
+      ], 120, 1),
+    ).toEqual([{ startSeconds: 50, endSeconds: 62 }]);
+  });
+
+  it('handles overlapping and unsorted scenes', () => {
+    expect(
+      findUncoveredRanges([
+        { startSeconds: 80, endSeconds: 120 },
+        { startSeconds: 0, endSeconds: 50 },
+        { startSeconds: 20, endSeconds: 70 },
+      ], 120),
+    ).toEqual([{ startSeconds: 70, endSeconds: 80 }]);
   });
 });
