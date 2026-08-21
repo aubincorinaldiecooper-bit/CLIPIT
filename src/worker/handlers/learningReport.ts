@@ -2,6 +2,7 @@ import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
 import { summariseLearning } from '../../db/repositories/clipRequests.js';
+import { summarisePerformance } from '../../db/repositories/performance.js';
 import type { LearningReportJob } from '../../queues/index.js';
 
 /**
@@ -20,6 +21,45 @@ import type { LearningReportJob } from '../../queues/index.js';
 export async function handleLearningReport(job: Job<LearningReportJob>): Promise<void> {
   const log = logger.child({ job: 'learning-report', jobId: job.id });
   const summary = await summariseLearning(env.LEARNING_REPORT_HOURS);
+
+  /**
+   * How it actually performed, from rows written as the work happened.
+   *
+   * Separate from the learning numbers on purpose. That half is about whether
+   * the answers are any good; this half is about how long people waited and
+   * what it cost, and it exists because a claim about speed went unchallenged
+   * for hours — nothing in the system could contradict it.
+   */
+  const performance = await summarisePerformance(env.LEARNING_REPORT_HOURS);
+
+  for (const path of performance.answers) {
+    log.info('how questions were answered', {
+      hours: performance.hours,
+      // 'notes' means recalled; 'footage' means the video was re-read.
+      from: path.answeredFrom,
+      answers: path.answers,
+      // What the person waited, from asking to being answered.
+      medianSeconds: path.medianSeconds,
+      p95Seconds: path.p95Seconds,
+      medianCostUsd: path.medianCostUsd,
+      totalCostUsd: path.totalCostUsd,
+    });
+  }
+
+  if (performance.reads.reads > 0) {
+    log.info('how reading videos performed', {
+      hours: performance.hours,
+      reads: performance.reads.reads,
+      medianSeconds: performance.reads.medianSeconds,
+      p95Seconds: performance.reads.p95Seconds,
+      medianCostUsd: performance.reads.medianCostUsd,
+      totalCostUsd: performance.reads.totalCostUsd,
+      // Seconds of video read per second of waiting. This is the number that
+      // says whether a change to concurrency, chunk size or the model helped:
+      // it is independent of how long the videos happened to be.
+      medianSecondsOfVideoPerSecond: performance.reads.medianSecondsOfVideoPerSecond,
+    });
+  }
 
   const answered = summary.answeredFromNotes + summary.answeredFromFootage;
   if (answered === 0 && summary.approved + summary.rejected === 0) {

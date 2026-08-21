@@ -283,16 +283,17 @@ export async function markFootageExpired(videoId: string): Promise<void> {
 export async function setIndexStatus(
   videoId: string,
   status: IndexStatus,
-  options: { error?: string | null; sceneCount?: number } = {},
+  options: { error?: string | null; sceneCount?: number; indexMs?: number } = {},
 ): Promise<void> {
   await queryOne(
     `UPDATE videos
         SET index_status = $2,
             index_error = $3,
             scene_count = COALESCE($4, scene_count),
+            index_ms = COALESCE($5, index_ms),
             updated_at = now()
       WHERE id = $1`,
-    [videoId, status, options.error ?? null, options.sceneCount ?? null],
+    [videoId, status, options.error ?? null, options.sceneCount ?? null, options.indexMs ?? null],
   );
 }
 
