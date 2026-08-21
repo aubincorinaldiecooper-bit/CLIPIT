@@ -211,6 +211,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           mode: desired.mode,
           tally,
           log,
+          readComplete: false,
         });
 
         if (answered > 0) {
@@ -294,6 +295,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         mode: resolved.mode,
         tally,
         log,
+        readComplete: true,
       });
 
       if (answered > 0) {
@@ -636,8 +638,14 @@ async function answerFromNotes(input: {
   mode: ResolvedSearchMode;
   tally: UsageTally;
   log: Logger;
+  /**
+   * False while the video is still being read. What is missing from the notes
+   * is then a stretch not reached yet, not a stretch that failed — and the two
+   * must not be reported in the same words.
+   */
+  readComplete: boolean;
 }): Promise<number> {
-  const { clipRequestId, video, chunks, instruction, mode, tally, log } = input;
+  const { clipRequestId, video, chunks, instruction, mode, tally, log, readComplete } = input;
   const startedAt = performance.now();
 
   // Memory is both halves: what was seen, and what was said. A spoken question
@@ -776,8 +784,10 @@ async function answerFromNotes(input: {
     await recordChunkFailure(clipRequestId, {
       chunkIndex: where.chunkIndex,
       chunkId: where.id,
-      message: 'This stretch is not described in the notes taken at upload',
-      code: 'not_in_notes',
+      message: readComplete
+        ? 'This stretch is not described in the notes taken at upload'
+        : 'This stretch had not been watched yet when the question was asked',
+      code: readComplete ? 'not_in_notes' : 'not_read_yet',
       globalStartSeconds: gap.startSeconds,
       globalEndSeconds: gap.endSeconds,
     });

@@ -168,6 +168,14 @@ export type ChunkFailureCode =
    * thing to the person reading it — nobody looked there.
    */
   | 'not_in_notes'
+  /**
+   * Not a failure at all: when this question was asked, the video had not been
+   * read that far yet. Distinct from `not_in_notes`, which means the read
+   * finished and that stretch is missing from it — one resolves itself in a
+   * minute, the other never will, and telling a person "I couldn't look there"
+   * about the first is simply untrue.
+   */
+  | 'not_read_yet'
   | 'provider_content_filter'
   | 'provider_error'
   | 'timeout'
