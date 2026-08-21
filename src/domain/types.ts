@@ -140,6 +140,7 @@ export interface ClipRequest {
   chunkErrors: ChunkError[];
   chunkDegradations: ChunkDegradation[];
   answeredFrom: AnsweredFrom | null;
+  uncertainMatches: UncertainMatch[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -189,6 +190,20 @@ export interface ChunkDegradation {
   globalStartSeconds: number;
   globalEndSeconds: number;
   reason: 'transcript_omitted';
+}
+
+/**
+ * A moment the model reported and our threshold discarded.
+ *
+ * Not a result — never generated into a clip, never counted, never ranked.
+ * It exists so an answer can say "I saw something at 04:12 I wasn't sure
+ * about" rather than reporting an absence we know to be untrue.
+ */
+export interface UncertainMatch {
+  globalStartSeconds: number;
+  globalEndSeconds: number;
+  confidence: number;
+  description: string;
 }
 
 export interface ClipMatch {

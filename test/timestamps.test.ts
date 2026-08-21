@@ -8,7 +8,6 @@ import {
   mapLocalRangeToGlobal,
   mergeOverlappingRanges,
   planChunkWindows,
-  planFrameTimestamps,
 } from '../src/services/timestamps.js';
 
 /**
@@ -291,22 +290,6 @@ describe('planChunkWindows', () => {
   });
 });
 
-describe('planFrameTimestamps', () => {
-  it('samples inside the chunk, away from both boundaries', () => {
-    const timestamps = planFrameTimestamps(600, 4);
-
-    expect(timestamps).toEqual([75, 225, 375, 525]);
-    expect(timestamps.every((value) => value > 0 && value < 600)).toBe(true);
-  });
-
-  it('samples the midpoint when only one frame is requested', () => {
-    expect(planFrameTimestamps(600, 1)).toEqual([300]);
-  });
-
-  it('returns nothing for an empty chunk', () => {
-    expect(planFrameTimestamps(0, 32)).toEqual([]);
-  });
-});
 
 describe('chunkDuration and formatTimecode', () => {
   it('computes chunk duration', () => {

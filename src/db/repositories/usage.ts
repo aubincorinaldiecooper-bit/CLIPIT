@@ -2,7 +2,7 @@ import { queryOne, queryRows } from '../pool.js';
 import { logger } from '../../lib/logger.js';
 
 /** What caused a model call. */
-export type UsageStage = 'transcription' | 'indexing' | 'search' | 'verification';
+export type UsageStage = 'transcription' | 'indexing' | 'search';
 
 export interface ModelTokenUsage {
   promptTokens: number;
@@ -119,7 +119,7 @@ export async function usageForVideoLifetime(videoId: string): Promise<UsageTotal
   return mapTotals(rows);
 }
 
-/** Cost-per-search: search and verification, by stage. */
+/** Cost-per-search, by stage. */
 export async function usageForClipRequest(clipRequestId: string): Promise<UsageTotals[]> {
   const rows = await queryRows<TotalsRow>(`${totalsSelect} WHERE clip_request_id = $1 GROUP BY stage`, [
     clipRequestId,
