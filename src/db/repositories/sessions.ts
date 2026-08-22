@@ -39,13 +39,31 @@ export interface CreatedSession {
   token: string;
 }
 
-export async function createSession(context: { ip?: string; userAgent?: string; label?: string }): Promise<CreatedSession> {
+export async function createSession(context: {
+  ip?: string;
+  userAgent?: string;
+  label?: string;
+  /**
+   * Set when the session belongs to a signed-in person. Identity lives in
+   * Better Auth on the frontend service; this is the opaque id it issued,
+   * recorded so everything the session creates belongs to the person rather
+   * than to one browser tab.
+   */
+  userId?: string;
+}): Promise<CreatedSession> {
   const token = generateToken();
   const row = await queryOne<SessionRow>(
-    `INSERT INTO sessions (token_hash, created_ip, user_agent, label, expires_at)
-     VALUES ($1, $2, $3, $4, now() + ($5 || ' seconds')::interval)
+    `INSERT INTO sessions (token_hash, user_id, created_ip, user_agent, label, expires_at)
+     VALUES ($1, $2, $3, $4, $5, now() + ($6 || ' seconds')::interval)
      RETURNING *`,
-    [hashToken(token), context.ip ?? null, context.userAgent ?? null, context.label ?? null, String(env.SESSION_TTL_SECONDS)],
+    [
+      hashToken(token),
+      context.userId ?? null,
+      context.ip ?? null,
+      context.userAgent ?? null,
+      context.label ?? null,
+      String(env.SESSION_TTL_SECONDS),
+    ],
   );
   return { session: mapSession(row!), token };
 }

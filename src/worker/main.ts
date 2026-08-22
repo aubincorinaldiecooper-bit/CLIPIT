@@ -101,7 +101,9 @@ async function main(): Promise<void> {
     nodeEnv: env.NODE_ENV,
     transcription: env.TRANSCRIPTION_ENABLED,
     videoModel: env.OPENROUTER_VIDEO_MODEL,
-    videoConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
+    // One number, and it governs everything that sends video: reading a video
+    // at upload and searching its footage both pass through the same gate.
+    videoCallConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
     indexing: env.INDEXING_ENABLED,
   });
 

@@ -159,6 +159,28 @@ export function isExhaustedAnswer(error: unknown): boolean {
   return error instanceof ExternalServiceError && error.message.startsWith(EXHAUSTED_ANSWER);
 }
 
+/**
+ * What the video gate is doing, measured.
+ *
+ * Exposed so a job can report the concurrency it ACHIEVED rather than the one
+ * it asked for. Reading a video was once raised from four to eight and stayed
+ * at four, because the workers queued behind this gate; nothing in the logs
+ * could tell the difference, and the settings readout said eight.
+ */
+export function videoCallStats(): { limit: number; inFlight: number; peak: number } {
+  return videoLimiter.snapshot();
+}
+
+/** Starts a fresh high-water mark, so one job's peak belongs to that job. */
+export function resetVideoCallPeak(): void {
+  videoLimiter.resetPeak();
+}
+
+/** The same, for the text lane that answers from notes. */
+export function textCallStats(): { limit: number; inFlight: number; peak: number } {
+  return textLimiter.snapshot();
+}
+
 function headers(): Record<string, string> {
   return {
     Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,

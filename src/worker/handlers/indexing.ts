@@ -7,6 +7,7 @@ import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { describeVideoChunk } from '../../services/search/sceneIndex.js';
+import { resetVideoCallPeak, videoCallStats } from '../../services/search/openrouterVideo.js';
 import { UsageTally } from '../../services/usageTally.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { appendScenes, clearScenes, type NewVideoScene } from '../../db/repositories/scenes.js';
@@ -46,6 +47,8 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
 
   const tally = new UsageTally();
   const startedAt = performance.now();
+  // So the peak reported at the end belongs to this read.
+  resetVideoCallPeak();
   await setIndexStatus(videoId, 'running', { sceneCount: 0 });
   // A previous attempt's notes go before this one starts, so a retry never
   // leaves half of one read mixed with half of another.
@@ -57,7 +60,10 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
     let partialChunks = 0;
 
     await withWorkDir(`index-${videoId}`, async (dir) => {
-      const results = await mapWithConcurrency(chunks, env.INDEXING_CONCURRENCY, async (chunk) => {
+      // The real gate is the semaphore inside the video client, which every
+      // call carrying video passes through. Matching it here just avoids
+      // spawning workers that would only queue behind it.
+      const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
         const chunkPath = path.join(dir, `chunk-${chunk.chunkIndex}.mp4`);
         await getStorage().downloadToFile(chunk.storageKey, chunkPath);
 
@@ -166,16 +172,30 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
     await setIndexStatus(videoId, 'ready', {
       sceneCount: storedScenes,
       error: unread || null,
+      // Recorded exactly, so "did that change help?" is answerable from the
+      // database rather than from whoever last read the logs.
+      indexMs: Math.round(performance.now() - startedAt),
     });
 
     // What reading this video cost, once, against what it saves every question
     // asked of it afterwards.
+    const gate = videoCallStats();
     log.info('video read into notes', {
       scenes: storedScenes,
       chunks: chunks.length,
       failedChunks,
       partialChunks,
       elapsedMs: Math.round(performance.now() - startedAt),
+      // Measured, not configured. `concurrencyReached` below
+      // `concurrencyAllowed` means something else was the bottleneck — which
+      // is exactly how a read raised to eight ran at four unnoticed.
+      concurrencyAllowed: gate.limit,
+      concurrencyReached: gate.peak,
+      // Seconds of video read per second of waiting: the one number that says
+      // whether a change to any of this actually helped.
+      secondsOfVideoPerSecond: video.durationSeconds
+        ? Number((video.durationSeconds / ((performance.now() - startedAt) / 1000)).toFixed(2))
+        : null,
       ...tally.summary(),
     });
   } catch (error) {

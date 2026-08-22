@@ -189,6 +189,7 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
         videoId: clipRequest.videoId,
         clipMatchId: match.id,
         sessionId: clipRequest.sessionId,
+        userId: clipRequest.userId,
         startSeconds: match.globalStartSeconds,
         endSeconds: match.globalEndSeconds,
       });

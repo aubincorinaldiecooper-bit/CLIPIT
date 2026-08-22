@@ -12,6 +12,7 @@ import {
   getVideo,
   getVideoWithReadProgress,
   listChunks,
+  listVideosForPrincipal,
   setVideoStatus,
   updateVideoMedia,
 } from '../../db/repositories/videos.js';
@@ -105,6 +106,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
       const video = await createVideo({
         sessionId,
+        userId: request.principal?.userId ?? null,
         sourceType: 'youtube',
         sourceUrl: body.url,
         status: 'queued',
@@ -121,6 +123,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const video = await createVideo({
       sessionId,
+      userId: request.principal?.userId ?? null,
       sourceType: 'upload',
       originalFilename: filename,
       title: filename,
@@ -181,6 +184,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const video = await createVideo({
       sessionId,
+      userId: request.principal?.userId ?? null,
       sourceType: 'upload',
       originalFilename: filename,
       title: filename,
@@ -259,6 +263,28 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
+  /**
+   * The caller's videos, newest first.
+   *
+   * For a signed-in person this spans every session they have ever had, which
+   * is the point of signing in: close the browser, come back tomorrow, and the
+   * videos are still theirs. For a guest it is only what this tab uploaded.
+   * Footage already removed is excluded — a library of unplayable entries is
+   * a list of disappointments.
+   */
+  app.get('/api/videos', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+
+    const videos = await listVideosForPrincipal({
+      sessionId: request.principal?.sessionId ?? null,
+      userId: request.principal?.userId ?? null,
+    });
+
+    return reply.send({ videos: videos.map((video) => serializeVideo(video)) });
+  });
+
   /** Status, metadata, and the analysis chunk grid. */
   app.get('/api/videos/:videoId', { preHandler: requireSession }, async (request, reply) => {
     await enforceRateLimits(request, [
@@ -314,6 +340,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const clipRequest = await createClipRequest({
       videoId,
       sessionId: request.principal?.sessionId ?? null,
+      userId: request.principal?.userId ?? null,
       instruction: body.instruction,
       mode: body.mode ?? env.CLIP_SEARCH_MODE,
     });

@@ -9,7 +9,12 @@ import { getStorage } from '../../services/storage/s3.js';
 import { attachThumbnails } from '../../services/media/thumbnails.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { UsageTally } from '../../services/usageTally.js';
-import { isContentFilterRejection, searchVideoChunk } from '../../services/search/openrouterVideo.js';
+import {
+  isContentFilterRejection,
+  resetVideoCallPeak,
+  searchVideoChunk,
+  videoCallStats,
+} from '../../services/search/openrouterVideo.js';
 import { searchNotes } from '../../services/search/noteSearch.js';
 import { isCorrection } from '../../services/search/rescanPolicy.js';
 import { assertVideoInputSupported } from '../../services/search/modelCapabilities.js';
@@ -132,6 +137,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       const previous = await getPreviousClipRequest({
         videoId: request.videoId,
         sessionId: request.sessionId,
+        userId: request.userId,
         before: request.createdAt,
       });
 
@@ -312,6 +318,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     if (resolved.mode !== 'transcript') await assertVideoInputSupported();
 
     await startClipRequest(clipRequestId, { chunksTotal: chunks.length, resolvedMode: resolved.mode });
+    // So the peak reported at the end belongs to this search.
+    resetVideoCallPeak();
     // Reading the footage is the only path that can report a real absence, so
     // it is the only one that runs when the notes came up empty.
     // Clear anything from a previous attempt so a retry cannot double-insert.
@@ -444,7 +452,10 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         // The three inputs that set wall-clock, logged alongside it so a slow
         // search can be read without correlating against config elsewhere.
         chunks: chunks.length,
-        concurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
+        // Allowed versus achieved. The second is the measurement; the first is
+        // only what we asked for, and the two have disagreed before.
+        concurrencyAllowed: videoCallStats().limit,
+        concurrencyReached: videoCallStats().peak,
         chunkSeconds: env.ANALYSIS_CHUNK_SECONDS,
         model: env.OPENROUTER_VIDEO_MODEL,
       });

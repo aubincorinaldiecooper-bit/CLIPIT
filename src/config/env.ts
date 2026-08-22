@@ -94,11 +94,18 @@ const envSchema = z.object({
    */
   OPENROUTER_VIDEO_MODEL: z.string().trim().default('qwen/qwen3.6-flash'),
   /**
-   * Chunks are independent, so this sets how much of a search runs at once.
-   * Ten chunks at 2 was five sequential rounds; 4 halves that while staying
-   * well inside provider rate limits. Raise from measured latency, not guesses.
+   * How many calls carrying video may be in flight at once — the whole
+   * account, covering both reading a video at upload and searching its
+   * footage. One number because the provider's limit is one limit: giving
+   * reading its own allowance simply meant reading and searching could add up
+   * to more than either was allowed.
+   *
+   * Measured: ten chunks at 4 read a 20-minute video in 130 seconds, three
+   * rounds of about forty-five. 8 makes it two. Raise it from a real upload,
+   * not a guess — past the provider's ceiling this turns into retries, which
+   * makes everything slower rather than faster.
    */
-  OPENROUTER_VIDEO_CONCURRENCY: int(4, 1, 16),
+  OPENROUTER_VIDEO_CONCURRENCY: int(8, 1, 16),
   /**
    * Room for the ANSWER, not for the answer plus the thinking that precedes
    * it. The reasoning budget below is added on top when the request is built,
@@ -129,17 +136,6 @@ const envSchema = z.object({
    * video rather than the sampled stills it originally used.
    */
   INDEXING_ENABLED: bool(true),
-  /**
-   * How many chunks are read at once at upload. Separate from the search
-   * concurrency because the two are answering different questions: a search is
-   * someone waiting, an upload read is work nobody is watching yet.
-   *
-   * Measured: ten chunks at four took 130 seconds — three rounds of about
-   * forty-five. At eight it is two rounds. Raise further only against a real
-   * upload; the ceiling is the provider's rate limit, and hitting it turns
-   * into retries that make the read slower, not faster.
-   */
-  INDEXING_CONCURRENCY: int(8, 1, 24),
   /**
    * How long a question waits for the video to finish being read.
    *
@@ -193,6 +189,13 @@ const envSchema = z.object({
   YOUTUBE_CAPTION_LANGS: z.string().default('en.*,en'),
 
   // --- Sessions & rate limiting ------------------------------------------
+  /**
+   * Shared secret between the frontend server and this API, for exchanging a
+   * verified Better Auth sign-in for an API session. Optional: without it the
+   * exchange route answers 503 and the app runs guest-only, which is how it
+   * ran before accounts existed.
+   */
+  AUTH_BRIDGE_SECRET: z.string().trim().min(32).optional(),
   SESSION_TTL_SECONDS: int(2_592_000, 3_600, 31_536_000),
   /** When false, /api routes accept unauthenticated requests (local dev only). */
   REQUIRE_SESSION: bool(true),
