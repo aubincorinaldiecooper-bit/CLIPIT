@@ -189,6 +189,13 @@ const envSchema = z.object({
   YOUTUBE_CAPTION_LANGS: z.string().default('en.*,en'),
 
   // --- Sessions & rate limiting ------------------------------------------
+  /**
+   * Shared secret between the frontend server and this API, for exchanging a
+   * verified Better Auth sign-in for an API session. Optional: without it the
+   * exchange route answers 503 and the app runs guest-only, which is how it
+   * ran before accounts existed.
+   */
+  AUTH_BRIDGE_SECRET: z.string().trim().min(32).optional(),
   SESSION_TTL_SECONDS: int(2_592_000, 3_600, 31_536_000),
   /** When false, /api routes accept unauthenticated requests (local dev only). */
   REQUIRE_SESSION: bool(true),

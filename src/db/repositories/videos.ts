@@ -138,6 +138,41 @@ export async function getVideoWithReadProgress(videoId: string): Promise<Video |
   };
 }
 
+/**
+ * The caller's videos, newest first, footage intact only.
+ *
+ * Owned by the person when they are signed in — across every session they
+ * have ever had — and by the single session otherwise. Videos whose footage
+ * the retention sweep has already removed are left out: they cannot be
+ * played or searched again, and listing them would be offering something we
+ * no longer have.
+ */
+export async function listVideosForPrincipal(principal: {
+  sessionId: string | null;
+  userId: string | null;
+}): Promise<Video[]> {
+  if (principal.userId) {
+    const rows = await queryRows<VideoRow>(
+      `SELECT * FROM videos
+        WHERE user_id = $1 AND footage_expired_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 30`,
+      [principal.userId],
+    );
+    return rows.map(mapVideo);
+  }
+
+  if (!principal.sessionId) return [];
+  const rows = await queryRows<VideoRow>(
+    `SELECT * FROM videos
+      WHERE session_id = $1 AND footage_expired_at IS NULL
+      ORDER BY created_at DESC
+      LIMIT 30`,
+    [principal.sessionId],
+  );
+  return rows.map(mapVideo);
+}
+
 export async function getVideo(videoId: string): Promise<Video | null> {
   const row = await queryOne<VideoRow>('SELECT * FROM videos WHERE id = $1', [videoId]);
   return row ? mapVideo(row) : null;
@@ -245,6 +280,12 @@ export async function listVideosWithUnreachableFootage(
        FROM videos v
        LEFT JOIN sessions s ON s.id = v.session_id
       WHERE v.footage_expired_at IS NULL
+        -- A signed-in person's footage is not tied to a browser tab. Their
+        -- session going quiet means they closed the laptop, not that the
+        -- video is unreachable: they can sign in again. Guest footage keeps
+        -- the old rule. What accounts eventually pay for storage is a product
+        -- decision for later; silently deleting their videos is not.
+        AND v.user_id IS NULL
         AND (
           v.session_id IS NULL
           OR s.id IS NULL

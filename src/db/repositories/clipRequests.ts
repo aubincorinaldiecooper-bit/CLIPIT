@@ -217,17 +217,28 @@ export async function finishClipRequest(
 export async function getPreviousClipRequest(input: {
   videoId: string;
   sessionId: string | null;
+  userId?: string | null;
   before: Date;
 }): Promise<ClipRequest | null> {
-  const row = await queryOne<ClipRequestRow>(
-    `SELECT * FROM clip_requests
-      WHERE video_id = $1
-        AND session_id IS NOT DISTINCT FROM $2
-        AND created_at < $3
-      ORDER BY created_at DESC
-      LIMIT 1`,
-    [input.videoId, input.sessionId, input.before],
-  );
+  // A signed-in person's "are you sure?" refers to THEIR last question, even
+  // from a new tab with a fresh session. A guest's can only mean this tab's.
+  const row = input.userId
+    ? await queryOne<ClipRequestRow>(
+        `SELECT * FROM clip_requests
+          WHERE video_id = $1 AND user_id = $2 AND created_at < $3
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [input.videoId, input.userId, input.before],
+      )
+    : await queryOne<ClipRequestRow>(
+        `SELECT * FROM clip_requests
+          WHERE video_id = $1
+            AND session_id IS NOT DISTINCT FROM $2
+            AND created_at < $3
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [input.videoId, input.sessionId, input.before],
+      );
   return row ? mapRequest(row) : null;
 }
 

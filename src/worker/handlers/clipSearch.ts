@@ -137,6 +137,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       const previous = await getPreviousClipRequest({
         videoId: request.videoId,
         sessionId: request.sessionId,
+        userId: request.userId,
         before: request.createdAt,
       });
 
