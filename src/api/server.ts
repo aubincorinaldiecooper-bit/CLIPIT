@@ -9,6 +9,7 @@ import { registerSessionRoutes } from './routes/sessions.js';
 import { registerVideoRoutes } from './routes/videos.js';
 import { registerClipRequestRoutes } from './routes/clipRequests.js';
 import { registerClipRoutes } from './routes/clips.js';
+import { registerStatsRoutes } from './routes/stats.js';
 
 export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -85,6 +86,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await registerVideoRoutes(app);
   await registerClipRequestRoutes(app);
   await registerClipRoutes(app);
+  await registerStatsRoutes(app);
 
   return app;
 }
