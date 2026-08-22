@@ -80,6 +80,56 @@ export async function clearClipKeysForVideo(videoId: string): Promise<void> {
   await queryOne('UPDATE clips SET storage_key = NULL, updated_at = now() WHERE video_id = $1', [videoId]);
 }
 
+/**
+ * A clip as the library shows it: the cut itself plus what it is OF — the
+ * moment's description and still from the match, and the video's name.
+ * Joined here rather than fetched per clip, because a library page that fires
+ * sixty follow-up requests is a library that feels broken on hotel wifi.
+ */
+export interface LibraryClip {
+  clip: Clip;
+  description: string;
+  thumbnailKey: string | null;
+  videoTitle: string | null;
+}
+
+/**
+ * Every finished clip the caller can still play, newest first.
+ *
+ * Owned by the person when signed in — across every session they have ever
+ * had — and by the single session otherwise. Only clips whose file still
+ * exists: the retention sweep nulls storage keys when guest footage goes, and
+ * listing a clip we cannot play would be offering something we no longer have.
+ */
+export async function listClipsForPrincipal(principal: {
+  sessionId: string | null;
+  userId: string | null;
+}): Promise<LibraryClip[]> {
+  const scope = principal.userId ? 'c.user_id = $1' : 'c.session_id = $1';
+  const owner = principal.userId ?? principal.sessionId;
+  if (!owner) return [];
+
+  const rows = await queryRows<ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }>(
+    `SELECT c.*, m.description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
+       FROM clips c
+       JOIN clip_matches m ON m.id = c.clip_match_id
+       JOIN videos v ON v.id = c.video_id
+      WHERE ${scope}
+        AND c.status = 'ready'
+        AND c.storage_key IS NOT NULL
+      ORDER BY c.created_at DESC
+      LIMIT 60`,
+    [owner],
+  );
+
+  return rows.map((row) => ({
+    clip: mapClip(row),
+    description: row.description,
+    thumbnailKey: row.thumbnail_key ?? null,
+    videoTitle: row.video_title ?? row.video_filename ?? null,
+  }));
+}
+
 export async function getClip(clipId: string): Promise<Clip | null> {
   const row = await queryOne<ClipRow>('SELECT * FROM clips WHERE id = $1', [clipId]);
   return row ? mapClip(row) : null;

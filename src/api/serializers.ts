@@ -343,6 +343,30 @@ export async function serializeVideoWithPlayback(video: Video, chunks?: VideoChu
   };
 }
 
+/**
+ * A library entry: the clip plus what it shows. The still and both URLs are
+ * signed here like everything else private — the library is the page most
+ * likely to be left open, so nothing in it may be a permanent link.
+ */
+export async function serializeLibraryClip(entry: {
+  clip: Clip;
+  description: string;
+  thumbnailKey: string | null;
+  videoTitle: string | null;
+}) {
+  const base = await serializeClip(entry.clip);
+  const thumbnailUrl = entry.thumbnailKey
+    ? await getStorage().createDownloadUrl(entry.thumbnailKey)
+    : null;
+
+  return {
+    ...base,
+    description: entry.description,
+    thumbnailUrl,
+    videoTitle: entry.videoTitle,
+  };
+}
+
 export async function serializeClip(clip: Clip, includeUrl = true) {
   let url: string | null = null;
   let downloadUrl: string | null = null;
