@@ -19,12 +19,32 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
       { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
     ]);
 
-    const entries = await listClipsForPrincipal({
-      sessionId: request.principal?.sessionId ?? null,
-      userId: request.principal?.userId ?? null,
-    });
+    const { before } = parse(
+      z.object({ before: z.coerce.date().optional() }),
+      request.query ?? {},
+      'query parameters',
+    );
 
-    return reply.send({ clips: await Promise.all(entries.map((entry) => serializeLibraryClip(entry))) });
+    // One extra row answers "is there more?" without a second count query. A
+    // library must never truncate silently: older clips exist, and the client
+    // is told exactly where the next page starts.
+    const pageSize = 30;
+    const entries = await listClipsForPrincipal(
+      {
+        sessionId: request.principal?.sessionId ?? null,
+        userId: request.principal?.userId ?? null,
+      },
+      { limit: pageSize + 1, ...(before ? { before } : {}) },
+    );
+
+    const pageEntries = entries.slice(0, pageSize);
+    const nextBefore =
+      entries.length > pageSize ? pageEntries[pageEntries.length - 1]!.clip.createdAt.toISOString() : null;
+
+    return reply.send({
+      clips: await Promise.all(pageEntries.map((entry) => serializeLibraryClip(entry))),
+      nextBefore,
+    });
   });
 
   /** A single clip, with a freshly signed playback URL once it is ready. */

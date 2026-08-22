@@ -101,14 +101,24 @@ export interface LibraryClip {
  * exists: the retention sweep nulls storage keys when guest footage goes, and
  * listing a clip we cannot play would be offering something we no longer have.
  */
-export async function listClipsForPrincipal(principal: {
-  sessionId: string | null;
-  userId: string | null;
-}): Promise<LibraryClip[]> {
+export async function listClipsForPrincipal(
+  principal: {
+    sessionId: string | null;
+    userId: string | null;
+  },
+  page: {
+    /** Return clips strictly older than this; omit for the newest page. */
+    before?: Date;
+    limit: number;
+  },
+): Promise<LibraryClip[]> {
   const scope = principal.userId ? 'c.user_id = $1' : 'c.session_id = $1';
   const owner = principal.userId ?? principal.sessionId;
   if (!owner) return [];
 
+  // Keyset rather than offset: a library someone scrolls while cutting new
+  // clips must not shift under them, and "skip 60" does exactly that when
+  // clip 61 arrives mid-scroll.
   const rows = await queryRows<ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }>(
     `SELECT c.*, m.description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
        FROM clips c
@@ -117,9 +127,10 @@ export async function listClipsForPrincipal(principal: {
       WHERE ${scope}
         AND c.status = 'ready'
         AND c.storage_key IS NOT NULL
+        AND ($2::timestamptz IS NULL OR c.created_at < $2)
       ORDER BY c.created_at DESC
-      LIMIT 60`,
-    [owner],
+      LIMIT $3`,
+    [owner, page.before ?? null, page.limit],
   );
 
   return rows.map((row) => ({
