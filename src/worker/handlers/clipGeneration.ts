@@ -6,7 +6,8 @@ import { errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { clipKey } from '../../services/storage/types.js';
-import { cutClip } from '../../services/media/ffmpeg.js';
+import { cutClip, ffprobe } from '../../services/media/ffmpeg.js';
+import { captionsSchema, prepareCaptionFilters } from '../../services/media/captions.js';
 import { applyClipPadding } from '../../services/timestamps.js';
 import { getClip, setClipStatus } from '../../db/repositories/clips.js';
 import { getVideo } from '../../db/repositories/videos.js';
@@ -56,6 +57,16 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       await getStorage().downloadToFile(video.originalStorageKey!, sourcePath);
       await job.updateProgress({ stage: 'cutting', percent: 40 });
 
+      // Captions are burned during the cut, sized against the real frame.
+      // The spec was validated when it was stored; validating again here
+      // means a hand-edited row cannot smuggle text into a shell command.
+      let videoFilters: string[] | undefined;
+      const spec = captionsSchema.safeParse(clip.captions ?? []);
+      if (spec.success && spec.data.length > 0) {
+        const probe = await ffprobe(sourcePath);
+        videoFilters = await prepareCaptionFilters(spec.data, dir, probe.height ?? 720);
+      }
+
       const outputPath = path.join(dir, `${clipId}.mp4`);
       const result = await cutClip({
         inputPath: sourcePath,
@@ -63,6 +74,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         startSeconds: padded.startSeconds,
         endSeconds: padded.endSeconds,
         hasAudio: video.hasAudio ?? true,
+        ...(videoFilters ? { videoFilters } : {}),
       });
 
       await job.updateProgress({ stage: 'uploading', percent: 80 });

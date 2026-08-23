@@ -11,6 +11,7 @@ import {
   splitIntoChunks,
 } from '../src/services/media/ffmpeg.js';
 import { mapLocalRangeToGlobal } from '../src/services/timestamps.js';
+import { prepareCaptionFilters } from '../src/services/media/captions.js';
 
 /**
  * Exercises the real ffmpeg pipeline. Skipped when ffmpeg is not installed, so
@@ -139,4 +140,33 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(result.sizeBytes).toBeGreaterThan(0);
     expect(result.durationSeconds).toBeCloseTo(2, 0);
   }, 180_000);
+  it('burns captions into a cut without breaking the encode', async () => {
+    const probe = await ffprobe(source);
+    const filters = await prepareCaptionFilters(
+      [
+        { text: "It's 100% live: rain & confetti", font: 'bold', sizePct: 8, color: '#fcd34d', yPct: 85, outline: true },
+        { text: 'colons: quotes\' and, commas', font: 'mono', sizePct: 5, color: '#ffffff', yPct: 10, outline: false },
+      ],
+      dir,
+      probe.height ?? 240,
+    );
+
+    const output = path.join(dir, 'captioned.mp4');
+    const result = await cutClip({
+      inputPath: source,
+      outputPath: output,
+      startSeconds: 1,
+      endSeconds: 4,
+      hasAudio: true,
+      videoFilters: filters,
+    });
+
+    // The encode survived text that exists to trip drawtext escaping, and
+    // produced a playable H.264 file of the requested length.
+    expect(result.durationSeconds).toBeCloseTo(3, 0);
+    const out = await ffprobe(output);
+    expect(out.videoCodec).toBe('h264');
+    expect((await stat(output)).size).toBeGreaterThan(1000);
+  }, 120_000);
+
 });

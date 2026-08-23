@@ -278,6 +278,10 @@ export interface Clip {
   userId: string | null;
   /** Inherited from the video it was cut from. */
   workspaceId: string | null;
+  /** The caption spec burned into this render, if any. */
+  captions: unknown;
+  /** Set when this clip is a captioned copy of another. */
+  derivedFromClipId: string | null;
   startSeconds: number;
   endSeconds: number;
   storageKey: string | null;

@@ -3,7 +3,17 @@ import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
 import type { FastifyRequest } from 'fastify';
-import { getClip, listClipsForPrincipal, listWorkspacesForClip } from '../../db/repositories/clips.js';
+import {
+  getClip,
+  insertDerivedClip,
+  listClipsForPrincipal,
+  listWorkspacesForClip,
+  setClipCaptionsForRender,
+} from '../../db/repositories/clips.js';
+import { getVideo } from '../../db/repositories/videos.js';
+import { captionsSchema } from '../../services/media/captions.js';
+import { enqueueClipGeneration } from '../../queues/index.js';
+import { logger } from '../../lib/logger.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, MINUTE } from '../rateLimit.js';
 import { serializeClip, serializeLibraryClip } from '../serializers.js';
@@ -86,5 +96,69 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
     await assertClipAccess(request, clip);
 
     return reply.send({ clip: await serializeClip(clip) });
+  });
+
+  /**
+   * Caption a clip: burn styled text into the footage.
+   *
+   * Two outcomes, in the owner's words. "Save new clip" makes a DERIVED clip
+   * in the caller's own library — same moment, its own file — so captioning
+   * something a teammate sent never alters theirs. "Replace existing one"
+   * re-renders in place, and only the person who cut the clip may do that.
+   *
+   * Every render starts from the pristine source, so editing again never
+   * stacks text on text — and a replace with an empty caption list is how
+   * captions come OFF a clip.
+   */
+  app.post('/api/clips/:clipId/captions', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'generate', perSession: env.RATE_LIMIT_GENERATE_PER_SESSION_HOURLY, windowSeconds: 60 * 60 },
+    ]);
+
+    const { clipId } = parse(
+      z.object({ clipId: z.string().uuid('must be a UUID') }),
+      request.params,
+      'path parameters',
+    );
+    const body = parse(
+      z.object({ mode: z.enum(['new', 'replace']), captions: captionsSchema }),
+      request.body ?? {},
+    );
+
+    const clip = await getClip(clipId);
+    if (!clip) throw HttpError.notFound('Clip not found');
+    await assertClipAccess(request, clip);
+
+    // Rendering needs the source footage; without it there is nothing to
+    // draw on, and saying so beats a job that fails in the background.
+    const video = await getVideo(clip.videoId);
+    if (!video?.originalStorageKey || video.footageExpiredAt) {
+      throw HttpError.conflict("The source footage for this clip has been removed, so captions can't be rendered.");
+    }
+
+    if (body.mode === 'replace') {
+      if (!clip.userId || clip.userId !== request.principal?.userId) {
+        throw HttpError.forbidden('Only the person who cut this clip can replace it — save as a new clip instead.');
+      }
+      await setClipCaptionsForRender(clipId, body.captions);
+      await enqueueClipGeneration({ clipId });
+      logger.info('clip re-render queued', { clipId, captions: body.captions.length });
+      return reply.code(202).send({ clip: await serializeClip({ ...clip, status: 'pending' }, false) });
+    }
+
+    if (body.captions.length === 0) {
+      throw HttpError.badRequest('A new clip needs at least one caption — otherwise it would be a plain copy.');
+    }
+
+    const derived = await insertDerivedClip({
+      sourceClip: clip,
+      sessionId: request.principal?.sessionId ?? null,
+      userId: request.principal?.userId ?? null,
+      workspaceId: request.principal?.ownWorkspaceId ?? null,
+      captions: body.captions,
+    });
+    await enqueueClipGeneration({ clipId: derived.id });
+    logger.info('captioned copy queued', { clipId, derivedClipId: derived.id });
+    return reply.code(202).send({ clip: await serializeClip(derived, false) });
   });
 }

@@ -273,6 +273,8 @@ export interface CutClipOptions {
   startSeconds: number;
   endSeconds: number;
   hasAudio: boolean;
+  /** Extra -vf filters (e.g. burned-in captions), applied in order. */
+  videoFilters?: string[];
 }
 
 /** Cuts a clip from the ORIGINAL source and re-encodes to MP4 / H.264 / AAC. */
@@ -295,6 +297,10 @@ export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: num
     '-profile:v', 'high',
     '-level', '4.1',
   ];
+
+  if (options.videoFilters?.length) {
+    args.push('-vf', options.videoFilters.join(','));
+  }
 
   if (options.hasAudio) {
     args.push('-c:a', 'aac', '-b:a', env.CLIP_AUDIO_BITRATE, '-ac', '2');

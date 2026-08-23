@@ -398,6 +398,9 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
     endSeconds: clip.endSeconds,
     startTimecode: formatTimecode(clip.startSeconds),
     endTimecode: formatTimecode(clip.endSeconds),
+    // The spec the editor saved, so re-opening the editor starts from it.
+    captions: clip.captions ?? null,
+    derivedFromClipId: clip.derivedFromClipId,
     durationSeconds: clip.durationSeconds,
     sizeBytes: clip.sizeBytes,
     url,

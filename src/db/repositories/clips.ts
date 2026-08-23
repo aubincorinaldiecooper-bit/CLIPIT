@@ -8,6 +8,8 @@ interface ClipRow {
   session_id: string | null;
   user_id: string | null;
   workspace_id: string | null;
+  captions: unknown;
+  derived_from_clip_id: string | null;
   start_seconds: number;
   end_seconds: number;
   storage_key: string | null;
@@ -27,6 +29,8 @@ function mapClip(row: ClipRow): Clip {
     sessionId: row.session_id,
     userId: row.user_id,
     workspaceId: row.workspace_id,
+    captions: row.captions ?? null,
+    derivedFromClipId: row.derived_from_clip_id,
     startSeconds: row.start_seconds,
     endSeconds: row.end_seconds,
     storageKey: row.storage_key,
@@ -56,7 +60,7 @@ export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> 
   const row = await queryOne<ClipRow>(
     `INSERT INTO clips (video_id, clip_match_id, session_id, user_id, workspace_id, start_seconds, end_seconds, status)
      VALUES ($1, $2, $3, $4, (SELECT workspace_id FROM videos WHERE id = $1), $5, $6, 'pending')
-     ON CONFLICT (clip_match_id) DO UPDATE
+     ON CONFLICT (clip_match_id) WHERE derived_from_clip_id IS NULL DO UPDATE
        SET start_seconds = EXCLUDED.start_seconds,
            end_seconds = EXCLUDED.end_seconds,
            status = CASE WHEN clips.status = 'ready' THEN clips.status ELSE 'pending' END,
@@ -216,6 +220,46 @@ export async function listWorkspacesForClip(clipId: string): Promise<string[]> {
     [clipId],
   );
   return rows.map((row) => row.workspace_id);
+}
+
+/**
+ * A derived clip: the same moment as its source, rendered again with captions
+ * burned in. It belongs to whoever pressed the button — their library, their
+ * workspace — and remembers where it came from.
+ */
+export async function insertDerivedClip(input: {
+  sourceClip: Clip;
+  sessionId: string | null;
+  userId: string | null;
+  workspaceId: string | null;
+  captions: unknown;
+}): Promise<Clip> {
+  const row = await queryOne<ClipRow>(
+    `INSERT INTO clips (video_id, clip_match_id, session_id, user_id, workspace_id,
+                        captions, derived_from_clip_id, start_seconds, end_seconds, status)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, 'pending')
+     RETURNING *`,
+    [
+      input.sourceClip.videoId,
+      input.sourceClip.clipMatchId,
+      input.sessionId,
+      input.userId,
+      input.workspaceId,
+      JSON.stringify(input.captions),
+      input.sourceClip.id,
+      input.sourceClip.startSeconds,
+      input.sourceClip.endSeconds,
+    ],
+  );
+  return mapClip(row!);
+}
+
+/** Store a new caption spec and send the clip back through rendering. */
+export async function setClipCaptionsForRender(clipId: string, captions: unknown): Promise<void> {
+  await queryOne(
+    `UPDATE clips SET captions = $2::jsonb, status = 'pending', updated_at = now() WHERE id = $1 RETURNING id`,
+    [clipId, JSON.stringify(captions)],
+  );
 }
 
 export async function getClip(clipId: string): Promise<Clip | null> {
