@@ -18,7 +18,7 @@ import {
 } from '../../db/repositories/videos.js';
 import { createClipRequest } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
-import { assertOwnership, requireSession } from '../auth.js';
+import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import { serializeClipRequest, serializeVideo, serializeVideoWithPlayback } from '../serializers.js';
 import { parse } from '../validation.js';
@@ -277,10 +277,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
       { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
     ]);
 
-    const videos = await listVideosForPrincipal({
-      sessionId: request.principal?.sessionId ?? null,
-      userId: request.principal?.userId ?? null,
-    });
+    const videos = await listVideosForPrincipal(ownerScope(request));
 
     return reply.send({ videos: videos.map((video) => serializeVideo(video)) });
   });

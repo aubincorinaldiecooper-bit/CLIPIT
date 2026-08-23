@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { HttpError } from '../src/lib/errors.js';
-import { assertOwnership } from '../src/api/auth.js';
+import { assertOwnership, ownerScope } from '../src/api/auth.js';
 import type { Principal } from '../src/domain/types.js';
 
 /**
@@ -76,5 +76,28 @@ describe('assertOwnership with workspaces', () => {
 
   it('refuses when there is no caller at all', () => {
     expect(check(null, { sessionId: 'session-1', userId: 'user-1' })).toThrow(HttpError);
+  });
+});
+
+/**
+ * The scope every listing query runs in. This exists as one helper for a
+ * reason worth locking down: when each route assembled its own literal, the
+ * workspace was added to ownership checks but forgotten in the listings, so
+ * teammates could open each other's clips by id while the library still
+ * showed one person's work. Ownership and listing must widen together.
+ */
+describe('ownerScope', () => {
+  it('carries the workspace, not just the caller', () => {
+    const scope = ownerScope(requestWith(principal({ userIds: ['user-1', 'user-2'] })));
+    expect(scope).toEqual({ sessionId: 'session-1', userId: 'user-1', userIds: ['user-1', 'user-2'] });
+  });
+
+  it('gives a guest a session and no owners', () => {
+    const scope = ownerScope(requestWith(principal({ userId: null, userIds: [], sessionId: 'session-9' })));
+    expect(scope).toEqual({ sessionId: 'session-9', userId: null, userIds: [] });
+  });
+
+  it('is all nulls when there is no principal', () => {
+    expect(ownerScope(requestWith(null))).toEqual({ sessionId: null, userId: null, userIds: [] });
   });
 });

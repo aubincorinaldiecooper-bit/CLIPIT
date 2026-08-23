@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
 import { getClip, listClipsForPrincipal } from '../../db/repositories/clips.js';
-import { assertOwnership, requireSession } from '../auth.js';
+import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, MINUTE } from '../rateLimit.js';
 import { serializeClip, serializeLibraryClip } from '../serializers.js';
 import { parse } from '../validation.js';
@@ -29,13 +29,10 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
     // library must never truncate silently: older clips exist, and the client
     // is told exactly where the next page starts.
     const pageSize = 30;
-    const entries = await listClipsForPrincipal(
-      {
-        sessionId: request.principal?.sessionId ?? null,
-        userId: request.principal?.userId ?? null,
-      },
-      { limit: pageSize + 1, ...(before ? { before } : {}) },
-    );
+    const entries = await listClipsForPrincipal(ownerScope(request), {
+      limit: pageSize + 1,
+      ...(before ? { before } : {}),
+    });
 
     const pageEntries = entries.slice(0, pageSize);
     const nextBefore =

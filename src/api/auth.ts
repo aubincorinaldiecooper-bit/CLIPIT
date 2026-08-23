@@ -77,6 +77,29 @@ export function principalOrNull(request: FastifyRequest): Principal | null {
 }
 
 /**
+ * The scope every "what is mine" query runs in: this session, this person,
+ * and everyone in their workspace.
+ *
+ * Deliberately one helper rather than three hand-built literals. When each
+ * route assembled its own, adding the workspace to the shape meant remembering
+ * three places — and forgetting one left a listing quietly narrowed to a
+ * single person while ownership checks had already widened. One shape, one
+ * place to change it.
+ */
+export function ownerScope(request: FastifyRequest): {
+  sessionId: string | null;
+  userId: string | null;
+  userIds: string[];
+} {
+  const principal = request.principal;
+  return {
+    sessionId: principal?.sessionId ?? null,
+    userId: principal?.userId ?? null,
+    userIds: principal?.userIds ?? [],
+  };
+}
+
+/**
  * Ownership check for a resource. Rows created before sessions existed, or by a
  * server-side process, have a null owner and are readable by anyone — which
  * only happens when REQUIRE_SESSION is off.

@@ -7,15 +7,13 @@ import { requireSession } from '../auth.js';
 import { enforceRateLimits, MINUTE } from '../rateLimit.js';
 import { parse } from '../validation.js';
 import {
-  consumeInvite,
+  acceptInviteAndJoin,
   findInviteByToken,
   getMembership,
   getWorkspaceForUser,
   insertInvite,
-  insertMember,
   listMembers,
   listPendingInvites,
-  moveMemberToWorkspace,
   removeMember,
   revokeInvite,
   type WorkspaceInviteRow,
@@ -225,24 +223,22 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
           'You are already in a workspace with other people. Leave that team before joining another.',
         );
       }
+
+      // An owner opening their own invitation link. Accepting would demote
+      // them to member and leave the workspace with no owner at all — nobody
+      // able to invite or remove anyone, permanently. Say so and spend
+      // nothing: the link stays good for the person it was meant for.
+      const preview = await findInviteByToken(token);
+      if (preview && preview.workspace_id === existing.workspace_id) {
+        throw HttpError.conflict('That invitation is for this workspace — you are already in it.');
+      }
     }
 
-    const invite = await consumeInvite(token, userId);
+    // Spending the invitation and taking up the membership happen together or
+    // not at all: a spent invitation that let nobody in cannot be retried.
+    const invite = await acceptInviteAndJoin(token, userId, request.principal?.email ?? null);
     if (!invite) {
       throw HttpError.badRequest('That invitation has expired or has already been used. Ask for a new one.');
-    }
-
-    // The invite is spent; the membership must follow. A person already alone
-    // in their own workspace is moved into the new one.
-    if (existing) {
-      await moveMemberToWorkspace(userId, invite.workspace_id, invite.email);
-    } else {
-      await insertMember({
-        workspaceId: invite.workspace_id,
-        userId,
-        role: 'member',
-        email: request.principal?.email ?? invite.email,
-      });
     }
 
     const workspace = await getWorkspaceForUser(userId);

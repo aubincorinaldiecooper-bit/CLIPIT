@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { queryOne, queryRows } from '../pool.js';
+import { queryOne, queryRows, withTransaction } from '../pool.js';
 
 /**
  * Workspaces: the room a team works in (migration 017). A workspace shares
@@ -111,48 +111,6 @@ export async function insertWorkspace(input: {
   return workspace;
 }
 
-export async function insertMember(input: {
-  workspaceId: string;
-  userId: string;
-  role: string;
-  email: string | null;
-}): Promise<WorkspaceMemberRow | null> {
-  return queryOne<WorkspaceMemberRow>(
-    `INSERT INTO workspace_members (workspace_id, user_id, role, email)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (user_id) DO NOTHING
-     RETURNING workspace_id, user_id, role, email, joined_at`,
-    [input.workspaceId, input.userId, input.role, input.email],
-  );
-}
-
-/**
- * Move someone into another workspace. Used when a person alone in their own
- * room accepts an invitation: the UNIQUE on user_id means membership moves
- * rather than accumulates, and the workspace they leave behind is deleted
- * only if it was theirs and now stands empty.
- */
-export async function moveMemberToWorkspace(
-  userId: string,
-  workspaceId: string,
-  email: string | null,
-): Promise<void> {
-  await queryOne(
-    `UPDATE workspace_members
-        SET workspace_id = $2, role = 'member', email = COALESCE(email, $3), joined_at = now()
-      WHERE user_id = $1
-      RETURNING user_id`,
-    [userId, workspaceId, email],
-  );
-  await queryOne(
-    `DELETE FROM workspaces w
-      WHERE w.owner_user_id = $1
-        AND NOT EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id)
-      RETURNING w.id`,
-    [userId],
-  );
-}
-
 export async function removeMember(workspaceId: string, userId: string): Promise<boolean> {
   const row = await queryOne<{ user_id: string }>(
     `DELETE FROM workspace_members
@@ -214,21 +172,66 @@ export async function findInviteByToken(token: string): Promise<WorkspaceInviteR
 }
 
 /**
- * Spend an invite: one UPDATE makes "check and consume" indivisible, so two
- * clicks on the same emailed link cannot both join, and an expired, revoked,
- * or already-accepted token returns null rather than a usable row.
+ * Spend an invite AND take up the membership it grants, in one transaction.
+ *
+ * These two must not be separable. Consuming the token first and writing the
+ * membership after leaves a window where the invitation is spent and nobody
+ * joined — and because the token is single-use, every retry then fails
+ * against an "already used" invitation that never let anyone in. Either both
+ * happen or neither does, and a membership write that affects no row rolls
+ * the consumption back.
+ *
+ * Returns null when the token was not spendable (expired, revoked, already
+ * used, or never existed) — the caller cannot tell which, deliberately.
  */
-export async function consumeInvite(token: string, acceptedBy: string): Promise<WorkspaceInviteRow | null> {
-  return queryOne<WorkspaceInviteRow>(
-    `UPDATE workspace_invites
-        SET accepted_at = now(), accepted_by = $2
-      WHERE token_hash = $1
-        AND accepted_at IS NULL
-        AND revoked_at IS NULL
-        AND expires_at > now()
-      RETURNING ${INVITE_COLUMNS}`,
-    [hashInviteToken(token), acceptedBy],
-  );
+export async function acceptInviteAndJoin(
+  token: string,
+  userId: string,
+  fallbackEmail: string | null,
+): Promise<WorkspaceInviteRow | null> {
+  return withTransaction(async (client) => {
+    const consumed = await client.query<WorkspaceInviteRow>(
+      `UPDATE workspace_invites
+          SET accepted_at = now(), accepted_by = $2
+        WHERE token_hash = $1
+          AND accepted_at IS NULL
+          AND revoked_at IS NULL
+          AND expires_at > now()
+        RETURNING ${INVITE_COLUMNS}`,
+      [hashInviteToken(token), userId],
+    );
+    const invite = consumed.rows[0];
+    if (!invite) return null;
+
+    // One statement covers both cases — a first-time joiner and a person
+    // moving out of the room they were alone in — so a membership race
+    // cannot land between a failed INSERT and a compensating UPDATE.
+    const joined = await client.query<{ user_id: string }>(
+      `INSERT INTO workspace_members (workspace_id, user_id, role, email)
+       VALUES ($1, $2, 'member', $3)
+       ON CONFLICT (user_id) DO UPDATE
+          SET workspace_id = EXCLUDED.workspace_id,
+              role = 'member',
+              email = COALESCE(workspace_members.email, EXCLUDED.email),
+              joined_at = now()
+       RETURNING user_id`,
+      [invite.workspace_id, userId, fallbackEmail ?? invite.email],
+    );
+    if (joined.rowCount === 0) {
+      // Nothing joined, so nothing may be spent either.
+      throw new Error('workspace membership write affected no row');
+    }
+
+    // The room they left, if it was theirs and now stands empty.
+    await client.query(
+      `DELETE FROM workspaces w
+        WHERE w.owner_user_id = $1
+          AND NOT EXISTS (SELECT 1 FROM workspace_members m WHERE m.workspace_id = w.id)`,
+      [userId],
+    );
+
+    return invite;
+  });
 }
 
 export async function revokeInvite(workspaceId: string, inviteId: string): Promise<boolean> {
