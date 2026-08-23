@@ -105,6 +105,7 @@ export async function listClipsForPrincipal(
   principal: {
     sessionId: string | null;
     userId: string | null;
+    userIds?: string[];
   },
   page: {
     /** Return clips strictly older than this; omit for the newest page. */
@@ -112,9 +113,16 @@ export async function listClipsForPrincipal(
     limit: number;
   },
 ): Promise<LibraryClip[]> {
-  const scope = principal.userId ? 'c.user_id = $1' : 'c.session_id = $1';
-  const owner = principal.userId ?? principal.sessionId;
-  if (!owner) return [];
+  // Signed in: the workspace's clips, teammates' included. Guest: this tab's.
+  const scope = principal.userId ? 'c.user_id = ANY($1::text[])' : 'c.session_id = ANY($1::text[])';
+  const owners = principal.userId
+    ? principal.userIds?.length
+      ? principal.userIds
+      : [principal.userId]
+    : principal.sessionId
+      ? [principal.sessionId]
+      : [];
+  if (owners.length === 0) return [];
 
   // Keyset rather than offset: a library someone scrolls while cutting new
   // clips must not shift under them, and "skip 60" does exactly that when
@@ -130,7 +138,7 @@ export async function listClipsForPrincipal(
         AND ($2::timestamptz IS NULL OR c.created_at < $2)
       ORDER BY c.created_at DESC
       LIMIT $3`,
-    [owner, page.before ?? null, page.limit],
+    [owners, page.before ?? null, page.limit],
   );
 
   return rows.map((row) => ({

@@ -2,6 +2,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { env } from '../config/env.js';
 import { HttpError } from '../lib/errors.js';
 import { findSessionByToken } from '../db/repositories/sessions.js';
+import { listWorkspaceUserIds } from '../db/repositories/workspaces.js';
 import type { Principal } from '../domain/types.js';
 
 /**
@@ -45,7 +46,18 @@ export async function attachPrincipal(request: FastifyRequest): Promise<void> {
   const session = await findSessionByToken(token);
   if (!session) return;
 
-  request.principal = { sessionId: session.id, userId: session.userId };
+  // A signed-in caller acts for their whole workspace. One small indexed
+  // lookup per authenticated request buys a single, always-current answer —
+  // no cache to go stale the moment someone is removed from a team.
+  const userIds = session.userId ? await listWorkspaceUserIds(session.userId) : [];
+  request.principal = {
+    sessionId: session.id,
+    userId: session.userId,
+    userIds,
+    // The session label is the address they signed in with, recorded at the
+    // auth exchange; null for guests.
+    email: session.label,
+  };
 }
 
 /** preHandler for routes that require a caller identity. */
@@ -80,7 +92,8 @@ export function assertOwnership(
   const principal = request.principal;
   if (!principal) throw HttpError.notFound(`${resourceName} not found`);
 
-  if (principal.userId && resource.userId && principal.userId === resource.userId) return;
+  // Anyone in the caller's workspace, which for a lone user is just them.
+  if (resource.userId && principal.userIds.includes(resource.userId)) return;
   if (resource.sessionId && principal.sessionId === resource.sessionId) return;
 
   // 404 rather than 403: an unauthorised caller should not learn the id exists.

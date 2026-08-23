@@ -49,10 +49,20 @@ export interface Session {
   createdAt: Date;
 }
 
-/** The authenticated actor behind a request. `userId` is reserved for real auth. */
+/**
+ * The authenticated actor behind a request.
+ *
+ * `userIds` is who this caller may act as: themselves, plus everyone who
+ * shares their workspace. A workspace shares everything, so "may I see this
+ * clip" is answered by asking whether its owner is one of these. For a guest
+ * (no userId) the list is empty and ownership falls back to the session.
+ */
 export interface Principal {
   sessionId: string;
   userId: string | null;
+  userIds: string[];
+  /** What they signed in as, when known — used to name people on a team. */
+  email: string | null;
 }
 
 export interface Video {

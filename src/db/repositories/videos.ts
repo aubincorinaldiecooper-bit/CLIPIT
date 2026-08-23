@@ -150,14 +150,18 @@ export async function getVideoWithReadProgress(videoId: string): Promise<Video |
 export async function listVideosForPrincipal(principal: {
   sessionId: string | null;
   userId: string | null;
+  userIds?: string[];
 }): Promise<Video[]> {
   if (principal.userId) {
+    // The whole workspace's library, not just this person's: a team shares
+    // everything, and a teammate's upload is one of "our videos".
+    const owners = principal.userIds?.length ? principal.userIds : [principal.userId];
     const rows = await queryRows<VideoRow>(
       `SELECT * FROM videos
-        WHERE user_id = $1 AND footage_expired_at IS NULL
+        WHERE user_id = ANY($1::text[]) AND footage_expired_at IS NULL
         ORDER BY created_at DESC
         LIMIT 30`,
-      [principal.userId],
+      [owners],
     );
     return rows.map(mapVideo);
   }

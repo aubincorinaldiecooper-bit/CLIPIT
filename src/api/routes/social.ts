@@ -68,6 +68,16 @@ function requireUserId(principal: { userId: string | null } | null): string {
   return principal.userId;
 }
 
+/**
+ * Everyone whose accounts and clips this caller may act on: their workspace.
+ * A workspace shares everything, so a teammate's connected TikTok is one this
+ * caller can publish to, and a teammate's clip is one they can publish.
+ */
+function workspaceUserIds(principal: { userId: string | null; userIds: string[] } | null): string[] {
+  if (!principal?.userId) return [];
+  return principal.userIds.length ? principal.userIds : [principal.userId];
+}
+
 export async function registerSocialRoutes(app: FastifyInstance): Promise<void> {
   /**
    * The OAuth return target. Registered before /:platform so "callback" is
@@ -183,7 +193,8 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     if (!userId) {
       return reply.send({ configured: true, signInRequired: true, accounts: [] });
     }
-    const accounts = await listSocialAccounts(userId);
+    // The workspace's accounts: a team publishes to the same places.
+    const accounts = await listSocialAccounts(workspaceUserIds(request.principal));
     return reply.send({
       configured: true,
       signInRequired: false,
@@ -210,7 +221,9 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     const { accountId } = parse(z.object({ accountId: z.string().min(1) }), request.params, 'path parameters');
 
     const account = await getSocialAccount(accountId);
-    if (!account || account.user_id !== userId) throw HttpError.notFound('Account not found');
+    if (!account || !workspaceUserIds(request.principal).includes(account.user_id)) {
+      throw HttpError.notFound('Account not found');
+    }
 
     await zernio.disconnectAccount(accountId);
     const updated = await setSocialAccountStatus(accountId, 'disconnected');
@@ -242,13 +255,14 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       request.body ?? {},
     );
 
+    const owners = workspaceUserIds(request.principal);
     const clip = await getClip(clipId);
-    if (!clip || clip.userId !== userId) throw HttpError.notFound('Clip not found');
+    if (!clip || !clip.userId || !owners.includes(clip.userId)) throw HttpError.notFound('Clip not found');
     if (clip.status !== 'ready' || !clip.storageKey) {
       throw HttpError.conflict('This clip is not ready yet — publish it once it has finished cutting');
     }
 
-    const stored = (await listSocialAccounts(userId)).filter((account) => account.status === 'connected');
+    const stored = (await listSocialAccounts(owners)).filter((account) => account.status === 'connected');
     if (stored.length === 0) {
       throw HttpError.unprocessable('No connected accounts. Connect one on the Publishing page first.');
     }

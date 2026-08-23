@@ -18,24 +18,33 @@ export interface ActivitySummary {
 export async function summariseActivity(principal: {
   sessionId: string | null;
   userId: string | null;
+  userIds?: string[];
 }): Promise<ActivitySummary> {
-  const scope = principal.userId ? 'user_id = $1' : 'session_id = $1';
-  const owner = principal.userId ?? principal.sessionId;
-  if (!owner) return { videos: 0, minutesOfVideo: 0, questionsAnswered: 0, clipsCut: 0 };
+  // Signed in, the numbers count the workspace's work — the same rows the
+  // library lists, so the home screen and the library never disagree.
+  const scope = principal.userId ? 'user_id = ANY($1::text[])' : 'session_id = ANY($1::text[])';
+  const owners = principal.userId
+    ? principal.userIds?.length
+      ? principal.userIds
+      : [principal.userId]
+    : principal.sessionId
+      ? [principal.sessionId]
+      : [];
+  if (owners.length === 0) return { videos: 0, minutesOfVideo: 0, questionsAnswered: 0, clipsCut: 0 };
 
   const [videos, questions, clips] = await Promise.all([
     queryOne<{ count: number; seconds: string | null }>(
       `SELECT count(*)::int AS count, COALESCE(SUM(duration_seconds), 0) AS seconds
          FROM videos WHERE ${scope}`,
-      [owner],
+      [owners],
     ),
     queryOne<{ count: number }>(
       `SELECT count(*)::int AS count FROM clip_requests WHERE ${scope} AND status = 'completed'`,
-      [owner],
+      [owners],
     ),
     queryOne<{ count: number }>(
       `SELECT count(*)::int AS count FROM clips WHERE ${scope} AND status = 'ready'`,
-      [owner],
+      [owners],
     ),
   ]);
 

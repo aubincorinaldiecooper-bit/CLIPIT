@@ -89,23 +89,30 @@ export async function upsertSocialAccount(input: {
   return row!;
 }
 
+/**
+ * The accounts a caller may publish to. `userIds` is the workspace: a team
+ * shares its connected accounts, so a teammate's TikTok is one of ours. Given
+ * a bare user id, it is a workspace of one.
+ */
 export async function listSocialAccounts(
-  userId: string,
+  userIdOrIds: string | string[],
   filter: { platform?: string } = {},
 ): Promise<SocialAccountRow[]> {
+  const owners = Array.isArray(userIdOrIds) ? userIdOrIds : [userIdOrIds];
+  if (owners.length === 0) return [];
   if (filter.platform) {
     return queryRows<SocialAccountRow>(
       `SELECT id, user_id, platform, display_name, status, created_at
-         FROM social_accounts WHERE user_id = $1 AND platform = $2
+         FROM social_accounts WHERE user_id = ANY($1::text[]) AND platform = $2
         ORDER BY created_at DESC`,
-      [userId, filter.platform],
+      [owners, filter.platform],
     );
   }
   return queryRows<SocialAccountRow>(
     `SELECT id, user_id, platform, display_name, status, created_at
-       FROM social_accounts WHERE user_id = $1
+       FROM social_accounts WHERE user_id = ANY($1::text[])
       ORDER BY created_at DESC`,
-    [userId],
+    [owners],
   );
 }
 
