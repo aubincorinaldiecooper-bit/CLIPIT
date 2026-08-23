@@ -222,6 +222,21 @@ export async function findInFlightPublish(
   );
 }
 
+/**
+ * Webhook-driven status update: Zernio only knows its own post id, so the
+ * lookup is by zernio_post_id (no user in a webhook to scope by — trust
+ * rests entirely on the verified signature). Returns the updated row count.
+ */
+export async function updatePublishedPostStatusByZernioId(zernioPostId: string, status: string): Promise<number> {
+  const rows = await queryRows<{ id: string }>(
+    `UPDATE published_posts SET status = $2
+      WHERE zernio_post_id = $1
+      RETURNING id`,
+    [zernioPostId, status],
+  );
+  return rows.length;
+}
+
 export async function listPublishedPosts(userId: string, limit = 50): Promise<PublishedPostRow[]> {
   return queryRows<PublishedPostRow>(
     `SELECT id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at
