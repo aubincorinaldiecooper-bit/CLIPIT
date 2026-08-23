@@ -95,7 +95,14 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
     if (!clip) throw HttpError.notFound('Clip not found');
     await assertClipAccess(request, clip);
 
-    return reply.send({ clip: await serializeClip(clip) });
+    return reply.send({
+      clip: {
+        ...(await serializeClip(clip)),
+        // Replacing re-renders someone's file in place; the editor only
+        // offers it to the person whose clip it is.
+        canReplace: Boolean(clip.userId && clip.userId === request.principal?.userId),
+      },
+    });
   });
 
   /**
