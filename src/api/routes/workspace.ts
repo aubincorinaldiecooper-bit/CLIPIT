@@ -9,13 +9,16 @@ import { parse } from '../validation.js';
 import {
   acceptInviteAndJoin,
   findInviteByToken,
+  getActiveWorkspace,
   getMembership,
-  getWorkspaceForUser,
   insertInvite,
+  leaveWorkspace,
   listMembers,
   listPendingInvites,
+  listWorkspacesForUser,
   removeMember,
   revokeInvite,
+  setActiveWorkspace,
   type WorkspaceInviteRow,
   type WorkspaceMemberRow,
 } from '../../db/repositories/workspaces.js';
@@ -79,19 +82,29 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
     ]);
 
     const userId = request.principal?.userId ?? null;
-    if (!userId) return reply.send({ signInRequired: true, workspace: null, members: [], invites: [] });
+    if (!userId) {
+      return reply.send({ signInRequired: true, workspace: null, workspaces: [], members: [], invites: [] });
+    }
 
     const workspace = await ensureWorkspace(userId, request.principal?.email ?? null);
-    const membership = await getMembership(userId);
+    const membership = await getMembership(userId, workspace.id);
     const isOwner = membership?.role === 'owner';
     const members = await listMembers(workspace.id);
     // Pending invitations are the owner's business: they name addresses that
     // have been offered access and have not taken it yet.
     const invites = isOwner ? await listPendingInvites(workspace.id) : [];
+    // Every room this person belongs to, so the page can offer the switch.
+    const workspaces = await listWorkspacesForUser(userId);
 
     return reply.send({
       signInRequired: false,
       workspace: { id: workspace.id, name: workspace.name, isOwner },
+      workspaces: workspaces.map((row) => ({
+        id: row.id,
+        name: row.name,
+        isOwner: row.owner_user_id === userId,
+        isActive: row.id === workspace.id,
+      })),
       members: members.map((member) => serializeMember(member, userId)),
       invites: invites.map(serializeInvite),
       // Said plainly so the page can warn instead of silently creating
@@ -113,7 +126,7 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
     );
 
     const workspace = await ensureWorkspace(userId, request.principal?.email ?? null);
-    const membership = await getMembership(userId);
+    const membership = await getMembership(userId, workspace.id);
     if (membership?.role !== 'owner') {
       throw HttpError.forbidden('Only the workspace owner can invite people');
     }
@@ -161,8 +174,8 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
     const userId = requireUserId(request.principal);
     const { inviteId } = parse(z.object({ inviteId: z.string().uuid() }), request.params, 'path parameters');
 
-    const workspace = await getWorkspaceForUser(userId);
-    const membership = await getMembership(userId);
+    const workspace = await getActiveWorkspace(userId);
+    const membership = workspace ? await getMembership(userId, workspace.id) : null;
     if (!workspace || membership?.role !== 'owner') {
       throw HttpError.forbidden('Only the workspace owner can withdraw invitations');
     }
@@ -192,7 +205,7 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
       return reply.send({ valid: false, workspaceName: null, email: null });
     }
 
-    const workspace = await getWorkspaceForUser(invite.invited_by);
+    const workspace = await getActiveWorkspace(invite.invited_by);
     return reply.send({
       valid: true,
       workspaceName: workspace?.name ?? 'a CLIPIT workspace',
@@ -212,26 +225,28 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
       request.body ?? {},
     );
 
-    // One workspace per person, so joining a team means leaving your own room
-    // behind — refuse rather than silently move someone's library out of
-    // reach. Their own workspace is only "leavable" if it is empty of others.
-    const existing = await getMembership(userId);
-    if (existing) {
-      const peers = await listMembers(existing.workspace_id);
-      if (peers.length > 1) {
-        throw HttpError.conflict(
-          'You are already in a workspace with other people. Leave that team before joining another.',
-        );
-      }
+    // Joining a team adds a room; nothing is taken away and nothing moves.
+    // Whatever they already have — their own workspace, other teams — is
+    // untouched, and they can switch back at any time.
+    //
+    // Their own room is made first if they have never signed in here before,
+    // so accepting cannot leave them a member of someone else's team with
+    // nowhere of their own to go back to.
+    await ensureWorkspace(userId, request.principal?.email ?? null);
 
-      // An owner opening their own invitation link. Accepting would demote
-      // them to member and leave the workspace with no owner at all — nobody
-      // able to invite or remove anyone, permanently. Say so and spend
-      // nothing: the link stays good for the person it was meant for.
-      const preview = await findInviteByToken(token);
-      if (preview && preview.workspace_id === existing.workspace_id) {
-        throw HttpError.conflict('That invitation is for this workspace — you are already in it.');
-      }
+    // Already in this room. Spend nothing — the link stays good for whoever
+    // it was actually meant for — and just take them there.
+    const preview = await findInviteByToken(token);
+    if (preview && (await getMembership(userId, preview.workspace_id))) {
+      await setActiveWorkspace(userId, preview.workspace_id);
+      const already = await getActiveWorkspace(userId);
+      return reply.send({
+        joined: true,
+        alreadyMember: true,
+        workspace: already
+          ? { id: already.id, name: already.name, isOwner: already.owner_user_id === userId }
+          : null,
+      });
     }
 
     // Spending the invitation and taking up the membership happen together or
@@ -241,12 +256,64 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
       throw HttpError.badRequest('That invitation has expired or has already been used. Ask for a new one.');
     }
 
-    const workspace = await getWorkspaceForUser(userId);
+    const workspace = await getActiveWorkspace(userId);
     logger.info('workspace invite accepted', { workspaceId: invite.workspace_id });
 
     return reply.send({
       joined: true,
+      alreadyMember: false,
       workspace: workspace ? { id: workspace.id, name: workspace.name, isOwner: false } : null,
+    });
+  });
+
+  /**
+   * Switch rooms. Everything the caller sees and creates from here on belongs
+   * to this workspace — one library at a time, which is what switching means.
+   */
+  app.post('/api/workspace/active', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+
+    const userId = requireUserId(request.principal);
+    const { workspaceId } = parse(z.object({ workspaceId: z.string().uuid() }), request.body ?? {});
+
+    // Membership is checked inside the write, so a workspace the caller does
+    // not belong to cannot be selected even under a race.
+    const switched = await setActiveWorkspace(userId, workspaceId);
+    if (!switched) throw HttpError.notFound('Workspace not found');
+
+    const workspace = await getActiveWorkspace(userId);
+    return reply.send({
+      workspace: workspace
+        ? { id: workspace.id, name: workspace.name, isOwner: workspace.owner_user_id === userId }
+        : null,
+    });
+  });
+
+  /**
+   * Leave a team. An owner cannot leave their own room — it is theirs, and a
+   * room with no owner has nobody who can invite or remove anyone. Leaving
+   * the room you were working in puts you back in your own.
+   */
+  app.delete('/api/workspace/members/me/:workspaceId', { preHandler: requireSession }, async (request, reply) => {
+    const userId = requireUserId(request.principal);
+    const { workspaceId } = parse(z.object({ workspaceId: z.string().uuid() }), request.params, 'path parameters');
+
+    const left = await leaveWorkspace(userId, workspaceId);
+    if (!left) {
+      throw HttpError.conflict(
+        'You cannot leave a workspace you own. Hand it over or remove the others first.',
+      );
+    }
+
+    logger.info('workspace left', { workspaceId });
+    const workspace = await getActiveWorkspace(userId);
+    return reply.send({
+      left: true,
+      workspace: workspace
+        ? { id: workspace.id, name: workspace.name, isOwner: workspace.owner_user_id === userId }
+        : null,
     });
   });
 
@@ -259,8 +326,8 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
       'path parameters',
     );
 
-    const workspace = await getWorkspaceForUser(userId);
-    const membership = await getMembership(userId);
+    const workspace = await getActiveWorkspace(userId);
+    const membership = workspace ? await getMembership(userId, workspace.id) : null;
     if (!workspace || membership?.role !== 'owner') {
       throw HttpError.forbidden('Only the workspace owner can remove people');
     }

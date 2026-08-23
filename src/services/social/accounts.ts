@@ -43,7 +43,11 @@ function usableZernioId(value: unknown): value is string {
  * publishes to, and mirror them locally. A malformed remote record is
  * skipped, never persisted, and never allowed to abort the rest of the sync.
  */
-export async function syncAccounts(userId: string, zernioProfileId: string): Promise<SocialAccountRow[]> {
+export async function syncAccounts(
+  userId: string,
+  zernioProfileId: string,
+  workspaceId: string | null,
+): Promise<SocialAccountRow[]> {
   const remote = await zernio.listAccounts({ profileId: zernioProfileId });
   const stored: SocialAccountRow[] = [];
   for (const raw of remote) {
@@ -55,6 +59,9 @@ export async function syncAccounts(userId: string, zernioProfileId: string): Pro
       await upsertSocialAccount({
         id,
         userId,
+        // The room the connect flow was started from, carried on the state
+        // token — not wherever the person happens to be standing now.
+        workspaceId,
         platform,
         displayName:
           (typeof account.displayName === 'string' && account.displayName) ||
@@ -81,11 +88,11 @@ export type ConnectAttemptOutcome = 'connected' | 'nothing_new' | 'failed';
  * earlier connection's coattails.
  */
 export async function verifyConnectAttempt(
-  userId: string,
+  workspaceId: string,
   platform: string,
   before: SocialAccountRow[],
 ): Promise<ConnectAttemptOutcome> {
-  const after = await listSocialAccounts(userId, { platform });
+  const after = await listSocialAccounts(workspaceId, { platform });
   return judgeConnectAttempt(before, after);
 }
 

@@ -50,17 +50,28 @@ export interface Session {
 }
 
 /**
- * The authenticated actor behind a request.
+ * The authenticated actor behind a request, and the rooms they can act in.
  *
- * `userIds` is who this caller may act as: themselves, plus everyone who
- * shares their workspace. A workspace shares everything, so "may I see this
- * clip" is answered by asking whether its owner is one of these. For a guest
- * (no userId) the list is empty and ownership falls back to the session.
+ * A person may belong to several workspaces and works in one at a time. "May
+ * I see this" is answered by the workspace a thing belongs to, not by who
+ * made it — which is what lets a team share a library without dragging one
+ * person's other projects into it. For a guest both lists are empty and
+ * ownership falls back to the session.
  */
 export interface Principal {
   sessionId: string;
   userId: string | null;
-  userIds: string[];
+  /**
+   * The workspace this caller is working in. Their library, their home
+   * counts, and anything they create belong to it. Null for guests.
+   */
+  activeWorkspaceId: string | null;
+  /**
+   * Every workspace they belong to. Opening something by its id works from
+   * any of them, so a link from a teammate is never a dead end just because
+   * the recipient is looking at a different workspace.
+   */
+  workspaceIds: string[];
   /** What they signed in as, when known — used to name people on a team. */
   email: string | null;
 }
@@ -69,6 +80,8 @@ export interface Video {
   id: string;
   sessionId: string | null;
   userId: string | null;
+  /** The workspace this was added to; null for a guest's upload. */
+  workspaceId: string | null;
   sourceType: SourceType;
   sourceUrl: string | null;
   originalFilename: string | null;
@@ -149,6 +162,8 @@ export interface ClipRequest {
   videoId: string;
   sessionId: string | null;
   userId: string | null;
+  /** Inherited from the video it was asked about. */
+  workspaceId: string | null;
   instruction: string;
   mode: SearchMode;
   resolvedMode: ResolvedSearchMode | null;
@@ -262,6 +277,8 @@ export interface Clip {
   clipMatchId: string;
   sessionId: string | null;
   userId: string | null;
+  /** Inherited from the video it was cut from. */
+  workspaceId: string | null;
   startSeconds: number;
   endSeconds: number;
   storageKey: string | null;

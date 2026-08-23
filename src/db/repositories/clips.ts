@@ -7,6 +7,7 @@ interface ClipRow {
   clip_match_id: string;
   session_id: string | null;
   user_id: string | null;
+  workspace_id: string | null;
   start_seconds: number;
   end_seconds: number;
   storage_key: string | null;
@@ -25,6 +26,7 @@ function mapClip(row: ClipRow): Clip {
     clipMatchId: row.clip_match_id,
     sessionId: row.session_id,
     userId: row.user_id,
+    workspaceId: row.workspace_id,
     startSeconds: row.start_seconds,
     endSeconds: row.end_seconds,
     storageKey: row.storage_key,
@@ -52,8 +54,8 @@ export interface UpsertClipInput {
  */
 export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> {
   const row = await queryOne<ClipRow>(
-    `INSERT INTO clips (video_id, clip_match_id, session_id, user_id, start_seconds, end_seconds, status)
-     VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+    `INSERT INTO clips (video_id, clip_match_id, session_id, user_id, workspace_id, start_seconds, end_seconds, status)
+     VALUES ($1, $2, $3, $4, (SELECT workspace_id FROM videos WHERE id = $1), $5, $6, 'pending')
      ON CONFLICT (clip_match_id) DO UPDATE
        SET start_seconds = EXCLUDED.start_seconds,
            end_seconds = EXCLUDED.end_seconds,
@@ -105,7 +107,7 @@ export async function listClipsForPrincipal(
   principal: {
     sessionId: string | null;
     userId: string | null;
-    userIds?: string[];
+    workspaceId?: string | null;
   },
   page: {
     /** Return clips strictly older than this; omit for the newest page. */
@@ -113,16 +115,16 @@ export async function listClipsForPrincipal(
     limit: number;
   },
 ): Promise<LibraryClip[]> {
-  // Signed in: the workspace's clips, teammates' included. Guest: this tab's.
-  const scope = principal.userId ? 'c.user_id = ANY($1::text[])' : 'c.session_id = ANY($1::text[])';
-  const owners = principal.userId
-    ? principal.userIds?.length
-      ? principal.userIds
-      : [principal.userId]
-    : principal.sessionId
-      ? [principal.sessionId]
-      : [];
-  if (owners.length === 0) return [];
+  // The room's clips, teammates' included — one workspace at a time. A
+  // signed-in person with no workspace yet, or a guest, falls back to what
+  // they made themselves.
+  const scope = principal.workspaceId
+    ? 'c.workspace_id = $1'
+    : principal.userId
+      ? 'c.user_id = $1'
+      : 'c.session_id = $1';
+  const owner = principal.workspaceId ?? principal.userId ?? principal.sessionId;
+  if (!owner) return [];
 
   // Keyset rather than offset: a library someone scrolls while cutting new
   // clips must not shift under them, and "skip 60" does exactly that when
@@ -138,7 +140,7 @@ export async function listClipsForPrincipal(
         AND ($2::timestamptz IS NULL OR c.created_at < $2)
       ORDER BY c.created_at DESC
       LIMIT $3`,
-    [owners, page.before ?? null, page.limit],
+    [owner, page.before ?? null, page.limit],
   );
 
   return rows.map((row) => ({

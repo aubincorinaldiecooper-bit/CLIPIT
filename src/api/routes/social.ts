@@ -69,13 +69,15 @@ function requireUserId(principal: { userId: string | null } | null): string {
 }
 
 /**
- * Everyone whose accounts and clips this caller may act on: their workspace.
- * A workspace shares everything, so a teammate's connected TikTok is one this
- * caller can publish to, and a teammate's clip is one they can publish.
+ * The room whose accounts and clips this caller may act on. A workspace
+ * shares everything inside it, so a teammate's connected TikTok is one this
+ * caller can publish to — and a clip from another of their workspaces is not.
  */
-function workspaceUserIds(principal: { userId: string | null; userIds: string[] } | null): string[] {
-  if (!principal?.userId) return [];
-  return principal.userIds.length ? principal.userIds : [principal.userId];
+function requireWorkspaceId(principal: { activeWorkspaceId: string | null } | null): string {
+  if (!principal?.activeWorkspaceId) {
+    throw HttpError.forbidden('Publishing needs an account — sign in first');
+  }
+  return principal.activeWorkspaceId;
 }
 
 export async function registerSocialRoutes(app: FastifyInstance): Promise<void> {
@@ -115,9 +117,10 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     try {
       const profile = await getSocialProfile(state.user_id);
       if (!profile) throw new Error('no Zernio profile for user at callback time');
-      const before = await listSocialAccounts(state.user_id, { platform: state.platform });
-      await syncAccounts(state.user_id, profile.zernio_profile_id);
-      const outcome = await verifyConnectAttempt(state.user_id, state.platform, before);
+      if (!state.workspace_id) throw new Error('connect state has no workspace');
+      const before = await listSocialAccounts(state.workspace_id, { platform: state.platform });
+      await syncAccounts(state.user_id, profile.zernio_profile_id, state.workspace_id);
+      const outcome = await verifyConnectAttempt(state.workspace_id, state.platform, before);
       if (outcome === 'connected') {
         to.searchParams.set('connected', state.platform);
         logger.info('social account connected', { platform: state.platform });
@@ -159,7 +162,12 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
 
     // Persist who/what server-side; thread only the opaque token through
     // Zernio. Nothing identifying ever rides in the redirect query string.
-    const token = await createConnectionState({ userId, platform, ttlSeconds: CONNECT_STATE_TTL_SECONDS });
+    const token = await createConnectionState({
+      userId,
+      workspaceId: requireWorkspaceId(request.principal),
+      platform,
+      ttlSeconds: CONNECT_STATE_TTL_SECONDS,
+    });
     const redirectTarget = new URL(env.ZERNIO_CONNECT_REDIRECT_URL);
     redirectTarget.searchParams.set('state', token);
 
@@ -193,8 +201,8 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     if (!userId) {
       return reply.send({ configured: true, signInRequired: true, accounts: [] });
     }
-    // The workspace's accounts: a team publishes to the same places.
-    const accounts = await listSocialAccounts(workspaceUserIds(request.principal));
+    // The room's accounts: a team publishes to the same places.
+    const accounts = await listSocialAccounts(requireWorkspaceId(request.principal));
     return reply.send({
       configured: true,
       signInRequired: false,
@@ -221,7 +229,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     const { accountId } = parse(z.object({ accountId: z.string().min(1) }), request.params, 'path parameters');
 
     const account = await getSocialAccount(accountId);
-    if (!account || !workspaceUserIds(request.principal).includes(account.user_id)) {
+    if (!account || account.workspace_id !== requireWorkspaceId(request.principal)) {
       throw HttpError.notFound('Account not found');
     }
 
@@ -255,14 +263,16 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       request.body ?? {},
     );
 
-    const owners = workspaceUserIds(request.principal);
+    // Publishing acts inside one room: the clip and the accounts it goes to
+    // must both belong to the workspace the caller is working in.
+    const workspaceId = requireWorkspaceId(request.principal);
     const clip = await getClip(clipId);
-    if (!clip || !clip.userId || !owners.includes(clip.userId)) throw HttpError.notFound('Clip not found');
+    if (!clip || clip.workspaceId !== workspaceId) throw HttpError.notFound('Clip not found');
     if (clip.status !== 'ready' || !clip.storageKey) {
       throw HttpError.conflict('This clip is not ready yet — publish it once it has finished cutting');
     }
 
-    const stored = (await listSocialAccounts(owners)).filter((account) => account.status === 'connected');
+    const stored = (await listSocialAccounts(workspaceId)).filter((account) => account.status === 'connected');
     if (stored.length === 0) {
       throw HttpError.unprocessable('No connected accounts. Connect one on the Publishing page first.');
     }
@@ -290,6 +300,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     const targetList = targets.map((account) => ({ platform: account.platform, accountId: account.id }));
     const post = await insertPublishedPost({
       userId,
+      workspaceId,
       clipId,
       zernioPostId: null,
       caption: body.caption,

@@ -1,36 +1,30 @@
 import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
 import {
-  getMembership,
-  getWorkspaceForUser,
+  getActiveWorkspace,
   insertWorkspace,
   setMemberEmail,
   type WorkspaceRow,
 } from '../../db/repositories/workspaces.js';
 
 /**
- * A person always has a workspace — their own, created the first time they
- * sign in. "Team" is then just that room with more people in it, which means
- * no user is ever in the awkward state of owning work that belongs to no
- * workspace.
+ * A person always has somewhere to work — their own room, created the first
+ * time they sign in, so nobody is ever in the awkward state of owning work
+ * that belongs to no workspace. Joining a team adds a room; it never replaces
+ * this one.
  */
 export async function ensureWorkspace(userId: string, email: string | null): Promise<WorkspaceRow> {
-  const existing = await getWorkspaceForUser(userId);
-  if (existing) {
+  const active = await getActiveWorkspace(userId);
+  if (active) {
     // A returning member may have signed in with an address we did not know
     // when they were invited; keep the team list honest about who is who.
     if (email) await setMemberEmail(userId, email);
-    return existing;
+    return active;
   }
   const name = email ? `${email.split('@')[0]}'s workspace` : 'My workspace';
   const workspace = await insertWorkspace({ name, ownerUserId: userId, email });
   logger.info('workspace created', { workspaceId: workspace.id });
   return workspace;
-}
-
-export async function isOwner(userId: string, workspaceId: string): Promise<boolean> {
-  const membership = await getMembership(userId);
-  return membership?.workspace_id === workspaceId && membership.role === 'owner';
 }
 
 /**

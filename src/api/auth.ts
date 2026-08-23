@@ -2,7 +2,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { env } from '../config/env.js';
 import { HttpError } from '../lib/errors.js';
 import { findSessionByToken } from '../db/repositories/sessions.js';
-import { listWorkspaceUserIds } from '../db/repositories/workspaces.js';
+import { getWorkspaceContext } from '../db/repositories/workspaces.js';
 import type { Principal } from '../domain/types.js';
 
 /**
@@ -46,14 +46,17 @@ export async function attachPrincipal(request: FastifyRequest): Promise<void> {
   const session = await findSessionByToken(token);
   if (!session) return;
 
-  // A signed-in caller acts for their whole workspace. One small indexed
-  // lookup per authenticated request buys a single, always-current answer —
-  // no cache to go stale the moment someone is removed from a team.
-  const userIds = session.userId ? await listWorkspaceUserIds(session.userId) : [];
+  // A signed-in caller acts inside a workspace. One small indexed lookup per
+  // authenticated request buys a single, always-current answer — no cache to
+  // go stale the moment someone switches rooms or leaves a team.
+  const context = session.userId
+    ? await getWorkspaceContext(session.userId)
+    : { activeWorkspaceId: null, workspaceIds: [] };
   request.principal = {
     sessionId: session.id,
     userId: session.userId,
-    userIds,
+    activeWorkspaceId: context.activeWorkspaceId,
+    workspaceIds: context.workspaceIds,
     // The session label is the address they signed in with, recorded at the
     // auth exchange; null for guests.
     email: session.label,
@@ -77,25 +80,28 @@ export function principalOrNull(request: FastifyRequest): Principal | null {
 }
 
 /**
- * The scope every "what is mine" query runs in: this session, this person,
- * and everyone in their workspace.
+ * The scope every "what is mine" listing runs in: this session, this person,
+ * and the workspace they are currently working in.
  *
  * Deliberately one helper rather than three hand-built literals. When each
  * route assembled its own, adding the workspace to the shape meant remembering
  * three places — and forgetting one left a listing quietly narrowed to a
  * single person while ownership checks had already widened. One shape, one
  * place to change it.
+ *
+ * The ACTIVE workspace only. A person in several rooms sees one library at a
+ * time — the room they are in — which is the whole point of switching.
  */
 export function ownerScope(request: FastifyRequest): {
   sessionId: string | null;
   userId: string | null;
-  userIds: string[];
+  workspaceId: string | null;
 } {
   const principal = request.principal;
   return {
     sessionId: principal?.sessionId ?? null,
     userId: principal?.userId ?? null,
-    userIds: principal?.userIds ?? [],
+    workspaceId: principal?.activeWorkspaceId ?? null,
   };
 }
 
@@ -103,10 +109,15 @@ export function ownerScope(request: FastifyRequest): {
  * Ownership check for a resource. Rows created before sessions existed, or by a
  * server-side process, have a null owner and are readable by anyone — which
  * only happens when REQUIRE_SESSION is off.
+ *
+ * Access by id is granted from ANY workspace the caller belongs to, not only
+ * the room they are currently in: a link a teammate sends should open, rather
+ * than read as missing because the recipient was looking elsewhere. Listings
+ * are narrower — those show the active workspace alone.
  */
 export function assertOwnership(
   request: FastifyRequest,
-  resource: { sessionId: string | null; userId: string | null },
+  resource: { sessionId: string | null; userId: string | null; workspaceId?: string | null },
   resourceName: string,
 ): void {
   if (!env.REQUIRE_SESSION) return;
@@ -115,8 +126,10 @@ export function assertOwnership(
   const principal = request.principal;
   if (!principal) throw HttpError.notFound(`${resourceName} not found`);
 
-  // Anyone in the caller's workspace, which for a lone user is just them.
-  if (resource.userId && principal.userIds.includes(resource.userId)) return;
+  if (resource.workspaceId && principal.workspaceIds.includes(resource.workspaceId)) return;
+  // A row with no workspace — made before workspaces existed, or by someone
+  // who had none — still answers to the person who made it.
+  if (!resource.workspaceId && resource.userId && principal.userId === resource.userId) return;
   if (resource.sessionId && principal.sessionId === resource.sessionId) return;
 
   // 404 rather than 403: an unauthorised caller should not learn the id exists.

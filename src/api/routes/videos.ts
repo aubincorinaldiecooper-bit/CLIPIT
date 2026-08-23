@@ -107,6 +107,8 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
       const video = await createVideo({
         sessionId,
         userId: request.principal?.userId ?? null,
+        // The room it lands in: whatever workspace they are working in now.
+        workspaceId: request.principal?.activeWorkspaceId ?? null,
         sourceType: 'youtube',
         sourceUrl: body.url,
         status: 'queued',
@@ -124,6 +126,8 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const video = await createVideo({
       sessionId,
       userId: request.principal?.userId ?? null,
+      // The room it lands in: whatever workspace they are working in now.
+      workspaceId: request.principal?.activeWorkspaceId ?? null,
       sourceType: 'upload',
       originalFilename: filename,
       title: filename,
@@ -185,6 +189,8 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const video = await createVideo({
       sessionId,
       userId: request.principal?.userId ?? null,
+      // The room it lands in: whatever workspace they are working in now.
+      workspaceId: request.principal?.activeWorkspaceId ?? null,
       sourceType: 'upload',
       originalFilename: filename,
       title: filename,
