@@ -77,6 +77,17 @@ const envSchema = z.object({
   BUCKET_NAME: nonEmpty('BUCKET_NAME'),
   S3_FORCE_PATH_STYLE: bool(true),
   SIGNED_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
+
+  // --- Social publishing (Zernio) ----------------------------------------
+  // All optional: without them, publishing answers honestly that it is not
+  // configured — the same pattern sign-in uses on the frontend.
+  ZERNIO_BASE_URL: z.string().url().optional(),
+  ZERNIO_API_KEY: z.string().min(1).optional(),
+  /** Must point at this API's /api/connect/callback, reachable from a browser. */
+  ZERNIO_CONNECT_REDIRECT_URL: z.string().url().optional(),
+  ZERNIO_WEBHOOK_SECRET: z.string().min(1).optional(),
+  /** The frontend origin the connect callback bounces people back to. */
+  FRONTEND_URL: z.string().url().optional(),
   UPLOAD_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
   BUCKET_CORS_AUTOCONFIGURE: bool(true),
   BUCKET_CORS_ORIGINS: z.string().trim().optional(),
