@@ -27,6 +27,18 @@ export class HttpError extends Error {
   static unprocessable(message: string, details?: unknown): HttpError {
     return new HttpError(422, 'unprocessable_entity', message, details);
   }
+
+  static forbidden(message: string): HttpError {
+    return new HttpError(403, 'forbidden', message);
+  }
+
+  static paymentRequired(message: string): HttpError {
+    return new HttpError(402, 'payment_required', message);
+  }
+
+  static serviceUnavailable(message: string): HttpError {
+    return new HttpError(503, 'service_unavailable', message);
+  }
 }
 
 /** Failure of an external dependency (OpenRouter, yt-dlp, ffmpeg, storage). */
