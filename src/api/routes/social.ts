@@ -10,18 +10,20 @@ import { getClip } from '../../db/repositories/clips.js';
 import {
   consumeConnectionState,
   createConnectionState,
+  findInFlightPublish,
   getSocialAccount,
   insertPublishedPost,
   listSocialAccounts,
   setSocialAccountStatus,
   getSocialProfile,
+  updatePublishedPost,
 } from '../../db/repositories/social.js';
 import {
   PUBLISH_PLATFORMS,
   getOrCreateZernioProfile,
   isPublishPlatform,
   syncAccounts,
-  verifyConnected,
+  verifyConnectAttempt,
 } from '../../services/social/accounts.js';
 import { zernio, ZernioApiError, zernioConfigured } from '../../services/zernio/client.js';
 import { getStorage } from '../../services/storage/s3.js';
@@ -43,6 +45,14 @@ import { getStorage } from '../../services/storage/s3.js';
  */
 
 const CONNECT_STATE_TTL_SECONDS = 15 * 60;
+
+/**
+ * How long a 'submitting' record blocks a re-publish of the same clip. Long
+ * enough to absorb a double-click or an automatic retry after a dropped
+ * response; short enough that a genuinely stuck submission doesn't lock the
+ * clip out of publishing forever.
+ */
+const PUBLISH_RETRY_GUARD_SECONDS = 2 * 60;
 
 function requireZernio(): void {
   if (!zernioConfigured()) {
@@ -88,18 +98,21 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
 
     // Synchronization is part of OAuth completion, not a side effect: the
     // redirect only says "connected" once the account list Zernio returns
-    // for this user actually contains the platform, re-read through the same
-    // user-scoped path the API serves.
+    // for this user actually changed for THIS attempt — judged against a
+    // snapshot taken before the sync, re-read through the same user-scoped
+    // path the API serves. An attempt that changed nothing while an older
+    // account was already connected reports 'nothing_new', not success.
     try {
       const profile = await getSocialProfile(state.user_id);
       if (!profile) throw new Error('no Zernio profile for user at callback time');
+      const before = await listSocialAccounts(state.user_id, { platform: state.platform });
       await syncAccounts(state.user_id, profile.zernio_profile_id);
-      const verified = await verifyConnected(state.user_id, state.platform);
-      if (verified) {
+      const outcome = await verifyConnectAttempt(state.user_id, state.platform, before);
+      if (outcome === 'connected') {
         to.searchParams.set('connected', state.platform);
         logger.info('social account connected', { platform: state.platform });
       } else {
-        to.searchParams.set('connect_error', 'account_sync_failed');
+        to.searchParams.set('connect_error', outcome === 'nothing_new' ? 'nothing_new' : 'account_sync_failed');
         to.searchParams.set('platform', state.platform);
       }
     } catch (cause) {
@@ -222,7 +235,9 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     const body = parse(
       z.object({
         caption: z.string().trim().max(5000).default(''),
-        accountIds: z.array(z.string().min(1)).max(10).optional(),
+        // min(1): an explicitly empty selection is a refusal to pick, not
+        // permission to post to every connected account. Omit to mean "all".
+        accountIds: z.array(z.string().min(1)).min(1).max(10).optional(),
       }),
       request.body ?? {},
     );
@@ -247,26 +262,55 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       }
     }
 
+    // The record is written BEFORE the external call, so a post Zernio
+    // accepts can never be one CLIPIT has no memory of. A retry that arrives
+    // while a submission for this clip is still in flight (or whose outcome
+    // was lost) is refused instead of duplicated on every account.
+    const inFlight = await findInFlightPublish(userId, clipId, PUBLISH_RETRY_GUARD_SECONDS);
+    if (inFlight) {
+      throw HttpError.conflict(
+        'This clip was already submitted moments ago. Check your accounts before publishing it again.',
+      );
+    }
+
+    const targetList = targets.map((account) => ({ platform: account.platform, accountId: account.id }));
+    const post = await insertPublishedPost({
+      userId,
+      clipId,
+      zernioPostId: null,
+      caption: body.caption,
+      targets: targetList,
+      status: 'submitting',
+    });
+
     // A fresh signed URL minted at publish time: Zernio downloads the file
     // server-side, so the API never proxies the bytes.
     const mediaUrl = await getStorage().createDownloadUrl(clip.storageKey);
 
-    const created = await zernio.createPost({
-      content: body.caption,
-      platforms: targets.map((account) => ({ platform: account.platform, accountId: account.id })),
-      mediaUrls: [mediaUrl],
-      publishNow: true,
-    });
+    let created;
+    try {
+      created = await zernio.createPost({
+        content: body.caption,
+        platforms: targetList,
+        mediaUrls: [mediaUrl],
+        publishNow: true,
+      });
+    } catch (cause) {
+      // A definite rejection frees the clip for another try. Anything
+      // ambiguous (timeout, dropped response) leaves the row 'submitting' so
+      // the guard above holds until it ages out — Zernio may have posted it.
+      if (cause instanceof ZernioApiError) {
+        await updatePublishedPost(post.id, { zernioPostId: null, status: 'failed' });
+      }
+      throw cause;
+    }
 
-    const post = await insertPublishedPost({
-      userId,
-      clipId,
+    const updated = await updatePublishedPost(post.id, {
       zernioPostId:
         (typeof created.id === 'string' && created.id) || (typeof created.postId === 'string' && created.postId) || null,
-      caption: body.caption,
-      targets: targets.map((account) => ({ platform: account.platform, accountId: account.id })),
       status: typeof created.status === 'string' ? created.status : 'submitted',
     });
+    const finalStatus = updated?.status ?? 'submitted';
 
     logger.info('clip publish submitted', { clipId, targets: targets.length });
 
@@ -274,8 +318,8 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       post: {
         id: post.id,
         clipId,
-        status: post.status,
-        targets: targets.map((account) => ({ platform: account.platform, accountId: account.id })),
+        status: finalStatus,
+        targets: targetList,
         createdAt: post.created_at.toISOString(),
       },
     });

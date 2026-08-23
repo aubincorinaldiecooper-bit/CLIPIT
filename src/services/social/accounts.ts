@@ -68,13 +68,41 @@ export async function syncAccounts(userId: string, zernioProfileId: string): Pro
   return stored;
 }
 
+export type ConnectAttemptOutcome = 'connected' | 'nothing_new' | 'failed';
+
 /**
- * The post-sync verification borrowed from populr: the upsert above is
- * in-memory proof of a write, not proof the user can see it. Re-reading
- * through the exact user-scoped path the API serves is what lets a callback
- * say "connected" and mean it.
+ * The post-sync verification borrowed from populr, sharpened to judge THIS
+ * attempt rather than the platform in general: re-read through the exact
+ * user-scoped path the API serves and compare against a snapshot taken
+ * before the sync. "Connected" means this attempt visibly changed something
+ * — a new account appeared, or an existing one came back to connected. An
+ * attempt that changed nothing while an old account was already connected is
+ * 'nothing_new', never a fresh success: a canceled OAuth must not ride an
+ * earlier connection's coattails.
  */
-export async function verifyConnected(userId: string, platform: string): Promise<boolean> {
-  const rows = await listSocialAccounts(userId, { platform });
-  return rows.some((row) => row.status === 'connected');
+export async function verifyConnectAttempt(
+  userId: string,
+  platform: string,
+  before: SocialAccountRow[],
+): Promise<ConnectAttemptOutcome> {
+  const after = await listSocialAccounts(userId, { platform });
+  return judgeConnectAttempt(before, after);
+}
+
+/** The pure decision, separated so it can be tested without a database. */
+export function judgeConnectAttempt(
+  before: Pick<SocialAccountRow, 'id' | 'status'>[],
+  after: Pick<SocialAccountRow, 'id' | 'status'>[],
+): ConnectAttemptOutcome {
+  const beforeStatusById = new Map(before.map((row) => [row.id, row.status]));
+
+  const changed = after.some((row) => {
+    if (row.status !== 'connected') return false;
+    const previous = beforeStatusById.get(row.id);
+    return previous === undefined || previous !== 'connected';
+  });
+  if (changed) return 'connected';
+
+  const alreadyConnected = before.some((row) => row.status === 'connected');
+  return alreadyConnected ? 'nothing_new' : 'failed';
 }

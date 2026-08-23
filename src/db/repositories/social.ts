@@ -69,11 +69,17 @@ export async function upsertSocialAccount(input: {
   displayName: string | null;
   status: string;
 }): Promise<SocialAccountRow> {
+  // Ownership follows the profile-scoped sync that produced this write: the
+  // account id is Zernio's, and if it later shows up under a different user's
+  // Zernio profile, the row moves to that user. Keeping the old user_id would
+  // quietly reactivate the row for its previous owner while the new owner's
+  // verification fails — the cross-user case this clause exists to prevent.
   const row = await queryOne<SocialAccountRow>(
     `INSERT INTO social_accounts (id, user_id, platform, display_name, status)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (id) DO UPDATE
-        SET platform = EXCLUDED.platform,
+        SET user_id = EXCLUDED.user_id,
+            platform = EXCLUDED.platform,
             display_name = EXCLUDED.display_name,
             status = EXCLUDED.status,
             updated_at = now()
@@ -181,6 +187,39 @@ export async function insertPublishedPost(input: {
     [input.userId, input.clipId, input.zernioPostId, input.caption, JSON.stringify(input.targets), input.status],
   );
   return row!;
+}
+
+export async function updatePublishedPost(
+  id: string,
+  input: { zernioPostId: string | null; status: string },
+): Promise<PublishedPostRow | null> {
+  return queryOne<PublishedPostRow>(
+    `UPDATE published_posts SET zernio_post_id = $2, status = $3
+      WHERE id = $1
+      RETURNING id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at`,
+    [id, input.zernioPostId, input.status],
+  );
+}
+
+/**
+ * The most recent record still in 'submitting' for this clip, if it is fresh
+ * enough to be the same publish attempt. This is the retry guard: a client
+ * that lost the response and tries again gets a conflict, not a second
+ * public post on every account.
+ */
+export async function findInFlightPublish(
+  userId: string,
+  clipId: string,
+  withinSeconds: number,
+): Promise<PublishedPostRow | null> {
+  return queryOne<PublishedPostRow>(
+    `SELECT id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at
+       FROM published_posts
+      WHERE user_id = $1 AND clip_id = $2 AND status = 'submitting'
+        AND created_at > now() - ($3 || ' seconds')::interval
+      ORDER BY created_at DESC LIMIT 1`,
+    [userId, clipId, String(withinSeconds)],
+  );
 }
 
 export async function listPublishedPosts(userId: string, limit = 50): Promise<PublishedPostRow[]> {
