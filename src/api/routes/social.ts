@@ -69,15 +69,16 @@ function requireUserId(principal: { userId: string | null } | null): string {
 }
 
 /**
- * The room whose accounts and clips this caller may act on. A workspace
- * shares everything inside it, so a teammate's connected TikTok is one this
- * caller can publish to — and a clip from another of their workspaces is not.
+ * Publishing happens from a person's own library: the accounts they connected
+ * and the clips they cut. Shared rooms hold clips people send each other;
+ * whose accounts a room would publish to is a question with no obvious right
+ * answer, so it is deliberately not asked here.
  */
-function requireWorkspaceId(principal: { activeWorkspaceId: string | null } | null): string {
-  if (!principal?.activeWorkspaceId) {
+function requireWorkspaceId(principal: { ownWorkspaceId: string | null } | null): string {
+  if (!principal?.ownWorkspaceId) {
     throw HttpError.forbidden('Publishing needs an account — sign in first');
   }
-  return principal.activeWorkspaceId;
+  return principal.ownWorkspaceId;
 }
 
 export async function registerSocialRoutes(app: FastifyInstance): Promise<void> {

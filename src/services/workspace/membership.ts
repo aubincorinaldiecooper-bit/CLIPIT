@@ -1,7 +1,7 @@
 import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
 import {
-  getActiveWorkspace,
+  getOwnWorkspace,
   insertWorkspace,
   setMemberEmail,
   type WorkspaceRow,
@@ -14,12 +14,12 @@ import {
  * this one.
  */
 export async function ensureWorkspace(userId: string, email: string | null): Promise<WorkspaceRow> {
-  const active = await getActiveWorkspace(userId);
-  if (active) {
+  const own = await getOwnWorkspace(userId);
+  if (own) {
     // A returning member may have signed in with an address we did not know
     // when they were invited; keep the team list honest about who is who.
     if (email) await setMemberEmail(userId, email);
-    return active;
+    return own;
   }
   const name = email ? `${email.split('@')[0]}'s workspace` : 'My workspace';
   const workspace = await insertWorkspace({ name, ownerUserId: userId, email });

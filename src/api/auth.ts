@@ -46,16 +46,16 @@ export async function attachPrincipal(request: FastifyRequest): Promise<void> {
   const session = await findSessionByToken(token);
   if (!session) return;
 
-  // A signed-in caller acts inside a workspace. One small indexed lookup per
-  // authenticated request buys a single, always-current answer — no cache to
-  // go stale the moment someone switches rooms or leaves a team.
+  // One small indexed lookup per authenticated request buys a single,
+  // always-current answer — no cache to go stale the moment someone joins or
+  // leaves a room.
   const context = session.userId
     ? await getWorkspaceContext(session.userId)
-    : { activeWorkspaceId: null, workspaceIds: [] };
+    : { ownWorkspaceId: null, workspaceIds: [] };
   request.principal = {
     sessionId: session.id,
     userId: session.userId,
-    activeWorkspaceId: context.activeWorkspaceId,
+    ownWorkspaceId: context.ownWorkspaceId,
     workspaceIds: context.workspaceIds,
     // The session label is the address they signed in with, recorded at the
     // auth exchange; null for guests.
@@ -81,16 +81,16 @@ export function principalOrNull(request: FastifyRequest): Principal | null {
 
 /**
  * The scope every "what is mine" listing runs in: this session, this person,
- * and the workspace they are currently working in.
+ * and their personal room.
  *
  * Deliberately one helper rather than three hand-built literals. When each
  * route assembled its own, adding the workspace to the shape meant remembering
- * three places — and forgetting one left a listing quietly narrowed to a
- * single person while ownership checks had already widened. One shape, one
- * place to change it.
+ * three places — and forgetting one left a listing quietly narrowed while
+ * ownership checks had already widened. One shape, one place to change it.
  *
- * The ACTIVE workspace only. A person in several rooms sees one library at a
- * time — the room they are in — which is the whole point of switching.
+ * The PERSONAL room only. What a shared room holds is a different question
+ * with a different answer, and merging the two would put other people's clips
+ * in someone's library the moment they joined a team.
  */
 export function ownerScope(request: FastifyRequest): {
   sessionId: string | null;
@@ -101,7 +101,7 @@ export function ownerScope(request: FastifyRequest): {
   return {
     sessionId: principal?.sessionId ?? null,
     userId: principal?.userId ?? null,
-    workspaceId: principal?.activeWorkspaceId ?? null,
+    workspaceId: principal?.ownWorkspaceId ?? null,
   };
 }
 

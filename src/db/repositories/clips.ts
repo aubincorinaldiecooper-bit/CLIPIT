@@ -96,12 +96,16 @@ export interface LibraryClip {
 }
 
 /**
- * Every finished clip the caller can still play, newest first.
+ * The caller's own library: every finished clip they can still play, newest
+ * first.
  *
- * Owned by the person when signed in — across every session they have ever
- * had — and by the single session otherwise. Only clips whose file still
- * exists: the retention sweep nulls storage keys when guest footage goes, and
- * listing a clip we cannot play would be offering something we no longer have.
+ * Theirs, and only theirs — being in a shared room does not put other
+ * people's clips here, and nothing can move a clip out. What a room holds is
+ * a separate question, answered by listWorkspaceClips.
+ *
+ * Only clips whose file still exists: the retention sweep nulls storage keys
+ * when guest footage goes, and listing a clip we cannot play would be
+ * offering something we no longer have.
  */
 export async function listClipsForPrincipal(
   principal: {
@@ -115,9 +119,8 @@ export async function listClipsForPrincipal(
     limit: number;
   },
 ): Promise<LibraryClip[]> {
-  // The room's clips, teammates' included — one workspace at a time. A
-  // signed-in person with no workspace yet, or a guest, falls back to what
-  // they made themselves.
+  // A signed-in person's own library; a guest's tab. Someone signed in
+  // before workspaces existed falls back to the rows they made.
   const scope = principal.workspaceId
     ? 'c.workspace_id = $1'
     : principal.userId
@@ -149,6 +152,70 @@ export async function listClipsForPrincipal(
     thumbnailKey: row.thumbnail_key ?? null,
     videoTitle: row.video_title ?? row.video_filename ?? null,
   }));
+}
+
+/**
+ * The clips that have been sent to a shared room, newest share first.
+ *
+ * Ordered by when it was SENT, not when it was cut: a room is a feed of what
+ * people have put in it, and a clip cut last week but shared this morning is
+ * this morning's news to everyone else in it.
+ */
+export async function listWorkspaceClips(workspaceId: string, limit = 60): Promise<LibraryClip[]> {
+  const rows = await queryRows<
+    ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }
+  >(
+    `SELECT c.*, m.description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
+       FROM workspace_clips s
+       JOIN clips c ON c.id = s.clip_id
+       JOIN clip_matches m ON m.id = c.clip_match_id
+       JOIN videos v ON v.id = c.video_id
+      WHERE s.workspace_id = $1
+        AND c.status = 'ready'
+        AND c.storage_key IS NOT NULL
+      ORDER BY s.created_at DESC
+      LIMIT $2`,
+    [workspaceId, limit],
+  );
+  return rows.map((row) => ({
+    clip: mapClip(row),
+    description: row.description,
+    thumbnailKey: row.thumbnail_key ?? null,
+    videoTitle: row.video_title ?? row.video_filename ?? null,
+  }));
+}
+
+/** Send a clip to a room. Sending the same clip twice is not an error. */
+export async function shareClipToWorkspace(input: {
+  workspaceId: string;
+  clipId: string;
+  sharedBy: string;
+}): Promise<void> {
+  await queryOne(
+    `INSERT INTO workspace_clips (workspace_id, clip_id, shared_by)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (workspace_id, clip_id) DO NOTHING
+     RETURNING clip_id`,
+    [input.workspaceId, input.clipId, input.sharedBy],
+  );
+}
+
+/** Take a clip back out of a room. The clip itself is untouched. */
+export async function unshareClipFromWorkspace(workspaceId: string, clipId: string): Promise<boolean> {
+  const row = await queryOne<{ clip_id: string }>(
+    `DELETE FROM workspace_clips WHERE workspace_id = $1 AND clip_id = $2 RETURNING clip_id`,
+    [workspaceId, clipId],
+  );
+  return row !== null;
+}
+
+/** Which of the caller's rooms a clip has already been sent to. */
+export async function listWorkspacesForClip(clipId: string): Promise<string[]> {
+  const rows = await queryRows<{ workspace_id: string }>(
+    'SELECT workspace_id FROM workspace_clips WHERE clip_id = $1',
+    [clipId],
+  );
+  return rows.map((row) => row.workspace_id);
 }
 
 export async function getClip(clipId: string): Promise<Clip | null> {

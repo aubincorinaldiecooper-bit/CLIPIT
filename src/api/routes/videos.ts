@@ -107,8 +107,9 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
       const video = await createVideo({
         sessionId,
         userId: request.principal?.userId ?? null,
-        // The room it lands in: whatever workspace they are working in now.
-        workspaceId: request.principal?.activeWorkspaceId ?? null,
+        // Uploads land in the person's own library, always. A shared room
+      // holds clips people send it, never videos.
+        workspaceId: request.principal?.ownWorkspaceId ?? null,
         sourceType: 'youtube',
         sourceUrl: body.url,
         status: 'queued',
@@ -126,8 +127,9 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const video = await createVideo({
       sessionId,
       userId: request.principal?.userId ?? null,
-      // The room it lands in: whatever workspace they are working in now.
-      workspaceId: request.principal?.activeWorkspaceId ?? null,
+      // Uploads land in the person's own library, always. A shared room
+      // holds clips people send it, never videos.
+      workspaceId: request.principal?.ownWorkspaceId ?? null,
       sourceType: 'upload',
       originalFilename: filename,
       title: filename,
@@ -189,8 +191,9 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const video = await createVideo({
       sessionId,
       userId: request.principal?.userId ?? null,
-      // The room it lands in: whatever workspace they are working in now.
-      workspaceId: request.principal?.activeWorkspaceId ?? null,
+      // Uploads land in the person's own library, always. A shared room
+      // holds clips people send it, never videos.
+      workspaceId: request.principal?.ownWorkspaceId ?? null,
       sourceType: 'upload',
       originalFilename: filename,
       title: filename,

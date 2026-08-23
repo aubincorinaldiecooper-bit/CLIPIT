@@ -2,11 +2,36 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
-import { getClip, listClipsForPrincipal } from '../../db/repositories/clips.js';
+import type { FastifyRequest } from 'fastify';
+import { getClip, listClipsForPrincipal, listWorkspacesForClip } from '../../db/repositories/clips.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, MINUTE } from '../rateLimit.js';
 import { serializeClip, serializeLibraryClip } from '../serializers.js';
 import { parse } from '../validation.js';
+import type { Clip } from '../../domain/types.js';
+
+/**
+ * May this caller open this clip?
+ *
+ * Two ways in, and the second is the whole point of sending a clip to a room:
+ * it is theirs (or a workspace-mate's), OR it has been sent to a room they
+ * are in. A clip lives in its maker's library, so without the second check a
+ * teammate would see it listed in the room and get "not found" on click.
+ *
+ * The share lookup only runs when the cheap check has already failed, so the
+ * common case costs nothing.
+ */
+export async function assertClipAccess(request: FastifyRequest, clip: Clip): Promise<void> {
+  try {
+    assertOwnership(request, clip, 'Clip');
+    return;
+  } catch (cause) {
+    const rooms = request.principal?.workspaceIds ?? [];
+    if (rooms.length === 0) throw cause;
+    const sharedWith = await listWorkspacesForClip(clip.id);
+    if (!sharedWith.some((workspaceId) => rooms.includes(workspaceId))) throw cause;
+  }
+}
 
 export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -58,7 +83,7 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
 
     const clip = await getClip(clipId);
     if (!clip) throw HttpError.notFound('Clip not found');
-    assertOwnership(request, clip, 'Clip');
+    await assertClipAccess(request, clip);
 
     return reply.send({ clip: await serializeClip(clip) });
   });

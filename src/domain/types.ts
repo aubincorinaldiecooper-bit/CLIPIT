@@ -52,24 +52,23 @@ export interface Session {
 /**
  * The authenticated actor behind a request, and the rooms they can act in.
  *
- * A person may belong to several workspaces and works in one at a time. "May
- * I see this" is answered by the workspace a thing belongs to, not by who
- * made it — which is what lets a team share a library without dragging one
- * person's other projects into it. For a guest both lists are empty and
- * ownership falls back to the session.
+ * A person has one personal room and belongs to any number of shared ones.
+ * "May I see this" is answered by the rooms a thing is in — its own library
+ * plus wherever it has been sent — never by a mode the caller is in. For a
+ * guest both are empty and ownership falls back to the session.
  */
 export interface Principal {
   sessionId: string;
   userId: string | null;
   /**
-   * The workspace this caller is working in. Their library, their home
-   * counts, and anything they create belong to it. Null for guests.
+   * Their personal room: where their uploads land and their library lives.
+   * Nothing moves it — there is no "currently in" state. Null for guests.
    */
-  activeWorkspaceId: string | null;
+  ownWorkspaceId: string | null;
   /**
-   * Every workspace they belong to. Opening something by its id works from
-   * any of them, so a link from a teammate is never a dead end just because
-   * the recipient is looking at a different workspace.
+   * Every room they belong to, personal and shared. Opening something by its
+   * id works from any of them, so a clip sent to a room opens for everyone in
+   * that room.
    */
   workspaceIds: string[];
   /** What they signed in as, when known — used to name people on a team. */

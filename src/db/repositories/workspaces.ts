@@ -2,10 +2,15 @@ import { createHash, randomBytes } from 'node:crypto';
 import { queryOne, queryRows, withTransaction } from '../pool.js';
 
 /**
- * Workspaces: the room a team works in (migration 017). A workspace shares
- * everything — library and connected accounts alike — so membership is the
- * answer to "may this person see this", and every row here belongs to a
- * signed-in user, never a guest session.
+ * Workspaces (migrations 017-019).
+ *
+ * Two kinds, one table. A PERSONAL workspace is the private library a person
+ * gets on first sign-in — one each, and nothing can move their work out of
+ * it. A SHARED workspace is a room with people in it, holding clips that have
+ * been sent there. You navigate to a shared room; you are never silently
+ * "inside" one.
+ *
+ * Everything here belongs to a signed-in user, never a guest session.
  */
 
 export interface WorkspaceRow {
@@ -40,33 +45,59 @@ const INVITE_COLUMNS = `id, workspace_id, email, invited_by, expires_at, accepte
 // --- workspaces and membership ----------------------------------------------
 
 /**
- * The workspace this person is currently working in — the one their library
- * shows and their next upload lands in. Null only before their first
- * workspace exists.
+ * A person's own room: where their uploads land and their library lives.
+ *
+ * There is no "currently in" state any more. Yours is yours, always, and a
+ * workspace is somewhere you navigate to rather than something you are
+ * inside — which is what makes every screen predictable.
  */
-export async function getActiveWorkspace(userId: string): Promise<WorkspaceRow | null> {
+export async function getOwnWorkspace(userId: string): Promise<WorkspaceRow | null> {
   return queryOne<WorkspaceRow>(
-    `SELECT w.id, w.name, w.owner_user_id, w.created_at
-       FROM workspace_active a
-       JOIN workspaces w ON w.id = a.workspace_id
-      WHERE a.user_id = $1`,
+    `SELECT id, name, owner_user_id, created_at FROM workspaces WHERE owner_user_id = $1 AND is_personal`,
     [userId],
   );
 }
 
-/** Every workspace this person belongs to, their own first. */
-export async function listWorkspacesForUser(
-  userId: string,
-): Promise<Array<WorkspaceRow & { role: string; is_active: boolean }>> {
-  return queryRows<WorkspaceRow & { role: string; is_active: boolean }>(
+/**
+ * The shared rooms this person belongs to, with how many people and clips are
+ * in each — the counts are what makes a list of names worth looking at.
+ *
+ * Their own room is left out: that is "Your clips", and showing it here as a
+ * team of one would be a second door to the same place.
+ */
+export async function listSharedWorkspaces(userId: string): Promise<
+  Array<WorkspaceRow & { role: string; member_count: number; clip_count: number }>
+> {
+  return queryRows<WorkspaceRow & { role: string; member_count: number; clip_count: number }>(
     `SELECT w.id, w.name, w.owner_user_id, w.created_at, m.role,
-            (a.workspace_id = w.id) AS is_active
+            (SELECT count(*)::int FROM workspace_members x WHERE x.workspace_id = w.id) AS member_count,
+            (SELECT count(*)::int FROM workspace_clips c WHERE c.workspace_id = w.id) AS clip_count
        FROM workspace_members m
        JOIN workspaces w ON w.id = m.workspace_id
-       LEFT JOIN workspace_active a ON a.user_id = m.user_id
-      WHERE m.user_id = $1
-      ORDER BY (w.owner_user_id = $1) DESC, m.joined_at ASC`,
+      WHERE m.user_id = $1 AND NOT w.is_personal
+      ORDER BY m.joined_at ASC`,
     [userId],
+  );
+}
+
+/** Rooms a clip can be sent to: every shared room the caller is in. */
+export async function listShareTargets(
+  userId: string,
+): Promise<Array<{ id: string; name: string }>> {
+  return queryRows<{ id: string; name: string }>(
+    `SELECT w.id, w.name
+       FROM workspace_members m
+       JOIN workspaces w ON w.id = m.workspace_id
+      WHERE m.user_id = $1 AND NOT w.is_personal
+      ORDER BY w.name ASC`,
+    [userId],
+  );
+}
+
+export async function getWorkspaceById(workspaceId: string): Promise<WorkspaceRow | null> {
+  return queryOne<WorkspaceRow>(
+    'SELECT id, name, owner_user_id, created_at FROM workspaces WHERE id = $1',
+    [workspaceId],
   );
 }
 
@@ -79,50 +110,20 @@ export async function getMembership(userId: string, workspaceId: string): Promis
   );
 }
 
-/** Switch rooms. Refuses a workspace the person is not a member of. */
-export async function setActiveWorkspace(userId: string, workspaceId: string): Promise<boolean> {
-  const row = await queryOne<{ user_id: string }>(
-    `INSERT INTO workspace_active (user_id, workspace_id)
-     SELECT $1, $2
-      WHERE EXISTS (SELECT 1 FROM workspace_members WHERE user_id = $1 AND workspace_id = $2)
-     ON CONFLICT (user_id) DO UPDATE SET workspace_id = EXCLUDED.workspace_id, updated_at = now()
-     RETURNING user_id`,
-    [userId, workspaceId],
-  );
-  return row !== null;
-}
-
 /**
- * Leave a workspace. An owner cannot leave their own — it is their room, and
- * a room with no owner has nobody who can invite or remove anyone. When the
- * room they leave was the one they were working in, they land back in their
- * own.
+ * Leave a shared room. An owner cannot leave their own — it is their room,
+ * and one with no owner has nobody who can invite or remove anyone. Nothing
+ * else moves: their library was never in the room to begin with, and clips
+ * they sent stay where they sent them.
  */
 export async function leaveWorkspace(userId: string, workspaceId: string): Promise<boolean> {
-  return withTransaction(async (client) => {
-    const left = await client.query<{ user_id: string }>(
-      `DELETE FROM workspace_members
-        WHERE user_id = $1 AND workspace_id = $2 AND role <> 'owner'
-        RETURNING user_id`,
-      [userId, workspaceId],
-    );
-    if (left.rowCount === 0) return false;
-
-    await client.query(
-      `UPDATE workspace_active a
-          SET workspace_id = (
-                SELECT m.workspace_id FROM workspace_members m
-                 JOIN workspaces w ON w.id = m.workspace_id
-                WHERE m.user_id = $1
-                ORDER BY (w.owner_user_id = $1) DESC, m.joined_at ASC
-                LIMIT 1
-              ),
-              updated_at = now()
-        WHERE a.user_id = $1 AND a.workspace_id = $2`,
-      [userId, workspaceId],
-    );
-    return true;
-  });
+  const left = await queryOne<{ user_id: string }>(
+    `DELETE FROM workspace_members
+      WHERE user_id = $1 AND workspace_id = $2 AND role <> 'owner'
+      RETURNING user_id`,
+    [userId, workspaceId],
+  );
+  return left !== null;
 }
 
 export async function listMembers(workspaceId: string): Promise<WorkspaceMemberRow[]> {
@@ -137,25 +138,26 @@ export async function listMembers(workspaceId: string): Promise<WorkspaceMemberR
 /**
  * What a signed-in caller may act on, resolved once per request:
  *
- * - `activeWorkspaceId` — the room they are working in. Their library, their
- *   home counts, and their next upload all belong to this one.
- * - `workspaceIds` — every room they belong to. Opening something by its id
- *   works from any of them, so a link a teammate sends is never a dead end
- *   just because the recipient is looking at a different workspace.
+ * - `ownWorkspaceId` — their personal room. Their library, their home counts,
+ *   and their next upload all belong to it, and nothing can move them.
+ * - `workspaceIds` — every room they belong to, personal and shared. Opening
+ *   something by its id works from any of them, so a link a teammate sends is
+ *   never a dead end.
  */
 export async function getWorkspaceContext(
   userId: string,
-): Promise<{ activeWorkspaceId: string | null; workspaceIds: string[] }> {
-  const rows = await queryRows<{ workspace_id: string; is_active: boolean }>(
-    `SELECT m.workspace_id, (a.workspace_id = m.workspace_id) AS is_active
+): Promise<{ ownWorkspaceId: string | null; workspaceIds: string[] }> {
+  const rows = await queryRows<{ workspace_id: string; is_own: boolean }>(
+    `SELECT m.workspace_id, (w.is_personal AND w.owner_user_id = $1) AS is_own
        FROM workspace_members m
-       LEFT JOIN workspace_active a ON a.user_id = m.user_id
+       JOIN workspaces w ON w.id = m.workspace_id
       WHERE m.user_id = $1`,
     [userId],
   );
-  const workspaceIds = rows.map((row) => row.workspace_id);
-  const active = rows.find((row) => row.is_active)?.workspace_id ?? workspaceIds[0] ?? null;
-  return { activeWorkspaceId: active, workspaceIds };
+  return {
+    ownWorkspaceId: rows.find((row) => row.is_own)?.workspace_id ?? null,
+    workspaceIds: rows.map((row) => row.workspace_id),
+  };
 }
 
 /**
@@ -169,9 +171,10 @@ export async function insertWorkspace(input: {
   email: string | null;
 }): Promise<WorkspaceRow> {
   const created = await queryOne<WorkspaceRow>(
-    `INSERT INTO workspaces (name, owner_user_id)
-     VALUES ($1, $2)
-     ON CONFLICT (owner_user_id) DO UPDATE SET owner_user_id = workspaces.owner_user_id
+    `INSERT INTO workspaces (name, owner_user_id, is_personal)
+     VALUES ($1, $2, true)
+     ON CONFLICT (owner_user_id) WHERE is_personal
+       DO UPDATE SET owner_user_id = workspaces.owner_user_id
      RETURNING id, name, owner_user_id, created_at`,
     [input.name, input.ownerUserId],
   );
@@ -183,15 +186,33 @@ export async function insertWorkspace(input: {
      RETURNING user_id`,
     [workspace.id, input.ownerUserId, input.email],
   );
-  // Their own room is where they start; joining another switches them.
-  await queryOne(
-    `INSERT INTO workspace_active (user_id, workspace_id)
-     VALUES ($1, $2)
-     ON CONFLICT (user_id) DO NOTHING
-     RETURNING user_id`,
-    [input.ownerUserId, workspace.id],
-  );
   return workspace;
+}
+
+/**
+ * A new shared room, owned by its creator. Distinct from insertWorkspace,
+ * which makes the one personal room a person gets on first sign-in: there is
+ * exactly one of those (the owner index enforces it) and any number of these.
+ */
+export async function createSharedWorkspace(input: {
+  name: string;
+  ownerUserId: string;
+  email: string | null;
+}): Promise<WorkspaceRow> {
+  return withTransaction(async (client) => {
+    const created = await client.query<WorkspaceRow>(
+      `INSERT INTO workspaces (name, owner_user_id, is_personal) VALUES ($1, $2, false)
+       RETURNING id, name, owner_user_id, created_at`,
+      [input.name, input.ownerUserId],
+    );
+    const workspace = created.rows[0]!;
+    await client.query(
+      `INSERT INTO workspace_members (workspace_id, user_id, role, email)
+       VALUES ($1, $2, 'owner', $3)`,
+      [workspace.id, input.ownerUserId, input.email],
+    );
+    return workspace;
+  });
 }
 
 export async function removeMember(workspaceId: string, userId: string): Promise<boolean> {
@@ -302,14 +323,6 @@ export async function acceptInviteAndJoin(
       // Nothing joined, so nothing may be spent either.
       throw new Error('workspace membership write affected no row');
     }
-
-    // Land them in the room they just accepted — that is what they clicked.
-    await client.query(
-      `INSERT INTO workspace_active (user_id, workspace_id)
-       VALUES ($1, $2)
-       ON CONFLICT (user_id) DO UPDATE SET workspace_id = EXCLUDED.workspace_id, updated_at = now()`,
-      [userId, invite.workspace_id],
-    );
 
     return invite;
   });
