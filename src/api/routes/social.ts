@@ -202,7 +202,8 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     if (!userId) {
       return reply.send({ configured: true, signInRequired: true, accounts: [] });
     }
-    // The room's accounts: a team publishes to the same places.
+    // The caller's own accounts: publishing belongs to a person's library,
+    // never to a shared room (see requireWorkspaceId above).
     const accounts = await listSocialAccounts(requireWorkspaceId(request.principal));
     return reply.send({
       configured: true,

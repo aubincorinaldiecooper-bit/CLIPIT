@@ -3,6 +3,7 @@ import { env } from '../config/env.js';
 import { HttpError } from '../lib/errors.js';
 import { findSessionByToken } from '../db/repositories/sessions.js';
 import { getWorkspaceContext } from '../db/repositories/workspaces.js';
+import { ensureWorkspace } from '../services/workspace/membership.js';
 import type { Principal } from '../domain/types.js';
 
 /**
@@ -49,9 +50,19 @@ export async function attachPrincipal(request: FastifyRequest): Promise<void> {
   // One small indexed lookup per authenticated request buys a single,
   // always-current answer — no cache to go stale the moment someone joins or
   // leaves a room.
-  const context = session.userId
+  let context = session.userId
     ? await getWorkspaceContext(session.userId)
     : { ownWorkspaceId: null, workspaceIds: [] };
+
+  // A signed-in person's own workspace exists from their FIRST authenticated
+  // request, not from the first time some page happens to ask for the
+  // workspace list. Anything they create is stamped with it, so nothing can
+  // be written with a NULL workspace and then vanish from their library the
+  // day the workspace appears. One insert, once per account, race-safe.
+  if (session.userId && !context.ownWorkspaceId) {
+    await ensureWorkspace(session.userId, session.label);
+    context = await getWorkspaceContext(session.userId);
+  }
   request.principal = {
     sessionId: session.id,
     userId: session.userId,
@@ -110,10 +121,10 @@ export function ownerScope(request: FastifyRequest): {
  * server-side process, have a null owner and are readable by anyone — which
  * only happens when REQUIRE_SESSION is off.
  *
- * Access by id is granted from ANY workspace the caller belongs to, not only
- * the room they are currently in: a link a teammate sends should open, rather
- * than read as missing because the recipient was looking elsewhere. Listings
- * are narrower — those show the active workspace alone.
+ * Access by id is granted from ANY workspace the caller belongs to — their
+ * personal one and every shared room — so a clip sent to a room opens for
+ * everyone in it. Listings are narrower: those show the personal library
+ * alone (see ownerScope above).
  */
 export function assertOwnership(
   request: FastifyRequest,

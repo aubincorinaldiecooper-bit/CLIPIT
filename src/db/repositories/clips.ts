@@ -123,14 +123,16 @@ export async function listClipsForPrincipal(
     limit: number;
   },
 ): Promise<LibraryClip[]> {
-  // A signed-in person's own library; a guest's tab. Someone signed in
-  // before workspaces existed falls back to the rows they made.
-  const scope = principal.workspaceId
-    ? 'c.workspace_id = $1'
+  // A signed-in person's own library; a guest's tab. The NULL-workspace arm
+  // is a safety net for rows written before the personal workspace existed —
+  // still this person's clips, and a library must not lose them.
+  const usePersonal = Boolean(principal.workspaceId && principal.userId);
+  const scope = usePersonal
+    ? '(c.workspace_id = $1 OR (c.user_id = $4 AND c.workspace_id IS NULL))'
     : principal.userId
       ? 'c.user_id = $1'
       : 'c.session_id = $1';
-  const owner = principal.workspaceId ?? principal.userId ?? principal.sessionId;
+  const owner = (usePersonal ? principal.workspaceId : principal.userId ?? principal.sessionId) ?? null;
   if (!owner) return [];
 
   // Keyset rather than offset: a library someone scrolls while cutting new
@@ -147,7 +149,7 @@ export async function listClipsForPrincipal(
         AND ($2::timestamptz IS NULL OR c.created_at < $2)
       ORDER BY c.created_at DESC
       LIMIT $3`,
-    [owner, page.before ?? null, page.limit],
+    usePersonal ? [owner, page.before ?? null, page.limit, principal.userId] : [owner, page.before ?? null, page.limit],
   );
 
   return rows.map((row) => ({
@@ -254,11 +256,15 @@ export async function insertDerivedClip(input: {
   return mapClip(row!);
 }
 
-/** Store a new caption spec and send the clip back through rendering. */
-export async function setClipCaptionsForRender(clipId: string, captions: unknown): Promise<void> {
+/**
+ * Send a clip back through rendering. Deliberately does NOT touch the caption
+ * spec: the new spec rides in the job and is written only when its render
+ * succeeds, so the row always describes the file that exists.
+ */
+export async function setClipRenderPending(clipId: string): Promise<void> {
   await queryOne(
-    `UPDATE clips SET captions = $2::jsonb, status = 'pending', updated_at = now() WHERE id = $1 RETURNING id`,
-    [clipId, JSON.stringify(captions)],
+    `UPDATE clips SET status = 'pending', error_message = NULL, updated_at = now() WHERE id = $1 RETURNING id`,
+    [clipId],
   );
 }
 
@@ -268,10 +274,15 @@ export async function getClip(clipId: string): Promise<Clip | null> {
 }
 
 export async function listClipsForRequest(requestId: string): Promise<Clip[]> {
+  // Originals only. A match can now also have DERIVED clips (captioned
+  // copies, possibly other people's); without this filter they collide with
+  // the original in the by-match map and a search result can end up pointing
+  // at a clip its owner cannot even open.
   const rows = await queryRows<ClipRow>(
     `SELECT c.* FROM clips c
        JOIN clip_matches m ON m.id = c.clip_match_id
       WHERE m.clip_request_id = $1
+        AND c.derived_from_clip_id IS NULL
       ORDER BY c.start_seconds ASC`,
     [requestId],
   );
@@ -281,7 +292,14 @@ export async function listClipsForRequest(requestId: string): Promise<Clip[]> {
 export async function setClipStatus(
   clipId: string,
   status: ClipStatus,
-  options: { errorMessage?: string | null; storageKey?: string | null; durationSeconds?: number | null; sizeBytes?: number | null } = {},
+  options: {
+    errorMessage?: string | null;
+    storageKey?: string | null;
+    durationSeconds?: number | null;
+    sizeBytes?: number | null;
+    /** Written only when provided — on the success of the render that used it. */
+    captions?: unknown;
+  } = {},
 ): Promise<void> {
   await queryOne(
     `UPDATE clips
@@ -290,6 +308,7 @@ export async function setClipStatus(
             storage_key = COALESCE($4, storage_key),
             duration_seconds = COALESCE($5, duration_seconds),
             size_bytes = COALESCE($6, size_bytes),
+            captions = COALESCE($7::jsonb, captions),
             updated_at = now()
       WHERE id = $1`,
     [
@@ -299,6 +318,7 @@ export async function setClipStatus(
       options.storageKey ?? null,
       options.durationSeconds ?? null,
       options.sizeBytes ?? null,
+      options.captions === undefined ? null : JSON.stringify(options.captions),
     ],
   );
 }

@@ -26,7 +26,10 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
     log.warn('clip no longer exists, dropping job');
     return;
   }
-  if (clip.status === 'ready' && clip.storageKey) {
+  // Re-render jobs (a Replace) carry their spec and must run even against a
+  // finished clip; only a plain generation of an already-finished clip is a
+  // duplicate worth skipping.
+  if (clip.status === 'ready' && clip.storageKey && job.data.captions === undefined) {
     log.info('clip already generated, skipping');
     return;
   }
@@ -58,13 +61,18 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       await job.updateProgress({ stage: 'cutting', percent: 40 });
 
       // Captions are burned during the cut, sized against the real frame.
-      // The spec was validated when it was stored; validating again here
-      // means a hand-edited row cannot smuggle text into a shell command.
+      // A Replace carries its spec in the job (the row keeps the old one
+      // until this render succeeds); everything else renders the row's. The
+      // spec is re-validated here so a hand-edited row cannot smuggle text
+      // into a shell command.
       let videoFilters: string[] | undefined;
-      const spec = captionsSchema.safeParse(clip.captions ?? []);
+      const spec = captionsSchema.safeParse(job.data.captions ?? clip.captions ?? []);
       if (spec.success && spec.data.length > 0) {
         const probe = await ffprobe(sourcePath);
-        videoFilters = await prepareCaptionFilters(spec.data, dir, probe.height ?? 720);
+        videoFilters = await prepareCaptionFilters(spec.data, dir, {
+          videoWidth: probe.width ?? Math.round(((probe.height ?? 720) * 16) / 9),
+          videoHeight: probe.height ?? 720,
+        });
       }
 
       const outputPath = path.join(dir, `${clipId}.mp4`);
@@ -86,6 +94,9 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         storageKey: key,
         durationSeconds: Number(result.durationSeconds.toFixed(3)),
         sizeBytes: result.sizeBytes,
+        // A Replace's spec becomes the row's truth only now, when the file
+        // that carries it exists.
+        ...(job.data.captions !== undefined ? { captions: job.data.captions } : {}),
       });
 
       log.info('clip generated', {
@@ -99,7 +110,16 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
   } catch (error) {
     const message = errorMessage(error);
     log.error('clip generation failed', { err: error });
-    await setClipStatus(clipId, 'failed', { errorMessage: message });
+    if (clip.storageKey) {
+      // A re-render failed, but the clip it was replacing still exists and
+      // still plays. Marking it 'failed' would delete a working clip from
+      // the library and every room it was shared into — so it goes back to
+      // 'ready', file, spec and all, with the failure recorded on it for
+      // the editor to report.
+      await setClipStatus(clipId, 'ready', { errorMessage: message });
+    } else {
+      await setClipStatus(clipId, 'failed', { errorMessage: message });
+    }
     throw error;
   }
 }

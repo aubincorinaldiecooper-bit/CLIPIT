@@ -144,10 +144,10 @@ export async function getVideoWithReadProgress(videoId: string): Promise<Video |
 }
 
 /**
- * The caller's videos, newest first, footage intact only.
+ * The caller's own library of videos, newest first, footage intact only.
  *
- * Owned by the person when they are signed in — across every session they
- * have ever had — and by the single session otherwise. Videos whose footage
+ * Signed in, that is their personal workspace — across every session they
+ * have ever had; a guest gets the single tab's uploads. Videos whose footage
  * the retention sweep has already removed are left out: they cannot be
  * played or searched again, and listing them would be offering something we
  * no longer have.
@@ -157,15 +157,17 @@ export async function listVideosForPrincipal(principal: {
   userId: string | null;
   workspaceId?: string | null;
 }): Promise<Video[]> {
-  if (principal.workspaceId) {
-    // The room's library, teammates' uploads included — one workspace at a
-    // time, which is what switching rooms means.
+  if (principal.workspaceId && principal.userId) {
+    // Their library. The NULL-workspace arm is a safety net for rows written
+    // before the personal workspace existed: they are still this person's
+    // videos, and a library must not lose them to a bookkeeping gap.
     const rows = await queryRows<VideoRow>(
       `SELECT * FROM videos
-        WHERE workspace_id = $1 AND footage_expired_at IS NULL
+        WHERE (workspace_id = $1 OR (user_id = $2 AND workspace_id IS NULL))
+          AND footage_expired_at IS NULL
         ORDER BY created_at DESC
         LIMIT 30`,
-      [principal.workspaceId],
+      [principal.workspaceId, principal.userId],
     );
     return rows.map(mapVideo);
   }

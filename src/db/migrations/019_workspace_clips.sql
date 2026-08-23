@@ -28,6 +28,31 @@ ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEF
 
 UPDATE workspaces SET is_personal = true WHERE is_personal = false;
 
+-- A personal workspace has exactly one person in it: its owner. Any other
+-- membership here is a leftover from the shared-everything era (017/018) on
+-- a database that ran those commits — and left in place it would quietly
+-- grant that person the owner's ENTIRE library, with no screen even showing
+-- the owner they are there. Membership rows are the access; they go now.
+-- (The clips such members had genuinely shared are preserved below as
+-- explicit workspace_clips shares — access to what was shared, never to the
+-- whole room.)
+DELETE FROM workspace_members m
+ USING workspaces w
+ WHERE w.id = m.workspace_id
+   AND w.is_personal
+   AND m.user_id <> w.owner_user_id;
+
+-- The same for invitations still open against a now-personal workspace: an
+-- accept after this point would recreate exactly the stale membership the
+-- delete above removes.
+UPDATE workspace_invites i
+   SET revoked_at = now()
+  FROM workspaces w
+ WHERE w.id = i.workspace_id
+   AND w.is_personal
+   AND i.accepted_at IS NULL
+   AND i.revoked_at IS NULL;
+
 DROP INDEX IF EXISTS workspaces_owner_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS workspaces_personal_owner_idx
     ON workspaces (owner_user_id) WHERE is_personal;

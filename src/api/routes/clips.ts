@@ -8,7 +8,7 @@ import {
   insertDerivedClip,
   listClipsForPrincipal,
   listWorkspacesForClip,
-  setClipCaptionsForRender,
+  setClipRenderPending,
 } from '../../db/repositories/clips.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import { captionsSchema } from '../../services/media/captions.js';
@@ -147,8 +147,17 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
       if (!clip.userId || clip.userId !== request.principal?.userId) {
         throw HttpError.forbidden('Only the person who cut this clip can replace it — save as a new clip instead.');
       }
-      await setClipCaptionsForRender(clipId, body.captions);
-      await enqueueClipGeneration({ clipId });
+      // One render at a time. A second replace while one is in flight would
+      // be silently swallowed by the queue's duplicate-job id and leave the
+      // row describing captions the file never got.
+      if (clip.status !== 'ready') {
+        throw HttpError.conflict('This clip is still rendering — try again when it finishes.');
+      }
+      // The new spec rides in the JOB and is written to the row only when
+      // its render succeeds; until then the row keeps describing the file
+      // that actually exists, and a failure hands the working clip back.
+      await setClipRenderPending(clipId);
+      await enqueueClipGeneration({ clipId, captions: body.captions });
       logger.info('clip re-render queued', { clipId, captions: body.captions.length });
       return reply.code(202).send({ clip: await serializeClip({ ...clip, status: 'pending' }, false) });
     }

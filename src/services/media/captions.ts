@@ -70,28 +70,103 @@ async function resolveFontFile(font: ClipCaption['font']): Promise<string> {
 }
 
 /**
- * One drawtext filter per caption, sizes computed against the real frame
- * height so the burn matches the preview.
+ * Average glyph width as a fraction of the font size, per face. Rough on
+ * purpose: it only has to keep lines comfortably inside the frame, and the
+ * SAME numbers drive the editor's preview wrapping (see the frontend's
+ * lib/captions.ts mirror), so both sides break lines in the same places.
+ */
+const CHAR_WIDTH_FACTOR: Record<ClipCaption['font'], number> = {
+  sans: 0.5,
+  bold: 0.53,
+  serif: 0.5,
+  mono: 0.6,
+};
+
+/** How much of the frame's width a caption line may use. */
+const USABLE_WIDTH_FRACTION = 0.92;
+
+/**
+ * How many characters fit on one line, from the frame's shape alone —
+ * resolution-independent, so the preview (which knows only the aspect
+ * ratio) computes the identical number.
+ */
+export function maxCharsPerLine(font: ClipCaption['font'], sizePct: number, aspectRatio: number): number {
+  return Math.max(4, Math.floor((USABLE_WIDTH_FRACTION * aspectRatio * 100) / (CHAR_WIDTH_FACTOR[font] * sizePct)));
+}
+
+/**
+ * Greedy word wrap; a single word longer than a line is broken hard rather
+ * than allowed to run off the frame. Pure and shared in spirit with the
+ * frontend mirror: what the editor shows as lines is exactly what is burned.
+ */
+export function wrapCaptionText(text: string, maxChars: number): string[] {
+  const lines: string[] = [];
+  for (const rawLine of text.split('\n')) {
+    const words = rawLine.split(/\s+/).filter((word) => word.length > 0);
+    if (words.length === 0) continue;
+    let current = '';
+    for (let word of words) {
+      while (word.length > maxChars) {
+        if (current) {
+          lines.push(current);
+          current = '';
+        }
+        lines.push(word.slice(0, maxChars));
+        word = word.slice(maxChars);
+      }
+      if (!current) current = word;
+      else if (current.length + 1 + word.length <= maxChars) current = `${current} ${word}`;
+      else {
+        lines.push(current);
+        current = word;
+      }
+    }
+    if (current) lines.push(current);
+  }
+  return lines.length > 0 ? lines : [text.trim() || ' '];
+}
+
+/**
+ * One drawtext filter per LINE, sizes computed against the real frame.
  *
- * The text itself goes through a textfile, never inline: drawtext's inline
- * escaping rules (colons, quotes, percent signs) are exactly the kind of
- * thing user text exists to trip over, and a file sidesteps all of it.
+ * Per-line filters rather than one multi-line drawtext because drawtext
+ * left-aligns lines inside its own text box; a filter per line, each with
+ * x=(w-text_w)/2, is what actually centres every line — and it is exactly
+ * how the preview lays lines out, so the two agree.
+ *
+ * The text itself travels via textfile, and expansion is switched OFF:
+ * drawtext's default "normal" expansion runs %{...} functions found in the
+ * text — even text loaded from a textfile — so a stray percent sign would
+ * silently swallow a caption, and %{gmtime} would stamp the server's clock
+ * into a user's video. With expansion=none the file's bytes are drawn
+ * literally, which is the only honest reading of "caption text".
  */
 export function buildDrawtextFilter(
+  line: string,
   caption: ClipCaption,
-  context: { fontFile: string; textFile: string; videoHeight: number },
+  context: {
+    fontFile: string;
+    textFile: string;
+    videoHeight: number;
+    /** This line's offset from the caption block's centre, in lines. */
+    lineOffset: number;
+  },
 ): string {
   const fontSize = Math.max(8, Math.round((context.videoHeight * caption.sizePct) / 100));
+  const lineHeight = Math.round(fontSize * 1.15);
+  const offsetPx = Math.round(context.lineOffset * lineHeight);
   const color = `0x${caption.color.slice(1)}`;
+  const offset = offsetPx === 0 ? '' : offsetPx > 0 ? `+${offsetPx}` : `${offsetPx}`;
   const parts = [
     `fontfile='${context.fontFile}'`,
     `textfile='${context.textFile}'`,
+    `expansion=none`,
     `fontsize=${fontSize}`,
     `fontcolor=${color}`,
-    // Centred horizontally; vertical centre at yPct, clamped so text never
-    // leaves the frame.
+    // Centred horizontally; the block's vertical centre at yPct, this line
+    // shifted by its offset, clamped so no line ever leaves the frame.
     `x=(w-text_w)/2`,
-    `y=min(max(h*${(caption.yPct / 100).toFixed(4)}-text_h/2\\,h*0.01)\\,h-text_h-h*0.01)`,
+    `y=min(max(h*${(caption.yPct / 100).toFixed(4)}${offset}-text_h/2\\,h*0.01)\\,h-text_h-h*0.01)`,
   ];
   if (caption.outline) {
     parts.push(`borderw=${Math.max(1, Math.round(fontSize / 14))}`, `bordercolor=black@0.85`);
@@ -100,20 +175,32 @@ export function buildDrawtextFilter(
 }
 
 /**
- * Write each caption's text to its own file in the work directory and return
- * the full filter list, in spec order (later captions draw over earlier).
+ * Lay out and write every caption: wrapped into lines that fit the frame's
+ * width, one textfile and one filter per line, in spec order (later captions
+ * draw over earlier).
  */
 export async function prepareCaptionFilters(
   captions: ClipCaption[],
   workDir: string,
-  videoHeight: number,
+  dimensions: { videoWidth: number; videoHeight: number },
 ): Promise<string[]> {
+  const aspectRatio = dimensions.videoWidth / Math.max(1, dimensions.videoHeight);
   const filters: string[] = [];
   for (const [index, caption] of captions.entries()) {
-    const textFile = path.join(workDir, `caption-${index}.txt`);
-    await writeFile(textFile, caption.text, 'utf8');
     const fontFile = await resolveFontFile(caption.font);
-    filters.push(buildDrawtextFilter(caption, { fontFile, textFile, videoHeight }));
+    const lines = wrapCaptionText(caption.text, maxCharsPerLine(caption.font, caption.sizePct, aspectRatio));
+    for (const [lineIndex, line] of lines.entries()) {
+      const textFile = path.join(workDir, `caption-${index}-${lineIndex}.txt`);
+      await writeFile(textFile, line, 'utf8');
+      filters.push(
+        buildDrawtextFilter(line, caption, {
+          fontFile,
+          textFile,
+          videoHeight: dimensions.videoHeight,
+          lineOffset: lineIndex - (lines.length - 1) / 2,
+        }),
+      );
+    }
   }
   return filters;
 }

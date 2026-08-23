@@ -26,6 +26,7 @@ import {
   leaveWorkspace,
   listMembers,
   listPendingInvites,
+  listShareTargets,
   listWorkspacesForUser,
   removeMember,
   revokeInvite,
@@ -176,18 +177,25 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
       listMembers(workspaceId),
       // The personal workspace IS the library: its page shows every playable
       // clip its owner has cut. A shared room shows what was sent to it.
+      // One page of 60 either way — and the response says when there is
+      // more, so the page can point at the full library instead of silently
+      // truncating.
       workspace.is_personal
-        ? listClipsForPrincipal({ sessionId: null, userId, workspaceId }, { limit: 60 })
-        : listWorkspaceClips(workspaceId),
+        ? listClipsForPrincipal({ sessionId: null, userId, workspaceId }, { limit: 61 })
+        : listWorkspaceClips(workspaceId, 61),
       // Pending invitations are the owner's business: they name addresses
       // that have been offered access and have not taken it yet.
       isOwner && !workspace.is_personal ? listPendingInvites(workspaceId) : Promise.resolve([]),
     ]);
 
+    const page = clips.slice(0, 60);
     return reply.send({
       workspace: { id: workspace.id, name: workspace.name, isOwner, isPersonal: workspace.is_personal },
       members: members.map((member) => serializeMember(member, userId)),
-      clips: await Promise.all(clips.map((entry) => serializeLibraryClip(entry))),
+      clips: await Promise.all(page.map((entry) => serializeLibraryClip(entry))),
+      // True when a 61st exists: the page must say so rather than let its
+      // own list silently disagree with the count beside it.
+      hasMoreClips: clips.length > page.length,
       invites: invites.map(serializeInvite),
       emailConfigured: Boolean(env.RESEND_API_KEY),
     });
@@ -206,6 +214,14 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
     const { workspaceId } = parse(z.object({ workspaceId: z.string().uuid() }), request.params, 'path parameters');
     const { clipId } = parse(z.object({ clipId: z.string().uuid() }), request.body ?? {});
     const { userId } = await requireMembership(request, workspaceId);
+
+    const target = await getWorkspaceById(workspaceId);
+    if (target?.is_personal) {
+      // A share into your own workspace would be invisible (its page lists
+      // the library, not shares) and unremovable from any screen — and for a
+      // teammate's clip it would quietly pin permanent access. Refused.
+      throw HttpError.conflict('Your own workspace already holds your clips — send to a shared workspace.');
+    }
 
     const clip = await getClip(clipId);
     if (!clip) throw HttpError.notFound('Clip not found');
@@ -435,13 +451,18 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
   app.get('/api/clips/:clipId/workspaces', { preHandler: requireSession }, async (request, reply) => {
     const { clipId } = parse(z.object({ clipId: z.string().uuid() }), request.params, 'path parameters');
     const userId = request.principal?.userId ?? null;
-    if (!userId) return reply.send({ workspaces: [], sharedWith: [] });
+    // A guest is told WHY the list is empty, not shown an empty list that
+    // reads as "you have no workspaces".
+    if (!userId) return reply.send({ signInRequired: true, workspaces: [], sharedWith: [] });
 
+    // Shared rooms only: the personal workspace already holds the caller's
+    // clips, and offering it as a destination created invisible shares.
     const [rooms, sharedWith] = await Promise.all([
-      listWorkspacesForUser(userId),
+      listShareTargets(userId),
       listWorkspacesForClip(clipId),
     ]);
     return reply.send({
+      signInRequired: false,
       workspaces: rooms.map((row) => ({ id: row.id, name: row.name })),
       sharedWith: sharedWith.filter((id) => rooms.some((row) => row.id === id)),
     });

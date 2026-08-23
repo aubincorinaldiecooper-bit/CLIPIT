@@ -16,9 +16,12 @@
 ALTER TABLE clips ADD COLUMN IF NOT EXISTS captions JSONB;
 ALTER TABLE clips ADD COLUMN IF NOT EXISTS derived_from_clip_id UUID REFERENCES clips (id) ON DELETE SET NULL;
 
--- The uniqueness moves from the column to the originals alone.
-ALTER TABLE clips DROP CONSTRAINT IF EXISTS clips_clip_match_id_key;
-DROP INDEX IF EXISTS clips_clip_match_id_key;
+-- The uniqueness moves from the column to the originals alone. The old rule
+-- lives in the standalone index 001 created (clips_match_unique_idx), NOT in
+-- a column constraint — dropping a guessed constraint name here would be a
+-- silent no-op under IF EXISTS, the old index would survive, and every
+-- "save as new clip" would then die on a duplicate key.
+DROP INDEX IF EXISTS clips_match_unique_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS clips_original_per_match_idx
     ON clips (clip_match_id)
     WHERE derived_from_clip_id IS NULL;

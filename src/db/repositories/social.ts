@@ -94,9 +94,9 @@ export async function upsertSocialAccount(input: {
 }
 
 /**
- * The accounts a workspace publishes to. A team shares its connected
- * accounts, so a teammate's TikTok is one of ours — and an account connected
- * in another of your workspaces is not.
+ * The accounts connected in one workspace. In the final model that is always
+ * a PERSONAL workspace: publishing belongs to a person's own library, and
+ * shared rooms deliberately have no accounts of their own.
  */
 export async function listSocialAccounts(
   workspaceId: string,

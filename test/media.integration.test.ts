@@ -144,12 +144,17 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     const probe = await ffprobe(source);
     const filters = await prepareCaptionFilters(
       [
-        { text: "It's 100% live: rain & confetti", font: 'bold', sizePct: 8, color: '#fcd34d', yPct: 85, outline: true },
-        { text: 'colons: quotes\' and, commas', font: 'mono', sizePct: 5, color: '#ffffff', yPct: 10, outline: false },
+        // %{gmtime} is the reason expansion is off: with drawtext's default
+        // expansion it would burn the server's clock into a user's video.
+        { text: "It's 100%{gmtime} live: rain & confetti", font: 'bold', sizePct: 8, color: '#fcd34d', yPct: 85, outline: true },
+        { text: 'colons: quotes\' and, commas — plus a line long enough that it must wrap onto a second line to stay inside the frame', font: 'mono', sizePct: 5, color: '#ffffff', yPct: 10, outline: false },
       ],
       dir,
-      probe.height ?? 240,
+      { videoWidth: probe.width ?? 320, videoHeight: probe.height ?? 240 },
     );
+    // The long mono caption wraps: more filters than captions.
+    expect(filters.length).toBeGreaterThan(2);
+    expect(filters.every((filter) => filter.includes('expansion=none'))).toBe(true);
 
     const output = path.join(dir, 'captioned.mp4');
     const result = await cutClip({

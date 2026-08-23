@@ -22,27 +22,31 @@ export async function summariseActivity(principal: {
 }): Promise<ActivitySummary> {
   // The numbers count the room's work — the same rows the library lists, so
   // the home screen and the library never disagree about what "ours" means.
-  const scope = principal.workspaceId
-    ? 'workspace_id = $1'
+  // Same safety net as the listings: rows written before the personal
+  // workspace existed still count as this person's work.
+  const usePersonal = Boolean(principal.workspaceId && principal.userId);
+  const scope = usePersonal
+    ? '(workspace_id = $1 OR (user_id = $2 AND workspace_id IS NULL))'
     : principal.userId
       ? 'user_id = $1'
       : 'session_id = $1';
-  const owner = principal.workspaceId ?? principal.userId ?? principal.sessionId;
+  const owner = (usePersonal ? principal.workspaceId : principal.userId ?? principal.sessionId) ?? null;
   if (!owner) return { videos: 0, minutesOfVideo: 0, questionsAnswered: 0, clipsCut: 0 };
+  const params = usePersonal ? [owner, principal.userId] : [owner];
 
   const [videos, questions, clips] = await Promise.all([
     queryOne<{ count: number; seconds: string | null }>(
       `SELECT count(*)::int AS count, COALESCE(SUM(duration_seconds), 0) AS seconds
          FROM videos WHERE ${scope}`,
-      [owner],
+      params,
     ),
     queryOne<{ count: number }>(
       `SELECT count(*)::int AS count FROM clip_requests WHERE ${scope} AND status = 'completed'`,
-      [owner],
+      params,
     ),
     queryOne<{ count: number }>(
       `SELECT count(*)::int AS count FROM clips WHERE ${scope} AND status = 'ready'`,
-      [owner],
+      params,
     ),
   ]);
 

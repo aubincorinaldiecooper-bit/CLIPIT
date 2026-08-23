@@ -41,6 +41,13 @@ export interface ClipSearchJob {
 
 export interface ClipGenerationJob {
   clipId: string;
+  /**
+   * Present on a caption re-render (Replace): the spec to burn. It rides in
+   * the JOB, not the row, so the row keeps describing the file that actually
+   * exists until the new render succeeds — a failed or superseded render can
+   * never leave the database claiming captions the file does not have.
+   */
+  captions?: import('../services/media/captions.js').ClipCaption[];
 }
 
 /**
