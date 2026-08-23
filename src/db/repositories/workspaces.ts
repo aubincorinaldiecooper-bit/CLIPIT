@@ -17,6 +17,8 @@ export interface WorkspaceRow {
   id: string;
   name: string;
   owner_user_id: string;
+  /** True for the one room each person gets on first sign-in: their library. */
+  is_personal: boolean;
   created_at: Date;
 }
 
@@ -53,29 +55,36 @@ const INVITE_COLUMNS = `id, workspace_id, email, invited_by, expires_at, accepte
  */
 export async function getOwnWorkspace(userId: string): Promise<WorkspaceRow | null> {
   return queryOne<WorkspaceRow>(
-    `SELECT id, name, owner_user_id, created_at FROM workspaces WHERE owner_user_id = $1 AND is_personal`,
+    `SELECT id, name, owner_user_id, is_personal, created_at FROM workspaces WHERE owner_user_id = $1 AND is_personal`,
     [userId],
   );
 }
 
 /**
- * The shared rooms this person belongs to, with how many people and clips are
- * in each — the counts are what makes a list of names worth looking at.
+ * Every workspace this person belongs to, their own FIRST — the traditional
+ * shape, by the owner's call: your first workspace is where all your clips
+ * live, and the ones after it are the rooms you share with people.
  *
- * Their own room is left out: that is "Your clips", and showing it here as a
- * team of one would be a second door to the same place.
+ * Counts are honest about what each page will show: the personal workspace
+ * counts the library's playable clips; a shared room counts what has been
+ * sent to it.
  */
-export async function listSharedWorkspaces(userId: string): Promise<
-  Array<WorkspaceRow & { role: string; member_count: number; clip_count: number }>
+export async function listWorkspacesForUser(userId: string): Promise<
+  Array<WorkspaceRow & { role: string; is_personal: boolean; member_count: number; clip_count: number }>
 > {
-  return queryRows<WorkspaceRow & { role: string; member_count: number; clip_count: number }>(
-    `SELECT w.id, w.name, w.owner_user_id, w.created_at, m.role,
+  return queryRows<WorkspaceRow & { role: string; is_personal: boolean; member_count: number; clip_count: number }>(
+    `SELECT w.id, w.name, w.owner_user_id, w.created_at, m.role, w.is_personal,
             (SELECT count(*)::int FROM workspace_members x WHERE x.workspace_id = w.id) AS member_count,
-            (SELECT count(*)::int FROM workspace_clips c WHERE c.workspace_id = w.id) AS clip_count
+            CASE WHEN w.is_personal THEN
+              (SELECT count(*)::int FROM clips c
+                WHERE c.workspace_id = w.id AND c.status = 'ready' AND c.storage_key IS NOT NULL)
+            ELSE
+              (SELECT count(*)::int FROM workspace_clips c WHERE c.workspace_id = w.id)
+            END AS clip_count
        FROM workspace_members m
        JOIN workspaces w ON w.id = m.workspace_id
-      WHERE m.user_id = $1 AND NOT w.is_personal
-      ORDER BY m.joined_at ASC`,
+      WHERE m.user_id = $1
+      ORDER BY w.is_personal DESC, m.joined_at ASC`,
     [userId],
   );
 }
@@ -96,7 +105,7 @@ export async function listShareTargets(
 
 export async function getWorkspaceById(workspaceId: string): Promise<WorkspaceRow | null> {
   return queryOne<WorkspaceRow>(
-    'SELECT id, name, owner_user_id, created_at FROM workspaces WHERE id = $1',
+    'SELECT id, name, owner_user_id, is_personal, created_at FROM workspaces WHERE id = $1',
     [workspaceId],
   );
 }
@@ -175,7 +184,7 @@ export async function insertWorkspace(input: {
      VALUES ($1, $2, true)
      ON CONFLICT (owner_user_id) WHERE is_personal
        DO UPDATE SET owner_user_id = workspaces.owner_user_id
-     RETURNING id, name, owner_user_id, created_at`,
+     RETURNING id, name, owner_user_id, is_personal, created_at`,
     [input.name, input.ownerUserId],
   );
   const workspace = created!;
@@ -202,7 +211,7 @@ export async function createSharedWorkspace(input: {
   return withTransaction(async (client) => {
     const created = await client.query<WorkspaceRow>(
       `INSERT INTO workspaces (name, owner_user_id, is_personal) VALUES ($1, $2, false)
-       RETURNING id, name, owner_user_id, created_at`,
+       RETURNING id, name, owner_user_id, is_personal, created_at`,
       [input.name, input.ownerUserId],
     );
     const workspace = created.rows[0]!;

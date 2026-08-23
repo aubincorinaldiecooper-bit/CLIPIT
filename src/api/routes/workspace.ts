@@ -9,6 +9,7 @@ import { parse } from '../validation.js';
 import { serializeLibraryClip } from '../serializers.js';
 import {
   getClip,
+  listClipsForPrincipal,
   listWorkspaceClips,
   listWorkspacesForClip,
   shareClipToWorkspace,
@@ -25,7 +26,7 @@ import {
   leaveWorkspace,
   listMembers,
   listPendingInvites,
-  listSharedWorkspaces,
+  listWorkspacesForUser,
   removeMember,
   revokeInvite,
   type WorkspaceInviteRow,
@@ -104,9 +105,9 @@ function serializeInvite(invite: WorkspaceInviteRow) {
 
 export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<void> {
   /**
-   * The rooms this person is in. Their own library is not among them: that is
-   * "Your clips", and listing it here as a team of one would be a second door
-   * to the same place.
+   * Every workspace this person is in, their own first — the traditional
+   * shape: your first workspace is where all your clips live, and creating
+   * another (with people invited into it) is how sharing starts.
    */
   app.get('/api/workspaces', { preHandler: requireSession }, async (request, reply) => {
     await enforceRateLimits(request, [
@@ -119,7 +120,7 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
     // Their personal room is made on first sight so uploads always have
     // somewhere to land, even for someone who never opens this page.
     await ensureWorkspace(userId, request.principal?.email ?? null);
-    const workspaces = await listSharedWorkspaces(userId);
+    const workspaces = await listWorkspacesForUser(userId);
 
     return reply.send({
       signInRequired: false,
@@ -127,6 +128,7 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
         id: row.id,
         name: row.name,
         isOwner: row.owner_user_id === userId,
+        isPersonal: row.is_personal,
         memberCount: row.member_count,
         clipCount: row.clip_count,
       })),
@@ -172,14 +174,18 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
 
     const [members, clips, invites] = await Promise.all([
       listMembers(workspaceId),
-      listWorkspaceClips(workspaceId),
+      // The personal workspace IS the library: its page shows every playable
+      // clip its owner has cut. A shared room shows what was sent to it.
+      workspace.is_personal
+        ? listClipsForPrincipal({ sessionId: null, userId, workspaceId }, { limit: 60 })
+        : listWorkspaceClips(workspaceId),
       // Pending invitations are the owner's business: they name addresses
       // that have been offered access and have not taken it yet.
-      isOwner ? listPendingInvites(workspaceId) : Promise.resolve([]),
+      isOwner && !workspace.is_personal ? listPendingInvites(workspaceId) : Promise.resolve([]),
     ]);
 
     return reply.send({
-      workspace: { id: workspace.id, name: workspace.name, isOwner },
+      workspace: { id: workspace.id, name: workspace.name, isOwner, isPersonal: workspace.is_personal },
       members: members.map((member) => serializeMember(member, userId)),
       clips: await Promise.all(clips.map((entry) => serializeLibraryClip(entry))),
       invites: invites.map(serializeInvite),
@@ -256,6 +262,9 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
 
     const workspace = await getWorkspaceById(workspaceId);
     if (!workspace) throw HttpError.notFound('Workspace not found');
+    if (workspace.is_personal) {
+      throw HttpError.conflict('Your personal workspace is yours alone — create a workspace to invite people into.');
+    }
 
     const members = await listMembers(workspaceId);
     if (members.some((member) => member.email?.toLowerCase() === email)) {
@@ -429,7 +438,7 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
     if (!userId) return reply.send({ workspaces: [], sharedWith: [] });
 
     const [rooms, sharedWith] = await Promise.all([
-      listSharedWorkspaces(userId),
+      listWorkspacesForUser(userId),
       listWorkspacesForClip(clipId),
     ]);
     return reply.send({
