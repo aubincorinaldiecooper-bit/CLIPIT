@@ -26,6 +26,11 @@ import {
   verifyConnectAttempt,
 } from '../../services/social/accounts.js';
 import { zernio, ZernioApiError, zernioConfigured } from '../../services/zernio/client.js';
+import { aspectOfSource, groupTargetsByShape } from '../../services/media/platformShapes.js';
+import { claimVariant } from '../../db/repositories/clipVariants.js';
+import { getVideo } from '../../db/repositories/videos.js';
+import { submitRecordedPost } from '../../services/social/submitPost.js';
+import { enqueueClipVariant } from '../../queues/index.js';
 import { getStorage } from '../../services/storage/s3.js';
 
 /**
@@ -299,56 +304,106 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       );
     }
 
+    // Each platform gets the SHAPE it wants — a 16:9 concert clip goes to
+    // TikTok as a 9:16 cut, to a YouTube upload as itself — and the person
+    // pressing Publish never has to know that. The publishing service takes
+    // one file per post, so targets wanting different shapes become separate
+    // posts, each carrying its own correctly-cut file.
+    const video = await getVideo(clip.videoId);
+    const sourceAspect = aspectOfSource(video?.width ?? null, video?.height ?? null);
     const targetList = targets.map((account) => ({ platform: account.platform, accountId: account.id }));
-    const post = await insertPublishedPost({
-      userId,
-      workspaceId,
-      clipId,
-      zernioPostId: null,
-      caption: body.caption,
-      targets: targetList,
-      status: 'submitting',
-    });
+    const groups = groupTargetsByShape(targetList, sourceAspect);
 
-    // A fresh signed URL minted at publish time: Zernio downloads the file
-    // server-side, so the API never proxies the bytes.
-    const mediaUrl = await getStorage().createDownloadUrl(clip.storageKey);
+    const posts: Array<{
+      id: string;
+      clipId: string;
+      status: string;
+      targets: typeof targetList;
+      aspect: string;
+      createdAt: string;
+    }> = [];
 
-    let created;
-    try {
-      created = await zernio.createPost({
-        content: body.caption,
-        platforms: targetList,
-        mediaUrls: [mediaUrl],
-        publishNow: true,
+    for (const group of groups) {
+      const post = await insertPublishedPost({
+        userId,
+        workspaceId,
+        clipId,
+        zernioPostId: null,
+        caption: body.caption,
+        targets: group.targets,
+        status: 'submitting',
       });
-    } catch (cause) {
-      // A definite rejection frees the clip for another try. Anything
-      // ambiguous (timeout, dropped response) leaves the row 'submitting' so
-      // the guard above holds until it ages out — Zernio may have posted it.
-      if (cause instanceof ZernioApiError) {
-        await updatePublishedPost(post.id, { zernioPostId: null, status: 'failed' });
+
+      if (group.aspect === null) {
+        // The clip as shot is the right file — submit it now.
+        const { status } = await submitRecordedPost({
+          postId: post.id,
+          caption: body.caption,
+          targets: group.targets,
+          storageKey: clip.storageKey,
+        });
+        posts.push({
+          id: post.id,
+          clipId,
+          status,
+          targets: group.targets,
+          aspect: 'source',
+          createdAt: post.created_at.toISOString(),
+        });
+        continue;
       }
-      throw cause;
-    }
 
-    const updated = await updatePublishedPost(post.id, {
-      zernioPostId:
-        (typeof created.id === 'string' && created.id) || (typeof created.postId === 'string' && created.postId) || null,
-      status: typeof created.status === 'string' ? created.status : 'submitted',
-    });
-    const finalStatus = updated?.status ?? 'submitted';
+      // This shape needs a cut. If a file for exactly this shape and framing
+      // already exists, post it now; otherwise claim the render and let the
+      // worker submit the moment the file is ready. Pressing Publish stays
+      // ONE act either way — the render is plumbing in the middle of it.
+      const { variant, created: claimed } = await claimVariant(clipId, group.aspect, clip.focusPct);
+      if (variant.status === 'ready' && variant.storageKey) {
+        const { status } = await submitRecordedPost({
+          postId: post.id,
+          caption: body.caption,
+          targets: group.targets,
+          storageKey: variant.storageKey,
+        });
+        posts.push({
+          id: post.id,
+          clipId,
+          status,
+          targets: group.targets,
+          aspect: group.aspect,
+          createdAt: post.created_at.toISOString(),
+        });
+        continue;
+      }
 
-    logger.info('clip publish submitted', { clipId, targets: targets.length });
-
-    return reply.code(202).send({
-      post: {
+      await updatePublishedPost(post.id, { zernioPostId: null, status: 'rendering' });
+      await enqueueClipVariant({
+        clipId,
+        variantId: variant.id,
+        aspect: group.aspect,
+        focusPct: clip.focusPct,
+        postId: post.id,
+      });
+      logger.info('clip publish waiting on reframe', {
+        clipId,
+        aspect: group.aspect,
+        variantId: variant.id,
+        claimed,
+      });
+      posts.push({
         id: post.id,
         clipId,
-        status: finalStatus,
-        targets: targetList,
+        status: 'rendering',
+        targets: group.targets,
+        aspect: group.aspect,
         createdAt: post.created_at.toISOString(),
-      },
-    });
+      });
+    }
+
+    logger.info('clip publish submitted', { clipId, targets: targets.length, posts: posts.length });
+
+    // `post` keeps the old single-post shape for existing clients; `posts`
+    // is the whole story, one entry per shape.
+    return reply.code(202).send({ post: posts[0], posts });
   });
 }

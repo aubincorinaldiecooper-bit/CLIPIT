@@ -282,6 +282,8 @@ export interface Clip {
   captions: unknown;
   /** Set when this clip is a captioned copy of another. */
   derivedFromClipId: string | null;
+  /** Where to look when this clip is cut to a platform's shape: the % position of the crop window's centre along the axis being cut. 50 until moved. */
+  focusPct: number;
   startSeconds: number;
   endSeconds: number;
   storageKey: string | null;

@@ -9,6 +9,7 @@ export const QUEUE_NAMES = {
   indexing: 'video-indexing',
   clipSearch: 'clip-search',
   clipGeneration: 'clip-generation',
+  clipVariant: 'clip-variant',
   thumbnailBackfill: 'thumbnail-backfill',
   retention: 'footage-retention',
   learningReport: 'learning-report',
@@ -51,6 +52,23 @@ export interface ClipGenerationJob {
 }
 
 /**
+ * Cut one clip to one platform shape.
+ *
+ * Queued by a publish that needs a shape which does not exist yet. The job
+ * carries the post it is preparing for, so the worker can submit it the
+ * moment the file is ready — the person pressed Publish once, and that has
+ * to remain a single act even though a render happens in the middle of it.
+ */
+export interface ClipVariantJob {
+  clipId: string;
+  variantId: string;
+  aspect: '9:16' | '1:1' | '4:5' | '16:9';
+  focusPct: number;
+  /** The published_posts row waiting on this file, if a publish queued it. */
+  postId?: string;
+}
+
+/**
  * Gives stills to matches found before stills existed. Carries no payload: the
  * work it does is defined entirely by what the database is still missing.
  */
@@ -83,6 +101,7 @@ let queues: {
   indexing: Queue<IndexingJob>;
   clipSearch: Queue<ClipSearchJob>;
   clipGeneration: Queue<ClipGenerationJob>;
+  clipVariant: Queue<ClipVariantJob>;
   thumbnailBackfill: Queue<ThumbnailBackfillJob>;
   retention: Queue<RetentionJob>;
   learningReport: Queue<LearningReportJob>;
@@ -98,6 +117,7 @@ export function getQueues() {
       indexing: new Queue<IndexingJob>(QUEUE_NAMES.indexing, { connection, defaultJobOptions }),
       clipSearch: new Queue<ClipSearchJob>(QUEUE_NAMES.clipSearch, { connection, defaultJobOptions }),
       clipGeneration: new Queue<ClipGenerationJob>(QUEUE_NAMES.clipGeneration, { connection, defaultJobOptions }),
+      clipVariant: new Queue<ClipVariantJob>(QUEUE_NAMES.clipVariant, { connection, defaultJobOptions }),
       thumbnailBackfill: new Queue<ThumbnailBackfillJob>(QUEUE_NAMES.thumbnailBackfill, {
         connection,
         defaultJobOptions,
@@ -185,6 +205,15 @@ export async function enqueueClipSearch(data: ClipSearchJob, options: JobsOption
 
 export async function enqueueClipGeneration(data: ClipGenerationJob): Promise<void> {
   await addWithStableId(getQueues().clipGeneration, 'generate', data, `generate-${data.clipId}`);
+}
+
+/**
+ * One job per variant row. The id is the row's, so two publishes racing for
+ * the same shape queue one render between them — the row was claimed
+ * atomically, and this keeps the work that follows just as single.
+ */
+export async function enqueueClipVariant(data: ClipVariantJob): Promise<void> {
+  await addWithStableId(getQueues().clipVariant, 'variant', data, `variant-${data.variantId}`);
 }
 
 /**
