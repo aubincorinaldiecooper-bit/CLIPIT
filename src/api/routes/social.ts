@@ -59,6 +59,53 @@ const CONNECT_STATE_TTL_SECONDS = 15 * 60;
  */
 const PUBLISH_RETRY_GUARD_SECONDS = 2 * 60;
 
+/** Platform names as their own users write them, never a lowercased id. */
+const PLATFORM_LABEL: Record<string, string> = {
+  tiktok: 'TikTok',
+  youtube: 'YouTube',
+  instagram: 'Instagram',
+};
+
+/**
+ * Turn a failure in the connect flow into something a person can act on.
+ *
+ * What this replaces is the generic 500 — "Something went wrong handling this
+ * request" — which is what a real user saw on every Connect button while the
+ * flow was permanently broken. It told the one person who could do something
+ * about it precisely nothing: not whether it was us or the platform, not
+ * whether waiting would help, not whether to stop trying.
+ *
+ * Two rules hold throughout. Only the HTTP STATUS is ever read, because the
+ * upstream body can carry tokens and billing identifiers. And the publishing
+ * provider is never named to the browser — the person connected a YouTube
+ * account, and that is the only vocabulary this app owes them.
+ */
+export function connectFailure(cause: unknown, context: string): HttpError {
+  if (!(cause instanceof ZernioApiError)) {
+    // Our own plumbing, not the platform's. Say so rather than implying the
+    // platform is down — blaming the wrong party sends someone off checking
+    // a service that was never the problem.
+    return HttpError.serviceUnavailable(`${context}. This one is on us — try again in a moment.`);
+  }
+  if (cause.status === 402) {
+    return HttpError.paymentRequired('Connecting another account needs a plan upgrade');
+  }
+  if (cause.status === 401 || cause.status === 403) {
+    return HttpError.serviceUnavailable(
+      `${context}. CLIPIT's own connection to the publishing service was refused — this is on our side, not yours.`,
+    );
+  }
+  if (cause.status === 429) {
+    return HttpError.serviceUnavailable(`${context}. Too many attempts just now — wait a minute and try again.`);
+  }
+  if (cause.status >= 500) {
+    return HttpError.serviceUnavailable(
+      `${context}. The publishing service isn't responding — this usually clears on its own, so try again shortly.`,
+    );
+  }
+  return HttpError.serviceUnavailable(`${context}. Try again, and let us know if it keeps happening.`);
+}
+
 function requireZernio(): void {
   if (!zernioConfigured()) {
     throw HttpError.serviceUnavailable('Publishing is not configured on this deployment');
@@ -164,7 +211,12 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       throw HttpError.badRequest(`CLIPIT publishes to: ${PUBLISH_PLATFORMS.join(', ')}`);
     }
 
-    const profileId = await getOrCreateZernioProfile(userId, `clipit-${userId.slice(0, 12)}`);
+    let profileId: string;
+    try {
+      profileId = await getOrCreateZernioProfile(userId, `clipit-${userId.slice(0, 12)}`);
+    } catch (cause) {
+      throw connectFailure(cause, 'Your publishing workspace could not be set up');
+    }
 
     // Persist who/what server-side; thread only the opaque token through
     // Zernio. Nothing identifying ever rides in the redirect query string.
@@ -181,12 +233,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     try {
       url = await zernio.getConnectUrl(platform, { profileId, redirectUrl: redirectTarget.toString() });
     } catch (cause) {
-      if (cause instanceof ZernioApiError && cause.status === 402) {
-        // Only the status is inspected — never the body, which can carry
-        // provider-internal billing identifiers.
-        throw HttpError.paymentRequired('Connecting another account needs a plan upgrade');
-      }
-      throw cause;
+      throw connectFailure(cause, `${PLATFORM_LABEL[platform] ?? platform} could not be reached for sign-in`);
     }
 
     return reply.send({ platform, url });
