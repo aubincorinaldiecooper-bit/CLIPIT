@@ -13,6 +13,7 @@ interface VideoRow {
   id: string;
   session_id: string | null;
   user_id: string | null;
+  workspace_id: string | null;
   source_type: SourceType;
   source_url: string | null;
   original_filename: string | null;
@@ -50,6 +51,7 @@ function mapVideo(row: VideoRow): Video {
     id: row.id,
     sessionId: row.session_id,
     userId: row.user_id,
+    workspaceId: row.workspace_id,
     sourceType: row.source_type,
     sourceUrl: row.source_url,
     originalFilename: row.original_filename,
@@ -88,6 +90,8 @@ function mapVideo(row: VideoRow): Video {
 export interface CreateVideoInput {
   sessionId: string | null;
   userId?: string | null;
+  /** The room this video is being added to; null for a guest's upload. */
+  workspaceId?: string | null;
   sourceType: SourceType;
   sourceUrl?: string | null;
   originalFilename?: string | null;
@@ -98,8 +102,8 @@ export interface CreateVideoInput {
 
 export async function createVideo(input: CreateVideoInput): Promise<Video> {
   const row = await queryOne<VideoRow>(
-    `INSERT INTO videos (session_id, user_id, source_type, source_url, original_filename, title, status, original_storage_key)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO videos (session_id, user_id, workspace_id, source_type, source_url, original_filename, title, status, original_storage_key)
+     VALUES ($1, $2, $9, $3, $4, $5, $6, $7, $8)
      RETURNING *`,
     [
       input.sessionId,
@@ -110,6 +114,7 @@ export async function createVideo(input: CreateVideoInput): Promise<Video> {
       input.title ?? null,
       input.status,
       input.originalStorageKey ?? null,
+      input.workspaceId ?? null,
     ],
   );
   return mapVideo(row!);
@@ -139,10 +144,10 @@ export async function getVideoWithReadProgress(videoId: string): Promise<Video |
 }
 
 /**
- * The caller's videos, newest first, footage intact only.
+ * The caller's own library of videos, newest first, footage intact only.
  *
- * Owned by the person when they are signed in — across every session they
- * have ever had — and by the single session otherwise. Videos whose footage
+ * Signed in, that is their personal workspace — across every session they
+ * have ever had; a guest gets the single tab's uploads. Videos whose footage
  * the retention sweep has already removed are left out: they cannot be
  * played or searched again, and listing them would be offering something we
  * no longer have.
@@ -150,8 +155,25 @@ export async function getVideoWithReadProgress(videoId: string): Promise<Video |
 export async function listVideosForPrincipal(principal: {
   sessionId: string | null;
   userId: string | null;
+  workspaceId?: string | null;
 }): Promise<Video[]> {
+  if (principal.workspaceId && principal.userId) {
+    // Their library. The NULL-workspace arm is a safety net for rows written
+    // before the personal workspace existed: they are still this person's
+    // videos, and a library must not lose them to a bookkeeping gap.
+    const rows = await queryRows<VideoRow>(
+      `SELECT * FROM videos
+        WHERE (workspace_id = $1 OR (user_id = $2 AND workspace_id IS NULL))
+          AND footage_expired_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 30`,
+      [principal.workspaceId, principal.userId],
+    );
+    return rows.map(mapVideo);
+  }
+
   if (principal.userId) {
+    // Signed in with no workspace yet: their own rows, as before.
     const rows = await queryRows<VideoRow>(
       `SELECT * FROM videos
         WHERE user_id = $1 AND footage_expired_at IS NULL

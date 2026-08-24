@@ -29,6 +29,8 @@ ENV NODE_ENV=production \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
+        fonts-liberation \
+        fonts-dejavu-core \
         ca-certificates \
         curl \
         python3 \

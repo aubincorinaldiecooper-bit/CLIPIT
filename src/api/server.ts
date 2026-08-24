@@ -12,6 +12,7 @@ import { registerClipRoutes } from './routes/clips.js';
 import { registerStatsRoutes } from './routes/stats.js';
 import { registerSocialRoutes } from './routes/social.js';
 import { registerZernioWebhookRoutes } from './routes/zernioWebhook.js';
+import { registerWorkspaceRoutes } from './routes/workspace.js';
 
 export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -91,6 +92,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await registerStatsRoutes(app);
   await registerSocialRoutes(app);
   await registerZernioWebhookRoutes(app);
+  await registerWorkspaceRoutes(app);
 
   return app;
 }

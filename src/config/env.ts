@@ -88,6 +88,13 @@ const envSchema = z.object({
   ZERNIO_WEBHOOK_SECRET: z.string().min(1).optional(),
   /** The frontend origin the connect callback bounces people back to. */
   FRONTEND_URL: z.string().url().optional(),
+
+  // --- Team invitations ---------------------------------------------------
+  // The same Resend account the sign-in links use. Optional: without a key,
+  // an invite is still created and its link still works — the API says the
+  // email could not be sent rather than pretending it arrived.
+  RESEND_API_KEY: z.string().min(1).optional(),
+  RESEND_FROM: z.string().min(1).optional(),
   UPLOAD_URL_EXPIRY_SECONDS: int(3600, 60, 604800),
   BUCKET_CORS_AUTOCONFIGURE: bool(true),
   BUCKET_CORS_ORIGINS: z.string().trim().optional(),

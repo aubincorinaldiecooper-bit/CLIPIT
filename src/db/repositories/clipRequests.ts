@@ -18,6 +18,7 @@ interface ClipRequestRow {
   video_id: string;
   session_id: string | null;
   user_id: string | null;
+  workspace_id: string | null;
   instruction: string;
   mode: SearchMode;
   resolved_mode: ResolvedSearchMode | null;
@@ -40,6 +41,7 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     videoId: row.video_id,
     sessionId: row.session_id,
     userId: row.user_id,
+    workspaceId: row.workspace_id,
     instruction: row.instruction,
     mode: row.mode,
     resolvedMode: row.resolved_mode,
@@ -65,8 +67,10 @@ export async function createClipRequest(input: {
   mode: SearchMode;
 }): Promise<ClipRequest> {
   const row = await queryOne<ClipRequestRow>(
-    `INSERT INTO clip_requests (video_id, session_id, user_id, instruction, mode)
-     VALUES ($1, $2, $3, $4, $5)
+    // The workspace comes from the video, not the asker: a question about a
+    // team's video belongs to that team, whichever room the asker is in.
+    `INSERT INTO clip_requests (video_id, session_id, user_id, workspace_id, instruction, mode)
+     VALUES ($1, $2, $3, (SELECT workspace_id FROM videos WHERE id = $1), $4, $5)
      RETURNING *`,
     [input.videoId, input.sessionId, input.userId ?? null, input.instruction, input.mode],
   );

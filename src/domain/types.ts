@@ -49,16 +49,38 @@ export interface Session {
   createdAt: Date;
 }
 
-/** The authenticated actor behind a request. `userId` is reserved for real auth. */
+/**
+ * The authenticated actor behind a request, and the rooms they can act in.
+ *
+ * A person has one personal room and belongs to any number of shared ones.
+ * "May I see this" is answered by the rooms a thing is in — its own library
+ * plus wherever it has been sent — never by a mode the caller is in. For a
+ * guest both are empty and ownership falls back to the session.
+ */
 export interface Principal {
   sessionId: string;
   userId: string | null;
+  /**
+   * Their personal room: where their uploads land and their library lives.
+   * Nothing moves it — there is no "currently in" state. Null for guests.
+   */
+  ownWorkspaceId: string | null;
+  /**
+   * Every room they belong to, personal and shared. Opening something by its
+   * id works from any of them, so a clip sent to a room opens for everyone in
+   * that room.
+   */
+  workspaceIds: string[];
+  /** What they signed in as, when known — used to name people on a team. */
+  email: string | null;
 }
 
 export interface Video {
   id: string;
   sessionId: string | null;
   userId: string | null;
+  /** The workspace this was added to; null for a guest's upload. */
+  workspaceId: string | null;
   sourceType: SourceType;
   sourceUrl: string | null;
   originalFilename: string | null;
@@ -139,6 +161,8 @@ export interface ClipRequest {
   videoId: string;
   sessionId: string | null;
   userId: string | null;
+  /** Inherited from the video it was asked about. */
+  workspaceId: string | null;
   instruction: string;
   mode: SearchMode;
   resolvedMode: ResolvedSearchMode | null;
@@ -252,6 +276,12 @@ export interface Clip {
   clipMatchId: string;
   sessionId: string | null;
   userId: string | null;
+  /** Inherited from the video it was cut from. */
+  workspaceId: string | null;
+  /** The caption spec burned into this render, if any. */
+  captions: unknown;
+  /** Set when this clip is a captioned copy of another. */
+  derivedFromClipId: string | null;
   startSeconds: number;
   endSeconds: number;
   storageKey: string | null;
