@@ -252,6 +252,103 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     });
   });
 
+  /**
+   * What a publish WOULD send, without sending it.
+   *
+   * The owner's rule: nothing goes out to the world unseen. This prepares
+   * the same shaped files the publish would use — rendering any that do not
+   * exist yet — and returns a playable URL per platform group, so a person
+   * can watch the actual cut before approving it. It posts nothing.
+   */
+  app.post('/api/clips/:clipId/publish/preview', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+    requireZernio();
+    requireUserId(request.principal);
+    const { clipId } = parse(z.object({ clipId: z.string().uuid() }), request.params, 'path parameters');
+    const body = parse(
+      z.object({ accountIds: z.array(z.string().min(1)).min(1).max(10).optional() }),
+      request.body ?? {},
+    );
+
+    const workspaceId = requireWorkspaceId(request.principal);
+    const clip = await getClip(clipId);
+    if (!clip || clip.workspaceId !== workspaceId) throw HttpError.notFound('Clip not found');
+    if (clip.status !== 'ready' || !clip.storageKey) {
+      throw HttpError.conflict('This clip is not ready yet — publish it once it has finished cutting');
+    }
+
+    const stored = (await listSocialAccounts(workspaceId)).filter((account) => account.status === 'connected');
+    if (stored.length === 0) {
+      throw HttpError.unprocessable('No connected accounts. Connect one on the Publishing page first.');
+    }
+    let targets = stored;
+    if (body.accountIds?.length) {
+      const wanted = new Set(body.accountIds);
+      targets = stored.filter((account) => wanted.has(account.id));
+      if (targets.length !== wanted.size) {
+        throw HttpError.badRequest('Some accountIds are not your connected accounts');
+      }
+    }
+
+    const video = await getVideo(clip.videoId);
+    const sourceAspect = aspectOfSource(video?.width ?? null, video?.height ?? null);
+    const targetList = targets.map((account) => ({ platform: account.platform, accountId: account.id }));
+    const groups = groupTargetsByShape(targetList, sourceAspect);
+
+    const previews = [];
+    for (const group of groups) {
+      if (group.aspect === null) {
+        previews.push({
+          aspect: 'source',
+          targets: group.targets,
+          status: 'ready' as const,
+          url: await getStorage().createDownloadUrl(clip.storageKey),
+          width: video?.width ?? null,
+          height: video?.height ?? null,
+        });
+        continue;
+      }
+
+      const { variant } = await claimVariant(clipId, group.aspect, clip.focusPct);
+      if (variant.status === 'ready' && variant.storageKey) {
+        previews.push({
+          aspect: group.aspect,
+          targets: group.targets,
+          status: 'ready' as const,
+          url: await getStorage().createDownloadUrl(variant.storageKey),
+          width: variant.width,
+          height: variant.height,
+        });
+        continue;
+      }
+
+      // Not cut yet: start it, and say so. The client polls this endpoint
+      // until every group is ready — a preview of a file that does not
+      // exist would be a promise about footage nobody has looked at.
+      if (variant.status !== 'rendering') {
+        await enqueueClipVariant({
+          clipId,
+          variantId: variant.id,
+          aspect: group.aspect,
+          focusPct: clip.focusPct,
+        });
+      }
+      previews.push({
+        aspect: group.aspect,
+        targets: group.targets,
+        status: variant.status === 'failed' ? ('failed' as const) : ('preparing' as const),
+        url: null,
+        width: null,
+        height: null,
+        ...(variant.status === 'failed' && variant.errorMessage ? { error: variant.errorMessage } : {}),
+      });
+    }
+
+    return reply.send({ clipId, previews });
+  });
+
   /** Publish one clip to chosen (or all) connected accounts. */
   app.post('/api/clips/:clipId/publish', { preHandler: requireSession }, async (request, reply) => {
     await enforceRateLimits(request, [
@@ -324,6 +421,13 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     }> = [];
 
     for (const group of groups) {
+      // A shaped group claims its render BEFORE the record is written, so
+      // the record can carry which render it waits on — that link is what
+      // lets a second publish racing onto the same render still be
+      // submitted when the one render finishes.
+      const claimed =
+        group.aspect === null ? null : await claimVariant(clipId, group.aspect, clip.focusPct);
+
       const post = await insertPublishedPost({
         userId,
         workspaceId,
@@ -332,6 +436,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
         caption: body.caption,
         targets: group.targets,
         status: 'submitting',
+        variantId: claimed?.variant.id ?? null,
       });
 
       if (group.aspect === null) {
@@ -354,10 +459,10 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       }
 
       // This shape needs a cut. If a file for exactly this shape and framing
-      // already exists, post it now; otherwise claim the render and let the
-      // worker submit the moment the file is ready. Pressing Publish stays
-      // ONE act either way — the render is plumbing in the middle of it.
-      const { variant, created: claimed } = await claimVariant(clipId, group.aspect, clip.focusPct);
+      // already exists, post it now; otherwise mark the post as waiting and
+      // queue the render — the worker submits every waiting post the moment
+      // the file is ready. Pressing Publish stays ONE act either way.
+      const variant = claimed!.variant;
       if (variant.status === 'ready' && variant.storageKey) {
         const { status } = await submitRecordedPost({
           postId: post.id,
@@ -388,7 +493,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
         clipId,
         aspect: group.aspect,
         variantId: variant.id,
-        claimed,
+        claimedFresh: claimed!.created,
       });
       posts.push({
         id: post.id,

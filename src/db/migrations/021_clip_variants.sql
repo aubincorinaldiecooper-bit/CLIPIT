@@ -49,3 +49,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS clip_variants_shape_idx
   ON clip_variants (clip_id, aspect, focus_pct);
 
 CREATE INDEX IF NOT EXISTS clip_variants_clip_idx ON clip_variants (clip_id);
+
+-- A post that must wait for a shape records WHICH render it waits on. This
+-- is what lets two publishes race onto the same variant safely: the render
+-- runs once, and on completion every post pointing at it is submitted — not
+-- just the one whose request happened to queue the job.
+ALTER TABLE published_posts ADD COLUMN IF NOT EXISTS variant_id UUID REFERENCES clip_variants (id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS published_posts_variant_idx ON published_posts (variant_id) WHERE variant_id IS NOT NULL;
