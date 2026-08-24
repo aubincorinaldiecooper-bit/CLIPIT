@@ -59,6 +59,53 @@ const CONNECT_STATE_TTL_SECONDS = 15 * 60;
  */
 const PUBLISH_RETRY_GUARD_SECONDS = 2 * 60;
 
+/** Platform names as their own users write them, never a lowercased id. */
+const PLATFORM_LABEL: Record<string, string> = {
+  tiktok: 'TikTok',
+  youtube: 'YouTube',
+  instagram: 'Instagram',
+};
+
+/**
+ * Turn a failure in the connect flow into something a person can act on.
+ *
+ * What this replaces is the generic 500 — "Something went wrong handling this
+ * request" — which is what a real user saw on every Connect button while the
+ * flow was permanently broken. It told the one person who could do something
+ * about it precisely nothing: not whether it was us or the platform, not
+ * whether waiting would help, not whether to stop trying.
+ *
+ * Two rules hold throughout. Only the HTTP STATUS is ever read, because the
+ * upstream body can carry tokens and billing identifiers. And the publishing
+ * provider is never named to the browser — the person connected a YouTube
+ * account, and that is the only vocabulary this app owes them.
+ */
+export function connectFailure(cause: unknown, context: string): HttpError {
+  if (!(cause instanceof ZernioApiError)) {
+    // Our own plumbing, not the platform's. Say so rather than implying the
+    // platform is down — blaming the wrong party sends someone off checking
+    // a service that was never the problem.
+    return HttpError.serviceUnavailable(`${context}. This one is on us — try again in a moment.`);
+  }
+  if (cause.status === 402) {
+    return HttpError.paymentRequired('Connecting another account needs a plan upgrade');
+  }
+  if (cause.status === 401 || cause.status === 403) {
+    return HttpError.serviceUnavailable(
+      `${context}. CLIPIT's own connection to the publishing service was refused — this is on our side, not yours.`,
+    );
+  }
+  if (cause.status === 429) {
+    return HttpError.serviceUnavailable(`${context}. Too many attempts just now — wait a minute and try again.`);
+  }
+  if (cause.status >= 500) {
+    return HttpError.serviceUnavailable(
+      `${context}. The publishing service isn't responding — this usually clears on its own, so try again shortly.`,
+    );
+  }
+  return HttpError.serviceUnavailable(`${context}. Try again, and let us know if it keeps happening.`);
+}
+
 function requireZernio(): void {
   if (!zernioConfigured()) {
     throw HttpError.serviceUnavailable('Publishing is not configured on this deployment');
@@ -164,7 +211,12 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       throw HttpError.badRequest(`CLIPIT publishes to: ${PUBLISH_PLATFORMS.join(', ')}`);
     }
 
-    const profileId = await getOrCreateZernioProfile(userId, `clipit-${userId.slice(0, 12)}`);
+    let profileId: string;
+    try {
+      profileId = await getOrCreateZernioProfile(userId, `clipit-${userId.slice(0, 12)}`);
+    } catch (cause) {
+      throw connectFailure(cause, 'Your publishing workspace could not be set up');
+    }
 
     // Persist who/what server-side; thread only the opaque token through
     // Zernio. Nothing identifying ever rides in the redirect query string.
@@ -181,12 +233,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     try {
       url = await zernio.getConnectUrl(platform, { profileId, redirectUrl: redirectTarget.toString() });
     } catch (cause) {
-      if (cause instanceof ZernioApiError && cause.status === 402) {
-        // Only the status is inspected — never the body, which can carry
-        // provider-internal billing identifiers.
-        throw HttpError.paymentRequired('Connecting another account needs a plan upgrade');
-      }
-      throw cause;
+      throw connectFailure(cause, `${PLATFORM_LABEL[platform] ?? platform} could not be reached for sign-in`);
     }
 
     return reply.send({ platform, url });
@@ -250,103 +297,6 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
         status: updated?.status ?? 'disconnected',
       },
     });
-  });
-
-  /**
-   * What a publish WOULD send, without sending it.
-   *
-   * The owner's rule: nothing goes out to the world unseen. This prepares
-   * the same shaped files the publish would use — rendering any that do not
-   * exist yet — and returns a playable URL per platform group, so a person
-   * can watch the actual cut before approving it. It posts nothing.
-   */
-  app.post('/api/clips/:clipId/publish/preview', { preHandler: requireSession }, async (request, reply) => {
-    await enforceRateLimits(request, [
-      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
-    ]);
-    requireZernio();
-    requireUserId(request.principal);
-    const { clipId } = parse(z.object({ clipId: z.string().uuid() }), request.params, 'path parameters');
-    const body = parse(
-      z.object({ accountIds: z.array(z.string().min(1)).min(1).max(10).optional() }),
-      request.body ?? {},
-    );
-
-    const workspaceId = requireWorkspaceId(request.principal);
-    const clip = await getClip(clipId);
-    if (!clip || clip.workspaceId !== workspaceId) throw HttpError.notFound('Clip not found');
-    if (clip.status !== 'ready' || !clip.storageKey) {
-      throw HttpError.conflict('This clip is not ready yet — publish it once it has finished cutting');
-    }
-
-    const stored = (await listSocialAccounts(workspaceId)).filter((account) => account.status === 'connected');
-    if (stored.length === 0) {
-      throw HttpError.unprocessable('No connected accounts. Connect one on the Publishing page first.');
-    }
-    let targets = stored;
-    if (body.accountIds?.length) {
-      const wanted = new Set(body.accountIds);
-      targets = stored.filter((account) => wanted.has(account.id));
-      if (targets.length !== wanted.size) {
-        throw HttpError.badRequest('Some accountIds are not your connected accounts');
-      }
-    }
-
-    const video = await getVideo(clip.videoId);
-    const sourceAspect = aspectOfSource(video?.width ?? null, video?.height ?? null);
-    const targetList = targets.map((account) => ({ platform: account.platform, accountId: account.id }));
-    const groups = groupTargetsByShape(targetList, sourceAspect);
-
-    const previews = [];
-    for (const group of groups) {
-      if (group.aspect === null) {
-        previews.push({
-          aspect: 'source',
-          targets: group.targets,
-          status: 'ready' as const,
-          url: await getStorage().createDownloadUrl(clip.storageKey),
-          width: video?.width ?? null,
-          height: video?.height ?? null,
-        });
-        continue;
-      }
-
-      const { variant } = await claimVariant(clipId, group.aspect, clip.focusPct);
-      if (variant.status === 'ready' && variant.storageKey) {
-        previews.push({
-          aspect: group.aspect,
-          targets: group.targets,
-          status: 'ready' as const,
-          url: await getStorage().createDownloadUrl(variant.storageKey),
-          width: variant.width,
-          height: variant.height,
-        });
-        continue;
-      }
-
-      // Not cut yet: start it, and say so. The client polls this endpoint
-      // until every group is ready — a preview of a file that does not
-      // exist would be a promise about footage nobody has looked at.
-      if (variant.status !== 'rendering') {
-        await enqueueClipVariant({
-          clipId,
-          variantId: variant.id,
-          aspect: group.aspect,
-          focusPct: clip.focusPct,
-        });
-      }
-      previews.push({
-        aspect: group.aspect,
-        targets: group.targets,
-        status: variant.status === 'failed' ? ('failed' as const) : ('preparing' as const),
-        url: null,
-        width: null,
-        height: null,
-        ...(variant.status === 'failed' && variant.errorMessage ? { error: variant.errorMessage } : {}),
-      });
-    }
-
-    return reply.send({ clipId, previews });
   });
 
   /** Publish one clip to chosen (or all) connected accounts. */
