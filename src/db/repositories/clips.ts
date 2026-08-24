@@ -10,6 +10,7 @@ interface ClipRow {
   workspace_id: string | null;
   captions: unknown;
   derived_from_clip_id: string | null;
+  focus_pct: number;
   start_seconds: number;
   end_seconds: number;
   storage_key: string | null;
@@ -31,6 +32,7 @@ function mapClip(row: ClipRow): Clip {
     workspaceId: row.workspace_id,
     captions: row.captions ?? null,
     derivedFromClipId: row.derived_from_clip_id,
+    focusPct: Number(row.focus_pct ?? 50),
     startSeconds: row.start_seconds,
     endSeconds: row.end_seconds,
     storageKey: row.storage_key,

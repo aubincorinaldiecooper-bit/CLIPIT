@@ -175,6 +175,47 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
   }, 120_000);
 
   /**
+   * A platform shape is a real crop of the real frame, with the captions
+   * drawn on the CROPPED frame. This cuts a 9:16 out of the synthetic 4:3
+   * source and checks the file that comes out is the shape a platform would
+   * accept — and that a caption still lands inside it.
+   */
+  it('cuts a vertical variant whose frame is actually vertical', async () => {
+    const { planReframe } = await import('../src/services/media/reframe.js');
+    const probe = await ffprobe(source);
+    const plan = planReframe(
+      { aspect: '9:16', focusPct: 50 },
+      { width: probe.width ?? 320, height: probe.height ?? 240 },
+    );
+    expect(plan.filter).not.toBeNull();
+
+    const filters = [plan.filter!];
+    filters.push(
+      ...(await prepareCaptionFilters(
+        [{ text: 'VERTICAL', font: 'bold', sizePct: 8, color: '#ffffff', yPct: 85, xPct: 50, widthPct: 92, outline: true }],
+        dir,
+        { videoWidth: plan.outputWidth, videoHeight: plan.outputHeight },
+      )),
+    );
+
+    const output = path.join(dir, 'vertical.mp4');
+    await cutClip({
+      inputPath: source,
+      outputPath: output,
+      startSeconds: 1,
+      endSeconds: 3,
+      hasAudio: true,
+      videoFilters: filters,
+    });
+
+    const out = await ffprobe(output);
+    // 240 tall, 9:16 → 134 wide, floored to the even 134.
+    expect(out.width).toBe(plan.outputWidth);
+    expect(out.height).toBe(plan.outputHeight);
+    expect((out.width ?? 0) / (out.height ?? 1)).toBeLessThan(1);
+  }, 180_000);
+
+  /**
    * Dragging a caption sideways has to move the pixels, not just the spec.
    * This burns the same word at two positions onto a black frame and reads
    * the rendered frame back: where the lit pixels actually are is the only

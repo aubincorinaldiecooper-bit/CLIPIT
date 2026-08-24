@@ -20,6 +20,7 @@ import { handleTranscription } from './handlers/transcription.js';
 import { handleIndexing } from './handlers/indexing.js';
 import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
+import { handleClipVariant } from './handlers/clipVariant.js';
 import { handleThumbnailBackfill } from './handlers/thumbnailBackfill.js';
 import { handleRetention } from './handlers/retention.js';
 import { handleLearningReport } from './handlers/learningReport.js';
@@ -120,6 +121,10 @@ async function main(): Promise<void> {
   startWorker(QUEUE_NAMES.indexing, handleIndexing, 1);
   startWorker(QUEUE_NAMES.clipSearch, handleClipSearch, env.CLIP_SEARCH_CONCURRENCY);
   startWorker(QUEUE_NAMES.clipGeneration, handleClipGeneration, env.CLIP_GENERATION_CONCURRENCY);
+  // Reframes share the clip renderer's budget: both are ffmpeg encodes of
+  // the same source, and letting them compete for the same slots is what
+  // keeps a burst of publishes from starving the cuts people are waiting on.
+  startWorker(QUEUE_NAMES.clipVariant, handleClipVariant, env.CLIP_GENERATION_CONCURRENCY);
   // One at a time: the sweep is background work and must never take a slot
   // from a search or a clip someone is waiting on.
   startWorker(QUEUE_NAMES.thumbnailBackfill, handleThumbnailBackfill, 1);

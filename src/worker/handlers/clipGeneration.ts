@@ -10,6 +10,7 @@ import { cutClip, ffprobe } from '../../services/media/ffmpeg.js';
 import { captionsSchema, prepareCaptionFilters } from '../../services/media/captions.js';
 import { applyClipPadding } from '../../services/timestamps.js';
 import { getClip, setClipStatus } from '../../db/repositories/clips.js';
+import { discardVariants } from '../../db/repositories/clipVariants.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import type { ClipGenerationJob } from '../../queues/index.js';
 
@@ -98,6 +99,13 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         // that carries it exists.
         ...(job.data.captions !== undefined ? { captions: job.data.captions } : {}),
       });
+
+      // The master changed, so every platform shape cut from the OLD master
+      // is stale — posting one would send footage the user just replaced.
+      // They re-render on the next publish that needs them.
+      if (job.data.captions !== undefined) {
+        await discardVariants(clipId);
+      }
 
       log.info('clip generated', {
         key,

@@ -208,6 +208,14 @@ export async function insertPublishedPost(input: {
   return row!;
 }
 
+export async function getPublishedPost(id: string): Promise<PublishedPostRow | null> {
+  return queryOne<PublishedPostRow>(
+    `SELECT id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at
+       FROM published_posts WHERE id = $1`,
+    [id],
+  );
+}
+
 export async function updatePublishedPost(
   id: string,
   input: { zernioPostId: string | null; status: string },
@@ -234,7 +242,7 @@ export async function findInFlightPublish(
   return queryOne<PublishedPostRow>(
     `SELECT id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at
        FROM published_posts
-      WHERE user_id = $1 AND clip_id = $2 AND status = 'submitting'
+      WHERE user_id = $1 AND clip_id = $2 AND status IN ('submitting', 'rendering')
         AND created_at > now() - ($3 || ' seconds')::interval
       ORDER BY created_at DESC LIMIT 1`,
     [userId, clipId, String(withinSeconds)],
