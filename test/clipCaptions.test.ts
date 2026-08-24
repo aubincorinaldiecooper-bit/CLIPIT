@@ -22,6 +22,7 @@ const caption = {
   color: '#fcd34d',
   yPct: 85,
   xPct: 50,
+  widthPct: 92,
   outline: true,
 };
 
@@ -116,6 +117,27 @@ describe('caption line wrapping', () => {
     expect(maxCharsPerLine('bold', 6, 16 / 9)).toBe(51);
     // Portrait frames fit far fewer characters.
     expect(maxCharsPerLine('bold', 6, 9 / 16)).toBeLessThan(20);
+  });
+
+  it('breaks lines on the text column the editor drew', () => {
+    // Half the frame's width fits about half as many characters.
+    const full = maxCharsPerLine('bold', 6, 16 / 9, 50, 92);
+    const half = maxCharsPerLine('bold', 6, 16 / 9, 50, 46);
+    expect(half).toBeLessThan(full);
+    expect(half).toBeGreaterThan(full / 2 - 2);
+  });
+
+  it('keeps the same words on the same lines when text is scaled', () => {
+    // A design tool grows the column and the type together; the line budget
+    // is the ratio between them, so the breaks must not move.
+    // Double both and the budget is identical, so the wrap is identical.
+    expect(maxCharsPerLine('bold', 3, 16 / 9, 50, 30)).toBe(maxCharsPerLine('bold', 6, 16 / 9, 50, 60));
+    expect(maxCharsPerLine('mono', 4, 4 / 5, 50, 24)).toBe(maxCharsPerLine('mono', 8, 4 / 5, 50, 48));
+
+    // Scaling stops where the frame does: a column cannot grow past the room
+    // it has, so the last part of a very large scale does re-wrap. Better
+    // that than text the renderer would slide back into frame.
+    expect(maxCharsPerLine('bold', 12, 16 / 9, 50, 200)).toBe(maxCharsPerLine('bold', 12, 16 / 9, 50, 92));
   });
 
   it('gives text near an edge the room it actually has', () => {

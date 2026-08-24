@@ -33,6 +33,16 @@ export const captionSchema = z.object({
    * the old (w-text_w)/2.
    */
   xPct: z.number().min(2).max(98).default(50),
+  /**
+   * The text column's width as % of the video's width — the box the editor
+   * draws, which is what decides where lines break.
+   *
+   * It defaults to 92, the fraction the renderer always allowed a caption to
+   * use, so specs without it wrap exactly as before. Carrying it explicitly
+   * is what lets the editor scale text the way a design tool does: grow the
+   * size and the column together and the same words stay on the same lines.
+   */
+  widthPct: z.number().min(5).max(92).default(92),
   /** A dark outline keeps light text readable over light footage. */
   outline: z.boolean().default(true),
 });
@@ -111,20 +121,21 @@ export function usableWidthFraction(xPct: number): number {
 }
 
 /**
- * How many characters fit on one line, from the frame's shape and where the
- * text sits — resolution-independent, so the preview (which knows only the
- * aspect ratio) computes the identical number.
+ * How many characters fit on one line: the text column the editor drew,
+ * never wider than the room that column actually has where it sits.
+ *
+ * Resolution-independent, so the editor (which knows only the aspect ratio)
+ * computes the identical number and breaks lines in the identical places.
  */
 export function maxCharsPerLine(
   font: ClipCaption['font'],
   sizePct: number,
   aspectRatio: number,
   xPct = 50,
+  widthPct = 92,
 ): number {
-  return Math.max(
-    4,
-    Math.floor((usableWidthFraction(xPct) * aspectRatio * 100) / (CHAR_WIDTH_FACTOR[font] * sizePct)),
-  );
+  const budget = Math.min(widthPct / 100, usableWidthFraction(xPct));
+  return Math.max(4, Math.floor((budget * aspectRatio * 100) / (CHAR_WIDTH_FACTOR[font] * sizePct)));
 }
 
 /**
@@ -230,7 +241,7 @@ export async function prepareCaptionFilters(
     const fontFile = await resolveFontFile(caption.font);
     const lines = wrapCaptionText(
       caption.text,
-      maxCharsPerLine(caption.font, caption.sizePct, aspectRatio, caption.xPct),
+      maxCharsPerLine(caption.font, caption.sizePct, aspectRatio, caption.xPct, caption.widthPct),
     );
     for (const [lineIndex, line] of lines.entries()) {
       const textFile = path.join(workDir, `caption-${index}-${lineIndex}.txt`);
