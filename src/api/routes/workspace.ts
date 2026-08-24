@@ -132,6 +132,9 @@ export async function registerWorkspaceRoutes(app: FastifyInstance): Promise<voi
         isPersonal: row.is_personal,
         memberCount: row.member_count,
         clipCount: row.clip_count,
+        // Whose room this is. A room you were invited to is "theirs" before
+        // it is anything else, and its given name alone does not say that.
+        ownerEmail: row.owner_email,
       })),
       // Said plainly so the page can warn instead of silently creating
       // invitations whose emails will never arrive.

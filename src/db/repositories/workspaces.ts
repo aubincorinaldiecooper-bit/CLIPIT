@@ -70,10 +70,32 @@ export async function getOwnWorkspace(userId: string): Promise<WorkspaceRow | nu
  * sent to it.
  */
 export async function listWorkspacesForUser(userId: string): Promise<
-  Array<WorkspaceRow & { role: string; is_personal: boolean; member_count: number; clip_count: number }>
+  Array<
+    WorkspaceRow & {
+      role: string;
+      is_personal: boolean;
+      member_count: number;
+      clip_count: number;
+      owner_email: string | null;
+    }
+  >
 > {
-  return queryRows<WorkspaceRow & { role: string; is_personal: boolean; member_count: number; clip_count: number }>(
+  return queryRows<
+    WorkspaceRow & {
+      role: string;
+      is_personal: boolean;
+      member_count: number;
+      clip_count: number;
+      owner_email: string | null;
+    }
+  >(
+    // A room belongs to somebody, and which somebody is the thing that tells
+    // one apart from another in a list. The owner's address lives on the
+    // membership row rather than the workspace, so it is joined in here.
     `SELECT w.id, w.name, w.owner_user_id, w.created_at, m.role, w.is_personal,
+            (SELECT o.email FROM workspace_members o
+              WHERE o.workspace_id = w.id AND o.user_id = w.owner_user_id
+              LIMIT 1) AS owner_email,
             (SELECT count(*)::int FROM workspace_members x WHERE x.workspace_id = w.id) AS member_count,
             CASE WHEN w.is_personal THEN
               (SELECT count(*)::int FROM clips c
