@@ -1,4 +1,4 @@
-import { zernio } from '../zernio/client.js';
+import { zernio, ZernioApiError } from '../zernio/client.js';
 import {
   getSocialProfile,
   insertSocialProfile,
@@ -24,13 +24,70 @@ export function isPublishPlatform(value: string): value is PublishPlatform {
  * One Zernio workspace per signed-in user, created on first use. Two racing
  * first-uses converge on one row (see insertSocialProfile); the loser's
  * Zernio profile is orphaned upstream, which is harmless.
+ *
+ * The local row and the upstream profile can disagree, and when they did this
+ * used to be unrecoverable — connecting any account failed forever with a
+ * 500. The label is deterministic (`clipit-<user>`), so once a profile exists
+ * upstream without a local row pointing at it, every later create is refused
+ * as a duplicate. Two real production failures, minutes apart on one account:
+ *
+ *   GET /api/connect/youtube    → null value in column "zernio_profile_id"
+ *                                 violates not-null constraint
+ *   GET /api/connect/instagram  → Zernio POST /profiles failed with 409
+ *
+ * They are one story. The first create SUCCEEDED upstream but returned a body
+ * with no id where we look for one; the unchecked `created.id` went into the
+ * insert as null and threw, so nothing was saved locally while the profile
+ * now existed remotely. Every attempt after that hit 409.
+ *
+ * So: the id is validated before it is trusted, and a create that cannot
+ * produce one — refused as a duplicate, or answered in an unexpected shape —
+ * falls back to finding the profile that is already there. Adopting an
+ * existing profile is right rather than merely convenient: it is this user's
+ * own profile, under a name derived from their own id.
  */
 export async function getOrCreateZernioProfile(userId: string, label: string): Promise<string> {
   const existing = await getSocialProfile(userId);
   if (existing) return existing.zernio_profile_id;
-  const created = await zernio.createProfile({ name: label });
-  const row = await insertSocialProfile(userId, created.id);
+
+  let profileId: string | null = null;
+  try {
+    const created = await zernio.createProfile({ name: label });
+    // Never trust the id straight into the column: an unusable one used to
+    // surface as a not-null constraint violation, which reads as a database
+    // fault when it is really an unexpected response shape.
+    if (usableZernioId(created?.id)) profileId = created.id;
+  } catch (cause) {
+    // Only the STATUS is inspected. The body can carry tokens or billing
+    // identifiers and must never be logged or forwarded.
+    const duplicate = cause instanceof ZernioApiError && (cause.status === 409 || cause.status === 422);
+    if (!duplicate) throw cause;
+  }
+
+  // Either the create was refused as a duplicate, or it answered in a shape
+  // we could not read an id from. Both mean the profile may already exist —
+  // so ask, rather than guess or give up.
+  if (!profileId) profileId = await findExistingProfileId(label);
+
+  if (!profileId) {
+    throw new ZernioApiError(
+      'Zernio did not return a usable profile id, and no existing profile matched',
+      502,
+      null,
+    );
+  }
+
+  const row = await insertSocialProfile(userId, profileId);
   return row.zernio_profile_id;
+}
+
+/** The id of the profile already carrying this exact label, if there is one. */
+async function findExistingProfileId(label: string): Promise<string | null> {
+  const profiles = await zernio.listProfiles();
+  for (const profile of profiles) {
+    if (profile?.name === label && usableZernioId(profile.id)) return profile.id;
+  }
+  return null;
 }
 
 /** A Zernio id that can be safely placed in a request path. */

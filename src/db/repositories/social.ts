@@ -190,10 +190,12 @@ export async function insertPublishedPost(input: {
   caption: string;
   targets: unknown;
   status: string;
+  /** The render this post waits on, when its shape does not exist yet. */
+  variantId?: string | null;
 }): Promise<PublishedPostRow> {
   const row = await queryOne<PublishedPostRow>(
-    `INSERT INTO published_posts (user_id, workspace_id, clip_id, zernio_post_id, caption, targets, status)
-     VALUES ($1, $7, $2, $3, $4, $5::jsonb, $6)
+    `INSERT INTO published_posts (user_id, workspace_id, clip_id, zernio_post_id, caption, targets, status, variant_id)
+     VALUES ($1, $7, $2, $3, $4, $5::jsonb, $6, $8)
      RETURNING id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at`,
     [
       input.userId,
@@ -203,9 +205,25 @@ export async function insertPublishedPost(input: {
       JSON.stringify(input.targets),
       input.status,
       input.workspaceId,
+      input.variantId ?? null,
     ],
   );
   return row!;
+}
+
+/**
+ * Every post still waiting on one render. The render submits (or fails)
+ * ALL of them when it finishes — a publish that raced onto an already-
+ * queued render must not wait forever because it was second.
+ */
+export async function listPostsWaitingOnVariant(variantId: string): Promise<PublishedPostRow[]> {
+  return queryRows<PublishedPostRow>(
+    `SELECT id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at
+       FROM published_posts
+      WHERE variant_id = $1 AND status = 'rendering'
+      ORDER BY created_at ASC`,
+    [variantId],
+  );
 }
 
 export async function getPublishedPost(id: string): Promise<PublishedPostRow | null> {

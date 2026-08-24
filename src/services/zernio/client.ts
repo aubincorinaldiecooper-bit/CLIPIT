@@ -122,6 +122,18 @@ export class ZernioClient {
     return this.unwrapObject<ZernioProfile>(res, ['profile', 'data']);
   }
 
+  /**
+   * Every profile on the account. Needed because creating one is not always
+   * possible: the name is deterministic per CLIPIT user, so a create can come
+   * back 409 when the profile already exists upstream while no local row
+   * points at it. Listing is how that state is recovered instead of being
+   * permanent.
+   */
+  async listProfiles(): Promise<ZernioProfile[]> {
+    const res = await this.request<unknown>('GET', '/profiles');
+    return this.unwrapList<ZernioProfile>(res, ['profiles', 'data']);
+  }
+
   // --- Connect (hosted OAuth) ----------------------------------------------
 
   /**

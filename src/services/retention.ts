@@ -4,6 +4,7 @@ import {
   listThumbnailKeysForVideo,
 } from '../db/repositories/clipRequests.js';
 import { clearClipKeysForVideo, listClipKeysForVideo } from '../db/repositories/clips.js';
+import { clearVariantsForVideo, listVariantKeysForVideo } from '../db/repositories/clipVariants.js';
 import { deleteScenes } from '../db/repositories/scenes.js';
 import { deleteTranscript } from '../db/repositories/transcripts.js';
 import { getVideo, listChunks, markFootageExpired } from '../db/repositories/videos.js';
@@ -20,8 +21,8 @@ import { getStorage } from './storage/s3.js';
  * What is kept is deliberately narrow: the question they asked, the moments we
  * found, and their thumbs up or down. That is what teaches us whether our
  * reading of a video is any good. What goes is the footage and everything
- * derived from it — the small copy, the segments, the clips, the stills, the
- * scene notes and the transcript — because those describe someone's video
+ * derived from it — the small copy, the segments, the clips, the platform-shaped cuts of
+ * those clips, the stills, the scene notes and the transcript — because those describe someone's video
  * rather than our reading of it, and once the footage is gone they cannot be
  * checked against anything anyway.
  */
@@ -36,9 +37,12 @@ export async function expireVideoFootage(videoId: string, log: Logger): Promise<
   if (!video || video.footageExpiredAt) return { objectsDeleted: 0, objectsFailed: 0 };
 
   const chunks = await listChunks(videoId);
-  const [clipKeys, thumbnailKeys] = await Promise.all([
+  const [clipKeys, thumbnailKeys, variantKeys] = await Promise.all([
     listClipKeysForVideo(videoId),
     listThumbnailKeysForVideo(videoId),
+    // The platform-shaped cuts are someone's footage too — a 9:16 crop of a
+    // deleted video is still that video.
+    listVariantKeysForVideo(videoId),
   ]);
 
   const keys = [
@@ -48,6 +52,7 @@ export async function expireVideoFootage(videoId: string, log: Logger): Promise<
     ...chunks.map((chunk) => chunk.storageKey),
     ...clipKeys,
     ...thumbnailKeys,
+    ...variantKeys,
   ].filter((key): key is string => typeof key === 'string' && key.length > 0);
 
   let objectsDeleted = 0;
@@ -71,6 +76,7 @@ export async function expireVideoFootage(videoId: string, log: Logger): Promise<
   await Promise.all([deleteScenes(videoId), deleteTranscript(videoId)]);
   await clearThumbnailsForVideo(videoId);
   await clearClipKeysForVideo(videoId);
+  await clearVariantsForVideo(videoId);
   await markFootageExpired(videoId);
 
   log.info('footage removed', {
@@ -80,6 +86,7 @@ export async function expireVideoFootage(videoId: string, log: Logger): Promise<
     chunks: chunks.length,
     clips: clipKeys.length,
     stills: thumbnailKeys.length,
+    shapes: variantKeys.length,
   });
 
   return { objectsDeleted, objectsFailed };

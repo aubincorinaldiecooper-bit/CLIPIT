@@ -154,3 +154,30 @@ export async function listVariantsForClip(clipId: string): Promise<ClipVariant[]
 export async function discardVariants(clipId: string): Promise<void> {
   await queryOne('DELETE FROM clip_variants WHERE clip_id = $1', [clipId]);
 }
+
+/**
+ * Every stored shape belonging to one video.
+ *
+ * Deleting a video deletes its footage and everything derived from it. A
+ * cropped copy IS someone's footage, so it goes with the rest — otherwise
+ * the API would report the video removed while vertical cuts of it sat in
+ * storage indefinitely.
+ */
+export async function listVariantKeysForVideo(videoId: string): Promise<string[]> {
+  const rows = await queryRows<{ storage_key: string }>(
+    `SELECT v.storage_key
+       FROM clip_variants v
+       JOIN clips c ON c.id = v.clip_id
+      WHERE c.video_id = $1 AND v.storage_key IS NOT NULL`,
+    [videoId],
+  );
+  return rows.map((row) => row.storage_key);
+}
+
+/** Forget the shapes of every clip cut from one video. */
+export async function clearVariantsForVideo(videoId: string): Promise<void> {
+  await queryOne(
+    `DELETE FROM clip_variants WHERE clip_id IN (SELECT id FROM clips WHERE video_id = $1)`,
+    [videoId],
+  );
+}

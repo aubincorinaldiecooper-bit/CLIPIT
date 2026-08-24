@@ -13,8 +13,9 @@ import { getClip } from '../../db/repositories/clips.js';
 import { setVariantStatus } from '../../db/repositories/clipVariants.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import type { ClipVariantJob } from '../../queues/index.js';
-import { getPublishedPost, updatePublishedPost } from '../../db/repositories/social.js';
+import { listPostsWaitingOnVariant, updatePublishedPost } from '../../db/repositories/social.js';
 import { submitRecordedPost } from '../../services/social/submitPost.js';
+import { ZernioApiError } from '../../services/zernio/client.js';
 
 /**
  * Cuts one clip to one platform's shape.
@@ -30,10 +31,22 @@ export async function handleClipVariant(job: Job<ClipVariantJob>): Promise<void>
   const { clipId, variantId, aspect, focusPct } = job.data;
   const log = logger.child({ job: 'clip-variant', clipId, variantId, aspect });
 
+  /**
+   * A render that cannot happen must say so to every post waiting on it.
+   * Leaving one 'rendering' forever would be progress reported for work
+   * that stopped — the exact absence-as-progress this codebase forbids.
+   */
+  const failWaitingPosts = async () => {
+    for (const post of await listPostsWaitingOnVariant(variantId)) {
+      await updatePublishedPost(post.id, { zernioPostId: null, status: 'failed' });
+    }
+  };
+
   const clip = await getClip(clipId);
   if (!clip) {
     log.warn('clip no longer exists, dropping job');
     await setVariantStatus(variantId, 'failed', { errorMessage: 'The clip no longer exists' });
+    await failWaitingPosts();
     return;
   }
 
@@ -44,6 +57,7 @@ export async function handleClipVariant(job: Job<ClipVariantJob>): Promise<void>
     await setVariantStatus(variantId, 'failed', {
       errorMessage: 'The source footage for this clip has been removed, so it cannot be reframed',
     });
+    await failWaitingPosts();
     return;
   }
 
@@ -118,26 +132,30 @@ export async function handleClipVariant(job: Job<ClipVariantJob>): Promise<void>
       });
       await job.updateProgress({ stage: 'ready', percent: 100 });
 
-      // A publish queued this render mid-act: finish the act. The person
-      // pressed Publish once; the file existing is the cue to send it.
-      if (job.data.postId) {
-        const post = await getPublishedPost(job.data.postId);
-        if (post && post.status === 'rendering') {
-          try {
-            const targets = Array.isArray(post.targets)
-              ? (post.targets as Array<{ platform: string; accountId: string }>)
-              : [];
-            await submitRecordedPost({
-              postId: post.id,
-              caption: post.caption,
-              targets,
-              storageKey: key,
-            });
-          } catch (error) {
-            // The FILE succeeded; only the hand-off failed. The variant row
-            // stays ready (the next publish reuses it), and the post says
-            // plainly that submission — not rendering — is what broke.
-            await updatePublishedPost(post.id, { zernioPostId: null, status: 'failed' });
+      // Publishes queued this render mid-act: finish the act, for EVERY post
+      // that pointed itself at this render — not just the one whose request
+      // happened to queue the job. Two publishes racing onto the same shape
+      // render once between them, and both still go out.
+      for (const post of await listPostsWaitingOnVariant(variantId)) {
+        try {
+          const targets = Array.isArray(post.targets)
+            ? (post.targets as Array<{ platform: string; accountId: string }>)
+            : [];
+          await submitRecordedPost({
+            postId: post.id,
+            caption: post.caption,
+            targets,
+            storageKey: key,
+          });
+        } catch (error) {
+          // submitRecordedPost already marked a DEFINITE rejection failed.
+          // Anything else is ambiguous — the service may have accepted the
+          // post and lost the response — so the row keeps its guarded state
+          // rather than being marked failed and retried into a public
+          // duplicate. The guard ages out on its own.
+          if (!(error instanceof ZernioApiError)) {
+            log.error('post submission after reframe is ambiguous', { postId: post.id, err: error });
+          } else {
             log.error('post submission after reframe failed', { postId: post.id, err: error });
           }
         }
@@ -152,11 +170,8 @@ export async function handleClipVariant(job: Job<ClipVariantJob>): Promise<void>
     // left 'rendering' forever would be progress reported for work that
     // stopped — the failure has to reach the record someone will look at.
     const attemptsAllowed = job.opts.attempts ?? 1;
-    if (job.data.postId && job.attemptsMade + 1 >= attemptsAllowed) {
-      const post = await getPublishedPost(job.data.postId);
-      if (post && post.status === 'rendering') {
-        await updatePublishedPost(post.id, { zernioPostId: null, status: 'failed' });
-      }
+    if (job.attemptsMade + 1 >= attemptsAllowed) {
+      await failWaitingPosts();
     }
     log.error('clip variant failed', { err: error });
     throw error;
