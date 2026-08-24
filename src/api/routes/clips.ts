@@ -95,9 +95,17 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
     if (!clip) throw HttpError.notFound('Clip not found');
     await assertClipAccess(request, clip);
 
+    // The source's true shape rides along so the caption editor can lay
+    // text out against the real frame even before (or without) the video
+    // file itself loading — a portrait source must never be previewed as
+    // 16:9 guesswork.
+    const video = await getVideo(clip.videoId);
+
     return reply.send({
       clip: {
         ...(await serializeClip(clip)),
+        sourceWidth: video?.width ?? null,
+        sourceHeight: video?.height ?? null,
         // Replacing re-renders someone's file in place; the editor only
         // offers it to the person whose clip it is.
         canReplace: Boolean(clip.userId && clip.userId === request.principal?.userId),
