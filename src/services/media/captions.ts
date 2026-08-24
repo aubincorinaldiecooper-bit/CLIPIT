@@ -23,6 +23,16 @@ export const captionSchema = z.object({
   color: z.string().regex(/^#[0-9a-fA-F]{6}$/),
   /** Vertical centre of the text as % of the video's height. */
   yPct: z.number().min(2).max(98),
+  /**
+   * Horizontal centre of the text as % of the video's width.
+   *
+   * Defaults to the middle, which is where every caption sat before the
+   * editor let people drag text sideways — so specs written by the old
+   * editor, and every row already in clips.captions, render exactly as they
+   * did. The renderer proves this: at 50 the clamped expression reduces to
+   * the old (w-text_w)/2.
+   */
+  xPct: z.number().min(2).max(98).default(50),
   /** A dark outline keeps light text readable over light footage. */
   outline: z.boolean().default(true),
 });
@@ -82,16 +92,39 @@ const CHAR_WIDTH_FACTOR: Record<ClipCaption['font'], number> = {
   mono: 0.6,
 };
 
-/** How much of the frame's width a caption line may use. */
+/** How much of the frame's width a caption line may use at most. */
 const USABLE_WIDTH_FRACTION = 0.92;
 
+/** The margin the renderer's clamp keeps between text and the frame edge. */
+const EDGE_MARGIN_FRACTION = 0.01;
+
 /**
- * How many characters fit on one line, from the frame's shape alone —
- * resolution-independent, so the preview (which knows only the aspect
- * ratio) computes the identical number.
+ * How wide a caption block centred at xPct can be before the renderer's
+ * clamp would start sliding it back toward the middle. Text dragged to the
+ * left edge has less room than text in the centre, and wrapping has to know
+ * that — otherwise the editor shows a line the renderer would move.
  */
-export function maxCharsPerLine(font: ClipCaption['font'], sizePct: number, aspectRatio: number): number {
-  return Math.max(4, Math.floor((USABLE_WIDTH_FRACTION * aspectRatio * 100) / (CHAR_WIDTH_FACTOR[font] * sizePct)));
+export function usableWidthFraction(xPct: number): number {
+  const x = xPct / 100;
+  const room = 2 * Math.min(x - EDGE_MARGIN_FRACTION, 1 - EDGE_MARGIN_FRACTION - x);
+  return Math.max(0, Math.min(USABLE_WIDTH_FRACTION, room));
+}
+
+/**
+ * How many characters fit on one line, from the frame's shape and where the
+ * text sits — resolution-independent, so the preview (which knows only the
+ * aspect ratio) computes the identical number.
+ */
+export function maxCharsPerLine(
+  font: ClipCaption['font'],
+  sizePct: number,
+  aspectRatio: number,
+  xPct = 50,
+): number {
+  return Math.max(
+    4,
+    Math.floor((usableWidthFraction(xPct) * aspectRatio * 100) / (CHAR_WIDTH_FACTOR[font] * sizePct)),
+  );
 }
 
 /**
@@ -153,6 +186,11 @@ export function buildDrawtextFilter(
   },
 ): string {
   const fontSize = Math.max(8, Math.round((context.videoHeight * caption.sizePct) / 100));
+  // A row stored before horizontal placement existed carries no xPct. The
+  // schema defaults it, and every path into here parses first — but a number
+  // that arrives missing would build "w*NaN", which ffmpeg accepts as a
+  // filter and draws nowhere. The centre is the honest fallback.
+  const xPct = Number.isFinite(caption.xPct) ? caption.xPct : 50;
   const lineHeight = Math.round(fontSize * 1.15);
   const offsetPx = Math.round(context.lineOffset * lineHeight);
   const color = `0x${caption.color.slice(1)}`;
@@ -163,9 +201,11 @@ export function buildDrawtextFilter(
     `expansion=none`,
     `fontsize=${fontSize}`,
     `fontcolor=${color}`,
-    // Centred horizontally; the block's vertical centre at yPct, this line
-    // shifted by its offset, clamped so no line ever leaves the frame.
-    `x=(w-text_w)/2`,
+    // The block's centre sits at (xPct, yPct); this line is shifted by its
+    // own offset, and both axes are clamped so no line ever leaves the
+    // frame. Every line of one caption centres on the SAME x, which is what
+    // keeps a wrapped block centred on itself wherever it was dragged.
+    `x=min(max(w*${(xPct / 100).toFixed(4)}-text_w/2\\,w*0.01)\\,w-text_w-w*0.01)`,
     `y=min(max(h*${(caption.yPct / 100).toFixed(4)}${offset}-text_h/2\\,h*0.01)\\,h-text_h-h*0.01)`,
   ];
   if (caption.outline) {
@@ -188,7 +228,10 @@ export async function prepareCaptionFilters(
   const filters: string[] = [];
   for (const [index, caption] of captions.entries()) {
     const fontFile = await resolveFontFile(caption.font);
-    const lines = wrapCaptionText(caption.text, maxCharsPerLine(caption.font, caption.sizePct, aspectRatio));
+    const lines = wrapCaptionText(
+      caption.text,
+      maxCharsPerLine(caption.font, caption.sizePct, aspectRatio, caption.xPct),
+    );
     for (const [lineIndex, line] of lines.entries()) {
       const textFile = path.join(workDir, `caption-${index}-${lineIndex}.txt`);
       await writeFile(textFile, line, 'utf8');

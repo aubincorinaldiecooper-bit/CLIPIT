@@ -3,6 +3,7 @@ import {
   buildDrawtextFilter,
   captionsSchema,
   maxCharsPerLine,
+  usableWidthFraction,
   wrapCaptionText,
 } from '../src/services/media/captions.js';
 
@@ -20,6 +21,7 @@ const caption = {
   sizePct: 6,
   color: '#fcd34d',
   yPct: 85,
+  xPct: 50,
   outline: true,
 };
 
@@ -53,12 +55,41 @@ describe('buildDrawtextFilter', () => {
     expect(buildDrawtextFilter(caption.text, caption, context)).toContain('fontcolor=0xfcd34d');
   });
 
-  it('centres horizontally and clamps the vertical position to the frame', () => {
+  it('places the block where it was dragged and clamps both axes to the frame', () => {
     const filter = buildDrawtextFilter(caption.text, caption, context);
-    expect(filter).toContain('x=(w-text_w)/2');
+    // Horizontal centre at xPct, vertical centre at yPct, each clamped so no
+    // line can leave the frame.
+    expect(filter).toContain('x=min(max(w*0.5000-text_w/2\\,w*0.01)\\,w-text_w-w*0.01)');
     expect(filter).toContain('h*0.8500');
     expect(filter).toContain('min(');
     expect(filter).toContain('max(');
+  });
+
+  it('honours a caption dragged off the centre line', () => {
+    const filter = buildDrawtextFilter(caption.text, { ...caption, xPct: 22 }, context);
+    expect(filter).toContain('w*0.2200-text_w/2');
+  });
+
+  it('draws at the centre rather than nowhere when xPct is missing entirely', () => {
+    // Not reachable through the API (everything is parsed first), but a
+    // "w*NaN" expression is a filter ffmpeg accepts and draws nothing from,
+    // which would look like a caption that silently vanished.
+    const { xPct: _dropped, ...withoutX } = caption;
+    const filter = buildDrawtextFilter(caption.text, withoutX as typeof caption, context);
+    expect(filter).toContain('w*0.5000-text_w/2');
+    expect(filter).not.toContain('NaN');
+  });
+
+  it('still centres text whose spec predates horizontal placement', () => {
+    // Rows written before the editor could drag sideways carry no xPct; the
+    // schema's default must land them exactly where they have always been.
+    const legacy = captionsSchema.parse([
+      { text: 'Hi', font: 'sans', sizePct: 5, color: '#ffffff', yPct: 50 },
+    ])[0]!;
+    expect(legacy.xPct).toBe(50);
+    // At 50 the clamp reduces to the old (w-text_w)/2 for any text that fits
+    // inside the margins: w*0.5-text_w/2 is exactly that expression.
+    expect(buildDrawtextFilter('Hi', legacy, context)).toContain('w*0.5000-text_w/2');
   });
 
   it('shifts wrapped lines around the block centre', () => {
@@ -85,6 +116,20 @@ describe('caption line wrapping', () => {
     expect(maxCharsPerLine('bold', 6, 16 / 9)).toBe(51);
     // Portrait frames fit far fewer characters.
     expect(maxCharsPerLine('bold', 6, 9 / 16)).toBeLessThan(20);
+  });
+
+  it('gives text near an edge the room it actually has', () => {
+    // A block centred at 15% can only be 28% of the frame wide before the
+    // renderer's clamp would drag it back toward the middle — so it wraps
+    // sooner, and the preview never shows a line that would move.
+    const centred = maxCharsPerLine('bold', 6, 16 / 9, 50);
+    const nearEdge = maxCharsPerLine('bold', 6, 16 / 9, 15);
+    expect(nearEdge).toBeLessThan(centred);
+    expect(usableWidthFraction(15)).toBeCloseTo(0.28, 5);
+    // Symmetric: the right edge is no different from the left.
+    expect(maxCharsPerLine('bold', 6, 16 / 9, 85)).toBe(nearEdge);
+    // The middle keeps the full budget it always had.
+    expect(usableWidthFraction(50)).toBe(0.92);
   });
 
   it('wraps on word boundaries and never emits an overlong line', () => {

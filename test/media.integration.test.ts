@@ -1,4 +1,4 @@
-import { mkdir, rm, stat } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { run } from '../src/lib/exec.js';
@@ -146,8 +146,8 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
       [
         // %{gmtime} is the reason expansion is off: with drawtext's default
         // expansion it would burn the server's clock into a user's video.
-        { text: "It's 100%{gmtime} live: rain & confetti", font: 'bold', sizePct: 8, color: '#fcd34d', yPct: 85, outline: true },
-        { text: 'colons: quotes\' and, commas — plus a line long enough that it must wrap onto a second line to stay inside the frame', font: 'mono', sizePct: 5, color: '#ffffff', yPct: 10, outline: false },
+        { text: "It's 100%{gmtime} live: rain & confetti", font: 'bold', sizePct: 8, color: '#fcd34d', yPct: 85, xPct: 50, outline: true },
+        { text: 'colons: quotes\' and, commas — plus a line long enough that it must wrap onto a second line to stay inside the frame', font: 'mono', sizePct: 5, color: '#ffffff', yPct: 10, xPct: 50, outline: false },
       ],
       dir,
       { videoWidth: probe.width ?? 320, videoHeight: probe.height ?? 240 },
@@ -173,5 +173,64 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(out.videoCodec).toBe('h264');
     expect((await stat(output)).size).toBeGreaterThan(1000);
   }, 120_000);
+
+  /**
+   * Dragging a caption sideways has to move the pixels, not just the spec.
+   * This burns the same word at two positions onto a black frame and reads
+   * the rendered frame back: where the lit pixels actually are is the only
+   * proof that "what you see is what gets burned in" survived the filter.
+   */
+  it('burns a caption where it was dragged, not always in the middle', async () => {
+    const canvas = path.join(dir, 'black.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'color=c=black:size=320x240:rate=10:duration=2',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', canvas,
+    ]);
+
+    /** Burn "HERE" at xPct and report the average x of every lit pixel. */
+    const litCentreX = async (xPct: number) => {
+      const filters = await prepareCaptionFilters(
+        [{ text: 'HERE', font: 'bold', sizePct: 10, color: '#ffffff', yPct: 50, xPct, outline: false }],
+        dir,
+        { videoWidth: 320, videoHeight: 240 },
+      );
+      const burned = path.join(dir, `placed-${xPct}.mp4`);
+      await cutClip({
+        inputPath: canvas,
+        outputPath: burned,
+        startSeconds: 0,
+        endSeconds: 1,
+        hasAudio: false,
+        videoFilters: filters,
+      });
+
+      const gray = path.join(dir, `placed-${xPct}.gray`);
+      await run('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-i', burned, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'gray', gray,
+      ]);
+      const pixels = await readFile(gray);
+      let sum = 0;
+      let lit = 0;
+      for (let index = 0; index < pixels.length; index += 1) {
+        if (pixels[index]! > 128) {
+          sum += index % 320;
+          lit += 1;
+        }
+      }
+      return { centreX: lit > 0 ? sum / lit : null, lit };
+    };
+
+    const left = await litCentreX(20);
+    const right = await litCentreX(80);
+
+    // Text was drawn at all — an empty frame would pass a "not centred" test
+    // trivially, and that is exactly the false clean bill this repo forbids.
+    expect(left.lit).toBeGreaterThan(50);
+    expect(right.lit).toBeGreaterThan(50);
+    expect(left.centreX!).toBeLessThan(320 * 0.35);
+    expect(right.centreX!).toBeGreaterThan(320 * 0.65);
+  }, 180_000);
 
 });
