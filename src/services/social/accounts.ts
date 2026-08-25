@@ -238,9 +238,37 @@ export async function verifyConnectAttempt(
   workspaceId: string,
   platform: string,
   before: SocialAccountRow[],
-): Promise<ConnectAttemptOutcome> {
+): Promise<{ outcome: ConnectAttemptOutcome; account: SocialAccountRow | null }> {
   const after = await listSocialAccounts(workspaceId, { platform });
-  return judgeConnectAttempt(before, after);
+  const outcome = judgeConnectAttempt(before, after);
+  // WHICH account this attempt connected, not merely that one did. A person
+  // connects a page, not a platform — and with several accounts on the same
+  // platform, "Instagram is connected" cannot tell them which one they just
+  // added. Only reported for a real success; on any other outcome there is no
+  // account to name and guessing one would be worse than saying nothing.
+  return { outcome, account: outcome === 'connected' ? newlyConnected(before, after) : null };
+}
+
+/**
+ * The account this attempt actually brought in, if it can be identified.
+ *
+ * Exported for the same reason judgeConnectAttempt is: the decision is pure,
+ * and a decision worth making is worth testing without a database.
+ */
+export function newlyConnected(
+  before: SocialAccountRow[],
+  after: SocialAccountRow[],
+): SocialAccountRow | null {
+  const beforeStatusById = new Map(before.map((row) => [row.id, row.status]));
+  // Prefer an account that did not exist before; fall back to one that came
+  // back FROM a broken state, which is what a reconnect looks like.
+  const fresh = after.find((row) => row.status === 'connected' && !beforeStatusById.has(row.id));
+  if (fresh) return fresh;
+  return (
+    after.find(
+      (row) => row.status === 'connected' && beforeStatusById.get(row.id) !== 'connected',
+    ) ?? null
+  );
 }
 
 /** The pure decision, separated so it can be tested without a database. */
