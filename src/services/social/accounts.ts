@@ -78,7 +78,18 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
     const duplicate = cause instanceof ZernioApiError && (cause.status === 409 || cause.status === 422);
     if (!duplicate) throw cause;
     createFailure = cause;
-    profileId = idFromBody((cause as ZernioApiError).body);
+    // Deliberately NOT scraped out of the refusal body. Codex caught what
+    // that costs: a body like {error: {id: "request-123", message: "profile
+    // exists"}} yields a REQUEST id, and this function's result is written to
+    // social_profiles permanently — every later connect would then aim at an
+    // id that is not a profile. That is the same permanent breakage this
+    // whole change exists to end, reintroduced by a different route.
+    //
+    // The name lookup below is not a guess: it matches the exact label this
+    // user's profile is created under. It was written as insurance against
+    // GET /profiles perhaps not existing; populr uses that route against the
+    // same API, so the insurance is not needed and the guess is not worth
+    // its risk.
   }
 
   // Still nothing: ask for the profile by name. This is a SECOND recovery,
@@ -110,29 +121,6 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
 
   const row = await insertSocialProfile(userId, profileId);
   return row.zernio_profile_id;
-}
-
-/**
- * An id out of a response body, wherever the provider chose to put it.
- *
- * A duplicate refusal usually names the thing it collided with, and that is
- * the id we need. The body is READ here and never logged or returned — the
- * error class exists precisely so callers can inspect it.
- */
-function idFromBody(body: unknown): string | null {
-  if (!body || typeof body !== 'object') return null;
-  const record = body as Record<string, unknown>;
-  const direct = pickId(record, ['profileId', 'profile_id', 'existingId', 'existing_id']);
-  if (direct) return direct;
-  // One level down, for {profile: {...}} / {data: {...}} / {error: {...}}.
-  for (const key of ['profile', 'data', 'error', 'details']) {
-    const nested = record[key];
-    if (nested && typeof nested === 'object') {
-      const found = idFromBody(nested);
-      if (found) return found;
-    }
-  }
-  return null;
 }
 
 /** The id of the profile already carrying this exact label, if there is one. */

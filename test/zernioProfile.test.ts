@@ -130,25 +130,7 @@ describe('getOrCreateZernioProfile', () => {
 
   // The failure that sent me looking: a friendly message with no log behind
   // it, and a recovery whose own error replaced the one that mattered.
-  it('reads the id out of a duplicate refusal, without a second call', async () => {
-    // A 409 usually names what it collided with. If the id is right there,
-    // the profile-list lookup should never happen.
-    createProfile.mockRejectedValue(
-      new ZernioApiError('Zernio POST /profiles failed with 409', 409, {
-        error: { message: 'profile already exists', profileId: 'p-from-conflict' },
-      }),
-    );
 
-    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('p-from-conflict');
-    expect(listProfiles).not.toHaveBeenCalled();
-  });
-
-  it('finds a nested id in a duplicate refusal', async () => {
-    createProfile.mockRejectedValue(
-      new ZernioApiError('conflict', 409, { data: { profile: { id: 'p-nested' } } }),
-    );
-    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('p-nested');
-  });
 
   it('reports the DUPLICATE, not the lookup failure, when recovery cannot run', async () => {
     // This is the live bug: create said 409 (recoverable, and informative),
@@ -171,16 +153,6 @@ describe('getOrCreateZernioProfile', () => {
     await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).rejects.toThrow(/503/);
   });
 
-  it('never returns a secret pulled out of an error body', async () => {
-    // idFromBody walks the body looking for an id. It must not come back with
-    // a token because the provider put one on the same object.
-    createProfile.mockRejectedValue(
-      new ZernioApiError('conflict', 409, { access_token: 'sk-live-SECRET', id: 'p-ok' }),
-    );
-    const result = await getOrCreateZernioProfile('u1', 'clipit-u1');
-    expect(result).toBe('p-ok');
-    expect(result).not.toContain('SECRET');
-  });
 
   // The root cause, found in populr's client against the same API:
   // "Zernio's profile id field is Mongo-style `_id` on most payloads."
@@ -209,5 +181,34 @@ describe('getOrCreateZernioProfile', () => {
     listProfiles.mockResolvedValue([{ _id: 'p-listed', name: 'clipit-u1' }]);
 
     await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('p-listed');
+  });
+
+  // Codex, P2 on this PR: an id inside an error body is a REQUEST id, not a
+  // profile. Trusting it would persist a non-profile id and aim every later
+  // connect at it — the same permanent breakage, by a different route.
+  it('never trusts an id found in a refusal body', async () => {
+    createProfile.mockRejectedValue(
+      new ZernioApiError('Zernio POST /profiles failed with 409', 409, {
+        error: { id: 'request-123', message: 'profile exists' },
+      }),
+    );
+    listProfiles.mockResolvedValue([{ _id: 'p-real', name: 'clipit-u1' }]);
+
+    // The name match decides, because it is the only unambiguous evidence.
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('p-real');
+    expect(listProfiles).toHaveBeenCalled();
+    expect(insertSocialProfile).toHaveBeenCalledWith('u1', 'p-real');
+  });
+
+  it('would rather fail than store an id it cannot vouch for', async () => {
+    // A refusal body full of plausible-looking ids, and no matching profile.
+    // Failing is correct: a wrong id here is written down forever.
+    createProfile.mockRejectedValue(
+      new ZernioApiError('conflict', 409, { id: 'req-9', data: { id: 'trace-4' } }),
+    );
+    listProfiles.mockResolvedValue([{ _id: 'p-other', name: 'clipit-someone-else' }]);
+
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).rejects.toThrow(/usable profile id/);
+    expect(insertSocialProfile).not.toHaveBeenCalled();
   });
 });
