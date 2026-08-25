@@ -1,3 +1,4 @@
+import { logger } from '../../lib/logger.js';
 import { zernio, ZernioApiError } from '../zernio/client.js';
 import {
   getSocialProfile,
@@ -51,23 +52,64 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
   if (existing) return existing.zernio_profile_id;
 
   let profileId: string | null = null;
+  /** What the create actually said, kept so a failed RECOVERY cannot replace it. */
+  let createFailure: unknown = null;
+
   try {
     const created = await zernio.createProfile({ name: label });
     // Never trust the id straight into the column: an unusable one used to
     // surface as a not-null constraint violation, which reads as a database
     // fault when it is really an unexpected response shape.
-    if (usableZernioId(created?.id)) profileId = created.id;
+    profileId = pickId(created, ['profileId', 'profile_id']);
+    if (!profileId) {
+      // The original bug, and the one branch here that could still pass in
+      // silence: the create SUCCEEDED and we could not find an id in what it
+      // said. Worth a line, because it means a profile now exists upstream
+      // that nothing local points at. Keys only — never the values, which is
+      // where a token would be.
+      logger.warn('profile create returned no usable id', {
+        keys: created && typeof created === 'object' ? Object.keys(created).slice(0, 12) : [],
+      });
+    }
   } catch (cause) {
-    // Only the STATUS is inspected. The body can carry tokens or billing
-    // identifiers and must never be logged or forwarded.
+    // Only the STATUS decides control flow. The body is never logged or
+    // forwarded — but reading an id out of it is not the same as exposing it,
+    // and a duplicate refusal is exactly where the id we need tends to be.
     const duplicate = cause instanceof ZernioApiError && (cause.status === 409 || cause.status === 422);
     if (!duplicate) throw cause;
+    createFailure = cause;
+    // Deliberately NOT scraped out of the refusal body. Codex caught what
+    // that costs: a body like {error: {id: "request-123", message: "profile
+    // exists"}} yields a REQUEST id, and this function's result is written to
+    // social_profiles permanently — every later connect would then aim at an
+    // id that is not a profile. That is the same permanent breakage this
+    // whole change exists to end, reintroduced by a different route.
+    //
+    // The name lookup below is not a guess: it matches the exact label this
+    // user's profile is created under. It was written as insurance against
+    // GET /profiles perhaps not existing; populr uses that route against the
+    // same API, so the insurance is not needed and the guess is not worth
+    // its risk.
   }
 
-  // Either the create was refused as a duplicate, or it answered in a shape
-  // we could not read an id from. Both mean the profile may already exist —
-  // so ask, rather than guess or give up.
-  if (!profileId) profileId = await findExistingProfileId(label);
+  // Still nothing: ask for the profile by name. This is a SECOND recovery,
+  // and it leans on GET /profiles — a route this client did not previously
+  // use, so it cannot be assumed to behave.
+  if (!profileId) {
+    try {
+      profileId = await findExistingProfileId(label);
+    } catch (lookupFailure) {
+      // A recovery that fails must not become the story. Reporting the lookup's
+      // error would tell someone the service is down when the truth is that
+      // their profile already exists and we could not look it up — a different
+      // problem with a different fix.
+      logger.warn('profile lookup failed while recovering from a duplicate', {
+        status: lookupFailure instanceof ZernioApiError ? lookupFailure.status : null,
+        name: lookupFailure instanceof Error ? lookupFailure.name : 'unknown',
+      });
+      throw createFailure ?? lookupFailure;
+    }
+  }
 
   if (!profileId) {
     throw new ZernioApiError(
@@ -85,7 +127,8 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
 async function findExistingProfileId(label: string): Promise<string | null> {
   const profiles = await zernio.listProfiles();
   for (const profile of profiles) {
-    if (profile?.name === label && usableZernioId(profile.id)) return profile.id;
+    const id = pickId(profile, ['profileId', 'profile_id']);
+    if (id && profile?.name === label) return id;
   }
   return null;
 }
@@ -93,6 +136,37 @@ async function findExistingProfileId(label: string): Promise<string | null> {
 /** A Zernio id that can be safely placed in a request path. */
 function usableZernioId(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '' && value !== 'undefined' && value !== 'null';
+}
+
+/**
+ * The id off a Zernio record, whichever key it came under.
+ *
+ * THE bug, and it cost a working publishing flow: Zernio's ids are Mongo-style
+ * `_id` on most payloads. This code read `.id`, got undefined, and pushed a
+ * null into a NOT NULL column — while the profile it had just created sat
+ * there upstream with nothing pointing at it. Every attempt afterwards was
+ * refused as a duplicate, permanently.
+ *
+ * Confirmed against populr's client, which talks to the same API and has
+ * always picked `_id` first:
+ *
+ *   "Zernio's profile id field is Mongo-style `_id` on most payloads; some
+ *    hand-built fallback records and other Zernio endpoints use plain `id`."
+ *
+ * Numbers count: an id that arrives as 1234 is still an id.
+ */
+function pickId(record: unknown, extraKeys: string[] = []): string | null {
+  if (!record || typeof record !== 'object') return null;
+  const source = record as Record<string, unknown>;
+  for (const key of ['_id', 'id', ...extraKeys]) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim() !== '') {
+      const trimmed = value.trim();
+      if (usableZernioId(trimmed)) return trimmed;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return null;
 }
 
 /**
@@ -109,7 +183,10 @@ export async function syncAccounts(
   const stored: SocialAccountRow[] = [];
   for (const raw of remote) {
     const account = raw as ZernioAccount;
-    const id = usableZernioId(account.id) ? account.id : usableZernioId(account.accountId) ? account.accountId : null;
+    // The same `_id` bug lived here: an account whose id arrives as `_id`
+    // was silently skipped, so a connection that genuinely succeeded upstream
+    // mirrored as nothing and the flow reported "account_sync_failed".
+    const id = pickId(account, ['accountId', 'account_id']);
     const platform = typeof account.platform === 'string' ? account.platform.toLowerCase() : null;
     if (!id || !platform || !isPublishPlatform(platform)) continue;
     stored.push(

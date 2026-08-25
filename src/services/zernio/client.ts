@@ -131,7 +131,7 @@ export class ZernioClient {
    */
   async listProfiles(): Promise<ZernioProfile[]> {
     const res = await this.request<unknown>('GET', '/profiles');
-    return this.unwrapList<ZernioProfile>(res, ['profiles', 'data']);
+    return this.unwrapList<ZernioProfile>(res, ['profiles', 'data', 'items']);
   }
 
   // --- Connect (hosted OAuth) ----------------------------------------------
