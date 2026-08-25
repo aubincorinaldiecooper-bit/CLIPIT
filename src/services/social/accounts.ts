@@ -260,15 +260,33 @@ export function newlyConnected(
   after: SocialAccountRow[],
 ): SocialAccountRow | null {
   const beforeStatusById = new Map(before.map((row) => [row.id, row.status]));
-  // Prefer an account that did not exist before; fall back to one that came
+
+  // Prefer an account that did not exist before; failing that, one that came
   // back FROM a broken state, which is what a reconnect looks like.
-  const fresh = after.find((row) => row.status === 'connected' && !beforeStatusById.has(row.id));
-  if (fresh) return fresh;
-  return (
-    after.find(
-      (row) => row.status === 'connected' && beforeStatusById.get(row.id) !== 'connected',
-    ) ?? null
+  const fresh = after.filter((row) => row.status === 'connected' && !beforeStatusById.has(row.id));
+  if (fresh.length > 0) return only(fresh);
+
+  const revived = after.filter(
+    (row) => row.status === 'connected' && beforeStatusById.get(row.id) !== 'connected',
   );
+  return only(revived);
+}
+
+/**
+ * The single candidate, or nobody.
+ *
+ * Codex, P2: taking the FIRST of several is picking by database ordering and
+ * then presenting the result as "the account you just added". More than one
+ * account can arrive unseen — a sync that failed earlier and caught up now,
+ * or two OAuth flows running at once — and in that case this attempt cannot
+ * be attributed to any one of them.
+ *
+ * Naming nobody costs a vaguer sentence ("Instagram is connected"), which is
+ * true. Naming the wrong page is a confident lie about what someone just did,
+ * and this whole change exists to be MORE precise, not less.
+ */
+function only(candidates: SocialAccountRow[]): SocialAccountRow | null {
+  return candidates.length === 1 ? candidates[0]! : null;
 }
 
 /** The pure decision, separated so it can be tested without a database. */

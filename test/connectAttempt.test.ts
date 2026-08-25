@@ -91,3 +91,29 @@ describe('newlyConnected', () => {
     expect(newlyConnected([], after)).toBeNull();
   });
 });
+
+describe('newlyConnected refuses to guess', () => {
+  const row = (id: string, status: string, display_name: string | null = null) =>
+    ({ id, status, display_name }) as never;
+
+  // Codex, P2 on CLIPIT#48. Several accounts can arrive unseen — an earlier
+  // sync that failed and caught up now, or two OAuth flows at once. Taking
+  // the first is picking by database ordering and calling it "the account you
+  // just added".
+  it('names nobody when two accounts arrived unseen', () => {
+    const after = [row('a1', 'connected', 'one'), row('a2', 'connected', 'two')];
+    expect(newlyConnected([], after)).toBeNull();
+  });
+
+  it('names nobody when two came back from a broken state at once', () => {
+    const before = [row('a1', 'reconnect_required'), row('a2', 'reconnect_required')];
+    const after = [row('a1', 'connected'), row('a2', 'connected')];
+    expect(newlyConnected(before, after)).toBeNull();
+  });
+
+  it('still names the one when exactly one is new, alongside untouched others', () => {
+    const before = [row('a1', 'connected', 'old')];
+    const after = [row('a1', 'connected', 'old'), row('a2', 'connected', 'new')];
+    expect(newlyConnected(before, after)?.display_name).toBe('new');
+  });
+});
