@@ -60,9 +60,8 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
     // Never trust the id straight into the column: an unusable one used to
     // surface as a not-null constraint violation, which reads as a database
     // fault when it is really an unexpected response shape.
-    if (usableZernioId(created?.id)) {
-      profileId = created.id;
-    } else {
+    profileId = pickId(created, ['profileId', 'profile_id']);
+    if (!profileId) {
       // The original bug, and the one branch here that could still pass in
       // silence: the create SUCCEEDED and we could not find an id in what it
       // said. Worth a line, because it means a profile now exists upstream
@@ -123,9 +122,8 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
 function idFromBody(body: unknown): string | null {
   if (!body || typeof body !== 'object') return null;
   const record = body as Record<string, unknown>;
-  for (const key of ['id', 'profileId', 'profile_id', 'existingId', 'existing_id']) {
-    if (usableZernioId(record[key])) return record[key] as string;
-  }
+  const direct = pickId(record, ['profileId', 'profile_id', 'existingId', 'existing_id']);
+  if (direct) return direct;
   // One level down, for {profile: {...}} / {data: {...}} / {error: {...}}.
   for (const key of ['profile', 'data', 'error', 'details']) {
     const nested = record[key];
@@ -141,7 +139,8 @@ function idFromBody(body: unknown): string | null {
 async function findExistingProfileId(label: string): Promise<string | null> {
   const profiles = await zernio.listProfiles();
   for (const profile of profiles) {
-    if (profile?.name === label && usableZernioId(profile.id)) return profile.id;
+    const id = pickId(profile, ['profileId', 'profile_id']);
+    if (id && profile?.name === label) return id;
   }
   return null;
 }
@@ -149,6 +148,37 @@ async function findExistingProfileId(label: string): Promise<string | null> {
 /** A Zernio id that can be safely placed in a request path. */
 function usableZernioId(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '' && value !== 'undefined' && value !== 'null';
+}
+
+/**
+ * The id off a Zernio record, whichever key it came under.
+ *
+ * THE bug, and it cost a working publishing flow: Zernio's ids are Mongo-style
+ * `_id` on most payloads. This code read `.id`, got undefined, and pushed a
+ * null into a NOT NULL column — while the profile it had just created sat
+ * there upstream with nothing pointing at it. Every attempt afterwards was
+ * refused as a duplicate, permanently.
+ *
+ * Confirmed against populr's client, which talks to the same API and has
+ * always picked `_id` first:
+ *
+ *   "Zernio's profile id field is Mongo-style `_id` on most payloads; some
+ *    hand-built fallback records and other Zernio endpoints use plain `id`."
+ *
+ * Numbers count: an id that arrives as 1234 is still an id.
+ */
+function pickId(record: unknown, extraKeys: string[] = []): string | null {
+  if (!record || typeof record !== 'object') return null;
+  const source = record as Record<string, unknown>;
+  for (const key of ['_id', 'id', ...extraKeys]) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim() !== '') {
+      const trimmed = value.trim();
+      if (usableZernioId(trimmed)) return trimmed;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return null;
 }
 
 /**
@@ -165,7 +195,10 @@ export async function syncAccounts(
   const stored: SocialAccountRow[] = [];
   for (const raw of remote) {
     const account = raw as ZernioAccount;
-    const id = usableZernioId(account.id) ? account.id : usableZernioId(account.accountId) ? account.accountId : null;
+    // The same `_id` bug lived here: an account whose id arrives as `_id`
+    // was silently skipped, so a connection that genuinely succeeded upstream
+    // mirrored as nothing and the flow reported "account_sync_failed".
+    const id = pickId(account, ['accountId', 'account_id']);
     const platform = typeof account.platform === 'string' ? account.platform.toLowerCase() : null;
     if (!id || !platform || !isPublishPlatform(platform)) continue;
     stored.push(

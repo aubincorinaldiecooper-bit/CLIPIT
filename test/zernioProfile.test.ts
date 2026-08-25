@@ -181,4 +181,33 @@ describe('getOrCreateZernioProfile', () => {
     expect(result).toBe('p-ok');
     expect(result).not.toContain('SECRET');
   });
+
+  // The root cause, found in populr's client against the same API:
+  // "Zernio's profile id field is Mongo-style `_id` on most payloads."
+  it('reads a Mongo-style _id from the create', async () => {
+    createProfile.mockResolvedValue({ _id: 'p-mongo', name: 'clipit-u1' });
+
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('p-mongo');
+    expect(insertSocialProfile).toHaveBeenCalledWith('u1', 'p-mongo');
+    // This is the whole bug: reading `.id` here got undefined and the null
+    // reached a NOT NULL column, while the profile existed upstream.
+    expect(listProfiles).not.toHaveBeenCalled();
+  });
+
+  it('prefers _id over id when a payload carries both', async () => {
+    createProfile.mockResolvedValue({ _id: 'p-canonical', id: 'p-legacy' });
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('p-canonical');
+  });
+
+  it('accepts an id that arrives as a number', async () => {
+    createProfile.mockResolvedValue({ _id: 4711 });
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('4711');
+  });
+
+  it('matches a listed profile by _id too', async () => {
+    createProfile.mockRejectedValue(new ZernioApiError('conflict', 409, null));
+    listProfiles.mockResolvedValue([{ _id: 'p-listed', name: 'clipit-u1' }]);
+
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('p-listed');
+  });
 });
