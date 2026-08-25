@@ -127,4 +127,58 @@ describe('getOrCreateZernioProfile', () => {
     await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).rejects.toThrow(/usable profile id/);
     expect(insertSocialProfile).not.toHaveBeenCalled();
   });
+
+  // The failure that sent me looking: a friendly message with no log behind
+  // it, and a recovery whose own error replaced the one that mattered.
+  it('reads the id out of a duplicate refusal, without a second call', async () => {
+    // A 409 usually names what it collided with. If the id is right there,
+    // the profile-list lookup should never happen.
+    createProfile.mockRejectedValue(
+      new ZernioApiError('Zernio POST /profiles failed with 409', 409, {
+        error: { message: 'profile already exists', profileId: 'p-from-conflict' },
+      }),
+    );
+
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('p-from-conflict');
+    expect(listProfiles).not.toHaveBeenCalled();
+  });
+
+  it('finds a nested id in a duplicate refusal', async () => {
+    createProfile.mockRejectedValue(
+      new ZernioApiError('conflict', 409, { data: { profile: { id: 'p-nested' } } }),
+    );
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).resolves.toBe('p-nested');
+  });
+
+  it('reports the DUPLICATE, not the lookup failure, when recovery cannot run', async () => {
+    // This is the live bug: create said 409 (recoverable, and informative),
+    // the profile-list lookup then failed, and the lookup's error became the
+    // message. Someone was told the service was down when in fact their
+    // profile existed and we could not look it up.
+    createProfile.mockRejectedValue(new ZernioApiError('Zernio POST /profiles failed with 409', 409, null));
+    listProfiles.mockRejectedValue(new ZernioApiError('Zernio GET /profiles failed with 500', 500, null));
+
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).rejects.toThrow(/409/);
+    expect(insertSocialProfile).not.toHaveBeenCalled();
+  });
+
+  it('reports the lookup failure when there was no duplicate to report', async () => {
+    // Create succeeded with an unreadable body, so there is no earlier error
+    // to prefer — here the lookup's own failure IS the story.
+    createProfile.mockResolvedValue({ created: true });
+    listProfiles.mockRejectedValue(new ZernioApiError('Zernio GET /profiles failed with 503', 503, null));
+
+    await expect(getOrCreateZernioProfile('u1', 'clipit-u1')).rejects.toThrow(/503/);
+  });
+
+  it('never returns a secret pulled out of an error body', async () => {
+    // idFromBody walks the body looking for an id. It must not come back with
+    // a token because the provider put one on the same object.
+    createProfile.mockRejectedValue(
+      new ZernioApiError('conflict', 409, { access_token: 'sk-live-SECRET', id: 'p-ok' }),
+    );
+    const result = await getOrCreateZernioProfile('u1', 'clipit-u1');
+    expect(result).toBe('p-ok');
+    expect(result).not.toContain('SECRET');
+  });
 });

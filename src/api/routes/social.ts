@@ -81,6 +81,20 @@ const PLATFORM_LABEL: Record<string, string> = {
  * account, and that is the only vocabulary this app owes them.
  */
 export function connectFailure(cause: unknown, context: string): HttpError {
+  // Record it. HttpError is returned to the browser verbatim and NEVER logged
+  // by the error handler, so turning these failures into friendly messages
+  // also turned them invisible: the first live failure after this shipped
+  // produced a perfect sentence for the user and not one line to debug from.
+  // Status and error name only — the body can carry tokens and billing ids.
+  logger.error('connect flow failed', {
+    context,
+    status: cause instanceof ZernioApiError ? cause.status : null,
+    name: cause instanceof Error ? cause.name : 'unknown',
+    // The provider's own message text is safe: it is the summary line the
+    // client builds ("Zernio POST /profiles failed with 409"), not the body.
+    detail: cause instanceof ZernioApiError ? cause.message : null,
+  });
+
   if (!(cause instanceof ZernioApiError)) {
     // Our own plumbing, not the platform's. Say so rather than implying the
     // platform is down — blaming the wrong party sends someone off checking

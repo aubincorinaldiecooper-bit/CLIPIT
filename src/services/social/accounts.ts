@@ -1,3 +1,4 @@
+import { logger } from '../../lib/logger.js';
 import { zernio, ZernioApiError } from '../zernio/client.js';
 import {
   getSocialProfile,
@@ -51,6 +52,9 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
   if (existing) return existing.zernio_profile_id;
 
   let profileId: string | null = null;
+  /** What the create actually said, kept so a failed RECOVERY cannot replace it. */
+  let createFailure: unknown = null;
+
   try {
     const created = await zernio.createProfile({ name: label });
     // Never trust the id straight into the column: an unusable one used to
@@ -58,16 +62,33 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
     // fault when it is really an unexpected response shape.
     if (usableZernioId(created?.id)) profileId = created.id;
   } catch (cause) {
-    // Only the STATUS is inspected. The body can carry tokens or billing
-    // identifiers and must never be logged or forwarded.
+    // Only the STATUS decides control flow. The body is never logged or
+    // forwarded — but reading an id out of it is not the same as exposing it,
+    // and a duplicate refusal is exactly where the id we need tends to be.
     const duplicate = cause instanceof ZernioApiError && (cause.status === 409 || cause.status === 422);
     if (!duplicate) throw cause;
+    createFailure = cause;
+    profileId = idFromBody((cause as ZernioApiError).body);
   }
 
-  // Either the create was refused as a duplicate, or it answered in a shape
-  // we could not read an id from. Both mean the profile may already exist —
-  // so ask, rather than guess or give up.
-  if (!profileId) profileId = await findExistingProfileId(label);
+  // Still nothing: ask for the profile by name. This is a SECOND recovery,
+  // and it leans on GET /profiles — a route this client did not previously
+  // use, so it cannot be assumed to behave.
+  if (!profileId) {
+    try {
+      profileId = await findExistingProfileId(label);
+    } catch (lookupFailure) {
+      // A recovery that fails must not become the story. Reporting the lookup's
+      // error would tell someone the service is down when the truth is that
+      // their profile already exists and we could not look it up — a different
+      // problem with a different fix.
+      logger.warn('profile lookup failed while recovering from a duplicate', {
+        status: lookupFailure instanceof ZernioApiError ? lookupFailure.status : null,
+        name: lookupFailure instanceof Error ? lookupFailure.name : 'unknown',
+      });
+      throw createFailure ?? lookupFailure;
+    }
+  }
 
   if (!profileId) {
     throw new ZernioApiError(
@@ -79,6 +100,30 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
 
   const row = await insertSocialProfile(userId, profileId);
   return row.zernio_profile_id;
+}
+
+/**
+ * An id out of a response body, wherever the provider chose to put it.
+ *
+ * A duplicate refusal usually names the thing it collided with, and that is
+ * the id we need. The body is READ here and never logged or returned — the
+ * error class exists precisely so callers can inspect it.
+ */
+function idFromBody(body: unknown): string | null {
+  if (!body || typeof body !== 'object') return null;
+  const record = body as Record<string, unknown>;
+  for (const key of ['id', 'profileId', 'profile_id', 'existingId', 'existing_id']) {
+    if (usableZernioId(record[key])) return record[key] as string;
+  }
+  // One level down, for {profile: {...}} / {data: {...}} / {error: {...}}.
+  for (const key of ['profile', 'data', 'error', 'details']) {
+    const nested = record[key];
+    if (nested && typeof nested === 'object') {
+      const found = idFromBody(nested);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 /** The id of the profile already carrying this exact label, if there is one. */
