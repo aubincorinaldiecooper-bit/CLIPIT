@@ -60,7 +60,18 @@ export async function getOrCreateZernioProfile(userId: string, label: string): P
     // Never trust the id straight into the column: an unusable one used to
     // surface as a not-null constraint violation, which reads as a database
     // fault when it is really an unexpected response shape.
-    if (usableZernioId(created?.id)) profileId = created.id;
+    if (usableZernioId(created?.id)) {
+      profileId = created.id;
+    } else {
+      // The original bug, and the one branch here that could still pass in
+      // silence: the create SUCCEEDED and we could not find an id in what it
+      // said. Worth a line, because it means a profile now exists upstream
+      // that nothing local points at. Keys only — never the values, which is
+      // where a token would be.
+      logger.warn('profile create returned no usable id', {
+        keys: created && typeof created === 'object' ? Object.keys(created).slice(0, 12) : [],
+      });
+    }
   } catch (cause) {
     // Only the STATUS decides control flow. The body is never logged or
     // forwarded — but reading an id out of it is not the same as exposing it,
