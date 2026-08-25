@@ -23,6 +23,7 @@ import {
   getOrCreateZernioProfile,
   isPublishPlatform,
   syncAccounts,
+  usableZernioId,
   verifyConnectAttempt,
 } from '../../services/social/accounts.js';
 import { zernio, ZernioApiError, zernioConfigured } from '../../services/zernio/client.js';
@@ -301,6 +302,17 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       throw HttpError.notFound('Account not found');
     }
 
+    // A stored id is not automatically a usable one. populr exports its guard
+    // for exactly this call: an id that got persisted as the literal
+    // "undefined" by an earlier normalisation bug would otherwise be sent as
+    // DELETE /accounts/undefined — a request against nothing, whose failure
+    // reads as "the platform refused" rather than "our record is bad".
+    if (!usableZernioId(accountId)) {
+      logger.error('refusing to disconnect with an unusable stored id', { platform: account.platform });
+      throw HttpError.unprocessable(
+        'This account is recorded incorrectly and cannot be disconnected automatically. Reconnect it, then try again.',
+      );
+    }
     await zernio.disconnectAccount(accountId);
     const updated = await setSocialAccountStatus(accountId, 'disconnected');
     return reply.send({

@@ -133,9 +133,22 @@ async function findExistingProfileId(label: string): Promise<string | null> {
   return null;
 }
 
-/** A Zernio id that can be safely placed in a request path. */
-function usableZernioId(value: unknown): value is string {
-  return typeof value === 'string' && value.trim() !== '' && value !== 'undefined' && value !== 'null';
+/**
+ * A Zernio id that can be safely placed in a request path.
+ *
+ * Trimmed and case-folded before the placeholder check. populr's equivalent
+ * learned this the hard way — its comment records that a pre-fix
+ * `String(account.id)` normalisation could persist the literal string
+ * "undefined", and a case-sensitive comparison lets "Undefined" through to be
+ * stored and then sent back as a request path.
+ *
+ * Exported for the same reason populr exports theirs: a caller acting on an
+ * ALREADY-STORED id needs to refuse it too, not just guard what comes in.
+ */
+export function usableZernioId(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed !== '' && trimmed !== 'undefined' && trimmed !== 'null';
 }
 
 /**

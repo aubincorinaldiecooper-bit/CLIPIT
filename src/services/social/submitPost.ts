@@ -11,6 +11,17 @@ import { updatePublishedPost } from '../../db/repositories/social.js';
  * middle takes, the record was written before anything external happened,
  * so a post the service accepts is never one CLIPIT has no memory of.
  */
+/** The provider's id for a post, whichever key this endpoint used. */
+function pickPostId(created: Record<string, unknown> | null | undefined): string | null {
+  if (!created || typeof created !== 'object') return null;
+  for (const key of ['postId', 'id', '_id']) {
+    const value = (created as Record<string, unknown>)[key];
+    if (typeof value === 'string' && value.trim() !== '') return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return null;
+}
+
 export async function submitRecordedPost(input: {
   postId: string;
   caption: string;
@@ -55,10 +66,13 @@ export async function submitRecordedPost(input: {
   }
 
   const updated = await updatePublishedPost(input.postId, {
-    zernioPostId:
-      (typeof created.id === 'string' && created.id) ||
-      (typeof created.postId === 'string' && created.postId) ||
-      null,
+    // `postId` FIRST, then `id`, then Mongo-style `_id`. The order is
+    // populr's, against the same API: a create response can carry both a
+    // `postId` and an `id`, and preferring `id` picks the wrong one. A wrong
+    // id here is quiet and lasting — the webhook that reports whether the
+    // post actually went out matches on this value, so status would never
+    // update again for that post.
+    zernioPostId: pickPostId(created),
     status: typeof created.status === 'string' ? created.status : 'submitted',
   });
 
