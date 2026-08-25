@@ -11,10 +11,15 @@ import type { ZernioAccount } from '../zernio/types.js';
 
 /**
  * The platforms CLIPIT publishes to — exactly what the Publishing page
- * promises, no more. Zernio supports others; widening this list is a product
- * decision, not a config change.
+ * promises, no more. The provider supports others; widening this list is a
+ * product decision, not a config change.
+ *
+ * X was added on the owner's instruction, from a design that lists it. Worth
+ * knowing: nothing here can confirm the provider will accept it. If it does
+ * not, the connect attempt fails at the provider and the Publishing page says
+ * so — the same path any other refusal takes — rather than failing silently.
  */
-export const PUBLISH_PLATFORMS = ['tiktok', 'youtube', 'instagram'] as const;
+export const PUBLISH_PLATFORMS = ['tiktok', 'youtube', 'instagram', 'x'] as const;
 export type PublishPlatform = (typeof PUBLISH_PLATFORMS)[number];
 
 export function isPublishPlatform(value: string): value is PublishPlatform {

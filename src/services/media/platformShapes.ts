@@ -21,6 +21,10 @@ const PLATFORM_SHAPE: Record<string, VariantAspect> = {
   // Short if it is under a minute AND uploaded as one — guessing wrong would
   // letterbox a real upload, so the safe default is the platform's own.
   youtube: '16:9',
+  // X is deliberately absent. It accepts landscape and vertical alike, so
+  // there is no shape it "wants" — and this file's own rule is that a platform
+  // we have no opinion about is posted exactly as the clip was shot. Guessing
+  // 9:16 here would crop the sides off a landscape clip for no reason.
 };
 
 /**
