@@ -3,7 +3,9 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
-import { createSession } from '../../db/repositories/sessions.js';
+import { adoptSessionWork, createSession, findSessionByToken } from '../../db/repositories/sessions.js';
+import { logger } from '../../lib/logger.js';
+import { ensureWorkspace } from '../../services/workspace/membership.js';
 import { clientIp, enforceRateLimits, HOUR } from '../rateLimit.js';
 import { parse } from '../validation.js';
 
@@ -22,6 +24,15 @@ const exchangeSchema = z.object({
   userId: z.string().trim().min(1).max(128),
   /** Shown in session listings; identifies whose session this is. */
   email: z.string().trim().email().max(320).optional(),
+  /**
+   * The GUEST token this browser was using, if it had one. Signing in then
+   * takes over the work done under it — the video uploaded, the clips cut —
+   * instead of leaving it stranded on a session nobody will return to.
+   *
+   * Optional by design: a first-time visitor who signs in before doing
+   * anything has nothing to carry, and that is not an error.
+   */
+  guestToken: z.string().trim().min(1).max(512).optional(),
 });
 
 /**
@@ -88,12 +99,39 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       ...(typeof userAgent === 'string' ? { userAgent } : {}),
     });
 
+    // Take over what this browser made while signed out. Everything here is
+    // best-effort: a session that cannot be carried is a smaller problem than
+    // a sign-in that fails, and the person is signed in either way.
+    let adopted: { videos: number; clipRequests: number; clips: number } | null = null;
+    if (body.guestToken) {
+      try {
+        const guest = await findSessionByToken(body.guestToken);
+        // Only a real GUEST session. One that already belongs to somebody is
+        // never harvested, however the token got here — that would be one
+        // account taking another's work.
+        if (guest && !guest.userId) {
+          const workspace = await ensureWorkspace(body.userId, body.email ?? null);
+          adopted = await adoptSessionWork({
+            sessionId: guest.id,
+            userId: body.userId,
+            workspaceId: workspace.id,
+          });
+          logger.info('adopted guest work on sign-in', adopted);
+        }
+      } catch (cause) {
+        logger.error('could not adopt guest work on sign-in', {
+          name: cause instanceof Error ? cause.name : 'unknown',
+        });
+      }
+    }
+
     return reply.code(201).send({
       token,
       tokenType: 'Bearer',
       sessionId: session.id,
       userId: body.userId,
       expiresAt: session.expiresAt.toISOString(),
+      ...(adopted ? { adopted } : {}),
     });
   });
 

@@ -188,9 +188,13 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
       if (!state.workspace_id) throw new Error('connect state has no workspace');
       const before = await listSocialAccounts(state.workspace_id, { platform: state.platform });
       await syncAccounts(state.user_id, profile.zernio_profile_id, state.workspace_id);
-      const outcome = await verifyConnectAttempt(state.workspace_id, state.platform, before);
+      const { outcome, account } = await verifyConnectAttempt(state.workspace_id, state.platform, before);
       if (outcome === 'connected') {
         to.searchParams.set('connected', state.platform);
+        // The page that was added, so the confirmation can name it. Someone
+        // connects an account, not a platform, and with two Instagram pages
+        // "Instagram is connected" does not say which one they just added.
+        if (account?.display_name) to.searchParams.set('account', account.display_name);
         logger.info('social account connected', { platform: state.platform });
       } else {
         to.searchParams.set('connect_error', outcome === 'nothing_new' ? 'nothing_new' : 'account_sync_failed');

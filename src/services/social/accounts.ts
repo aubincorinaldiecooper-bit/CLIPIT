@@ -11,10 +11,15 @@ import type { ZernioAccount } from '../zernio/types.js';
 
 /**
  * The platforms CLIPIT publishes to — exactly what the Publishing page
- * promises, no more. Zernio supports others; widening this list is a product
- * decision, not a config change.
+ * promises, no more. The provider supports others; widening this list is a
+ * product decision, not a config change.
+ *
+ * X was added on the owner's instruction, from a design that lists it. Worth
+ * knowing: nothing here can confirm the provider will accept it. If it does
+ * not, the connect attempt fails at the provider and the Publishing page says
+ * so — the same path any other refusal takes — rather than failing silently.
  */
-export const PUBLISH_PLATFORMS = ['tiktok', 'youtube', 'instagram'] as const;
+export const PUBLISH_PLATFORMS = ['tiktok', 'youtube', 'instagram', 'x'] as const;
 export type PublishPlatform = (typeof PUBLISH_PLATFORMS)[number];
 
 export function isPublishPlatform(value: string): value is PublishPlatform {
@@ -238,9 +243,55 @@ export async function verifyConnectAttempt(
   workspaceId: string,
   platform: string,
   before: SocialAccountRow[],
-): Promise<ConnectAttemptOutcome> {
+): Promise<{ outcome: ConnectAttemptOutcome; account: SocialAccountRow | null }> {
   const after = await listSocialAccounts(workspaceId, { platform });
-  return judgeConnectAttempt(before, after);
+  const outcome = judgeConnectAttempt(before, after);
+  // WHICH account this attempt connected, not merely that one did. A person
+  // connects a page, not a platform — and with several accounts on the same
+  // platform, "Instagram is connected" cannot tell them which one they just
+  // added. Only reported for a real success; on any other outcome there is no
+  // account to name and guessing one would be worse than saying nothing.
+  return { outcome, account: outcome === 'connected' ? newlyConnected(before, after) : null };
+}
+
+/**
+ * The account this attempt actually brought in, if it can be identified.
+ *
+ * Exported for the same reason judgeConnectAttempt is: the decision is pure,
+ * and a decision worth making is worth testing without a database.
+ */
+export function newlyConnected(
+  before: SocialAccountRow[],
+  after: SocialAccountRow[],
+): SocialAccountRow | null {
+  const beforeStatusById = new Map(before.map((row) => [row.id, row.status]));
+
+  // Prefer an account that did not exist before; failing that, one that came
+  // back FROM a broken state, which is what a reconnect looks like.
+  const fresh = after.filter((row) => row.status === 'connected' && !beforeStatusById.has(row.id));
+  if (fresh.length > 0) return only(fresh);
+
+  const revived = after.filter(
+    (row) => row.status === 'connected' && beforeStatusById.get(row.id) !== 'connected',
+  );
+  return only(revived);
+}
+
+/**
+ * The single candidate, or nobody.
+ *
+ * Codex, P2: taking the FIRST of several is picking by database ordering and
+ * then presenting the result as "the account you just added". More than one
+ * account can arrive unseen — a sync that failed earlier and caught up now,
+ * or two OAuth flows running at once — and in that case this attempt cannot
+ * be attributed to any one of them.
+ *
+ * Naming nobody costs a vaguer sentence ("Instagram is connected"), which is
+ * true. Naming the wrong page is a confident lie about what someone just did,
+ * and this whole change exists to be MORE precise, not less.
+ */
+function only(candidates: SocialAccountRow[]): SocialAccountRow | null {
+  return candidates.length === 1 ? candidates[0]! : null;
 }
 
 /** The pure decision, separated so it can be tested without a database. */
