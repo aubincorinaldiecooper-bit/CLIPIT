@@ -20,7 +20,7 @@ import { createClipRequest } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
-import { serializeClipRequest, serializeVideo, serializeVideoWithPlayback } from '../serializers.js';
+import { serializeClipRequest, serializeVideo, serializeVideoWithPlayback, videoPosterUrl } from '../serializers.js';
 import { parse } from '../validation.js';
 
 const uuidSchema = z.string().uuid('must be a UUID');
@@ -421,7 +421,16 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const videos = await listVideosForPrincipal(ownerScope(request));
 
-    return reply.send({ videos: videos.map((video) => serializeVideo(video)) });
+    // Each row carries its own poster frame, so the library shows the footage
+    // rather than a list of filenames.
+    return reply.send({
+      videos: await Promise.all(
+        videos.map(async (video) => ({
+          ...serializeVideo(video),
+          posterUrl: await videoPosterUrl(video),
+        })),
+      ),
+    });
   });
 
   /** Status, metadata, and the analysis chunk grid. */

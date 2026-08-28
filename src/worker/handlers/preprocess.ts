@@ -7,7 +7,7 @@ import { errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { chunkKey, proxyKey } from '../../services/storage/types.js';
-import { createAnalysisProxy, ffprobe, splitIntoChunks } from '../../services/media/ffmpeg.js';
+import { createAnalysisProxy, extractFrameAt, ffprobe, splitIntoChunks } from '../../services/media/ffmpeg.js';
 import { getVideo, replaceChunks, setIndexStatus, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
 import { enqueueIndexing, enqueueTranscription, type PreprocessingJob } from '../../queues/index.js';
 
@@ -83,6 +83,25 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       await updateVideoMedia(videoId, { proxyStorageKey });
 
       log.info('analysis proxy created', { proxyStorageKey });
+
+      // A poster frame for the video itself, so the library shows the footage
+      // rather than a filename. Pulled from the proxy that is already on disk
+      // — one extra seek, no second download — and best-effort by design: a
+      // missing picture must never cost an ingestion. Taken a little way in,
+      // because the first frame of a video is very often black.
+      try {
+        const posterPath = path.join(dir, 'poster.jpg');
+        const at = Math.min(3, Math.max(0, (probe.durationSeconds ?? 0) / 2));
+        if (await extractFrameAt(proxyPath, at, posterPath, 640)) {
+          const posterStorageKey = `posters/${videoId}.jpg`;
+          await storage.uploadFile(posterStorageKey, posterPath, 'image/jpeg');
+          await updateVideoMedia(videoId, { posterStorageKey });
+          log.info('poster frame captured', { posterStorageKey });
+        }
+      } catch (cause) {
+        log.warn('could not capture a poster frame', { error: errorMessage(cause) });
+      }
+
       await job.updateProgress({ stage: 'proxy_created', percent: 60 });
 
       // 3. Split the proxy into analysis chunks and record their global bounds.

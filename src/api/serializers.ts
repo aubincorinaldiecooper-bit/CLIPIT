@@ -321,8 +321,22 @@ export async function serializeClipRequest(
  * can seat the video in a player and seek straight to matched moments. Reads
  * stay side-effect free — this only signs a URL for bytes already in storage.
  */
+/**
+ * The video's own poster frame, signed.
+ *
+ * Split out because serializeVideo is synchronous and signing is not: the
+ * list route awaits this per row, and the detail route folds it in below.
+ * Null is an ordinary answer — the frame is captured best-effort at
+ * preprocess time, and a video that has not reached that step yet simply has
+ * no picture of itself.
+ */
+export async function videoPosterUrl(video: Video): Promise<string | null> {
+  if (!video.posterStorageKey) return null;
+  return getStorage().createDownloadUrl(video.posterStorageKey);
+}
+
 export async function serializeVideoWithPlayback(video: Video, chunks?: VideoChunk[]) {
-  const base = serializeVideo(video, chunks);
+  const base = { ...serializeVideo(video, chunks), posterUrl: await videoPosterUrl(video) };
 
   // The original is playable exactly when bytes were confirmed for the
   // CURRENT key. Both ingestion paths set sizeBytes at that moment — the
