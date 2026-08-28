@@ -4,6 +4,9 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type { Readable } from 'node:stream';
 import {
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -55,6 +58,46 @@ export class S3StorageAdapter implements StorageAdapter {
    * leaves the browser and the failure carries no HTTP status to explain
    * itself. `PutBucketCors` replaces the whole policy, so one rule covers it.
    */
+  async createMultipartUpload(key: string, contentType: string): Promise<string> {
+    const started = await this.client.send(
+      new CreateMultipartUploadCommand({ Bucket: this.bucket, Key: key, ContentType: contentType }),
+    );
+    if (!started.UploadId) throw new Error('storage did not return a multipart upload id');
+    return started.UploadId;
+  }
+
+  async createPartUploadUrl(
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    expiresInSeconds = env.UPLOAD_URL_EXPIRY_SECONDS,
+  ): Promise<string> {
+    const command = new UploadPartCommand({
+      Bucket: this.bucket,
+      Key: key,
+      UploadId: uploadId,
+      PartNumber: partNumber,
+    });
+    return getSignedUrl(this.client, command, { expiresIn: expiresInSeconds });
+  }
+
+  async completeMultipartUpload(
+    key: string,
+    uploadId: string,
+    parts: Array<{ partNumber: number; etag: string }>,
+  ): Promise<void> {
+    await this.client.send(
+      new CompleteMultipartUploadCommand({
+        Bucket: this.bucket,
+        Key: key,
+        UploadId: uploadId,
+        MultipartUpload: {
+          Parts: parts.map((part) => ({ PartNumber: part.partNumber, ETag: part.etag })),
+        },
+      }),
+    );
+  }
+
   async ensureUploadCors(origins: string[]): Promise<void> {
     try {
       await this.client.send(

@@ -11,6 +11,17 @@ export interface StoredObject {
 export interface StorageAdapter {
   /** Presigned PUT URL handed to the client so uploads bypass the API server. */
   createUploadUrl(key: string, contentType: string, expiresInSeconds?: number): Promise<string>;
+
+  /**
+   * A large file arrives in pieces. One presigned PUT caps at 5GB — S3's own
+   * ceiling for a single request — and real footage at hours of runtime is
+   * bigger, so the browser asks for a part-by-part upload instead: start it,
+   * PUT each numbered slice to its own URL, then complete it with the ETags
+   * storage returned.
+   */
+  createMultipartUpload(key: string, contentType: string): Promise<string>;
+  createPartUploadUrl(key: string, uploadId: string, partNumber: number, expiresInSeconds?: number): Promise<string>;
+  completeMultipartUpload(key: string, uploadId: string, parts: Array<{ partNumber: number; etag: string }>): Promise<void>;
   /** Presigned GET URL for playback / download. */
   /**
    * `downloadFilename` makes the object arrive as a save rather than a

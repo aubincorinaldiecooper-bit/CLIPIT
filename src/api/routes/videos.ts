@@ -25,6 +25,17 @@ import { parse } from '../validation.js';
 
 const uuidSchema = z.string().uuid('must be a UUID');
 
+/**
+ * One presigned PUT tops out at 5GB — S3's own ceiling for a single request —
+ * so anything bigger is uploaded in parts. The threshold sits under the
+ * ceiling to keep a margin, and the part size keeps the part count small
+ * enough to presign in one response.
+ */
+const SINGLE_PUT_MAX_BYTES = 4.5 * 1024 * 1024 * 1024;
+const PART_SIZE_BYTES = 512 * 1024 * 1024;
+/** Six hours of high-bitrate footage with room to spare. */
+const MAX_UPLOAD_BYTES = 64 * 1024 * 1024 * 1024;
+
 const createVideoSchema = z.discriminatedUnion('sourceType', [
   z.object({
     sourceType: z.literal('youtube'),
@@ -34,8 +45,23 @@ const createVideoSchema = z.discriminatedUnion('sourceType', [
     sourceType: z.literal('upload'),
     filename: z.string().trim().min(1, 'filename is required').max(255),
     contentType: z.string().trim().max(120).optional(),
+    /** Announced so the server can decide single-PUT versus part-by-part. */
+    sizeBytes: z.number().int().positive().max(MAX_UPLOAD_BYTES).optional(),
   }),
 ]);
+
+const completeMultipartSchema = z.object({
+  uploadId: z.string().trim().min(1).max(2048),
+  parts: z
+    .array(
+      z.object({
+        partNumber: z.number().int().min(1).max(10000),
+        etag: z.string().trim().min(1).max(256),
+      }),
+    )
+    .min(1)
+    .max(10000),
+});
 
 const uploadUrlSchema = z.object({
   filename: z.string().trim().min(1, 'filename is required').max(255),
@@ -139,6 +165,35 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const key = originalKey(video.id, filename);
     await updateVideoMedia(video.id, { originalStorageKey: key });
 
+    // Big files go in pieces: a single presigned PUT cannot carry more than
+    // 5GB, and six hours of real footage is far past that.
+    if (body.sizeBytes && body.sizeBytes > SINGLE_PUT_MAX_BYTES) {
+      const storage = getStorage();
+      const uploadId = await storage.createMultipartUpload(key, contentType);
+      const partCount = Math.ceil(body.sizeBytes / PART_SIZE_BYTES);
+      const partUrls = await Promise.all(
+        Array.from({ length: partCount }, (_, index) =>
+          storage.createPartUploadUrl(key, uploadId, index + 1),
+        ),
+      );
+      logger.info('multipart upload reserved', { videoId: video.id, key, partCount });
+      return reply.code(201).send({
+        video: serializeVideo({ ...video, originalStorageKey: key }),
+        upload: {
+          method: 'PUT' as const,
+          multipart: {
+            uploadId,
+            partSizeBytes: PART_SIZE_BYTES,
+            partUrls,
+          },
+          storageKey: key,
+          headers: {},
+          expiresInSeconds: env.UPLOAD_URL_EXPIRY_SECONDS,
+          instructions: `PUT each ${PART_SIZE_BYTES}-byte slice to its numbered URL, collect each response's ETag, then POST /api/videos/${video.id}/complete-multipart before /uploaded`,
+        },
+      });
+    }
+
     const upload = await issueUploadUrl(video.id, filename, contentType);
     logger.info('upload reserved', { videoId: video.id, key });
 
@@ -146,6 +201,25 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
       video: serializeVideo({ ...video, originalStorageKey: key }),
       upload,
     });
+  });
+
+  /**
+   * Seals a part-by-part upload: storage stitches the numbered pieces into
+   * one object. Only then is POST /:videoId/uploaded meaningful.
+   */
+  app.post('/api/videos/:videoId/complete-multipart', { preHandler: requireSession }, async (request, reply) => {
+    const { videoId } = parse(z.object({ videoId: uuidSchema }), request.params, 'path parameters');
+    const body = parse(completeMultipartSchema, request.body);
+
+    const video = await getVideo(videoId);
+    if (!video) throw HttpError.notFound('Video not found');
+    assertOwnership(request, video, 'Video');
+    if (video.sourceType !== 'upload') throw HttpError.conflict('This video was not created as an upload');
+    if (!video.originalStorageKey) throw HttpError.conflict('This video has no reserved upload location');
+
+    await getStorage().completeMultipartUpload(video.originalStorageKey, body.uploadId, body.parts);
+    logger.info('multipart upload completed', { videoId, parts: body.parts.length });
+    return reply.send({ ok: true });
   });
 
   /** Issues (or reissues) a presigned upload URL. */
