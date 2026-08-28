@@ -47,7 +47,7 @@ export async function sendInviteEmail(input: {
   const body = [
     `${inviter} invited you to join ${input.workspaceName} on CLIPIT.`,
     '',
-    'Joining means you see the clips people send to this workspace, and you can send your own there. Your library stays yours.',
+    'Joining means you see the clips people send to this room, and you can send your own there. Your library stays yours.',
     '',
     input.acceptUrl,
     '',
@@ -66,7 +66,7 @@ export async function sendInviteEmail(input: {
         html: [
           `<p>${escapeHtml(inviter)} invited you to join <strong>${escapeHtml(input.workspaceName)}</strong> on CLIPIT.</p>`,
           `<p>Joining means you see the clips people send to <strong>${escapeHtml(input.workspaceName)}</strong>, and you can send your own there. Your library stays yours.</p>`,
-          `<p><a href="${escapeHtml(input.acceptUrl)}">Join the workspace</a></p>`,
+          `<p><a href="${escapeHtml(input.acceptUrl)}">Join the room</a></p>`,
           `<p style="color:#666;font-size:13px">The invitation works once and expires in 7 days. If you did not expect it, ignore this email.</p>`,
         ].join('\n'),
       }),
