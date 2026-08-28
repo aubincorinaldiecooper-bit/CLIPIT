@@ -4,8 +4,10 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type { Readable } from 'node:stream';
 import {
+  AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
+  PutBucketLifecycleConfigurationCommand,
   UploadPartCommand,
   DeleteObjectCommand,
   GetObjectCommand,
@@ -70,6 +72,7 @@ export class S3StorageAdapter implements StorageAdapter {
     key: string,
     uploadId: string,
     partNumber: number,
+    contentLength: number,
     expiresInSeconds = env.UPLOAD_URL_EXPIRY_SECONDS,
   ): Promise<string> {
     const command = new UploadPartCommand({
@@ -77,8 +80,42 @@ export class S3StorageAdapter implements StorageAdapter {
       Key: key,
       UploadId: uploadId,
       PartNumber: partNumber,
+      // Signed into the URL: storage refuses a part of any other size, so a
+      // caller cannot stretch each slice to S3's own 5GB per-part ceiling.
+      ContentLength: contentLength,
     });
     return getSignedUrl(this.client, command, { expiresIn: expiresInSeconds });
+  }
+
+  async abortMultipartUpload(key: string, uploadId: string): Promise<void> {
+    await this.client.send(
+      new AbortMultipartUploadCommand({ Bucket: this.bucket, Key: key, UploadId: uploadId }),
+    );
+  }
+
+  /**
+   * Parts of an upload nobody ever completed sit in the bucket, stored and
+   * billed, invisible to object listings — DeleteObject cannot reach them.
+   * This lifecycle rule sweeps them a week after they were started. Boot-time
+   * and best-effort, the same posture as the CORS rule: credentials without
+   * bucket-policy rights should not stop the server starting.
+   */
+  async ensureAbandonedUploadLifecycle(): Promise<void> {
+    await this.client.send(
+      new PutBucketLifecycleConfigurationCommand({
+        Bucket: this.bucket,
+        LifecycleConfiguration: {
+          Rules: [
+            {
+              ID: 'sweep-abandoned-multipart-uploads',
+              Status: 'Enabled',
+              Filter: { Prefix: '' },
+              AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 },
+            },
+          ],
+        },
+      }),
+    );
   }
 
   async completeMultipartUpload(

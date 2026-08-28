@@ -50,6 +50,13 @@ const createVideoSchema = z.discriminatedUnion('sourceType', [
   }),
 ]);
 
+const partUrlSchema = z.object({
+  uploadId: z.string().trim().min(1).max(2048),
+  partNumber: z.number().int().min(1).max(10000),
+  /** The exact bytes of this slice; signed into the URL, never larger than a slice. */
+  contentLength: z.number().int().positive().max(PART_SIZE_BYTES),
+});
+
 const completeMultipartSchema = z.object({
   uploadId: z.string().trim().min(1).max(2048),
   parts: z
@@ -171,25 +178,24 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
       const storage = getStorage();
       const uploadId = await storage.createMultipartUpload(key, contentType);
       const partCount = Math.ceil(body.sizeBytes / PART_SIZE_BYTES);
-      const partUrls = await Promise.all(
-        Array.from({ length: partCount }, (_, index) =>
-          storage.createPartUploadUrl(key, uploadId, index + 1),
-        ),
-      );
       logger.info('multipart upload reserved', { videoId: video.id, key, partCount });
       return reply.code(201).send({
         video: serializeVideo({ ...video, originalStorageKey: key }),
         upload: {
           method: 'PUT' as const,
+          // No URLs here: each part's URL is asked for just before it is
+          // sent (POST /:videoId/part-url). Presigning the whole set up
+          // front gave every URL the same clock, and any upload slower than
+          // that expiry was stranded mid-file with no way to refresh.
           multipart: {
             uploadId,
             partSizeBytes: PART_SIZE_BYTES,
-            partUrls,
+            partCount,
           },
           storageKey: key,
           headers: {},
           expiresInSeconds: env.UPLOAD_URL_EXPIRY_SECONDS,
-          instructions: `PUT each ${PART_SIZE_BYTES}-byte slice to its numbered URL, collect each response's ETag, then POST /api/videos/${video.id}/complete-multipart before /uploaded`,
+          instructions: `For each ${PART_SIZE_BYTES}-byte slice, POST /api/videos/${video.id}/part-url for a fresh URL, PUT the slice, collect the ETag; then POST /api/videos/${video.id}/complete-multipart before /uploaded`,
         },
       });
     }
@@ -201,6 +207,50 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
       video: serializeVideo({ ...video, originalStorageKey: key }),
       upload,
     });
+  });
+
+  /**
+   * A fresh URL for one numbered part, signed the moment it is needed. The
+   * part's exact byte length is signed in, so storage refuses any other size
+   * — the ceiling cannot be stretched a part at a time.
+   */
+  app.post('/api/videos/:videoId/part-url', { preHandler: requireSession }, async (request, reply) => {
+    const { videoId } = parse(z.object({ videoId: uuidSchema }), request.params, 'path parameters');
+    const body = parse(partUrlSchema, request.body);
+
+    const video = await getVideo(videoId);
+    if (!video) throw HttpError.notFound('Video not found');
+    assertOwnership(request, video, 'Video');
+    if (video.sourceType !== 'upload') throw HttpError.conflict('This video was not created as an upload');
+    if (!video.originalStorageKey) throw HttpError.conflict('This video has no reserved upload location');
+
+    const url = await getStorage().createPartUploadUrl(
+      video.originalStorageKey,
+      body.uploadId,
+      body.partNumber,
+      body.contentLength,
+    );
+    return reply.send({ url });
+  });
+
+  /**
+   * Walks away from a part-by-part upload cleanly. Parts already in storage
+   * are stored and billed until aborted — DeleteObject cannot reach them —
+   * so the browser calls this when an upload fails or is abandoned, and a
+   * bucket lifecycle rule sweeps whatever nobody aborted.
+   */
+  app.post('/api/videos/:videoId/abort-multipart', { preHandler: requireSession }, async (request, reply) => {
+    const { videoId } = parse(z.object({ videoId: uuidSchema }), request.params, 'path parameters');
+    const body = parse(z.object({ uploadId: z.string().trim().min(1).max(2048) }), request.body);
+
+    const video = await getVideo(videoId);
+    if (!video) throw HttpError.notFound('Video not found');
+    assertOwnership(request, video, 'Video');
+    if (!video.originalStorageKey) throw HttpError.conflict('This video has no reserved upload location');
+
+    await getStorage().abortMultipartUpload(video.originalStorageKey, body.uploadId);
+    logger.info('multipart upload aborted', { videoId });
+    return reply.send({ ok: true });
   });
 
   /**
@@ -302,6 +352,15 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const object = await getStorage().head(video.originalStorageKey);
     if (!object) {
       throw HttpError.conflict('No uploaded file found at the reserved location — complete the upload first');
+    }
+
+    // The ceiling, enforced against what storage actually holds — the one
+    // measurement a client cannot shape. An announced size only chooses the
+    // upload path; an object past the limit is removed, not ingested.
+    if (object.sizeBytes > MAX_UPLOAD_BYTES) {
+      await getStorage().remove(video.originalStorageKey).catch(() => {});
+      await setVideoStatus(videoId, 'failed', 'The uploaded file is larger than the 64GB limit.');
+      throw HttpError.conflict('The uploaded file is larger than the 64GB limit.');
     }
 
     await updateVideoMedia(videoId, { sizeBytes: object.sizeBytes });
