@@ -114,25 +114,33 @@ export interface DescribeChunkInput {
   chunkCount: number;
   chunkDurationSeconds: number;
   videoPath: string;
+  /** Storage key of the same chunk, for providers that take a URL. */
+  videoStorageKey?: string;
   onUsage?: VideoUsageReporter;
 }
 
 /** Reads one chunk of video into scenes. */
 export async function describeVideoChunk(input: DescribeChunkInput): Promise<DescribeResult> {
-  const video = await videoPartFromFile(input.videoPath);
+  // Same rule as search: when the provider takes a URL, the local bytes are
+  // not read at all.
+  const carriedByUrl = env.VIDEO_PROVIDER === 'minicpm' && Boolean(input.videoStorageKey);
+  const video = carriedByUrl ? null : await videoPartFromFile(input.videoPath);
 
   const answer = await askVideoModel({
     chunkIndex: input.chunkIndex,
     chunkDurationSeconds: input.chunkDurationSeconds,
     systemPrompt: INDEX_SYSTEM_PROMPT,
-    parts: [{ type: 'text', text: buildIndexInstruction(input) }, video.part],
-    videoBytes: video.bytes,
+    parts: video
+      ? [{ type: 'text', text: buildIndexInstruction(input) }, video.part]
+      : [{ type: 'text', text: buildIndexInstruction(input) }],
+    videoBytes: video?.bytes ?? 0,
     // Descriptions of everything in two minutes run far longer than a list of
     // matching moments, and an answer cut off mid-scene loses the tail of the
     // chunk — which is a hole in the notes nobody would ever see.
     answerMaxTokens: env.INDEX_ANSWER_MAX_TOKENS,
     purpose: 'index',
     ...(input.onUsage ? { onUsage: input.onUsage } : {}),
+    ...(input.videoStorageKey ? { videoStorageKey: input.videoStorageKey } : {}),
   });
 
   return { ...parseModelScenes(answer.content, input.chunkDurationSeconds), rawResponse: answer.content };

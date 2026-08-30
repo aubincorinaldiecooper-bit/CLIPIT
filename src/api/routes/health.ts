@@ -34,7 +34,21 @@ export async function registerHealthRoutes(app: FastifyInstance): Promise<void> 
         maxSourceDurationSeconds: env.MAX_SOURCE_DURATION_SECONDS,
         analysisChunkSeconds: env.ANALYSIS_CHUNK_SECONDS,
         transcriptionEnabled: env.TRANSCRIPTION_ENABLED,
-        model: env.OPENROUTER_VIDEO_MODEL,
+        // Which service reads video, and the model that answers for it.
+        videoProvider: env.VIDEO_PROVIDER,
+        model: env.VIDEO_PROVIDER === 'minicpm' ? 'openbmb/MiniCPM-V-4.6' : env.OPENROUTER_VIDEO_MODEL,
+        // Presence only — no probe. The Modal endpoint wakes a GPU when
+        // called, and Railway polls this route; a health check that costs
+        // GPU-seconds per poll would be a bill, not a check. Deeper probing
+        // is a deliberate decision, not a default.
+        ...(env.VIDEO_PROVIDER === 'minicpm'
+          ? {
+              minicpm: {
+                endpointConfigured: Boolean(env.MINICPM_VIDEO_URL),
+                proxyTokenConfigured: Boolean(env.MODAL_PROXY_TOKEN_ID && env.MODAL_PROXY_TOKEN_SECRET),
+              },
+            }
+          : {}),
       },
       time: new Date().toISOString(),
     });

@@ -72,6 +72,7 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
           chunkCount: chunks.length,
           chunkDurationSeconds: chunk.durationSeconds,
           videoPath: chunkPath,
+          videoStorageKey: chunk.storageKey,
           onUsage: (usage) => {
             tally.add(usage);
             void recordModelUsage({ ...usage, stage: 'indexing', videoId });

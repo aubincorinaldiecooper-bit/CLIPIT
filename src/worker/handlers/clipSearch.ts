@@ -870,6 +870,7 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
       chunkCount: input.chunkCount,
       chunkDurationSeconds: chunk.durationSeconds,
       videoPath: chunkPath,
+      videoStorageKey: chunk.storageKey,
       transcript: withTranscript ? transcript : [],
       onUsage: (usage) => {
         // Both attempts are billed, so both are tallied. A retry that recovers
