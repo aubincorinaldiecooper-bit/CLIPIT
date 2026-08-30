@@ -114,11 +114,8 @@ const envSchema = z.object({
    * Modal's SDK as private compute — there is no public HTTP endpoint to
    * protect, and nothing to reach without the API token.
    */
-  MINICPM_MODAL_APP: z.string().trim().default('clipit-minicpm-v46'),
-  MINICPM_MODAL_CLS: z.string().trim().default('MiniCPMModel'),
-  MINICPM_MODAL_METHOD: z.string().trim().default('analyze'),
-  /** Modal environment to resolve the app in; empty means the token's default. */
-  MINICPM_MODAL_ENVIRONMENT: z.string().trim().optional(),
+  MODAL_APP_NAME: z.string().trim().default('clipit-minicpm-v46'),
+  MODAL_CLASS_NAME: z.string().trim().default('MiniCPMModel'),
   /**
    * One request's whole allowance, cold start included: Modal pulling the
    * model onto a GPU takes minutes when the app has scaled to zero, and a
@@ -372,14 +369,6 @@ function loadEnv(): Env {
     problems.push(
       'OPENROUTER_API_KEY is required when TRANSCRIPTION_ENABLED=true (set TRANSCRIPTION_ENABLED=false to run visual-only search)',
     );
-  }
-
-  if (value.VIDEO_PROVIDER === 'minicpm') {
-    // The same rule as OPENROUTER_API_KEY: a missing credential fails at
-    // startup, loudly, not at the first video someone uploads.
-    if (!value.MODAL_TOKEN_ID || !value.MODAL_TOKEN_SECRET) {
-      problems.push('MODAL_TOKEN_ID and MODAL_TOKEN_SECRET are required when VIDEO_PROVIDER=minicpm');
-    }
   }
 
   if (problems.length > 0) {

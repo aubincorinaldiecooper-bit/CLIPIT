@@ -44,7 +44,10 @@ export async function registerHealthRoutes(app: FastifyInstance): Promise<void> 
         ...(env.VIDEO_PROVIDER === 'minicpm'
           ? {
               minicpm: {
-                modalApp: env.MINICPM_MODAL_APP,
+                modalApp: env.MODAL_APP_NAME,
+                // THIS process's env only. The worker is the one that needs
+                // the token; an API deliberately running without it (least
+                // privilege) will honestly say false here.
                 tokenConfigured: Boolean(env.MODAL_TOKEN_ID && env.MODAL_TOKEN_SECRET),
               },
             }

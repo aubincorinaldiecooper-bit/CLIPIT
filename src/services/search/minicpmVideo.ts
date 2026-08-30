@@ -58,6 +58,12 @@ interface MiniCpmResult {
   metrics?: Record<string, unknown>;
 }
 
+/**
+ * The remote method's name is part of the deployment's contract, stable in
+ * code on both sides — configuration for it would be a knob nobody turns.
+ */
+const ANALYZE_METHOD = 'analyze';
+
 const minicpmLimiter = new Semaphore(env.MINICPM_VIDEO_CONCURRENCY);
 
 /**
@@ -72,19 +78,21 @@ let methodCache: Promise<Function_> | null = null;
 function modalClient(): ModalClient {
   // Explicit credentials rather than ambient env reading, so custody is
   // visible here: this token is Clipit's, revocable on its own.
+  // No environment param on purpose: the SDK itself honours the standard
+  // MODAL_ENVIRONMENT variable when one is set, and inventing a second name
+  // for the same thing would be configuration nobody needs.
   clientCache ??= new ModalClient({
     tokenId: env.MODAL_TOKEN_ID!,
     tokenSecret: env.MODAL_TOKEN_SECRET!,
-    ...(env.MINICPM_MODAL_ENVIRONMENT ? { environment: env.MINICPM_MODAL_ENVIRONMENT } : {}),
   });
   return clientCache;
 }
 
 function lookupMethod(): Promise<Function_> {
   methodCache ??= (async () => {
-    const cls = await modalClient().cls.fromName(env.MINICPM_MODAL_APP, env.MINICPM_MODAL_CLS);
+    const cls = await modalClient().cls.fromName(env.MODAL_APP_NAME, env.MODAL_CLASS_NAME);
     const instance = await cls.instance();
-    return instance.method(env.MINICPM_MODAL_METHOD);
+    return instance.method(ANALYZE_METHOD);
   })();
   return methodCache;
 }
@@ -135,7 +143,7 @@ function classify(error: unknown): ExternalServiceError {
   if (error instanceof NotFoundError) {
     return new ExternalServiceError(
       'minicpm-video',
-      `Modal cannot find ${env.MINICPM_MODAL_APP}/${env.MINICPM_MODAL_CLS} — check the app name, environment, and that Clipit's token may see it (${error.message})`,
+      `Modal cannot find ${env.MODAL_APP_NAME}/${env.MODAL_CLASS_NAME} — check the app name, environment, and that Clipit's token may see it (${error.message})`,
       { retryable: false, cause: error },
     );
   }
@@ -243,7 +251,7 @@ async function requestOnce(input: VideoModelRequest & { videoStorageKey: string 
   logger.info('MiniCPM call complete', {
     provider: 'modal',
     model: payload?.model ?? 'openbmb/MiniCPM-V-4.6',
-    app: env.MINICPM_MODAL_APP,
+    app: env.MODAL_APP_NAME,
     purpose: input.purpose,
     chunkIndex: input.chunkIndex,
     videoDurationSeconds: input.chunkDurationSeconds,

@@ -45,19 +45,12 @@ export class HttpError extends Error {
 export class ExternalServiceError extends Error {
   readonly service: string;
   readonly retryable: boolean;
-  /** When the service named its own backoff (Retry-After), honour it. */
-  readonly retryAfterMs?: number;
 
-  constructor(
-    service: string,
-    message: string,
-    options?: { retryable?: boolean; cause?: unknown; retryAfterMs?: number },
-  ) {
+  constructor(service: string, message: string, options?: { retryable?: boolean; cause?: unknown }) {
     super(message, options?.cause ? { cause: options.cause } : undefined);
     this.name = 'ExternalServiceError';
     this.service = service;
     this.retryable = options?.retryable ?? true;
-    if (options?.retryAfterMs !== undefined) this.retryAfterMs = options.retryAfterMs;
   }
 }
 

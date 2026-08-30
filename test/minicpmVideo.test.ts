@@ -160,6 +160,64 @@ describe('MiniCPM provider seam', () => {
     expect(remoteMock).toHaveBeenCalledTimes(2);
   });
 
+  it('classifies a credential rejection as configuration and does not retry it', async () => {
+    remoteMock.mockRejectedValue(new Error('unauthenticated: token signature invalid'));
+    const { askMiniCpmVideo } = await import('../src/services/search/minicpmVideo.js');
+
+    await expect(
+      askMiniCpmVideo({
+        chunkIndex: 0,
+        chunkDurationSeconds: 120,
+        systemPrompt: 'sys',
+        parts: [{ type: 'text', text: 'find it' }],
+        videoBytes: 0,
+        purpose: 'search',
+        videoStorageKey: 'chunks/video-1/0.mp4',
+      }),
+    ).rejects.toThrow(/MODAL_TOKEN_ID/);
+    // Each retry against a locked door is an audit-log entry — exactly one call.
+    expect(remoteMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs calls strictly serially at concurrency 1 — the client never out-fans the single container', async () => {
+    let releaseFirst!: (value: unknown) => void;
+    remoteMock
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseFirst = resolve; }))
+      .mockResolvedValueOnce({ model: 'openbmb/MiniCPM-V-4.6', result: 'second' });
+    const { askMiniCpmVideo } = await import('../src/services/search/minicpmVideo.js');
+
+    const ask = (chunkIndex: number) =>
+      askMiniCpmVideo({
+        chunkIndex,
+        chunkDurationSeconds: 120,
+        systemPrompt: 'sys',
+        parts: [{ type: 'text', text: 'describe it' }],
+        videoBytes: 0,
+        purpose: 'index',
+        videoStorageKey: `chunks/video-1/${chunkIndex}.mp4`,
+      });
+
+    const first = ask(0);
+    const second = ask(1);
+    // Give the second call every chance to jump the queue if it could.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(remoteMock).toHaveBeenCalledTimes(1);
+
+    releaseFirst({ model: 'openbmb/MiniCPM-V-4.6', result: 'first' });
+    const [a, b] = await Promise.all([first, second]);
+    expect(a.content).toBe('first');
+    expect(b.content).toBe('second');
+    expect(remoteMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('reads the deployment names from config with the deployed defaults', async () => {
+    const { env } = await import('../src/config/env.js');
+    expect(env.MODAL_APP_NAME).toBe('clipit-minicpm-v46');
+    expect(env.MODAL_CLASS_NAME).toBe('MiniCPMModel');
+    expect(env.MINICPM_VIDEO_CONCURRENCY).toBe(1);
+    expect(env.MINICPM_MAX_RETRIES).toBe(1); // pinned by this file's env setup
+  });
+
   it('treats an empty result as a failure, never as "no moments here"', async () => {
     remoteMock.mockResolvedValue({ model: 'openbmb/MiniCPM-V-4.6', result: '' });
     const { askMiniCpmVideo } = await import('../src/services/search/minicpmVideo.js');

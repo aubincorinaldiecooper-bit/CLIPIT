@@ -78,22 +78,18 @@ async function main(): Promise<void> {
   console.log('chunk:', storageKey);
   console.log('chunk bytes:', head.sizeBytes);
   console.log('proxy spec:', `${env.PROXY_HEIGHT}p, ${env.PROXY_FPS} fps (from env — the chunk was cut from this proxy)`);
-  console.log('modal target:', `${env.MINICPM_MODAL_APP} / ${env.MINICPM_MODAL_CLS} / ${env.MINICPM_MODAL_METHOD}`);
+  console.log('modal target:', `${env.MODAL_APP_NAME} / ${env.MODAL_CLASS_NAME} / analyze`);
   console.log('client deadline:', `${env.MINICPM_REQUEST_TIMEOUT_SECONDS}s`);
   console.log('invoking once through the Modal SDK…');
 
-  const modal = new ModalClient({
-    tokenId: env.MODAL_TOKEN_ID,
-    tokenSecret: env.MODAL_TOKEN_SECRET,
-    ...(env.MINICPM_MODAL_ENVIRONMENT ? { environment: env.MINICPM_MODAL_ENVIRONMENT } : {}),
-  });
+  const modal = new ModalClient({ tokenId: env.MODAL_TOKEN_ID, tokenSecret: env.MODAL_TOKEN_SECRET });
 
   const startedAt = performance.now();
   try {
     const lookupStartedAt = performance.now();
-    const cls = await modal.cls.fromName(env.MINICPM_MODAL_APP, env.MINICPM_MODAL_CLS);
+    const cls = await modal.cls.fromName(env.MODAL_APP_NAME, env.MODAL_CLASS_NAME);
     const instance = await cls.instance();
-    const analyze = instance.method(env.MINICPM_MODAL_METHOD);
+    const analyze = instance.method('analyze');
     const lookupMs = Math.round(performance.now() - lookupStartedAt);
 
     const callStartedAt = performance.now();
