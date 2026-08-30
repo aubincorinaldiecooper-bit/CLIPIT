@@ -1,6 +1,7 @@
 import { env } from '../config/env.js';
 import { getStorage } from '../services/storage/s3.js';
 import { formatTimecode } from '../services/timestamps.js';
+import { latestVersionsForMatches } from '../db/repositories/reclips.js';
 import type {
   ChunkDegradation,
   ChunkFailureCode,
@@ -9,6 +10,7 @@ import type {
   ClipRequest,
   Video,
   VideoChunk,
+  MomentVersion,
 } from '../domain/types.js';
 
 /** Shapes rows into the public API representation. Storage keys never leak. */
@@ -109,21 +111,28 @@ export function serializeVideo(video: Video, chunks?: VideoChunk[]) {
   };
 }
 
-export async function serializeMatch(match: ClipMatch, clip?: Clip | null) {
+export async function serializeMatch(match: ClipMatch, clip?: Clip | null, currentVersion?: MomentVersion | null) {
   // Signed like any other private object: the still lives in the same bucket
   // as the media it came from and must not be publicly readable.
   const thumbnailUrl = match.thumbnailKey
     ? await getStorage().createDownloadUrl(match.thumbnailKey)
     : null;
 
+  // What the person sees is the moment's CURRENT boundaries — after a
+  // Re-clip, the latest version's. The match row itself keeps the original
+  // first-pass prediction untouched; only the presentation moves.
+  const startSeconds = currentVersion?.startSeconds ?? match.globalStartSeconds;
+  const endSeconds = currentVersion?.endSeconds ?? match.globalEndSeconds;
+  const reclipCount = currentVersion && currentVersion.version > 1 ? currentVersion.version - 1 : 0;
+
   return {
     id: match.id,
     chunkId: match.chunkId,
-    startSeconds: match.globalStartSeconds,
-    endSeconds: match.globalEndSeconds,
-    startTimecode: formatTimecode(match.globalStartSeconds),
-    endTimecode: formatTimecode(match.globalEndSeconds),
-    durationSeconds: Number((match.globalEndSeconds - match.globalStartSeconds).toFixed(3)),
+    startSeconds,
+    endSeconds,
+    startTimecode: formatTimecode(startSeconds),
+    endTimecode: formatTimecode(endSeconds),
+    durationSeconds: Number((endSeconds - startSeconds).toFixed(3)),
     localStartSeconds: match.localStartSeconds,
     localEndSeconds: match.localEndSeconds,
     description: match.description,
@@ -136,6 +145,15 @@ export async function serializeMatch(match: ClipMatch, clip?: Clip | null) {
     // an approval that vanished on refresh would read as not having registered.
     feedback: match.feedback,
     feedbackReason: match.feedbackReason,
+    // The Re-clip lifecycle, so a reload lands on the truth: how many
+    // re-evaluations this moment has spent, how many remain, whether one is
+    // running, and — when the last one failed — why, in words already safe
+    // to show.
+    reclipStatus: match.reclipStatus,
+    reclipError: match.reclipError,
+    reclipCount,
+    reclipsRemaining: Math.max(0, env.MAX_RECLIPS_PER_MOMENT - reclipCount),
+    reclippedAt: reclipCount > 0 && currentVersion ? currentVersion.createdAt.toISOString() : null,
     // A finished match carries the actual cut and its signed URL. Previously
     // this contained only an id and status, which left a client with no media
     // to put in the thumbnail player; its only playable URL was the parent
@@ -317,7 +335,16 @@ export async function serializeClipRequest(
     createdAt: request.createdAt.toISOString(),
     updatedAt: request.updatedAt.toISOString(),
     ...(matches
-      ? { matches: await Promise.all(matches.map((match) => serializeMatch(match, clipsByMatchId?.get(match.id) ?? null))) }
+      ? {
+          matches: await (async () => {
+            const versions = await latestVersionsForMatches(matches.map((match) => match.id));
+            return Promise.all(
+              matches.map((match) =>
+                serializeMatch(match, clipsByMatchId?.get(match.id) ?? null, versions.get(match.id) ?? null),
+              ),
+            );
+          })(),
+        }
       : {}),
   };
 }

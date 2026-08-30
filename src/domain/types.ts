@@ -308,6 +308,34 @@ export interface ClipMatch {
   provider: string | null;
   model: string | null;
   promptVersion: string | null;
+  /**
+   * The Re-clip lifecycle. Null when nothing is happening; 'pending' while a
+   * re-evaluation is queued or running (it can take minutes on a cold GPU);
+   * 'failed' when the last attempt produced no new version. Success clears
+   * the status — the new version row is the record of success.
+   */
+  reclipStatus: 'pending' | 'failed' | null;
+  /** Why the last Re-clip failed, in words safe to show. */
+  reclipError: string | null;
+  createdAt: Date;
+}
+
+/**
+ * One version of where a moment's boundaries sit. Version 1 is the model's
+ * first-pass prediction, copied from the match row the first time a Re-clip
+ * is requested; each Re-clip appends the next version. The match row itself
+ * is never updated — this table is why.
+ */
+export interface MomentVersion {
+  id: string;
+  matchId: string;
+  version: number;
+  trigger: 'initial' | 'reclip';
+  startSeconds: number;
+  endSeconds: number;
+  provider: string | null;
+  model: string | null;
+  promptVersion: string | null;
   createdAt: Date;
 }
 

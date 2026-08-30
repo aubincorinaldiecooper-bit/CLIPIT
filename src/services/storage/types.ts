@@ -85,6 +85,14 @@ export function chunkKey(videoId: string, chunkIndex: number): string {
   return `${StoragePrefix.proxies}/${videoId}/chunks/${String(chunkIndex).padStart(4, '0')}.mp4`;
 }
 
+/**
+ * The temporary context window a Re-clip shows the model. Deleted by the
+ * worker as soon as the call finishes — it exists only to be looked at once.
+ */
+export function reclipWindowKey(videoId: string, matchId: string): string {
+  return `videos/${videoId}/reclip/${matchId}.mp4`;
+}
+
 export function clipKey(videoId: string, clipId: string): string {
   return `${StoragePrefix.clips}/${videoId}/${clipId}.mp4`;
 }

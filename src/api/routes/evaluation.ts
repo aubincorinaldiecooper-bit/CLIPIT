@@ -25,6 +25,8 @@ const querySchema = z.object({
   model: z.string().trim().min(1).max(200).optional(),
   promptVersion: z.string().trim().min(1).max(64).optional(),
   durationBucket: z.enum(['under_5m', '5m_to_20m', '20m_to_60m', 'over_60m']).optional(),
+  /** Usage lane: first-pass analysis or Re-clip re-evaluation. */
+  stage: z.enum(['initial', 'reclip']).optional(),
 });
 
 function ownerEmails(): string[] {

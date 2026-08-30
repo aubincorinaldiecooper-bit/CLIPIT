@@ -347,6 +347,15 @@ export async function setClipRenderPending(clipId: string): Promise<void> {
   );
 }
 
+/** The root clip cut from a moment, if one exists. Copies stay out of it. */
+export async function getRootClipByMatchId(matchId: string): Promise<Clip | null> {
+  const row = await queryOne<ClipRow>(
+    `SELECT * FROM clips WHERE clip_match_id = $1 AND derived_from_clip_id IS NULL`,
+    [matchId],
+  );
+  return row ? mapClip(row) : null;
+}
+
 export async function getClip(clipId: string): Promise<Clip | null> {
   const row = await queryOne<ClipRow>('SELECT * FROM clips WHERE id = $1', [clipId]);
   return row ? mapClip(row) : null;

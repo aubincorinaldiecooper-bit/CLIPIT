@@ -21,6 +21,7 @@ import { handleIndexing } from './handlers/indexing.js';
 import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
 import { handleClipVariant } from './handlers/clipVariant.js';
+import { handleReclip } from './handlers/reclip.js';
 import { handleThumbnailBackfill } from './handlers/thumbnailBackfill.js';
 import { handleRetention } from './handlers/retention.js';
 import { handleLearningReport } from './handlers/learningReport.js';
@@ -139,6 +140,9 @@ async function main(): Promise<void> {
   // the same source, and letting them compete for the same slots is what
   // keeps a burst of publishes from starving the cuts people are waiting on.
   startWorker(QUEUE_NAMES.clipVariant, handleClipVariant, env.CLIP_GENERATION_CONCURRENCY);
+  // One at a time on purpose: each Re-clip is a GPU call, and this worker
+  // must never be able to out-fan the MiniCPM concurrency budget on its own.
+  startWorker(QUEUE_NAMES.reclip, handleReclip, 1);
   // One at a time: the sweep is background work and must never take a slot
   // from a search or a clip someone is waiting on.
   startWorker(QUEUE_NAMES.thumbnailBackfill, handleThumbnailBackfill, 1);

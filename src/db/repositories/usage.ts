@@ -2,7 +2,10 @@ import { queryOne, queryRows } from '../pool.js';
 import { logger } from '../../lib/logger.js';
 
 /** What caused a model call. */
-export type UsageStage = 'transcription' | 'indexing' | 'search';
+// 'reclip' is its own stage on purpose: re-evaluation spend must never
+// blend into first-pass analysis, or the re-clip cost share — a business
+// number — stops existing.
+export type UsageStage = 'transcription' | 'indexing' | 'search' | 'reclip';
 
 export interface ModelTokenUsage {
   promptTokens: number;

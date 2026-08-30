@@ -117,20 +117,75 @@ export function summariseBoundaryErrors(errors: BoundaryError[]): BoundaryErrorS
 }
 
 /**
- * Which of the four states a measured clip is in. One rule needs stating:
- * a rejection wins over an edit. Someone can move a clip's boundaries and
- * THEN throw the moment away, and a discarded moment is not a kept one —
- * counting its boundaries as accuracy ground truth would score the model
- * on a moment the person ultimately said was wrong.
+ * How far one Re-clip moved the boundaries it was asked to reconsider.
+ *
+ * Named boundary SHIFT everywhere, deliberately: this is the model moving
+ * its own answer, which is a correction signal and nothing more. It is not
+ * timestamp error, not MAE, not accuracy — those words are reserved for a
+ * future benchmark with human-labelled ground truth.
  */
-export function classifyClipState(input: {
-  edited: boolean;
-  feedback: string | null;
-}): 'rejected' | 'edited_and_kept' | 'accepted_without_edit' | 'generated_never_reviewed' {
-  if (input.feedback === 'rejected') return 'rejected';
-  if (input.edited) return 'edited_and_kept';
-  if (input.feedback === 'approved') return 'accepted_without_edit';
-  return 'generated_never_reviewed';
+export interface BoundaryShift {
+  startShiftSeconds: number;
+  endShiftSeconds: number;
+  absoluteStartShiftSeconds: number;
+  absoluteEndShiftSeconds: number;
+  /** (|start shift| + |end shift|) / 2 — one number per Re-clip. */
+  averageBoundaryShiftSeconds: number;
+}
+
+export function boundaryShift(
+  previous: { startSeconds: number; endSeconds: number },
+  next: { startSeconds: number; endSeconds: number },
+): BoundaryShift {
+  const startShift = round3(next.startSeconds - previous.startSeconds);
+  const endShift = round3(next.endSeconds - previous.endSeconds);
+  return {
+    startShiftSeconds: startShift,
+    endShiftSeconds: endShift,
+    absoluteStartShiftSeconds: Math.abs(startShift),
+    absoluteEndShiftSeconds: Math.abs(endShift),
+    averageBoundaryShiftSeconds: round3((Math.abs(startShift) + Math.abs(endShift)) / 2),
+  };
+}
+
+export interface BoundaryShiftSummary {
+  reclipsMeasured: number;
+  averageAbsoluteStartShiftSeconds: number | null;
+  averageAbsoluteEndShiftSeconds: number | null;
+  /** Signed averages: a consistent sign is a finding ("starts move earlier"). */
+  averageSignedStartShiftSeconds: number | null;
+  averageSignedEndShiftSeconds: number | null;
+  medianBoundaryShiftSeconds: number | null;
+  p90BoundaryShiftSeconds: number | null;
+  /** Share of Re-clips whose average shift stayed under each threshold. */
+  withinSeconds: { '1': number | null; '2': number | null; '3': number | null; '5': number | null };
+}
+
+export function summariseBoundaryShifts(shifts: BoundaryShift[]): BoundaryShiftSummary {
+  if (shifts.length === 0) {
+    return {
+      reclipsMeasured: 0,
+      averageAbsoluteStartShiftSeconds: null,
+      averageAbsoluteEndShiftSeconds: null,
+      averageSignedStartShiftSeconds: null,
+      averageSignedEndShiftSeconds: null,
+      medianBoundaryShiftSeconds: null,
+      p90BoundaryShiftSeconds: null,
+      withinSeconds: { '1': null, '2': null, '3': null, '5': null },
+    };
+  }
+  const averages = shifts.map((shift) => shift.averageBoundaryShiftSeconds).sort((a, b) => a - b);
+  const within = (limit: number) => round4(shifts.filter((shift) => shift.averageBoundaryShiftSeconds < limit).length / shifts.length);
+  return {
+    reclipsMeasured: shifts.length,
+    averageAbsoluteStartShiftSeconds: round3(mean(shifts.map((shift) => shift.absoluteStartShiftSeconds))),
+    averageAbsoluteEndShiftSeconds: round3(mean(shifts.map((shift) => shift.absoluteEndShiftSeconds))),
+    averageSignedStartShiftSeconds: round3(mean(shifts.map((shift) => shift.startShiftSeconds))),
+    averageSignedEndShiftSeconds: round3(mean(shifts.map((shift) => shift.endShiftSeconds))),
+    medianBoundaryShiftSeconds: round3(percentile(averages, 50)),
+    p90BoundaryShiftSeconds: round3(percentile(averages, 90)),
+    withinSeconds: { '1': within(1), '2': within(2), '3': within(3), '5': within(5) },
+  };
 }
 
 /**
@@ -177,6 +232,13 @@ function toNumber(value: unknown): number {
 export type DurationBucket = 'under_5m' | '5m_to_20m' | '20m_to_60m' | 'over_60m';
 
 export interface EvaluationFilters {
+  /**
+   * Restrict usage-based numbers to one lane of work: 'initial' is
+   * first-pass analysis (indexing + search), 'reclip' is re-evaluation.
+   * Quality and boundary sections ignore it — a moment's feedback belongs
+   * to the moment, not to a stage.
+   */
+  stage?: 'initial' | 'reclip';
   /** Inclusive lower bound on when the thing was created. */
   from?: Date;
   /** Exclusive upper bound. */
@@ -417,85 +479,159 @@ async function searchSection(filters: EvaluationFilters): Promise<SearchSection>
 // Timestamps — the most important section
 // ---------------------------------------------------------------------------
 
-export interface TimestampSection {
-  /** Root clips whose prediction is on record, in range. */
-  clipsMeasured: number;
-  /** The four states, so "no edit" is never silently read as "perfect". */
-  states: {
-    editedAndKept: number;
-    acceptedWithoutEdit: number;
-    generatedNeverReviewed: number;
-    rejected: number;
-  };
-  /** acceptedWithoutEdit / (acceptedWithoutEdit + edited accepted-equivalents). */
-  noEditRate: number | null;
-  errors: BoundaryErrorSummary;
+export interface BoundarySection {
+  /**
+   * The denominator everything below shares: moments a person actually
+   * reviewed — explicit thumbs feedback, or at least one Re-clip (asking for
+   * a retry IS a review of the first result). Unreviewed moments are counted
+   * separately and never treated as successes or failures.
+   */
+  eligibleReviewedMoments: number;
+  momentsNeverReviewed: number;
+  /**
+   * "How often does Clipit get the moment right on the first try?"
+   * Approved with ZERO Re-clips, over eligible reviewed moments.
+   */
+  firstPassSuccesses: number;
+  firstPassSuccessRate: number | null;
+  /** Reviewed moments that asked for at least one Re-clip, over eligible. */
+  momentsReclipped: number;
+  reclipRate: number | null;
+  /**
+   * Did Re-clip help? Among re-clipped moments whose person gave a verdict
+   * AFTER the last Re-clip finished: how many approved. A replacement nobody
+   * judged is not counted as accepted — generating one is not acceptance.
+   */
+  reviewedReclips: number;
+  acceptedReclips: number;
+  reclipAcceptanceRate: number | null;
+  /**
+   * Moments whose rejection said "Timing is off" ('bad_boundaries'), over
+   * moments with explicit feedback. The live proxy for boundary quality.
+   */
+  momentsWithExplicitFeedback: number;
+  timingDownvotes: number;
+  timingDownvoteRate: number | null;
+  /** How far Re-clips moved boundaries. A correction signal — never accuracy. */
+  shifts: BoundaryShiftSummary;
 }
 
-async function timestampSection(filters: EvaluationFilters): Promise<TimestampSection> {
-  const { where, params } = buildWhere(filters, { timeColumn: 'c.created_at', matchAlias: 'm', videoAlias: 'v' });
+async function boundarySection(filters: EvaluationFilters): Promise<BoundarySection> {
+  const { where, params } = buildWhere(filters, { timeColumn: 'm.created_at', matchAlias: 'm', videoAlias: 'v' });
 
-  const rows = await queryRows<{
-    predicted_start: string;
-    predicted_end: string;
-    final_start: string;
-    final_end: string;
-    edited: boolean;
-    feedback: string | null;
+  const totals = await queryOne<{
+    eligible: string;
+    never_reviewed: string;
+    first_pass: string;
+    reclipped: string;
+    reviewed_reclips: string;
+    accepted_reclips: string;
+    with_feedback: string;
+    timing_downvotes: string;
   }>(
-    `SELECT c.predicted_start_seconds AS predicted_start,
-            c.predicted_end_seconds AS predicted_end,
-            c.start_seconds AS final_start,
-            c.end_seconds AS final_end,
-            (c.boundaries_edited_at IS NOT NULL) AS edited,
-            m.feedback
-       FROM clips c
-       JOIN clip_matches m ON m.id = c.clip_match_id
-       JOIN videos v ON v.id = c.video_id
-       ${where ? `${where} AND` : 'WHERE'} c.derived_from_clip_id IS NULL
-        AND c.predicted_start_seconds IS NOT NULL
-        AND c.predicted_end_seconds IS NOT NULL`,
+    `WITH moments AS (
+       SELECT m.id,
+              m.feedback,
+              m.feedback_reason,
+              m.feedback_at,
+              (SELECT count(*) FROM moment_versions mv
+                WHERE mv.match_id = m.id AND mv.trigger = 'reclip')::int AS reclips,
+              (SELECT max(mv.created_at) FROM moment_versions mv
+                WHERE mv.match_id = m.id AND mv.trigger = 'reclip') AS last_reclip_at
+         FROM clip_matches m
+         JOIN clip_requests r ON r.id = m.clip_request_id
+         JOIN videos v ON v.id = r.video_id
+         ${where}
+     )
+     SELECT count(*) FILTER (WHERE feedback IS NOT NULL OR reclips > 0)::bigint AS eligible,
+            count(*) FILTER (WHERE feedback IS NULL AND reclips = 0)::bigint AS never_reviewed,
+            count(*) FILTER (WHERE feedback = 'approved' AND reclips = 0)::bigint AS first_pass,
+            count(*) FILTER (WHERE reclips > 0)::bigint AS reclipped,
+            count(*) FILTER (WHERE reclips > 0 AND feedback IS NOT NULL
+                               AND feedback_at >= last_reclip_at)::bigint AS reviewed_reclips,
+            count(*) FILTER (WHERE reclips > 0 AND feedback = 'approved'
+                               AND feedback_at >= last_reclip_at)::bigint AS accepted_reclips,
+            count(*) FILTER (WHERE feedback IS NOT NULL)::bigint AS with_feedback,
+            count(*) FILTER (WHERE feedback_reason = 'bad_boundaries')::bigint AS timing_downvotes
+       FROM moments`,
     params,
   );
 
-  let editedAndKept = 0;
-  let acceptedWithoutEdit = 0;
-  let generatedNeverReviewed = 0;
-  let rejected = 0;
-  const errors: BoundaryError[] = [];
+  // Consecutive version pairs: every 'reclip' row against the version before
+  // it, so a second Re-clip measures movement from the first, not from the
+  // original twice.
+  const shiftRows = await queryRows<{
+    prev_start: string;
+    prev_end: string;
+    next_start: string;
+    next_end: string;
+  }>(
+    `SELECT lag(mv.start_seconds) OVER w AS prev_start,
+            lag(mv.end_seconds) OVER w AS prev_end,
+            mv.start_seconds AS next_start,
+            mv.end_seconds AS next_end,
+            mv.trigger
+       FROM moment_versions mv
+       JOIN clip_matches m ON m.id = mv.match_id
+       JOIN clip_requests r ON r.id = m.clip_request_id
+       JOIN videos v ON v.id = r.video_id
+       ${where}
+     WINDOW w AS (PARTITION BY mv.match_id ORDER BY mv.version)`,
+    params,
+  ).then((rows) =>
+    rows.filter(
+      (row) => (row as unknown as { trigger: string }).trigger === 'reclip' && row.prev_start !== null,
+    ),
+  );
 
-  for (const row of rows) {
-    const state = classifyClipState({ edited: row.edited, feedback: row.feedback });
-    if (state === 'rejected') {
-      rejected += 1;
-    } else if (state === 'edited_and_kept') {
-      editedAndKept += 1;
-      // Ground truth: the person moved these boundaries on purpose AND kept
-      // the moment. An edited-then-rejected clip lands in `rejected` above
-      // and stays out of this sample.
-      errors.push(
-        boundaryErrors({
-          predictedStartSeconds: toNumber(row.predicted_start),
-          predictedEndSeconds: toNumber(row.predicted_end),
-          finalStartSeconds: toNumber(row.final_start),
-          finalEndSeconds: toNumber(row.final_end),
-        }),
-      );
-    } else if (state === 'accepted_without_edit') {
-      acceptedWithoutEdit += 1;
-    } else {
-      // No edit, no verdict. Not evidence of anything, and counted as such.
-      generatedNeverReviewed += 1;
-    }
-  }
+  const shifts = shiftRows.map((row) =>
+    boundaryShift(
+      { startSeconds: toNumber(row.prev_start), endSeconds: toNumber(row.prev_end) },
+      { startSeconds: toNumber(row.next_start), endSeconds: toNumber(row.next_end) },
+    ),
+  );
 
-  const editDecisions = acceptedWithoutEdit + editedAndKept;
+  const eligible = toNumber(totals?.eligible);
+  const firstPass = toNumber(totals?.first_pass);
+  const reclipped = toNumber(totals?.reclipped);
+  const reviewedReclips = toNumber(totals?.reviewed_reclips);
+  const acceptedReclips = toNumber(totals?.accepted_reclips);
+  const withFeedback = toNumber(totals?.with_feedback);
+  const timingDownvotes = toNumber(totals?.timing_downvotes);
 
   return {
-    clipsMeasured: rows.length,
-    states: { editedAndKept, acceptedWithoutEdit, generatedNeverReviewed, rejected },
-    noEditRate: editDecisions > 0 ? round4(acceptedWithoutEdit / editDecisions) : null,
-    errors: summariseBoundaryErrors(errors),
+    eligibleReviewedMoments: eligible,
+    momentsNeverReviewed: toNumber(totals?.never_reviewed),
+    firstPassSuccesses: firstPass,
+    firstPassSuccessRate: eligible > 0 ? round4(firstPass / eligible) : null,
+    momentsReclipped: reclipped,
+    reclipRate: eligible > 0 ? round4(reclipped / eligible) : null,
+    reviewedReclips,
+    acceptedReclips,
+    reclipAcceptanceRate: reviewedReclips > 0 ? round4(acceptedReclips / reviewedReclips) : null,
+    momentsWithExplicitFeedback: withFeedback,
+    timingDownvotes,
+    timingDownvoteRate: withFeedback > 0 ? round4(timingDownvotes / withFeedback) : null,
+    shifts: summariseBoundaryShifts(shifts),
+  };
+}
+
+/**
+ * True timestamp accuracy needs a human-labelled evaluation set: a video, an
+ * expected moment, and boundaries a person approved as correct. None exists
+ * yet, and nothing in production substitutes for it — Re-clip shifts are the
+ * model reconsidering itself. Until labelled data exists this section says
+ * exactly that, instead of a misleading zero.
+ */
+export interface LabelledAccuracySection {
+  available: false;
+  note: string;
+}
+
+function labelledAccuracySection(): LabelledAccuracySection {
+  return {
+    available: false,
+    note: 'Insufficient labelled data. Timestamp MAE, ±Ns accuracy, precision and recall require a human-labelled benchmark; Re-clip boundary shifts are not ground truth.',
   };
 }
 
@@ -543,6 +679,20 @@ export interface EconomicsSection {
   effectiveCostPerSourceHourUsd: null;
   /** Modal inference seconds per source hour, where the deployment reported it. */
   inferenceSecondsPerSourceHour: number | null;
+  /**
+   * First-pass analysis vs Re-clip, kept apart so re-evaluation spend is a
+   * visible line item. 'initial' is indexing + search; speech-to-text is in
+   * segments but is not moment analysis. Costs combine reported provider
+   * dollars with the Modal estimate where a rate is configured.
+   */
+  initialAnalysisCalls: number;
+  reclipCalls: number;
+  initialInferenceMs: number | null;
+  reclipInferenceMs: number | null;
+  initialCostUsd: number | null;
+  reclipCostUsd: number | null;
+  /** Re-clip cost over all analysis cost (initial + reclip). */
+  reclipCostShare: number | null;
   /** Wall-clock read time per source hour: how far from real-time the read runs. */
   analysisMsPerSourceHour: number | null;
   segments: UsageSegment[];
@@ -603,6 +753,11 @@ async function economicsSection(filters: EvaluationFilters): Promise<EconomicsSe
   if (filters.provider) pushUsage('u.provider = ?', filters.provider);
   if (filters.model) pushUsage('u.model = ?', filters.model);
   if (filters.promptVersion) pushUsage('u.prompt_version = ?', filters.promptVersion);
+  if (filters.stage === 'reclip') pushUsage("u.stage = ?", 'reclip');
+  if (filters.stage === 'initial') {
+    usageParams.push('indexing', 'search');
+    usageLane.push(`u.stage IN ($${usageParams.length - 1}, $${usageParams.length})`);
+  }
   if (filters.durationBucket) {
     pushUsage(
       `u.video_id IN (SELECT v.id FROM videos v WHERE ${DURATION_BUCKET_SQL} = ?)`,
@@ -672,6 +827,29 @@ async function economicsSection(filters: EvaluationFilters): Promise<EconomicsSe
   const estimatedModal = rate !== null ? round4((modalGpuMs / 3_600_000) * rate) : null;
   const wallMs = toNumber(videoTotals?.wall_ms);
 
+  // The initial-vs-reclip split. A segment's spend is its reported dollars
+  // plus its Modal estimate; when neither exists the split stays null rather
+  // than reading as free.
+  const segmentSpend = (segment: UsageSegment): number | null => {
+    if (segment.totalCostUsd === null && segment.estimatedCostUsd === null) return null;
+    return (segment.totalCostUsd ?? 0) + (segment.estimatedCostUsd ?? 0);
+  };
+  const initialSegments = segments.filter((segment) => segment.stage === 'indexing' || segment.stage === 'search');
+  const reclipSegments = segments.filter((segment) => segment.stage === 'reclip');
+  const sumOrNull = (values: Array<number | null>): number | null => {
+    const present = values.filter((value): value is number => value !== null);
+    return present.length > 0 ? round4(present.reduce((sum, value) => sum + value, 0)) : null;
+  };
+  const initialCalls = initialSegments.reduce((sum, segment) => sum + segment.calls, 0);
+  const reclipCalls = reclipSegments.reduce((sum, segment) => sum + segment.calls, 0);
+  const initialInferenceMs = sumOrNull(initialSegments.map((segment) => segment.totalInferenceMs));
+  const reclipInferenceMs = sumOrNull(reclipSegments.map((segment) => segment.totalInferenceMs));
+  const initialCost = sumOrNull(initialSegments.map(segmentSpend));
+  const reclipCost = sumOrNull(reclipSegments.map(segmentSpend));
+  const analysisCost = (initialCost ?? 0) + (reclipCost ?? 0);
+  const reclipCostShare =
+    reclipCost !== null && analysisCost > 0 ? round4(reclipCost / analysisCost) : null;
+
   return {
     sourceVideoHoursAnalyzed: round4(sourceHours),
     videosAnalyzed: toNumber(videoTotals?.videos),
@@ -684,6 +862,13 @@ async function economicsSection(filters: EvaluationFilters): Promise<EconomicsSe
     effectiveCostPerSourceHourUsd: null,
     inferenceSecondsPerSourceHour:
       sourceHours > 0 && modalInferenceMs > 0 ? round4(modalInferenceMs / 1000 / sourceHours) : null,
+    initialAnalysisCalls: initialCalls,
+    reclipCalls,
+    initialInferenceMs: initialInferenceMs === null ? null : Math.round(initialInferenceMs),
+    reclipInferenceMs: reclipInferenceMs === null ? null : Math.round(reclipInferenceMs),
+    initialCostUsd: initialCost,
+    reclipCostUsd: reclipCost,
+    reclipCostShare,
     analysisMsPerSourceHour: sourceHours > 0 && wallMs > 0 ? Math.round(wallMs / sourceHours) : null,
     segments,
   };
@@ -704,24 +889,27 @@ export interface EvaluationReport {
   };
   quality: QualitySection;
   searches: SearchSection;
-  timestamps: TimestampSection;
+  boundaries: BoundarySection;
+  labelledAccuracy: LabelledAccuracySection;
   economics: EconomicsSection;
   /** Standing caveats a reader must not discover the hard way. */
   notes: string[];
 }
 
 export async function evaluationReport(filters: EvaluationFilters): Promise<EvaluationReport> {
-  const [quality, searches, timestamps, economics] = await Promise.all([
+  const [quality, searches, boundaries, economics] = await Promise.all([
     qualitySection(filters),
     searchSection(filters),
-    timestampSection(filters),
+    boundarySection(filters),
     economicsSection(filters),
   ]);
 
   const notes = [
     'Observed miss rate counts explicit missed_moment rejections over searches with any moment feedback. It is behavioural evidence, not labelled recall.',
-    'Timestamp error is computed only over clips whose boundaries a person deliberately moved. Untouched clips sit in their own states and are never averaged in as zero error.',
+    'Boundary shift measures how far Re-clip moved the boundaries it reconsidered. It is the model correcting itself — a correction signal, never timestamp error or accuracy.',
+    "First-pass success counts moments approved with zero Re-clips, over moments a person reviewed (explicit feedback or at least one Re-clip). Unreviewed moments are excluded from the denominator, not assumed successful.",
     'Estimated Modal cost is measured GPU milliseconds × the configured rate. It excludes failed calls that never wrote a usage row, cold-start scheduling, and warm idle; the billed number on the Modal dashboard is the effective truth.',
+    'Re-clip cost share compares the reclip stage against the analysis stages (indexing, search, reclip). Speech-to-text is reported in segments but is not moment analysis.',
   ];
   if (quality.momentsWithoutAttribution > 0) {
     notes.push(
@@ -743,7 +931,8 @@ export async function evaluationReport(filters: EvaluationFilters): Promise<Eval
     },
     quality,
     searches,
-    timestamps,
+    boundaries,
+    labelledAccuracy: labelledAccuracySection(),
     economics,
     notes,
   };

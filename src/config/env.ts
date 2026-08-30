@@ -132,6 +132,22 @@ const envSchema = z.object({
   MINICPM_VIDEO_CONCURRENCY: int(1, 1, 8),
   MINICPM_MAX_RETRIES: int(2, 0, 5),
   /**
+   * How much footage around a moment a Re-clip re-examines. The point of the
+   * window is boundary reconsideration — enough room before the hook and
+   * after the payoff to move either edge meaningfully, without re-reading
+   * footage that cannot belong to this moment. Clamped to the video's edges
+   * at use.
+   */
+  RECLIP_CONTEXT_BEFORE_SECONDS: int(10, 0, 120),
+  RECLIP_CONTEXT_AFTER_SECONDS: int(10, 0, 120),
+  /**
+   * Re-clips per moment, total, ever. Each one is a paid model call on GPU
+   * time, requested by a single tap — without a ceiling, one frustrated
+   * person rage-tapping is an unbounded bill. Two is the starting point, to
+   * be revisited with re-clip acceptance data, not a felt sense.
+   */
+  MAX_RECLIPS_PER_MOMENT: int(2, 0, 10),
+  /**
    * Clipit's own Modal API token — server-side only, never logged, never in
    * the browser. The Modal SDK also reads these names from the environment
    * itself; they are declared here so a missing credential fails at startup
