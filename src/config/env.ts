@@ -101,6 +101,44 @@ const envSchema = z.object({
 
   // --- OpenRouter video understanding and speech-to-text -----------------
   TRANSCRIPTION_ENABLED: bool(true),
+  /**
+   * Which service reads the actual video. `openrouter` is the current
+   * behaviour, unchanged. `minicpm` sends chunks to our own MiniCPM-V 4.6
+   * deployment on Modal instead. Notes lookups and transcription stay on
+   * OpenRouter under either setting — this switch governs only the calls that
+   * carry video.
+   */
+  VIDEO_PROVIDER: z.enum(['openrouter', 'minicpm']).default('openrouter'),
+  /**
+   * The deployed Modal app, class and method that read video. Invoked through
+   * Modal's SDK as private compute — there is no public HTTP endpoint to
+   * protect, and nothing to reach without the API token.
+   */
+  MODAL_APP_NAME: z.string().trim().default('clipit-minicpm-v46'),
+  MODAL_CLASS_NAME: z.string().trim().default('MiniCPMModel'),
+  /**
+   * One request's whole allowance, cold start included: Modal pulling the
+   * model onto a GPU takes minutes when the app has scaled to zero, and a
+   * timeout shorter than that would fail every first request of the day.
+   * Also the lifetime of the signed chunk URL handed to Modal.
+   */
+  MINICPM_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
+  /**
+   * Deliberately 1 until measured. Each in-flight request can hold a GPU, and
+   * unlike OpenRouter the bill here is per-second of GPU time, not per token
+   * — eight concurrent chunks could mean eight containers. Raising this is a
+   * cost decision the owner makes with numbers, not a default.
+   */
+  MINICPM_VIDEO_CONCURRENCY: int(1, 1, 8),
+  MINICPM_MAX_RETRIES: int(2, 0, 5),
+  /**
+   * Clipit's own Modal API token — server-side only, never logged, never in
+   * the browser. The Modal SDK also reads these names from the environment
+   * itself; they are declared here so a missing credential fails at startup
+   * instead of at the first video.
+   */
+  MODAL_TOKEN_ID: z.string().trim().optional(),
+  MODAL_TOKEN_SECRET: z.string().trim().optional(),
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
   OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
   /**
@@ -262,7 +300,10 @@ const envSchema = z.object({
   PROXY_FPS: num(2, 0.5, 30),
   PROXY_CRF: int(30, 0, 51),
   PROXY_PRESET: z.string().default('veryfast'),
-  CLIP_PADDING_SECONDS: num(1.5, 0, 30),
+  // The model is responsible for the moment's boundaries. Adding another
+  // handle here made the rendered file longer than the timestamps shown in
+  // the result, and compounded the prompt's former request for context.
+  CLIP_PADDING_SECONDS: num(0, 0, 30),
   MIN_CLIP_SECONDS: num(2, 0.5, 600),
   MAX_CLIP_SECONDS: num(300, 1, 3_600),
   CLIP_VIDEO_CRF: int(20, 0, 51),

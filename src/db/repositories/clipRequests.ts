@@ -82,6 +82,23 @@ export async function getClipRequest(requestId: string): Promise<ClipRequest | n
   return row ? mapRequest(row) : null;
 }
 
+/**
+ * Every question asked about one video, in the order it appeared in the chat.
+ *
+ * This is deliberately scoped by the video at the repository boundary. The
+ * route checks ownership of that video before calling it, and callers never
+ * have to reconstruct a conversation from request ids kept in browser memory.
+ */
+export async function listClipRequestsForVideo(videoId: string): Promise<ClipRequest[]> {
+  const rows = await queryRows<ClipRequestRow>(
+    `SELECT * FROM clip_requests
+      WHERE video_id = $1
+      ORDER BY created_at ASC, id ASC`,
+    [videoId],
+  );
+  return rows.map(mapRequest);
+}
+
 export async function startClipRequest(
   requestId: string,
   input: { chunksTotal: number; resolvedMode: ResolvedSearchMode },

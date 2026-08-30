@@ -79,6 +79,18 @@ function startWorker<T>(name: string, processor: Processor<T>, concurrency: numb
   return worker;
 }
 
+/**
+ * Only the worker invokes MiniCPM, so only the worker demands the Modal
+ * token — the API never receives infrastructure credentials it does not use.
+ * Same rule as the binary checks below: fail at startup, loudly, not at the
+ * first video someone uploads.
+ */
+function checkVideoProviderConfig(): void {
+  if (env.VIDEO_PROVIDER === 'minicpm' && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
+    throw new Error('VIDEO_PROVIDER=minicpm requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker');
+  }
+}
+
 async function checkBinaries(): Promise<void> {
   const checks: Array<[string, () => Promise<unknown>]> = [
     ['ffmpeg/ffprobe', assertFfmpegAvailable],
@@ -107,6 +119,8 @@ async function main(): Promise<void> {
     videoCallConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
     indexing: env.INDEXING_ENABLED,
   });
+
+  checkVideoProviderConfig();
 
   await checkBinaries();
   await runMigrations();

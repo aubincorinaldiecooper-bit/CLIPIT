@@ -15,9 +15,16 @@ function match(overrides: Partial<MergeableMatch> & { globalStartSeconds: number
 }
 
 describe('shouldMerge', () => {
-  it('merges matches separated by less than the gap', () => {
+  it('does not join nearby moments found in the same chunk', () => {
     const a = match({ globalStartSeconds: 10, globalEndSeconds: 20 });
     const b = match({ globalStartSeconds: 21, globalEndSeconds: 30 });
+
+    expect(shouldMerge(a, b, options)).toBe(false);
+  });
+
+  it('joins adjacent pieces reported by different chunk searches', () => {
+    const a = match({ chunkId: 'chunk-a', globalStartSeconds: 590, globalEndSeconds: 600 });
+    const b = match({ chunkId: 'chunk-b', globalStartSeconds: 600, globalEndSeconds: 610 });
 
     expect(shouldMerge(a, b, options)).toBe(true);
   });
@@ -61,6 +68,19 @@ describe('shouldMerge', () => {
 });
 
 describe('aggregateMatches', () => {
+  it('does not chain several nearby moments into one long result', () => {
+    const merged = aggregateMatches(
+      [
+        match({ globalStartSeconds: 10, globalEndSeconds: 15 }),
+        match({ globalStartSeconds: 16, globalEndSeconds: 21 }),
+        match({ globalStartSeconds: 22, globalEndSeconds: 27 }),
+      ],
+      options,
+    );
+
+    expect(merged).toHaveLength(3);
+  });
+
   it('joins a moment split across a chunk boundary', () => {
     // The classic case: a chunk ends at 600s mid-event, so the same moment is
     // reported as the tail of one chunk and the head of the next.

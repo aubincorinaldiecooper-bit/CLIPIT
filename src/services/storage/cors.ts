@@ -30,6 +30,19 @@ export async function ensureUploadCors(): Promise<void> {
   if (!env.BUCKET_CORS_AUTOCONFIGURE) return;
 
   const storage = getStorage();
+
+  // While configuring the bucket anyway: sweep multipart uploads nobody ever
+  // completed. Their parts are stored and billed but invisible to listings,
+  // and DeleteObject cannot reach them — only an abort or this rule can.
+  if (storage.ensureAbandonedUploadLifecycle) {
+    try {
+      await storage.ensureAbandonedUploadLifecycle();
+      logger.info('abandoned-multipart lifecycle rule applied');
+    } catch (cause) {
+      logger.warn('could not apply abandoned-multipart lifecycle rule', { error: errorMessage(cause) });
+    }
+  }
+
   if (!storage.ensureUploadCors) return;
 
   const origins = uploadCorsOrigins();

@@ -39,6 +39,12 @@ export interface VideoModelRequest {
    */
   purpose: 'search' | 'index' | 'notes';
   onUsage?: VideoUsageReporter;
+  /**
+   * Where the chunk lives in storage. The MiniCPM provider hands Modal a
+   * signed URL to it instead of base64 bytes; the OpenRouter path never reads
+   * this. Only calls that carry video set it.
+   */
+  videoStorageKey?: string;
 }
 
 export interface VideoModelAnswer {
@@ -93,6 +99,8 @@ export interface VideoSearchInput {
   chunkCount: number;
   chunkDurationSeconds: number;
   videoPath?: string;
+  /** Storage key of the same chunk, for providers that take a URL. */
+  videoStorageKey?: string;
   transcript: TranscriptLine[];
   /** Optional: called once per completed request with its tokens and cost. */
   onUsage?: VideoUsageReporter;
@@ -211,10 +219,17 @@ async function buildContent(input: VideoSearchInput): Promise<{ parts: ContentPa
 
   let videoBytes = 0;
   if (input.mode !== 'transcript') {
-    if (!input.videoPath) throw new Error('Actual video is required for visual search');
-    const video = await videoPartFromFile(input.videoPath);
-    videoBytes = video.bytes;
-    parts.push(video.part);
+    // MiniCPM carries the video as a signed URL to the chunk in storage, so
+    // base64-reading the file here would be megabytes of work the request
+    // never uses. The provider still requires the key — a video search with
+    // neither file nor key fails loudly either way.
+    const carriedByUrl = env.VIDEO_PROVIDER === 'minicpm' && Boolean(input.videoStorageKey);
+    if (!carriedByUrl) {
+      if (!input.videoPath) throw new Error('Actual video is required for visual search');
+      const video = await videoPartFromFile(input.videoPath);
+      videoBytes = video.bytes;
+      parts.push(video.part);
+    }
   }
 
   if (input.mode !== 'visual') {
@@ -471,6 +486,26 @@ async function completeOrAnswerWithoutThinking(input: VideoModelRequest): Promis
  * waiting on beyond the configured concurrency.
  */
 export async function askVideoModel(input: VideoModelRequest): Promise<VideoModelAnswer> {
+  /**
+   * The provider seam. Notes lookups carry no video and stay on OpenRouter's
+   * text lane under either provider — the switch governs only calls that
+   * read actual footage. MiniCPM keeps its own queue, retries and cost
+   * accounting behind the same answer shape, so nothing above this line
+   * knows which service watched the video.
+   */
+  if (env.VIDEO_PROVIDER === 'minicpm' && input.purpose !== 'notes') {
+    if (!input.videoStorageKey) {
+      // A video call with no storage key cannot be sent by URL. Loud, not
+      // quiet: falling back to OpenRouter here would silently unmake the
+      // provider decision the configuration states.
+      throw new ExternalServiceError('minicpm-video', 'video call reached the MiniCPM provider without a storage key', {
+        retryable: false,
+      });
+    }
+    const { askMiniCpmVideo } = await import('./minicpmVideo.js');
+    return askMiniCpmVideo({ ...input, videoStorageKey: input.videoStorageKey });
+  }
+
   const limiter = input.purpose === 'notes' ? textLimiter : videoLimiter;
   return limiter.run(async () => {
     let lastError: unknown;
@@ -508,6 +543,7 @@ export async function searchVideoChunk(input: VideoSearchInput): Promise<VideoSe
     videoBytes,
     purpose: 'search',
     ...(input.onUsage ? { onUsage: input.onUsage } : {}),
+    ...(input.videoStorageKey ? { videoStorageKey: input.videoStorageKey } : {}),
   });
 
   const parsed = parseModelMatches(answer.content);

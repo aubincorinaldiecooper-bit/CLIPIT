@@ -98,6 +98,8 @@ export interface Video {
   metadata: Record<string, unknown>;
   originalStorageKey: string | null;
   proxyStorageKey: string | null;
+  /** One frame of the video itself, for the library's card. */
+  posterStorageKey: string | null;
   captionsStorageKey: string | null;
   chunkSeconds: number | null;
   chunkCount: number;

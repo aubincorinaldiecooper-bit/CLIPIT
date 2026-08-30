@@ -109,8 +109,17 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
 
       log.info('clip generated', {
         key,
+        // Both ranges make boundary problems diagnosable from one log line.
+        // With the default zero padding they are identical; an intentional
+        // deployment override remains visible instead of silently changing
+        // what the timestamps on screen mean.
+        requestedStartSeconds: clip.startSeconds,
+        requestedEndSeconds: clip.endSeconds,
         startSeconds: padded.startSeconds,
         endSeconds: padded.endSeconds,
+        paddingSeconds: env.CLIP_PADDING_SECONDS,
+        requestedDurationSeconds: Number((clip.endSeconds - clip.startSeconds).toFixed(3)),
+        renderedDurationSeconds: Number(result.durationSeconds.toFixed(3)),
         sizeBytes: result.sizeBytes,
       });
       await job.updateProgress({ stage: 'ready', percent: 100 });

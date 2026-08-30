@@ -31,6 +31,7 @@ interface VideoRow {
   metadata: Record<string, unknown>;
   original_storage_key: string | null;
   proxy_storage_key: string | null;
+  poster_storage_key: string | null;
   captions_storage_key: string | null;
   chunk_seconds: number | null;
   chunk_count: number;
@@ -69,6 +70,7 @@ function mapVideo(row: VideoRow): Video {
     metadata: row.metadata ?? {},
     originalStorageKey: row.original_storage_key,
     proxyStorageKey: row.proxy_storage_key,
+    posterStorageKey: row.poster_storage_key,
     captionsStorageKey: row.captions_storage_key,
     chunkSeconds: row.chunk_seconds,
     chunkCount: row.chunk_count,
@@ -215,6 +217,7 @@ export interface VideoMediaUpdate {
   originalFilename?: string | null;
   originalStorageKey?: string | null;
   proxyStorageKey?: string | null;
+  posterStorageKey?: string | null;
   captionsStorageKey?: string | null;
   durationSeconds?: number | null;
   sizeBytes?: number | null;
@@ -235,6 +238,7 @@ const mediaColumns: Record<keyof VideoMediaUpdate, string> = {
   originalFilename: 'original_filename',
   originalStorageKey: 'original_storage_key',
   proxyStorageKey: 'proxy_storage_key',
+  posterStorageKey: 'poster_storage_key',
   captionsStorageKey: 'captions_storage_key',
   durationSeconds: 'duration_seconds',
   sizeBytes: 'size_bytes',
