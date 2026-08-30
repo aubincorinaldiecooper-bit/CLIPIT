@@ -14,6 +14,7 @@ import { recordModelUsage } from '../../db/repositories/usage.js';
 import { appendScenes, clearScenes, type NewVideoScene } from '../../db/repositories/scenes.js';
 import { findUncoveredRanges } from '../../services/timestamps.js';
 import { getVideo, listChunks, setIndexStatus } from '../../db/repositories/videos.js';
+import { coolMiniCpm } from '../../services/search/minicpmVideo.js';
 import type { IndexingJob } from '../../queues/index.js';
 
 /**
@@ -216,5 +217,12 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
     log.error('indexing failed', { err: error });
     await setIndexStatus(videoId, 'failed', { error: message });
     throw error;
+  } finally {
+    // The read is done — succeeded or not — so stop HOLDING the GPU. This
+    // does not shut it down: it hands back to Modal's idle window, which is
+    // what keeps the container alive through the minutes right after a read,
+    // when the questions actually arrive. In `finally` so a failed read can
+    // never leave a floor of one L4 standing.
+    void coolMiniCpm(`indexing-finished:${videoId}`);
   }
 }

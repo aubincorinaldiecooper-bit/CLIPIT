@@ -23,6 +23,7 @@ import {
 } from '../../db/repositories/clipRequests.js';
 import { listClipsForRequest } from '../../db/repositories/clips.js';
 import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
+import { warmMiniCpm } from '../../services/search/minicpmVideo.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import { serializeClipRequest, serializeVideo, serializeVideoWithPlayback, videoPosterUrl } from '../serializers.js';
@@ -155,6 +156,9 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
       });
 
       await enqueueIngestion({ videoId: video.id });
+      // Not awaited: the GPU takes tens of seconds to come back from zero,
+      // and that wait belongs to the download, not to this response.
+      void warmMiniCpm('youtube-queued');
       logger.info('youtube video queued', { videoId: video.id });
 
       return reply.code(201).send({ video: serializeVideo(video) });
@@ -177,6 +181,12 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const key = originalKey(video.id, filename);
     await updateVideoMedia(video.id, { originalStorageKey: key });
+
+    // The earliest honest signal that someone is about to need the GPU: the
+    // upload target exists, and not one byte has been sent yet. On a large
+    // file that is minutes of runway, which is more than the cold start
+    // needs. Not awaited — reserving an upload must never wait on Modal.
+    void warmMiniCpm('upload-reserved');
 
     // Big files go in pieces: a single presigned PUT cannot carry more than
     // 5GB, and six hours of real footage is far past that.
@@ -332,6 +342,12 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const key = originalKey(video.id, filename);
     await updateVideoMedia(video.id, { originalStorageKey: key });
+
+    // The earliest honest signal that someone is about to need the GPU: the
+    // upload target exists, and not one byte has been sent yet. On a large
+    // file that is minutes of runway, which is more than the cold start
+    // needs. Not awaited — reserving an upload must never wait on Modal.
+    void warmMiniCpm('upload-reserved');
 
     return reply.code(201).send({
       video: serializeVideo({ ...video, originalStorageKey: key }),

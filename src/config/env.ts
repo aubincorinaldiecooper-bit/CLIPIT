@@ -134,6 +134,24 @@ const envSchema = z.object({
   MINICPM_VIDEO_CONCURRENCY: int(1, 1, 8),
   MINICPM_MAX_RETRIES: int(2, 0, 5),
   /**
+   * Wake the GPU when an upload STARTS, so the model loads while the bytes
+   * are still arriving instead of after them.
+   *
+   * A cold MiniCPM container measured 36 seconds in production
+   * (2026-08-30), and all of it landed after the upload finished — the exact
+   * moment someone is waiting. Warming overlaps it with work already in
+   * flight. The cost is an L4 held for the idle window below even when the
+   * person never asks anything, so this is a latency-for-money trade and it
+   * is switchable.
+   */
+  MINICPM_WARM_ON_UPLOAD: bool(true),
+  /**
+   * How long Modal keeps the warmed container after the last call. It is the
+   * backstop under our own cool-down: if the worker dies mid-read, Modal
+   * still releases the GPU rather than billing it indefinitely.
+   */
+  MINICPM_WARM_IDLE_SECONDS: int(300, 30, 3600),
+  /**
    * How much footage around a moment a Re-clip re-examines. The point of the
    * window is boundary reconsideration — enough room before the hook and
    * after the payoff to move either edge meaningfully, without re-reading
