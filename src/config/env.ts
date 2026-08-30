@@ -109,8 +109,16 @@ const envSchema = z.object({
    * carry video.
    */
   VIDEO_PROVIDER: z.enum(['openrouter', 'minicpm']).default('openrouter'),
-  /** The Modal analyze endpoint, e.g. https://<workspace>--minicpm-v46-minicpm-analyze.modal.run */
-  MINICPM_VIDEO_URL: z.string().trim().optional(),
+  /**
+   * The deployed Modal app, class and method that read video. Invoked through
+   * Modal's SDK as private compute — there is no public HTTP endpoint to
+   * protect, and nothing to reach without the API token.
+   */
+  MINICPM_MODAL_APP: z.string().trim().default('clipit-minicpm-v46'),
+  MINICPM_MODAL_CLS: z.string().trim().default('MiniCPMModel'),
+  MINICPM_MODAL_METHOD: z.string().trim().default('analyze'),
+  /** Modal environment to resolve the app in; empty means the token's default. */
+  MINICPM_MODAL_ENVIRONMENT: z.string().trim().optional(),
   /**
    * One request's whole allowance, cold start included: Modal pulling the
    * model onto a GPU takes minutes when the app has scaled to zero, and a
@@ -126,9 +134,14 @@ const envSchema = z.object({
    */
   MINICPM_VIDEO_CONCURRENCY: int(1, 1, 8),
   MINICPM_MAX_RETRIES: int(2, 0, 5),
-  /** Modal Proxy Token for the Clipit deployment — never sent to a browser. */
-  MODAL_PROXY_TOKEN_ID: z.string().trim().optional(),
-  MODAL_PROXY_TOKEN_SECRET: z.string().trim().optional(),
+  /**
+   * Clipit's own Modal API token — server-side only, never logged, never in
+   * the browser. The Modal SDK also reads these names from the environment
+   * itself; they are declared here so a missing credential fails at startup
+   * instead of at the first video.
+   */
+  MODAL_TOKEN_ID: z.string().trim().optional(),
+  MODAL_TOKEN_SECRET: z.string().trim().optional(),
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
   OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
   /**
@@ -364,9 +377,8 @@ function loadEnv(): Env {
   if (value.VIDEO_PROVIDER === 'minicpm') {
     // The same rule as OPENROUTER_API_KEY: a missing credential fails at
     // startup, loudly, not at the first video someone uploads.
-    if (!value.MINICPM_VIDEO_URL) problems.push('MINICPM_VIDEO_URL is required when VIDEO_PROVIDER=minicpm');
-    if (!value.MODAL_PROXY_TOKEN_ID || !value.MODAL_PROXY_TOKEN_SECRET) {
-      problems.push('MODAL_PROXY_TOKEN_ID and MODAL_PROXY_TOKEN_SECRET are required when VIDEO_PROVIDER=minicpm');
+    if (!value.MODAL_TOKEN_ID || !value.MODAL_TOKEN_SECRET) {
+      problems.push('MODAL_TOKEN_ID and MODAL_TOKEN_SECRET are required when VIDEO_PROVIDER=minicpm');
     }
   }
 

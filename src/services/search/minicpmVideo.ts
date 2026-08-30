@@ -1,3 +1,13 @@
+import {
+  ExecutionError,
+  FunctionTimeoutError,
+  InternalFailure,
+  InvalidError,
+  ModalClient,
+  NotFoundError,
+  RemoteError,
+  type Function_,
+} from 'modal';
 import { env } from '../../config/env.js';
 import { Semaphore, sleep } from '../../lib/concurrency.js';
 import { ExternalServiceError } from '../../lib/errors.js';
@@ -6,69 +16,89 @@ import { getStorage } from '../storage/s3.js';
 import type { VideoModelAnswer, VideoModelRequest } from './openrouterVideo.js';
 
 /**
- * The MiniCPM-V 4.6 provider: our own model, on our own Modal deployment,
- * reading actual video.
+ * The MiniCPM-V 4.6 provider: our own model on our own GPU, invoked as
+ * private Modal compute through Modal's SDK.
  *
- * This module is the only place in CLIPIT that knows the Modal endpoint
- * exists. It receives the same request the OpenRouter provider receives and
- * returns the same answer shape, so everything above the seam — prompt
- * building, JSON extraction, zod validation, timestamp clamping, coverage
- * accounting — is identical under either provider.
+ * This module is the only place in CLIPIT that knows Modal exists. It
+ * receives the same request the OpenRouter provider receives and returns the
+ * same answer shape, so everything above the seam — prompt building, JSON
+ * extraction, zod validation, timestamp clamping, coverage accounting — is
+ * identical under either provider.
  *
- * The wire protocol is the endpoint's, not ours:
+ * There is no HTTP endpoint and no URL to protect. The path is
  *
- *     POST $MINICPM_VIDEO_URL
- *     { "video_url": "<signed chunk URL>", "prompt": "<text>" }
- *  →  { "model": "openbmb/MiniCPM-V-4.6", "result": "<free-form text>" }
+ *     ModalClient (MODAL_TOKEN_ID / MODAL_TOKEN_SECRET, Clipit's own token)
+ *       → app clipit-minicpm-v46 → class MiniCPMModel → analyze(video_url, prompt)
  *
- * Two deliberate differences from the OpenRouter path:
+ * and the deployed method answers `{ model, result, metrics }`, where
+ * `result` is free text the existing parsers consume.
  *
- * - The video travels as a SIGNED URL, not base64. Modal downloads the chunk
- *   itself, so request bodies stay small and a cold container can fetch at
- *   its own pace. The URL is signed fresh per call, lives exactly as long as
- *   the request timeout, and is never logged — a logged signed URL is a
- *   logged copy of someone's footage.
+ * The video itself still travels as a SIGNED chunk URL — Modal downloads it
+ * inside the container. Signed fresh per attempt, alive exactly as long as
+ * the request's allowance, never logged: a logged signed URL is a logged copy
+ * of someone's footage.
  *
- * - Retry-After is honoured. A GPU service that says "come back in 20s" means
- *   it; hammering it during a cold start only queues cost.
+ * Cost rules, unchanged from the HTTP design: one gate on in-flight calls
+ * (the deployment runs max_containers=1, so Clipit-side concurrency stays 1
+ * until the Modal side is deliberately widened), bounded retries, and only
+ * errors Modal itself documents as retryable are retried — InternalFailure
+ * and transport failures. A function timeout is not retried (the same chunk
+ * would overrun the same way), and neither is anything that reads as bad
+ * input or bad configuration.
  *
  * MiniCPM reports no token counts, so usage rows carry zeros with a null
- * cost — the tally's callsMissingCost makes that visible instead of silently
- * pricing GPU seconds at zero. Latency and call counts are recorded, which is
- * what a later cost-per-source-hour calculation actually needs.
+ * cost — the tally's callsMissingCost keeps that visible instead of silently
+ * pricing GPU seconds at zero. Latency and call counts are recorded; the
+ * returned metrics are logged for the cost-per-source-hour arithmetic.
  */
 
-interface MiniCpmResponse {
+interface MiniCpmResult {
   model?: string;
   result?: string;
+  metrics?: Record<string, unknown>;
 }
 
-const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
-
-/**
- * One gate for every call that can hold a GPU. Deliberately its own semaphore
- * rather than the OpenRouter one: the two providers have different cost
- * models, and a queue for one must not starve the other during a switchover.
- */
 const minicpmLimiter = new Semaphore(env.MINICPM_VIDEO_CONCURRENCY);
 
-/** Test seam: how long a Retry-After is trusted before the cap takes over. */
-const RETRY_AFTER_CAP_MS = 60_000;
+/**
+ * The remote handle, resolved once and kept. Lookup is itself a network
+ * round-trip; paying it per chunk would double every call. A redeploy of the
+ * Modal app can strand the cached handle, so a not-found during invocation
+ * drops the cache and looks up again once (see requestOnce).
+ */
+let clientCache: ModalClient | null = null;
+let methodCache: Promise<Function_> | null = null;
 
-function retryAfterMs(response: Response): number | null {
-  const header = response.headers.get('retry-after');
-  if (!header) return null;
-  const seconds = Number(header);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(RETRY_AFTER_CAP_MS, seconds * 1000);
-  const at = Date.parse(header);
-  if (!Number.isNaN(at)) return Math.min(RETRY_AFTER_CAP_MS, Math.max(0, at - Date.now()));
-  return null;
+function modalClient(): ModalClient {
+  // Explicit credentials rather than ambient env reading, so custody is
+  // visible here: this token is Clipit's, revocable on its own.
+  clientCache ??= new ModalClient({
+    tokenId: env.MODAL_TOKEN_ID!,
+    tokenSecret: env.MODAL_TOKEN_SECRET!,
+    ...(env.MINICPM_MODAL_ENVIRONMENT ? { environment: env.MINICPM_MODAL_ENVIRONMENT } : {}),
+  });
+  return clientCache;
+}
+
+function lookupMethod(): Promise<Function_> {
+  methodCache ??= (async () => {
+    const cls = await modalClient().cls.fromName(env.MINICPM_MODAL_APP, env.MINICPM_MODAL_CLS);
+    const instance = await cls.instance();
+    return instance.method(env.MINICPM_MODAL_METHOD);
+  })();
+  return methodCache;
+}
+
+/** Test seam: forget the cached client and handle. */
+export function resetMiniCpmClient(): void {
+  clientCache = null;
+  methodCache = null;
 }
 
 /**
- * The prompt is the request's text parts, joined under the system prompt. The
- * endpoint takes one string; the video part is carried by URL instead, and the
- * base64 body the OpenRouter path would have sent is simply not used here.
+ * The prompt is the request's text parts joined under the system prompt. The
+ * remote method takes one string; the video is carried by URL, and the base64
+ * body the OpenRouter path would have sent is never built here.
  */
 function promptFromRequest(input: VideoModelRequest): string {
   const text = input.parts
@@ -78,13 +108,66 @@ function promptFromRequest(input: VideoModelRequest): string {
   return `${input.systemPrompt}\n\n${text}`;
 }
 
+/**
+ * What went wrong, in the terms the retry loop understands.
+ *
+ * Modal's SDK throws typed errors, and they sort cleanly: InternalFailure is
+ * documented "safe to retry"; a FunctionTimeoutError means the remote method
+ * exceeded ITS OWN configured timeout, which a retry would only repeat at
+ * full GPU price; NotFoundError is a wrong app/class name or a token without
+ * access — configuration, not weather; ExecutionError and RemoteError mean
+ * the method itself raised, which the same input would raise again.
+ */
+function classify(error: unknown): ExternalServiceError {
+  if (error instanceof ExternalServiceError) return error;
+  if (error instanceof InternalFailure) {
+    return new ExternalServiceError('minicpm-video', `Modal internal failure: ${error.message}`, {
+      retryable: true,
+      cause: error,
+    });
+  }
+  if (error instanceof FunctionTimeoutError) {
+    return new ExternalServiceError('minicpm-video', `MiniCPM analyze exceeded its Modal timeout: ${error.message}`, {
+      retryable: false,
+      cause: error,
+    });
+  }
+  if (error instanceof NotFoundError) {
+    return new ExternalServiceError(
+      'minicpm-video',
+      `Modal cannot find ${env.MINICPM_MODAL_APP}/${env.MINICPM_MODAL_CLS} — check the app name, environment, and that Clipit's token may see it (${error.message})`,
+      { retryable: false, cause: error },
+    );
+  }
+  if (error instanceof ExecutionError || error instanceof RemoteError || error instanceof InvalidError) {
+    return new ExternalServiceError('minicpm-video', `MiniCPM analyze failed remotely: ${error.message}`, {
+      retryable: false,
+      cause: error,
+    });
+  }
+  const message = (error as Error).message ?? String(error);
+  // Anything smelling of credentials is configuration: retrying knocks on a
+  // locked door and each knock is an audit-log entry.
+  if (/auth|credential|token|permission|unauthenticated|unauthorized/i.test(message)) {
+    return new ExternalServiceError(
+      'minicpm-video',
+      `Modal rejected Clipit's credentials — check MODAL_TOKEN_ID/MODAL_TOKEN_SECRET (${message})`,
+      { retryable: false, cause: error },
+    );
+  }
+  // The remainder is transport: gRPC drops, DNS, resets. Worth another try.
+  return new ExternalServiceError('minicpm-video', `Modal call failed: ${message}`, {
+    retryable: true,
+    cause: error,
+  });
+}
+
 export async function askMiniCpmVideo(
   input: VideoModelRequest & { videoStorageKey: string },
 ): Promise<VideoModelAnswer> {
-  const endpoint = env.MINICPM_VIDEO_URL;
-  if (!endpoint || !env.MODAL_PROXY_TOKEN_ID || !env.MODAL_PROXY_TOKEN_SECRET) {
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
     // Startup validation makes this unreachable in a real process; it exists
-    // so a misconfigured test can never fall through to an open endpoint.
+    // so a misconfigured test can never mint an anonymous client.
     throw new ExternalServiceError('minicpm-video', 'MiniCPM provider is not configured', { retryable: false });
   }
 
@@ -92,19 +175,17 @@ export async function askMiniCpmVideo(
     let lastError: unknown;
     for (let attempt = 0; attempt <= env.MINICPM_MAX_RETRIES; attempt += 1) {
       try {
-        return await requestOnce(input, endpoint);
+        return await requestOnce(input);
       } catch (error) {
         lastError = error;
         const retryable = error instanceof ExternalServiceError && error.retryable;
         if (!retryable || attempt === env.MINICPM_MAX_RETRIES) break;
-        const askedFor = error instanceof ExternalServiceError ? error.retryAfterMs : undefined;
-        const delayMs = askedFor ?? Math.min(30_000, 1_000 * 2 ** attempt);
-        logger.warn('retrying MiniCPM video request', {
+        const delayMs = Math.min(30_000, 1_000 * 2 ** attempt);
+        logger.warn('retrying MiniCPM call', {
           purpose: input.purpose,
           chunkIndex: input.chunkIndex,
           attempt: attempt + 1,
           delayMs,
-          honouredRetryAfter: askedFor !== undefined,
         });
         await sleep(delayMs);
       }
@@ -113,115 +194,108 @@ export async function askMiniCpmVideo(
   });
 }
 
-async function requestOnce(
-  input: VideoModelRequest & { videoStorageKey: string },
-  endpoint: string,
-): Promise<VideoModelAnswer> {
-  // Signed per attempt, so a retry after a long backoff never carries an
-  // already-expired URL. Lifetime matches the request timeout: long enough
-  // for a cold container to fetch, gone the moment the request has no use
-  // for it.
+async function requestOnce(input: VideoModelRequest & { videoStorageKey: string }): Promise<VideoModelAnswer> {
+  // Signed per attempt, so a retry after a backoff never carries an expired
+  // URL. Lifetime matches the request allowance: long enough for a cold
+  // container to pull the model and then fetch the chunk, gone right after.
   const videoUrl = await getStorage().createDownloadUrl(input.videoStorageKey, {
     expiresInSeconds: env.MINICPM_REQUEST_TIMEOUT_SECONDS,
   });
 
-  const body = JSON.stringify({ video_url: videoUrl, prompt: promptFromRequest(input) });
   const startedAt = performance.now();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), env.MINICPM_REQUEST_TIMEOUT_SECONDS * 1000);
 
+  let method: Function_;
   try {
-    let response: Response;
-    try {
-      response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // Modal proxy auth. The token pair is Clipit's own, revocable
-          // without touching any other project, and exists only server-side.
-          'Modal-Key': env.MODAL_PROXY_TOKEN_ID!,
-          'Modal-Secret': env.MODAL_PROXY_TOKEN_SECRET!,
-        },
-        body,
-        signal: controller.signal,
-      });
-    } catch (error) {
-      const aborted = (error as Error).name === 'AbortError';
-      throw new ExternalServiceError(
-        'minicpm-video',
-        aborted ? 'MiniCPM request timed out' : `MiniCPM request failed: ${(error as Error).message}`,
-        { retryable: true, cause: error },
-      );
+    method = await lookupMethod();
+  } catch (error) {
+    methodCache = null;
+    throw classify(error);
+  }
+
+  let payload: MiniCpmResult;
+  try {
+    payload = await withDeadline(
+      method.remote([], { video_url: videoUrl, prompt: promptFromRequest(input) }) as Promise<MiniCpmResult>,
+      env.MINICPM_REQUEST_TIMEOUT_SECONDS * 1000,
+    );
+  } catch (error) {
+    // A stale handle from a Modal redeploy answers not-found. One fresh
+    // lookup, one more call — inside this same attempt, not a retry.
+    if (error instanceof NotFoundError) {
+      resetMiniCpmClient();
+      try {
+        method = await lookupMethod();
+        payload = await withDeadline(
+          method.remote([], { video_url: videoUrl, prompt: promptFromRequest(input) }) as Promise<MiniCpmResult>,
+          env.MINICPM_REQUEST_TIMEOUT_SECONDS * 1000,
+        );
+      } catch (secondError) {
+        throw classify(secondError);
+      }
+    } else {
+      throw classify(error);
     }
+  }
 
-    const latencyMs = Math.round(performance.now() - startedAt);
+  const latencyMs = Math.round(performance.now() - startedAt);
+  const content = payload?.result;
 
-    if (!response.ok) {
-      const responseBody = await response.text().catch(() => '');
-      logger.warn('MiniCPM video request failed', {
-        purpose: input.purpose,
-        chunkIndex: input.chunkIndex,
-        videoDurationSeconds: input.chunkDurationSeconds,
-        status: response.status,
-        latencyMs,
-      });
-      // 401/403 is the proxy refusing the token. Retrying cannot help and
-      // each retry is a knock on a door that logs failed auth attempts.
-      const authFailure = response.status === 401 || response.status === 403;
-      throw new ExternalServiceError(
-        'minicpm-video',
-        authFailure
-          ? `Modal proxy rejected Clipit's token (status ${response.status}) — check MODAL_PROXY_TOKEN_ID/SECRET`
-          : `MiniCPM request failed with status ${response.status}: ${responseBody.slice(0, 400)}`,
-        {
-          retryable: !authFailure && RETRYABLE_STATUS.has(response.status),
-          ...(retryAfterMs(response) !== null ? { retryAfterMs: retryAfterMs(response)! } : {}),
-        },
-      );
-    }
+  logger.info('MiniCPM call complete', {
+    provider: 'modal',
+    model: payload?.model ?? 'openbmb/MiniCPM-V-4.6',
+    app: env.MINICPM_MODAL_APP,
+    purpose: input.purpose,
+    chunkIndex: input.chunkIndex,
+    videoDurationSeconds: input.chunkDurationSeconds,
+    latencyMs,
+    answerChars: typeof content === 'string' ? content.length : 0,
+    // Whatever the deployment measured about itself — GPU seconds live here
+    // eventually, and this is the trail cost-per-source-hour is built from.
+    metrics: payload?.metrics ?? null,
+  });
 
-    let payload: MiniCpmResponse;
-    try {
-      payload = (await response.json()) as MiniCpmResponse;
-    } catch (error) {
-      throw new ExternalServiceError('minicpm-video', 'MiniCPM response was not JSON', {
-        retryable: false,
-        cause: error,
-      });
-    }
+  // Zero tokens with a null cost, not silence: the call happened, it held a
+  // GPU for latencyMs, and the usage table is how anything is ever priced.
+  input.onUsage?.({
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    costUsd: null,
+    latencyMs,
+    provider: 'modal',
+    model: payload?.model ?? 'openbmb/MiniCPM-V-4.6',
+  });
 
-    const content = payload.result;
+  // The same rule as the OpenRouter path: a blank answer must never parse as
+  // a considered "no moments here".
+  if (typeof content !== 'string' || content.trim() === '') {
+    throw new ExternalServiceError('minicpm-video', 'MiniCPM returned an empty result', { retryable: false });
+  }
 
-    logger.info('MiniCPM video request complete', {
-      provider: 'modal',
-      model: payload.model ?? 'openbmb/MiniCPM-V-4.6',
-      purpose: input.purpose,
-      chunkIndex: input.chunkIndex,
-      videoDurationSeconds: input.chunkDurationSeconds,
-      latencyMs,
-      answerChars: typeof content === 'string' ? content.length : 0,
-    });
+  return { content, reasoningDisabled: false };
+}
 
-    // Zero tokens with a null cost, not silence: the call happened, it held a
-    // GPU for latencyMs, and the usage table is how anything is ever priced.
-    input.onUsage?.({
-      promptTokens: 0,
-      completionTokens: 0,
-      totalTokens: 0,
-      costUsd: null,
-      latencyMs,
-      provider: 'modal',
-      model: payload.model ?? 'openbmb/MiniCPM-V-4.6',
-    });
-
-    // The same rule as the OpenRouter path: a blank answer must never parse
-    // as a considered "no moments here".
-    if (typeof content !== 'string' || content.trim() === '') {
-      throw new ExternalServiceError('minicpm-video', 'MiniCPM returned an empty result', { retryable: false });
-    }
-
-    return { content, reasoningDisabled: false };
+/**
+ * A client-side deadline over the remote call. It cannot cancel work already
+ * running on the GPU — Modal's own function timeout bounds that — but it
+ * stops a chunk from hanging the pipeline when the connection quietly dies.
+ */
+async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new ExternalServiceError('minicpm-video', `MiniCPM call exceeded the ${Math.round(ms / 1000)}s client deadline`, {
+            retryable: false,
+          }),
+        ),
+      ms,
+    );
+  });
+  try {
+    return await Promise.race([promise, deadline]);
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timer!);
   }
 }
