@@ -10,9 +10,10 @@ import {
   listMatchesByIds,
   setMatchFeedback,
 } from '../../db/repositories/clipRequests.js';
-import { listClipsForRequest, upsertClipForMatch } from '../../db/repositories/clips.js';
+import { getRootClipByMatchId, listClipsForRequest, upsertClipForMatch } from '../../db/repositories/clips.js';
+import { claimReclip, clearReclipPending, latestVersionsForMatches } from '../../db/repositories/reclips.js';
 import { getVideo } from '../../db/repositories/videos.js';
-import { enqueueClipGeneration } from '../../queues/index.js';
+import { enqueueClipGeneration, enqueueReclip } from '../../queues/index.js';
 import { assertOwnership, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import {
@@ -119,7 +120,81 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
     const match = await setMatchFeedback(requestId, matchId, verdict, reason ?? null);
     if (!match) throw HttpError.notFound('Match not found');
 
-    return reply.send({ match: await serializeMatch(match) });
+    const versions = await latestVersionsForMatches([matchId]);
+    return reply.send({ match: await serializeMatch(match, null, versions.get(matchId) ?? null) });
+  });
+
+  /**
+   * Asks the system to reconsider this SAME moment: a wider window of the
+   * surrounding footage is re-read and a better standalone cut of the same
+   * moment replaces the boundaries. This is the automated answer to "the
+   * timing is off" — the person never repairs timestamps by hand.
+   *
+   * Bounded on purpose: each press is a paid model call on GPU time, so the
+   * per-moment ceiling and the pending-claim below keep a double-tap, an
+   * impatient retry, or a stuck queue from turning one tap into many calls.
+   */
+  app.post('/api/clip-requests/:requestId/matches/:matchId/reclip', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      {
+        scope: 'generate',
+        perSession: env.RATE_LIMIT_GENERATE_PER_SESSION_HOURLY,
+        perIp: env.RATE_LIMIT_GENERATE_PER_IP_HOURLY,
+        windowSeconds: HOUR,
+      },
+    ]);
+
+    const { requestId, matchId } = parse(
+      z.object({ requestId: uuidSchema, matchId: uuidSchema }),
+      request.params,
+      'path parameters',
+    );
+
+    const clipRequest = await getClipRequest(requestId);
+    if (!clipRequest) throw HttpError.notFound('Clip request not found');
+    assertOwnership(request, clipRequest, 'Clip request');
+
+    const [match] = await listMatchesByIds(requestId, [matchId]);
+    if (!match) throw HttpError.notFound('Match not found');
+
+    const video = await getVideo(clipRequest.videoId);
+    if (!video?.proxyStorageKey) {
+      throw HttpError.conflict('The footage for this video is no longer stored, so it cannot be re-examined.');
+    }
+
+    // A moment whose clip is mid-render cannot take new boundaries — say so
+    // now, before any GPU time is spent finding boundaries it cannot apply.
+    const clip = await getRootClipByMatchId(matchId);
+    if (clip && clip.status !== 'ready' && clip.status !== 'failed') {
+      throw HttpError.conflict('This clip is still rendering — try Re-clip when it finishes.');
+    }
+
+    // The claim is the whole cost gate: it refuses a moment already
+    // re-evaluating AND consumes one attempt from the lifetime allowance in
+    // the same statement — a double-tap gets a truthful 409, and failed paid
+    // calls count against the ceiling exactly like successful ones.
+    const claimed = await claimReclip(matchId, env.MAX_RECLIPS_PER_MOMENT);
+    if (!claimed) {
+      if (match.reclipStatus === 'pending') {
+        throw HttpError.conflict('A Re-clip for this moment is already running.');
+      }
+      throw HttpError.conflict('This moment has used all its Re-clip attempts.');
+    }
+
+    try {
+      await enqueueReclip({ matchId, clipRequestId: requestId });
+    } catch (cause) {
+      // No job means nothing will ever clear the pending state — put the
+      // moment back exactly as it was and say the tap did not take.
+      await clearReclipPending(matchId);
+      logger.error('reclip rolled back: job could not be queued', { matchId, err: cause });
+      throw HttpError.serviceUnavailable('Re-clip could not be queued. Nothing was changed — try again in a moment.');
+    }
+
+    const [updated] = await listMatchesByIds(requestId, [matchId]);
+    const versions = await latestVersionsForMatches([matchId]);
+    logger.info('reclip queued', { requestId, matchId, attempt: (match.reclipAttempts ?? 0) + 1 });
+    return reply.code(202).send({ match: await serializeMatch(updated ?? match, null, versions.get(matchId) ?? null) });
   });
 
   /**
@@ -191,15 +266,21 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       });
     }
 
+    // A re-clipped moment's cut must use its CURRENT boundaries. The match
+    // row keeps the original prediction untouched; the version history says
+    // where the moment stands now.
+    const currentBounds = await latestVersionsForMatches(matches.map((match) => match.id));
+
     const clips: Clip[] = [];
     for (const match of matches) {
+      const bounds = currentBounds.get(match.id);
       const clip = await upsertClipForMatch({
         videoId: clipRequest.videoId,
         clipMatchId: match.id,
         sessionId: clipRequest.sessionId,
         userId: clipRequest.userId,
-        startSeconds: match.globalStartSeconds,
-        endSeconds: match.globalEndSeconds,
+        startSeconds: bounds?.startSeconds ?? match.globalStartSeconds,
+        endSeconds: bounds?.endSeconds ?? match.globalEndSeconds,
       });
       clips.push(clip);
 

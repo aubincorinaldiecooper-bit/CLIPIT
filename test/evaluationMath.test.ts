@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   boundaryErrors,
-  classifyClipState,
+  boundaryShift,
   costPerSourceHour,
   percentile,
   summariseBoundaryErrors,
+  summariseBoundaryShifts,
 } from '../src/services/evaluation.js';
 
 /**
@@ -107,19 +108,60 @@ describe('percentile', () => {
   });
 });
 
-describe('classifyClipState', () => {
-  it('a rejection wins over an edit — a discarded moment is not ground truth', () => {
-    // Someone can adjust a clip's boundaries and THEN throw the moment away;
-    // its timing must not score the model on a moment the person said was wrong.
-    expect(classifyClipState({ edited: true, feedback: 'rejected' })).toBe('rejected');
+describe('boundaryShift', () => {
+  it('reports signed and absolute movement per boundary, and their average', () => {
+    // Start pulled 2s earlier, end pushed 1s later — the classic "hook was
+    // late, payoff was cut" correction.
+    const shift = boundaryShift(
+      { startSeconds: 194.2, endSeconds: 228.7 },
+      { startSeconds: 192.2, endSeconds: 229.7 },
+    );
+    expect(shift.startShiftSeconds).toBe(-2);
+    expect(shift.endShiftSeconds).toBe(1);
+    expect(shift.absoluteStartShiftSeconds).toBe(2);
+    expect(shift.absoluteEndShiftSeconds).toBe(1);
+    expect(shift.averageBoundaryShiftSeconds).toBe(1.5);
   });
 
-  it('maps the remaining states from the two facts', () => {
-    expect(classifyClipState({ edited: true, feedback: 'approved' })).toBe('edited_and_kept');
-    expect(classifyClipState({ edited: true, feedback: null })).toBe('edited_and_kept');
-    expect(classifyClipState({ edited: false, feedback: 'approved' })).toBe('accepted_without_edit');
-    expect(classifyClipState({ edited: false, feedback: null })).toBe('generated_never_reviewed');
-    expect(classifyClipState({ edited: false, feedback: 'rejected' })).toBe('rejected');
+  it('an unchanged cut is a zero shift, not an error', () => {
+    const shift = boundaryShift({ startSeconds: 10, endSeconds: 20 }, { startSeconds: 10, endSeconds: 20 });
+    expect(shift.averageBoundaryShiftSeconds).toBe(0);
+  });
+});
+
+describe('summariseBoundaryShifts', () => {
+  it('reports nulls over no re-clips instead of a confident zero', () => {
+    const summary = summariseBoundaryShifts([]);
+    expect(summary.reclipsMeasured).toBe(0);
+    expect(summary.medianBoundaryShiftSeconds).toBeNull();
+    expect(summary.p90BoundaryShiftSeconds).toBeNull();
+    expect(summary.withinSeconds['1']).toBeNull();
+  });
+
+  it('keeps signed averages signed — a consistent direction is the finding', () => {
+    // Every re-clip moved the start EARLIER: signed average is negative
+    // while the absolute average stays positive.
+    const shifts = [
+      boundaryShift({ startSeconds: 100, endSeconds: 130 }, { startSeconds: 98, endSeconds: 130 }),
+      boundaryShift({ startSeconds: 50, endSeconds: 70 }, { startSeconds: 46, endSeconds: 70 }),
+    ];
+    const summary = summariseBoundaryShifts(shifts);
+    expect(summary.averageSignedStartShiftSeconds).toBe(-3);
+    expect(summary.averageAbsoluteStartShiftSeconds).toBe(3);
+    expect(summary.averageSignedEndShiftSeconds).toBe(0);
+  });
+
+  it('median, P90 and the within-N bands come from per-reclip averages', () => {
+    const mk = (s: number) => boundaryShift({ startSeconds: 0, endSeconds: 0 }, { startSeconds: s, endSeconds: s });
+    // Average shifts: 0.5, 0.5, 1.5, 2.5, 6 — one bad tail.
+    const summary = summariseBoundaryShifts([mk(0.5), mk(0.5), mk(1.5), mk(2.5), mk(6)]);
+    expect(summary.reclipsMeasured).toBe(5);
+    expect(summary.medianBoundaryShiftSeconds).toBe(1.5);
+    expect(summary.withinSeconds['1']).toBe(0.4);
+    expect(summary.withinSeconds['2']).toBe(0.6);
+    expect(summary.withinSeconds['3']).toBe(0.8);
+    expect(summary.withinSeconds['5']).toBe(0.8);
+    expect(summary.p90BoundaryShiftSeconds).toBeGreaterThan(2.5);
   });
 });
 

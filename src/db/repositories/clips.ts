@@ -99,11 +99,12 @@ export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> 
  * it. Runs only on root clips: a captioned copy inherits its footage from
  * its source, and its boundaries with it.
  *
- * `status = 'ready'` in the WHERE is the claim, not a courtesy check: two
- * edits racing past an in-memory status read would otherwise both write,
- * share one queued render (stable job id), and leave the file cut from one
- * set of boundaries while the row describes the other. The second edit
- * finding no ready row is told to wait, which is the truth.
+ * The status condition in the WHERE is the claim, not a courtesy check: two
+ * re-evaluations racing past an in-memory status read would otherwise both
+ * write, share one queued render (stable job id), and leave the file cut
+ * from one set of boundaries while the row describes the other. A clip
+ * mid-render is refused; a FAILED clip is claimable on purpose — new
+ * boundaries are precisely how a failed render gets another chance.
  */
 export async function setClipBoundaries(
   clipId: string,
@@ -118,7 +119,7 @@ export async function setClipBoundaries(
             status = 'pending',
             error_message = NULL,
             updated_at = now()
-      WHERE id = $1 AND derived_from_clip_id IS NULL AND status = 'ready'
+      WHERE id = $1 AND derived_from_clip_id IS NULL AND status IN ('ready', 'failed')
       RETURNING *`,
     [clipId, startSeconds, endSeconds],
   );
@@ -126,28 +127,35 @@ export async function setClipBoundaries(
 }
 
 /**
- * Undoes a boundary edit whose re-render never made it into the queue.
+ * Undoes a boundary change whose re-render never happened — the job could
+ * not be queued, or the render itself terminally failed.
  *
- * Without this, a queue outage in the moment between the claim above and
- * the enqueue leaves the row `pending` forever: the file still shows the
- * old cut, the row describes the new one, and every later edit is refused
- * by the ready-claim. Putting the previous boundaries, edit mark and
- * `ready` status back returns the clip to exactly the state the person
- * could see — an edit that failed is an edit that did not happen.
+ * Without this the row would keep describing the NEW boundaries while the
+ * stored file (if any) still shows the old cut, and every later attempt
+ * would be refused by the claim. Putting back the previous boundaries, the
+ * previous edit mark and the previous STATUS returns the clip to exactly
+ * the state the person could see — a re-evaluation that failed is one that
+ * did not happen. Matches rows in 'pending' (never started) or
+ * 'generating' (died mid-render).
  */
 export async function restoreClipBoundaries(
   clipId: string,
-  previous: { startSeconds: number; endSeconds: number; boundariesEditedAt: Date | null },
+  previous: {
+    startSeconds: number;
+    endSeconds: number;
+    boundariesEditedAt: Date | null;
+    status?: 'ready' | 'failed';
+  },
 ): Promise<void> {
   await queryOne(
     `UPDATE clips
         SET start_seconds = $2,
             end_seconds = $3,
             boundaries_edited_at = $4,
-            status = 'ready',
+            status = $5,
             updated_at = now()
-      WHERE id = $1 AND status = 'pending'`,
-    [clipId, previous.startSeconds, previous.endSeconds, previous.boundariesEditedAt],
+      WHERE id = $1 AND status IN ('pending', 'generating')`,
+    [clipId, previous.startSeconds, previous.endSeconds, previous.boundariesEditedAt, previous.status ?? 'ready'],
   );
 }
 
@@ -345,6 +353,15 @@ export async function setClipRenderPending(clipId: string): Promise<void> {
     `UPDATE clips SET status = 'pending', error_message = NULL, updated_at = now() WHERE id = $1 RETURNING id`,
     [clipId],
   );
+}
+
+/** The root clip cut from a moment, if one exists. Copies stay out of it. */
+export async function getRootClipByMatchId(matchId: string): Promise<Clip | null> {
+  const row = await queryOne<ClipRow>(
+    `SELECT * FROM clips WHERE clip_match_id = $1 AND derived_from_clip_id IS NULL`,
+    [matchId],
+  );
+  return row ? mapClip(row) : null;
 }
 
 export async function getClip(clipId: string): Promise<Clip | null> {

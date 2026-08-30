@@ -144,3 +144,37 @@ describe('parseModelMatches', () => {
     expect(result.warnings[0]).toContain('matches');
   });
 });
+
+describe('parseReclipBoundaries', () => {
+  it('accepts a clean answer and rounds to milliseconds', async () => {
+    const { parseReclipBoundaries } = await import('../src/services/search/modelResponse.js');
+    expect(parseReclipBoundaries('{"start_seconds":6.5,"end_seconds":41.0}', 55)).toEqual({
+      startSeconds: 6.5,
+      endSeconds: 41,
+    });
+  });
+
+  it('digs the JSON out of a chatty or fenced reply', async () => {
+    const { parseReclipBoundaries } = await import('../src/services/search/modelResponse.js');
+    expect(
+      parseReclipBoundaries('Here you go:\n```json\n{"start_seconds":2,"end_seconds":10}\n```', 55),
+    ).toEqual({ startSeconds: 2, endSeconds: 10 });
+  });
+
+  it('clamps into the segment instead of trusting timestamps past its end', async () => {
+    const { parseReclipBoundaries } = await import('../src/services/search/modelResponse.js');
+    expect(parseReclipBoundaries('{"start_seconds":-3,"end_seconds":99}', 40)).toEqual({
+      startSeconds: 0,
+      endSeconds: 40,
+    });
+  });
+
+  it('returns null — never invented boundaries — for prose, bad numbers, or an empty span', async () => {
+    const { parseReclipBoundaries } = await import('../src/services/search/modelResponse.js');
+    expect(parseReclipBoundaries('the clip looks good to me', 40)).toBeNull();
+    expect(parseReclipBoundaries('{"start_seconds":"soon","end_seconds":10}', 40)).toBeNull();
+    expect(parseReclipBoundaries('{"start_seconds":30,"end_seconds":12}', 40)).toBeNull();
+    // Both boundaries clamp to the same edge: nothing left of the moment.
+    expect(parseReclipBoundaries('{"start_seconds":50,"end_seconds":60}', 40)).toBeNull();
+  });
+});

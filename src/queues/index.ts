@@ -10,6 +10,7 @@ export const QUEUE_NAMES = {
   clipSearch: 'clip-search',
   clipGeneration: 'clip-generation',
   clipVariant: 'clip-variant',
+  reclip: 'moment-reclip',
   thumbnailBackfill: 'thumbnail-backfill',
   retention: 'footage-retention',
   learningReport: 'learning-report',
@@ -49,6 +50,36 @@ export interface ClipGenerationJob {
    * never leave the database claiming captions the file does not have.
    */
   captions?: import('../services/media/captions.js').ClipCaption[];
+  /**
+   * Present when this render applies a Re-clip. Same principle as captions:
+   * the moment's new version and its cleared pending state become true only
+   * when the file that carries the new boundaries exists — a render that
+   * fails rolls the clip back to `previous` and records the failure instead.
+   */
+  reclip?: {
+    matchId: string;
+    startSeconds: number;
+    endSeconds: number;
+    provider: string | null;
+    model: string | null;
+    promptVersion: string | null;
+    previous: {
+      startSeconds: number;
+      endSeconds: number;
+      boundariesEditedAt: string | null;
+      status: 'ready' | 'failed';
+    };
+  };
+}
+
+/**
+ * Re-evaluate one moment's boundaries with wider context. One job per
+ * moment at a time — the stable id below and the pending claim in the
+ * database together make a double-tap harmless.
+ */
+export interface ReclipJob {
+  matchId: string;
+  clipRequestId: string;
 }
 
 /**
@@ -102,6 +133,7 @@ let queues: {
   clipSearch: Queue<ClipSearchJob>;
   clipGeneration: Queue<ClipGenerationJob>;
   clipVariant: Queue<ClipVariantJob>;
+  reclip: Queue<ReclipJob>;
   thumbnailBackfill: Queue<ThumbnailBackfillJob>;
   retention: Queue<RetentionJob>;
   learningReport: Queue<LearningReportJob>;
@@ -118,6 +150,7 @@ export function getQueues() {
       clipSearch: new Queue<ClipSearchJob>(QUEUE_NAMES.clipSearch, { connection, defaultJobOptions }),
       clipGeneration: new Queue<ClipGenerationJob>(QUEUE_NAMES.clipGeneration, { connection, defaultJobOptions }),
       clipVariant: new Queue<ClipVariantJob>(QUEUE_NAMES.clipVariant, { connection, defaultJobOptions }),
+      reclip: new Queue<ReclipJob>(QUEUE_NAMES.reclip, { connection, defaultJobOptions }),
       thumbnailBackfill: new Queue<ThumbnailBackfillJob>(QUEUE_NAMES.thumbnailBackfill, {
         connection,
         defaultJobOptions,
@@ -205,6 +238,16 @@ export async function enqueueClipSearch(data: ClipSearchJob, options: JobsOption
 
 export async function enqueueClipGeneration(data: ClipGenerationJob): Promise<void> {
   await addWithStableId(getQueues().clipGeneration, 'generate', data, `generate-${data.clipId}`);
+}
+
+/**
+ * One Re-clip job per moment, single attempt. The model call inside has its
+ * own bounded retries; letting BullMQ retry on top of that could spend the
+ * whole per-moment budget on one tap. A failure lands in reclip_status where
+ * the person can see it and decide.
+ */
+export async function enqueueReclip(data: ReclipJob): Promise<void> {
+  await addWithStableId(getQueues().reclip, 'reclip', data, `reclip-${data.matchId}`, { attempts: 1 });
 }
 
 /**
