@@ -47,4 +47,9 @@ CREATE INDEX IF NOT EXISTS idx_moment_versions_match ON moment_versions (match_i
 ALTER TABLE clip_matches
     ADD COLUMN IF NOT EXISTS reclip_status TEXT
         CHECK (reclip_status IS NULL OR reclip_status IN ('pending', 'failed')),
-    ADD COLUMN IF NOT EXISTS reclip_error  TEXT;
+    ADD COLUMN IF NOT EXISTS reclip_error  TEXT,
+    -- Paid ATTEMPTS, not successes. The lifetime ceiling has to bound GPU
+    -- spend, and a call that returned unusable boundaries cost the same as
+    -- one that worked — counting only successful versions would let failures
+    -- be retried without limit.
+    ADD COLUMN IF NOT EXISTS reclip_attempts INTEGER NOT NULL DEFAULT 0;

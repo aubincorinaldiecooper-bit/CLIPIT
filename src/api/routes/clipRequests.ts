@@ -11,7 +11,7 @@ import {
   setMatchFeedback,
 } from '../../db/repositories/clipRequests.js';
 import { getRootClipByMatchId, listClipsForRequest, upsertClipForMatch } from '../../db/repositories/clips.js';
-import { claimReclip, clearReclipPending, countReclips, latestVersionsForMatches } from '../../db/repositories/reclips.js';
+import { claimReclip, clearReclipPending, latestVersionsForMatches } from '../../db/repositories/reclips.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import { enqueueClipGeneration, enqueueReclip } from '../../queues/index.js';
 import { assertOwnership, requireSession } from '../auth.js';
@@ -157,11 +157,6 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
     const [match] = await listMatchesByIds(requestId, [matchId]);
     if (!match) throw HttpError.notFound('Match not found');
 
-    const spent = await countReclips(matchId);
-    if (spent >= env.MAX_RECLIPS_PER_MOMENT) {
-      throw HttpError.conflict('This moment has reached its Re-clip limit.');
-    }
-
     const video = await getVideo(clipRequest.videoId);
     if (!video?.proxyStorageKey) {
       throw HttpError.conflict('The footage for this video is no longer stored, so it cannot be re-examined.');
@@ -174,11 +169,16 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       throw HttpError.conflict('This clip is still rendering — try Re-clip when it finishes.');
     }
 
-    // The claim: only a moment not already re-evaluating can start another.
-    // A double-tap or a second tab gets a truthful 409, not a second call.
-    const claimed = await claimReclip(matchId);
+    // The claim is the whole cost gate: it refuses a moment already
+    // re-evaluating AND consumes one attempt from the lifetime allowance in
+    // the same statement — a double-tap gets a truthful 409, and failed paid
+    // calls count against the ceiling exactly like successful ones.
+    const claimed = await claimReclip(matchId, env.MAX_RECLIPS_PER_MOMENT);
     if (!claimed) {
-      throw HttpError.conflict('A Re-clip for this moment is already running.');
+      if (match.reclipStatus === 'pending') {
+        throw HttpError.conflict('A Re-clip for this moment is already running.');
+      }
+      throw HttpError.conflict('This moment has used all its Re-clip attempts.');
     }
 
     try {
@@ -193,7 +193,7 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
 
     const [updated] = await listMatchesByIds(requestId, [matchId]);
     const versions = await latestVersionsForMatches([matchId]);
-    logger.info('reclip queued', { requestId, matchId, priorReclips: spent });
+    logger.info('reclip queued', { requestId, matchId, attempt: (match.reclipAttempts ?? 0) + 1 });
     return reply.code(202).send({ match: await serializeMatch(updated ?? match, null, versions.get(matchId) ?? null) });
   });
 

@@ -317,6 +317,8 @@ export interface ClipMatch {
   reclipStatus: 'pending' | 'failed' | null;
   /** Why the last Re-clip failed, in words safe to show. */
   reclipError: string | null;
+  /** Paid re-evaluation attempts spent, successful or not. Bounds GPU spend. */
+  reclipAttempts: number;
   createdAt: Date;
 }
 

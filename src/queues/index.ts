@@ -50,6 +50,26 @@ export interface ClipGenerationJob {
    * never leave the database claiming captions the file does not have.
    */
   captions?: import('../services/media/captions.js').ClipCaption[];
+  /**
+   * Present when this render applies a Re-clip. Same principle as captions:
+   * the moment's new version and its cleared pending state become true only
+   * when the file that carries the new boundaries exists — a render that
+   * fails rolls the clip back to `previous` and records the failure instead.
+   */
+  reclip?: {
+    matchId: string;
+    startSeconds: number;
+    endSeconds: number;
+    provider: string | null;
+    model: string | null;
+    promptVersion: string | null;
+    previous: {
+      startSeconds: number;
+      endSeconds: number;
+      boundariesEditedAt: string | null;
+      status: 'ready' | 'failed';
+    };
+  };
 }
 
 /**

@@ -284,6 +284,7 @@ interface ClipMatchRow {
   prompt_version: string | null;
   reclip_status: 'pending' | 'failed' | null;
   reclip_error: string | null;
+  reclip_attempts: number | null;
   created_at: Date;
 }
 
@@ -308,6 +309,7 @@ function mapMatch(row: ClipMatchRow): ClipMatch {
     promptVersion: row.prompt_version ?? null,
     reclipStatus: row.reclip_status ?? null,
     reclipError: row.reclip_error ?? null,
+    reclipAttempts: row.reclip_attempts ?? 0,
     createdAt: row.created_at,
   };
 }

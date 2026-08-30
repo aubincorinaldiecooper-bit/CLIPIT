@@ -10,7 +10,6 @@ import { getClipRequest, listMatchesByIds } from '../../db/repositories/clipRequ
 import {
   appendReclipVersion,
   clearReclipPending,
-  countReclips,
   ensureInitialVersion,
   listVersions,
   markReclipFailed,
@@ -22,6 +21,7 @@ import { recordModelUsage } from '../../db/repositories/usage.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { reclipWindowKey } from '../../services/storage/types.js';
 import { cutClip, ffprobe } from '../../services/media/ffmpeg.js';
+import { applyClipPadding } from '../../services/timestamps.js';
 import { askVideoModel, videoPartFromFile, type ContentPart } from '../../services/search/openrouterVideo.js';
 import { RECLIP_SYSTEM_PROMPT, buildReclipInstruction, buildTranscriptBlock } from '../../services/search/prompt.js';
 import { parseReclipBoundaries } from '../../services/search/modelResponse.js';
@@ -69,11 +69,11 @@ async function runReclip(job: Job<ReclipJob>, log: ReturnType<typeof logger.chil
     throw new ReclipFailure('The footage for this video is no longer stored, so it cannot be re-examined.');
   }
 
-  // The ceiling is enforced at the endpoint too; re-checked here because the
-  // queue outlives the request that filled it.
-  const spent = await countReclips(matchId);
-  if (spent >= env.MAX_RECLIPS_PER_MOMENT) {
-    throw new ReclipFailure('This moment has reached its Re-clip limit.');
+  // The claim at the endpoint consumed this run's attempt and enforced the
+  // ceiling; re-checked here because the queue outlives the request that
+  // filled it. Attempts count PAID CALLS, successful or not.
+  if ((match.reclipAttempts ?? 0) > env.MAX_RECLIPS_PER_MOMENT) {
+    throw new ReclipFailure('This moment has used all its Re-clip attempts.');
   }
 
   // Version 1 is the first-pass prediction, copied from the immutable match
@@ -178,39 +178,87 @@ async function runReclip(job: Job<ReclipJob>, log: ReturnType<typeof logger.chil
       throw new ReclipFailure('The model did not return usable boundaries. Nothing was changed.');
     }
 
-    const newStart = Number((windowStart + refined.startSeconds).toFixed(3));
-    const newEnd = Number((windowStart + refined.endSeconds).toFixed(3));
+    const rawStart = Number((windowStart + refined.startSeconds).toFixed(3));
+    const rawEnd = Number((windowStart + refined.endSeconds).toFixed(3));
 
     // Same-moment identity, enforced rather than hoped for: the refined cut
     // must overlap the boundaries it was asked to reconsider. An answer
     // elsewhere in the window is a different moment, and accepting it would
     // silently replace what the person was evaluating.
-    if (newStart >= current.endSeconds || newEnd <= current.startSeconds) {
+    if (rawStart >= current.endSeconds || rawEnd <= current.startSeconds) {
       throw new ReclipFailure('The model wandered to a different moment. Nothing was changed.');
     }
 
-    // If a clip file exists, claim it before recording the new version: the
-    // version history must never say boundaries moved while the rendered
-    // file provably kept the old ones.
+    // Normalised under the SAME duration rules the renderer applies, so the
+    // recorded boundaries and the rendered file can never disagree: a span
+    // under MIN_CLIP_SECONDS is widened, one over MAX is truncated, both
+    // clamped to the footage — here, where the version is written, not
+    // silently later at render time.
+    const normalized = applyClipPadding(
+      { startSeconds: rawStart, endSeconds: rawEnd },
+      {
+        paddingSeconds: env.CLIP_PADDING_SECONDS,
+        videoDurationSeconds: video.durationSeconds ?? Number.POSITIVE_INFINITY,
+        minDurationSeconds: env.MIN_CLIP_SECONDS,
+        maxDurationSeconds: env.MAX_CLIP_SECONDS,
+      },
+    );
+    const newStart = normalized.startSeconds;
+    const newEnd = normalized.endSeconds;
+
     const clip = await getRootClipByMatchId(matchId);
-    let claimed = null;
     if (clip) {
-      claimed = await setClipBoundaries(clip.id, newStart, newEnd);
+      // With a rendered file in play, the render decides the truth. The clip
+      // is claimed (only ready or failed rows can be), the new boundaries
+      // and the finalization payload ride in the generation job, and the
+      // moment's version + cleared pending state are written by the render's
+      // SUCCESS — or rolled back by its final failure. Nothing is recorded
+      // here, because nothing has happened yet.
+      const claimed = await setClipBoundaries(clip.id, newStart, newEnd);
       if (!claimed) {
         throw new ReclipFailure('The clip was busy rendering. Try again when it settles.');
       }
       try {
-        await enqueueClipGeneration({ clipId: clip.id });
+        await enqueueClipGeneration({
+          clipId: clip.id,
+          reclip: {
+            matchId,
+            startSeconds: newStart,
+            endSeconds: newEnd,
+            provider: answer.provider,
+            model: answer.model,
+            promptVersion: answer.promptVersion,
+            previous: {
+              startSeconds: clip.startSeconds,
+              endSeconds: clip.endSeconds,
+              boundariesEditedAt: clip.boundariesEditedAt ? clip.boundariesEditedAt.toISOString() : null,
+              status: clip.status === 'failed' ? 'failed' : 'ready',
+            },
+          },
+        });
       } catch (queueError) {
         await restoreClipBoundaries(clip.id, {
           startSeconds: clip.startSeconds,
           endSeconds: clip.endSeconds,
           boundariesEditedAt: clip.boundariesEditedAt,
+          status: clip.status === 'failed' ? 'failed' : 'ready',
         });
         throw queueError;
       }
+      log.info('reclip render queued', {
+        clipId: clip.id,
+        startSeconds: newStart,
+        endSeconds: newEnd,
+        startShiftSeconds: Number((newStart - current.startSeconds).toFixed(3)),
+        endShiftSeconds: Number((newEnd - current.endSeconds).toFixed(3)),
+        provider: answer.provider,
+        model: answer.model,
+      });
+      return;
     }
 
+    // No rendered file exists, so the boundaries themselves are the whole
+    // outcome: record the version and clear the pending state directly.
     const version = await appendReclipVersion({
       matchId,
       startSeconds: newStart,
@@ -227,7 +275,7 @@ async function runReclip(job: Job<ReclipJob>, log: ReturnType<typeof logger.chil
       endSeconds: newEnd,
       startShiftSeconds: Number((newStart - current.startSeconds).toFixed(3)),
       endShiftSeconds: Number((newEnd - current.endSeconds).toFixed(3)),
-      clipReRendered: Boolean(claimed),
+      clipReRendered: false,
       provider: answer.provider,
       model: answer.model,
     });

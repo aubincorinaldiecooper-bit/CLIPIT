@@ -559,29 +559,42 @@ async function boundarySection(filters: EvaluationFilters): Promise<BoundarySect
 
   // Consecutive version pairs: every 'reclip' row against the version before
   // it, so a second Re-clip measures movement from the first, not from the
-  // original twice.
+  // original twice. Pairing happens over ALL versions (a filter inside the
+  // window would pair a version with the wrong predecessor); attribution
+  // filters then apply to the RECLIP VERSION's own provider/model/prompt —
+  // a moment found by model A and re-clipped by model B is model B's shift,
+  // not A's.
+  const { where: shiftWhere, params: shiftParams } = buildWhere(filters, {
+    timeColumn: 'sq.created_at',
+    matchAlias: 'sq',
+    videoAlias: 'v',
+  });
   const shiftRows = await queryRows<{
     prev_start: string;
     prev_end: string;
     next_start: string;
     next_end: string;
   }>(
-    `SELECT lag(mv.start_seconds) OVER w AS prev_start,
-            lag(mv.end_seconds) OVER w AS prev_end,
-            mv.start_seconds AS next_start,
-            mv.end_seconds AS next_end,
-            mv.trigger
-       FROM moment_versions mv
-       JOIN clip_matches m ON m.id = mv.match_id
+    `SELECT sq.prev_start, sq.prev_end, sq.next_start, sq.next_end
+       FROM (
+         SELECT mv.match_id,
+                mv.trigger,
+                mv.provider,
+                mv.model,
+                mv.prompt_version,
+                mv.created_at,
+                lag(mv.start_seconds) OVER w AS prev_start,
+                lag(mv.end_seconds) OVER w AS prev_end,
+                mv.start_seconds AS next_start,
+                mv.end_seconds AS next_end
+           FROM moment_versions mv
+         WINDOW w AS (PARTITION BY mv.match_id ORDER BY mv.version)
+       ) sq
+       JOIN clip_matches m ON m.id = sq.match_id
        JOIN clip_requests r ON r.id = m.clip_request_id
        JOIN videos v ON v.id = r.video_id
-       ${where}
-     WINDOW w AS (PARTITION BY mv.match_id ORDER BY mv.version)`,
-    params,
-  ).then((rows) =>
-    rows.filter(
-      (row) => (row as unknown as { trigger: string }).trigger === 'reclip' && row.prev_start !== null,
-    ),
+       ${shiftWhere ? `${shiftWhere} AND` : 'WHERE'} sq.trigger = 'reclip' AND sq.prev_start IS NOT NULL`,
+    shiftParams,
   );
 
   const shifts = shiftRows.map((row) =>

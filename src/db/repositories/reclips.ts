@@ -103,17 +103,24 @@ export async function countReclips(matchId: string): Promise<number> {
 }
 
 /**
- * Claims the moment for one Re-clip run. The WHERE is the guard: only a
- * moment not already pending can be claimed, so a double-tap (or two tabs)
- * yields one job and one refusal instead of two GPU calls.
+ * Claims the moment for one Re-clip run and CONSUMES one attempt from its
+ * lifetime allowance, atomically. The WHERE is the whole cost control: only
+ * a moment not already pending and still under the ceiling can be claimed,
+ * so a double-tap yields one call, and a string of failed answers cannot be
+ * retried past the limit — every claim was a paid model call, successful or
+ * not, and every claim counts.
  */
-export async function claimReclip(matchId: string): Promise<boolean> {
+export async function claimReclip(matchId: string, maxAttempts: number): Promise<boolean> {
   const row = await queryOne<{ id: string }>(
     `UPDATE clip_matches
-        SET reclip_status = 'pending', reclip_error = NULL
-      WHERE id = $1 AND (reclip_status IS NULL OR reclip_status = 'failed')
+        SET reclip_status = 'pending',
+            reclip_error = NULL,
+            reclip_attempts = reclip_attempts + 1
+      WHERE id = $1
+        AND (reclip_status IS NULL OR reclip_status = 'failed')
+        AND reclip_attempts < $2
       RETURNING id`,
-    [matchId],
+    [matchId, maxAttempts],
   );
   return Boolean(row);
 }

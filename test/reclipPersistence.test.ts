@@ -40,6 +40,7 @@ const match = {
   promptVersion: 'abc123',
   reclipStatus: null,
   reclipError: null,
+  reclipAttempts: 0,
   createdAt: new Date('2026-08-29T00:00:00Z'),
 };
 
@@ -93,14 +94,20 @@ describe('appendReclipVersion', () => {
 });
 
 describe('claimReclip', () => {
-  it('claims atomically: only a moment not already pending can start a run', async () => {
+  it('claims atomically AND consumes one attempt against the ceiling in the same statement', async () => {
     queryOne.mockResolvedValue(null);
     const { claimReclip } = await import('../src/db/repositories/reclips.js');
 
-    const claimed = await claimReclip('match-1');
-    const [sql] = queryOne.mock.calls[0]! as [string];
-    // Two taps race to this UPDATE; the WHERE lets exactly one through.
-    expect(sql.slice(sql.indexOf('WHERE'))).toContain("reclip_status IS NULL OR reclip_status = 'failed'");
+    const claimed = await claimReclip('match-1', 2);
+    const [sql, params] = queryOne.mock.calls[0]! as [string, unknown[]];
+    // Two taps race to this UPDATE; the WHERE lets exactly one through —
+    // and a string of failed PAID calls cannot run past the limit, because
+    // every claim increments the attempt counter the WHERE checks.
+    const where = sql.slice(sql.indexOf('WHERE'));
+    expect(where).toContain("reclip_status IS NULL OR reclip_status = 'failed'");
+    expect(where).toContain('reclip_attempts < $2');
+    expect(sql).toContain('reclip_attempts = reclip_attempts + 1');
+    expect(params).toEqual(['match-1', 2]);
     expect(claimed).toBe(false);
   });
 });

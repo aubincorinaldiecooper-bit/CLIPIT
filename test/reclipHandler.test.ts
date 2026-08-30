@@ -51,7 +51,6 @@ vi.mock('../src/db/repositories/reclips.js', () => ({
   ensureInitialVersion: repos.ensureInitialVersion,
   listVersions: repos.listVersions,
   appendReclipVersion: repos.appendReclipVersion,
-  countReclips: repos.countReclips,
   clearReclipPending: repos.clearReclipPending,
   markReclipFailed: repos.markReclipFailed,
 }));
@@ -87,6 +86,8 @@ const match = {
   provider: 'modal',
   model: 'openbmb/MiniCPM-V-4.6',
   promptVersion: 'v1',
+  // The endpoint's claim consumed this run's attempt before the job ran.
+  reclipAttempts: 1,
 };
 
 beforeEach(() => {
@@ -105,7 +106,6 @@ beforeEach(() => {
   repos.getClipRequest.mockResolvedValue({ id: 'request-1', videoId: 'video-1', instruction: 'the goal' });
   repos.listMatchesByIds.mockResolvedValue([match]);
   repos.getVideo.mockResolvedValue({ id: 'video-1', proxyStorageKey: 'videos/video-1/proxy.mp4', durationSeconds: 600 });
-  repos.countReclips.mockResolvedValue(0);
   repos.ensureInitialVersion.mockResolvedValue(undefined);
   repos.listVersions.mockResolvedValue([
     { matchId: 'match-1', version: 1, trigger: 'initial', startSeconds: 130, endSeconds: 150 },
@@ -208,24 +208,37 @@ describe('handleReclip', () => {
     expect(repos.markReclipFailed).toHaveBeenCalledWith('match-1', expect.stringContaining('usable boundaries'));
   });
 
-  it('enforces the per-moment ceiling before spending any GPU time', async () => {
-    repos.countReclips.mockResolvedValue(env.MAX_RECLIPS_PER_MOMENT);
+  it('enforces the attempts ceiling before spending any GPU time — failed paid calls count too', async () => {
+    repos.listMatchesByIds.mockResolvedValue([{ ...match, reclipAttempts: env.MAX_RECLIPS_PER_MOMENT + 1 }]);
     await handleReclip(job);
     expect(askVideoModel).not.toHaveBeenCalled();
-    expect(repos.markReclipFailed).toHaveBeenCalledWith('match-1', expect.stringContaining('limit'));
+    expect(repos.markReclipFailed).toHaveBeenCalledWith('match-1', expect.stringContaining('attempts'));
   });
 
-  it('re-cuts an existing ready clip through the atomic claim, then records the version', async () => {
-    repos.getRootClipByMatchId.mockResolvedValue({ id: 'clip-1', startSeconds: 130, endSeconds: 150, boundariesEditedAt: null });
+  it('hands finalization to the render when a clip exists: claim, queue with the payload, record NOTHING yet', async () => {
+    repos.getRootClipByMatchId.mockResolvedValue({ id: 'clip-1', startSeconds: 130, endSeconds: 150, boundariesEditedAt: null, status: 'ready' });
     repos.setClipBoundaries.mockResolvedValue({ id: 'clip-1' });
     await handleReclip(job);
     expect(repos.setClipBoundaries).toHaveBeenCalledWith('clip-1', 128, 151);
-    expect(enqueueClipGeneration).toHaveBeenCalledWith({ clipId: 'clip-1' });
-    expect(repos.appendReclipVersion).toHaveBeenCalled();
+    // The version and the cleared pending state are written by the render's
+    // SUCCESS — a queued render is not a succeeded one.
+    expect(enqueueClipGeneration).toHaveBeenCalledWith({
+      clipId: 'clip-1',
+      reclip: expect.objectContaining({
+        matchId: 'match-1',
+        startSeconds: 128,
+        endSeconds: 151,
+        provider: 'modal',
+        previous: expect.objectContaining({ startSeconds: 130, endSeconds: 150, status: 'ready' }),
+      }),
+    });
+    expect(repos.appendReclipVersion).not.toHaveBeenCalled();
+    expect(repos.clearReclipPending).not.toHaveBeenCalled();
+    expect(repos.markReclipFailed).not.toHaveBeenCalled();
   });
 
   it('a lost clip claim fails the Re-clip with the original untouched — no version, no render', async () => {
-    repos.getRootClipByMatchId.mockResolvedValue({ id: 'clip-1', startSeconds: 130, endSeconds: 150, boundariesEditedAt: null });
+    repos.getRootClipByMatchId.mockResolvedValue({ id: 'clip-1', startSeconds: 130, endSeconds: 150, boundariesEditedAt: null, status: 'ready' });
     repos.setClipBoundaries.mockResolvedValue(null);
     await handleReclip(job);
     expect(enqueueClipGeneration).not.toHaveBeenCalled();
@@ -233,8 +246,8 @@ describe('handleReclip', () => {
     expect(repos.markReclipFailed).toHaveBeenCalledWith('match-1', expect.stringContaining('busy rendering'));
   });
 
-  it('a failed render enqueue restores the clip exactly and reports failure', async () => {
-    repos.getRootClipByMatchId.mockResolvedValue({ id: 'clip-1', startSeconds: 130, endSeconds: 150, boundariesEditedAt: null });
+  it('a failed render enqueue restores the clip exactly — boundaries AND status — and reports failure', async () => {
+    repos.getRootClipByMatchId.mockResolvedValue({ id: 'clip-1', startSeconds: 130, endSeconds: 150, boundariesEditedAt: null, status: 'failed' });
     repos.setClipBoundaries.mockResolvedValue({ id: 'clip-1' });
     enqueueClipGeneration.mockRejectedValue(new Error('redis down'));
     await handleReclip(job);
@@ -242,9 +255,27 @@ describe('handleReclip', () => {
       startSeconds: 130,
       endSeconds: 150,
       boundariesEditedAt: null,
+      status: 'failed',
     });
     expect(repos.appendReclipVersion).not.toHaveBeenCalled();
     expect(repos.markReclipFailed).toHaveBeenCalled();
+  });
+
+  it("normalizes a refined span to the renderer's duration rules before recording it", async () => {
+    // 12.0s..12.8s in the window is 0.8s — under MIN_CLIP_SECONDS. The
+    // recorded version must already carry the widened span the renderer
+    // would produce, or timestamps and file would disagree.
+    askVideoModel.mockResolvedValue({
+      content: '{"start_seconds":12.0,"end_seconds":12.8}',
+      provider: 'modal',
+      model: 'openbmb/MiniCPM-V-4.6',
+      promptVersion: 'reclip-v1',
+      reasoningDisabled: false,
+    });
+    await handleReclip(job);
+    expect(repos.appendReclipVersion).toHaveBeenCalledTimes(1);
+    const recorded = repos.appendReclipVersion.mock.calls[0]![0] as { startSeconds: number; endSeconds: number };
+    expect(recorded.endSeconds - recorded.startSeconds).toBeGreaterThanOrEqual(env.MIN_CLIP_SECONDS);
   });
 
   it('footage already swept means a visible refusal, not a crash loop', async () => {
