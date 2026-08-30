@@ -6,6 +6,7 @@ import type { FastifyRequest } from 'fastify';
 import {
   deleteClipRow,
   getClip,
+  listClipFamily,
   insertDerivedClip,
   listClipsForPrincipal,
   listWorkspacesForClip,
@@ -218,11 +219,14 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
   });
 
   /**
-   * Delete a clip. Refused while anything still depends on the file: a
-   * publish being submitted or shaped right now, or a scheduled post
-   * waiting on it — deleting under those would leave a promise that can
+   * Delete a clip, and with it every captioned copy made from it — a
+   * version of a clip you deleted is a version of nothing, and the schema
+   * cannot hold two originals for one moment anyway.
+   *
+   * Refused while anything still depends on the files: a publish being
+   * submitted or shaped right now, or a scheduled post waiting on any clip
+   * in the family — deleting under those would leave a promise that can
    * only fail, hours later, for a reason the person deleted on purpose.
-   * The files go best-effort after the row; see deleteClipRow.
    */
   app.delete('/api/clips/:clipId', { preHandler: requireSession }, async (request, reply) => {
     await enforceRateLimits(request, [
@@ -238,31 +242,36 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
     if (!clip) throw HttpError.notFound('Clip not found');
     assertOwnership(request, clip, 'Clip');
 
-    const activePosts = await listActivePostsForClip(clipId);
-    if (activePosts.length > 0) {
-      throw HttpError.conflict('This clip is being published right now. Try again in a minute.');
-    }
-    const waiting = await listWaitingScheduledPostsForClip(clipId);
-    if (waiting.length > 0) {
-      throw HttpError.conflict(
-        'This clip has a scheduled post waiting. Cancel the scheduled post first, then delete the clip.',
-      );
+    // The guards cover the whole family, not just the clip named: a
+    // captioned copy can be the one mid-publish, and deleting its parent
+    // takes it too.
+    const family = await listClipFamily(clipId);
+    for (const memberId of family) {
+      if ((await listActivePostsForClip(memberId)).length > 0) {
+        throw HttpError.conflict('This clip is being published right now. Try again in a minute.');
+      }
+      if ((await listWaitingScheduledPostsForClip(memberId)).length > 0) {
+        throw HttpError.conflict(
+          'This clip has a scheduled post waiting. Cancel the scheduled post first, then delete the clip.',
+        );
+      }
     }
 
     const removed = await deleteClipRow(clipId);
     if (!removed) throw HttpError.notFound('Clip not found');
 
-    // Files after the row, best-effort: an orphaned object costs pennies; a
+    // Files after the rows, best-effort: an orphaned object costs pennies; a
     // row for a file that is gone would keep a dead clip in the library.
-    const keys = [removed.storageKey, ...removed.variantKeys].filter((key): key is string => Boolean(key));
-    for (const key of keys) {
+    for (const key of removed.storageKeys) {
       await getStorage()
         .remove(key)
         .catch((cause: unknown) =>
           logger.warn('clip file removal failed; object orphaned', { clipId, key, err: cause }),
         );
     }
-    logger.info('clip deleted', { clipId, files: keys.length });
-    return reply.send({ deleted: true });
+    logger.info('clip deleted', { clipId, clips: removed.deletedCount, files: removed.storageKeys.length });
+    // `deletedCount` is the whole family, so the caller can say "and its 2
+    // captioned copies" rather than implying one row went.
+    return reply.send({ deleted: true, deletedCount: removed.deletedCount });
   });
 }

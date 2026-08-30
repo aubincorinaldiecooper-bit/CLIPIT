@@ -426,24 +426,64 @@ export async function setClipTitle(clipId: string, title: string | null): Promis
 }
 
 /**
- * Remove a clip. The row is the deletion — foreign keys already agree on
- * what follows (room shares and shape cuts go with it, published posts keep
- * their history with the clip reference nulled). The caller deletes the
- * files afterwards, best-effort: an orphaned object costs pennies, a
- * dangling row costs trust.
+ * Remove a clip and every copy made from it.
+ *
+ * Captioned copies are children of their original (`derived_from_clip_id`),
+ * and the FK there is ON DELETE SET NULL — so deleting an original promotes
+ * each copy to an original. With two or more copies that violates
+ * `clips_original_per_match_idx` (one root per match), and the delete dies
+ * on a duplicate key. Codex caught this on CLIPIT#56.
+ *
+ * Rather than leave orphans or fail, the whole family goes: a captioned
+ * version of a clip you deleted is a version of nothing. The count comes
+ * back so the caller can say how many actually went.
  */
-export async function deleteClipRow(clipId: string): Promise<{ storageKey: string | null; variantKeys: string[] } | null> {
+export async function deleteClipRow(
+  clipId: string,
+): Promise<{ storageKeys: string[]; deletedCount: number } | null> {
+  // The subtree, in case a copy was ever made from a copy.
+  const family = await queryRows<{ id: string }>(
+    `WITH RECURSIVE tree AS (
+       SELECT id FROM clips WHERE id = $1
+       UNION ALL
+       SELECT c.id FROM clips c JOIN tree t ON c.derived_from_clip_id = t.id
+     )
+     SELECT id FROM tree`,
+    [clipId],
+  );
+  if (family.length === 0) return null;
+  const ids = family.map((row) => row.id);
+
+  // Every file the family owns: the clips themselves and their platform
+  // cuts. Gathered BEFORE the delete, which takes the rows with it.
   const variants = await queryRows<{ storage_key: string | null }>(
-    `SELECT storage_key FROM clip_variants WHERE clip_id = $1 AND storage_key IS NOT NULL`,
-    [clipId],
+    `SELECT storage_key FROM clip_variants WHERE clip_id = ANY($1::uuid[]) AND storage_key IS NOT NULL`,
+    [ids],
   );
-  const rows = await queryRows<{ storage_key: string | null }>(
-    `DELETE FROM clips WHERE id = $1 RETURNING storage_key`,
-    [clipId],
+  const deleted = await queryRows<{ storage_key: string | null }>(
+    `DELETE FROM clips WHERE id = ANY($1::uuid[]) RETURNING storage_key`,
+    [ids],
   );
-  if (rows.length === 0) return null;
+  if (deleted.length === 0) return null;
+
   return {
-    storageKey: rows[0]!.storage_key ?? null,
-    variantKeys: variants.map((row) => row.storage_key).filter((key): key is string => Boolean(key)),
+    storageKeys: [...deleted, ...variants]
+      .map((row) => row.storage_key)
+      .filter((key): key is string => Boolean(key)),
+    deletedCount: deleted.length,
   };
+}
+
+/** A clip and every copy descended from it — what a delete would take. */
+export async function listClipFamily(clipId: string): Promise<string[]> {
+  const rows = await queryRows<{ id: string }>(
+    `WITH RECURSIVE tree AS (
+       SELECT id FROM clips WHERE id = $1
+       UNION ALL
+       SELECT c.id FROM clips c JOIN tree t ON c.derived_from_clip_id = t.id
+     )
+     SELECT id FROM tree`,
+    [clipId],
+  );
+  return rows.map((row) => row.id);
 }

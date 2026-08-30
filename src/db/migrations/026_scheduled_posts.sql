@@ -24,6 +24,10 @@ CREATE TABLE scheduled_posts (
     status       TEXT NOT NULL DEFAULT 'waiting',
     error        TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The published_posts rows this promise created when it fired. The
+    -- schedule's own status says the worker ran; these say what actually
+    -- reached the platforms, which is what a person is asking about.
+    post_ids     JSONB NOT NULL DEFAULT '[]',
     -- When the fire was claimed; lets a claim stuck in 'firing' (process
     -- death mid-fire) be reclaimed after a quarantine instead of never.
     claimed_at   TIMESTAMPTZ,

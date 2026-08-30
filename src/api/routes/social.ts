@@ -32,8 +32,9 @@ import {
   cancelScheduledPost,
   getScheduledPost,
   insertScheduledPost,
-  listWaitingScheduledPosts,
+  listScheduledPostsForUser,
   type ScheduledPostRow,
+  type ScheduledPostView,
 } from '../../db/repositories/scheduledPosts.js';
 import { enqueueScheduledPublish, removeScheduledPublishJob } from '../../queues/index.js';
 
@@ -420,13 +421,23 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     return reply.code(202).send({ post: posts[0], posts });
   });
 
-  /** The publishes promised for later and not yet fired, soonest first. */
+  /**
+   * The publishes promised for later — those still waiting, and those that
+   * recently fired or failed. A failed promise that vanished from this list
+   * would turn a missed publication into a silent one.
+   */
   app.get('/api/scheduled-posts', { preHandler: requireSession }, async (request, reply) => {
     const userId = requireUserId(request.principal);
     if (!zernioConfigured()) return reply.send({ scheduled: [] });
-    const rows = await listWaitingScheduledPosts(userId);
+    const rows = await listScheduledPostsForUser(userId);
     return reply.send({
-      scheduled: rows.map((row) => ({ ...serializeScheduledPost(row), clipTitle: row.clip_description ?? null })),
+      scheduled: rows.map((row: ScheduledPostView) => ({
+        ...serializeScheduledPost(row),
+        clipTitle: row.clip_description ?? null,
+        // What the platforms actually did, read from the posts themselves.
+        outcome: row.outcome,
+        firedAt: row.fired_at ? row.fired_at.toISOString() : null,
+      })),
     });
   });
 

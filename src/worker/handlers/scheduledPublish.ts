@@ -2,10 +2,13 @@ import type { Job } from 'bullmq';
 import { logger } from '../../lib/logger.js';
 import type { ScheduledPublishJob } from '../../queues/index.js';
 import {
+  CLAIM_QUARANTINE_MS,
   claimScheduledPost,
+  getScheduledPost,
   markScheduledPostFailed,
   markScheduledPostFired,
 } from '../../db/repositories/scheduledPosts.js';
+import { enqueueScheduledPublish } from '../../queues/index.js';
 import { executeClipPublish } from '../../services/social/publishClip.js';
 import { zernioConfigured } from '../../services/zernio/client.js';
 
@@ -24,10 +27,29 @@ export async function handleScheduledPublish(job: Job<ScheduledPublishJob>): Pro
   const { scheduledPostId } = job.data;
 
   // The claim is the gate: a canceled promise, one already kept, or one
-  // another worker holds all fail it, and the alarm rings into a no-op.
+  // another worker holds all fail it.
   const claimed = await claimScheduledPost(scheduledPostId);
   if (!claimed) {
-    logger.info('scheduled publish skipped — not claimable', { scheduledPostId });
+    // A row still inside its quarantine is the one case where "not
+    // claimable" does not mean "nothing to do". BullMQ retries a stalled
+    // job well before the quarantine expires (its lock is minutes, the
+    // quarantine is ten), so THIS run is the retry — and if it just
+    // returned, no later run would exist and a promise whose worker died
+    // mid-fire would sit in 'firing' forever. Re-arm the alarm for when
+    // the quarantine lifts, and the claim will succeed then.
+    const existing = await getScheduledPost(scheduledPostId);
+    if (existing?.status === 'firing') {
+      const readyAt = new Date((existing.claimed_at?.getTime() ?? Date.now()) + CLAIM_QUARANTINE_MS + 1000);
+      await enqueueScheduledPublish({ scheduledPostId }, readyAt).catch((cause) =>
+        logger.error('could not re-arm a quarantined scheduled publish', { scheduledPostId, err: cause }),
+      );
+      logger.info('scheduled publish re-armed past quarantine', {
+        scheduledPostId,
+        readyAt: readyAt.toISOString(),
+      });
+      return;
+    }
+    logger.info('scheduled publish skipped — not claimable', { scheduledPostId, status: existing?.status });
     return;
   }
 
@@ -45,7 +67,9 @@ export async function handleScheduledPublish(job: Job<ScheduledPublishJob>): Pro
       caption: claimed.caption,
       accountIds: claimed.account_ids.length > 0 ? claimed.account_ids : null,
     });
-    await markScheduledPostFired(scheduledPostId);
+    // The post rows ride along: a shape still being cut can still fail,
+    // and the listing reads THEM rather than trusting 'fired' as success.
+    await markScheduledPostFired(scheduledPostId, posts.map((post) => post.id));
     logger.info('scheduled publish fired', { scheduledPostId, clipId: claimed.clip_id, posts: posts.length });
   } catch (cause) {
     const message = cause instanceof Error && cause.message ? cause.message : 'The publish could not be submitted.';
