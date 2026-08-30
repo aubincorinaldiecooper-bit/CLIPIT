@@ -226,7 +226,7 @@ export async function listClipsForPrincipal(
   // clips must not shift under them, and "skip 60" does exactly that when
   // clip 61 arrives mid-scroll.
   const rows = await queryRows<ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }>(
-    `SELECT c.*, m.description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
+    `SELECT c.*, COALESCE(c.title, m.description) AS description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
        FROM clips c
        JOIN clip_matches m ON m.id = c.clip_match_id
        JOIN videos v ON v.id = c.video_id
@@ -258,7 +258,7 @@ export async function listWorkspaceClips(workspaceId: string, limit = 60): Promi
   const rows = await queryRows<
     ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }
   >(
-    `SELECT c.*, m.description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
+    `SELECT c.*, COALESCE(c.title, m.description) AS description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
        FROM workspace_clips s
        JOIN clips c ON c.id = s.clip_id
        JOIN clip_matches m ON m.id = c.clip_match_id
@@ -417,4 +417,33 @@ export async function setClipStatus(
       options.captions === undefined ? null : JSON.stringify(options.captions),
     ],
   );
+}
+
+/** Give a clip a name of the person's own. Null takes the name back. */
+export async function setClipTitle(clipId: string, title: string | null): Promise<Clip | null> {
+  const rows = await queryRows<ClipRow>(`UPDATE clips SET title = $2 WHERE id = $1 RETURNING *`, [clipId, title]);
+  return rows[0] ? mapClip(rows[0]) : null;
+}
+
+/**
+ * Remove a clip. The row is the deletion — foreign keys already agree on
+ * what follows (room shares and shape cuts go with it, published posts keep
+ * their history with the clip reference nulled). The caller deletes the
+ * files afterwards, best-effort: an orphaned object costs pennies, a
+ * dangling row costs trust.
+ */
+export async function deleteClipRow(clipId: string): Promise<{ storageKey: string | null; variantKeys: string[] } | null> {
+  const variants = await queryRows<{ storage_key: string | null }>(
+    `SELECT storage_key FROM clip_variants WHERE clip_id = $1 AND storage_key IS NOT NULL`,
+    [clipId],
+  );
+  const rows = await queryRows<{ storage_key: string | null }>(
+    `DELETE FROM clips WHERE id = $1 RETURNING storage_key`,
+    [clipId],
+  );
+  if (rows.length === 0) return null;
+  return {
+    storageKey: rows[0]!.storage_key ?? null,
+    variantKeys: variants.map((row) => row.storage_key).filter((key): key is string => Boolean(key)),
+  };
 }

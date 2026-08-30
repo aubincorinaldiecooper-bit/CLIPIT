@@ -27,12 +27,15 @@ import {
   verifyConnectAttempt,
 } from '../../services/social/accounts.js';
 import { zernio, ZernioApiError, zernioConfigured } from '../../services/zernio/client.js';
-import { aspectOfSource, groupTargetsByShape } from '../../services/media/platformShapes.js';
-import { claimVariant } from '../../db/repositories/clipVariants.js';
-import { getVideo } from '../../db/repositories/videos.js';
-import { submitRecordedPost } from '../../services/social/submitPost.js';
-import { enqueueClipVariant } from '../../queues/index.js';
-import { getStorage } from '../../services/storage/s3.js';
+import { executeClipPublish } from '../../services/social/publishClip.js';
+import {
+  cancelScheduledPost,
+  getScheduledPost,
+  insertScheduledPost,
+  listWaitingScheduledPosts,
+  type ScheduledPostRow,
+} from '../../db/repositories/scheduledPosts.js';
+import { enqueueScheduledPublish, removeScheduledPublishJob } from '../../queues/index.js';
 
 /**
  * Social publishing, the clip-first way: connect an account once (hosted
@@ -329,7 +332,7 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     });
   });
 
-  /** Publish one clip to chosen (or all) connected accounts. */
+  /** Publish one clip to chosen (or all) connected accounts — now, or later. */
   app.post('/api/clips/:clipId/publish', { preHandler: requireSession }, async (request, reply) => {
     await enforceRateLimits(request, [
       { scope: 'generate', perSession: env.RATE_LIMIT_GENERATE_PER_SESSION_HOURLY, windowSeconds: 60 * 60 },
@@ -343,152 +346,124 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
         // min(1): an explicitly empty selection is a refusal to pick, not
         // permission to post to every connected account. Omit to mean "all".
         accountIds: z.array(z.string().min(1)).min(1).max(10).optional(),
+        /**
+         * Post at this time instead of now. The submission itself — file,
+         * caption, accounts — runs at that minute through the exact same
+         * path as an immediate publish; nothing external happens today.
+         */
+        scheduledAt: z.string().datetime({ offset: true }).optional(),
       }),
       request.body ?? {},
     );
 
-    // Publishing acts inside one room: the clip and the accounts it goes to
-    // must both belong to the workspace the caller is working in.
     const workspaceId = requireWorkspaceId(request.principal);
-    const clip = await getClip(clipId);
-    if (!clip || clip.workspaceId !== workspaceId) throw HttpError.notFound('Clip not found');
-    if (clip.status !== 'ready' || !clip.storageKey) {
-      throw HttpError.conflict('This clip is not ready yet — publish it once it has finished cutting');
-    }
 
-    const stored = (await listSocialAccounts(workspaceId)).filter((account) => account.status === 'connected');
-    if (stored.length === 0) {
-      throw HttpError.unprocessable('No connected accounts. Connect one on the Publishing page first.');
-    }
-
-    let targets = stored;
-    if (body.accountIds?.length) {
-      const wanted = new Set(body.accountIds);
-      targets = stored.filter((account) => wanted.has(account.id));
-      if (targets.length !== wanted.size) {
-        throw HttpError.badRequest('Some accountIds are not your connected accounts');
+    if (body.scheduledAt !== undefined) {
+      const when = new Date(body.scheduledAt);
+      const lead = when.getTime() - Date.now();
+      if (lead < 60 * 1000) {
+        throw HttpError.badRequest('Pick a time at least a minute from now — or use Post now.');
       }
-    }
+      if (lead > SCHEDULE_HORIZON_DAYS * 24 * 60 * 60 * 1000) {
+        throw HttpError.badRequest(`Scheduling reaches ${SCHEDULE_HORIZON_DAYS} days ahead at most.`);
+      }
 
-    // The record is written BEFORE the external call, so a post Zernio
-    // accepts can never be one CLIPIT has no memory of. A retry that arrives
-    // while a submission for this clip is still in flight (or whose outcome
-    // was lost) is refused instead of duplicated on every account.
-    const inFlight = await findInFlightPublish(userId, clipId, PUBLISH_RETRY_GUARD_SECONDS);
-    if (inFlight) {
-      throw HttpError.conflict(
-        'This clip was already submitted moments ago. Check your accounts before publishing it again.',
-      );
-    }
+      // Checked NOW so a bad promise is refused to your face rather than
+      // failing quietly at 6 PM — and checked AGAIN at fire time by
+      // executeClipPublish, because hours can undo any of it.
+      const clip = await getClip(clipId);
+      if (!clip || clip.workspaceId !== workspaceId) throw HttpError.notFound('Clip not found');
+      if (clip.status !== 'ready' || !clip.storageKey) {
+        throw HttpError.conflict('This clip is not ready yet — schedule it once it has finished cutting');
+      }
+      const stored = (await listSocialAccounts(workspaceId)).filter((account) => account.status === 'connected');
+      if (stored.length === 0) {
+        throw HttpError.unprocessable('No connected accounts. Connect one on the Publishing page first.');
+      }
+      if (body.accountIds?.length) {
+        const known = new Set(stored.map((account) => account.id));
+        if (!body.accountIds.every((id) => known.has(id))) {
+          throw HttpError.badRequest('Some accountIds are not your connected accounts');
+        }
+      }
 
-    // Each platform gets the SHAPE it wants — a 16:9 concert clip goes to
-    // TikTok as a 9:16 cut, to a YouTube upload as itself — and the person
-    // pressing Publish never has to know that. The publishing service takes
-    // one file per post, so targets wanting different shapes become separate
-    // posts, each carrying its own correctly-cut file.
-    const video = await getVideo(clip.videoId);
-    const sourceAspect = aspectOfSource(video?.width ?? null, video?.height ?? null);
-    const targetList = targets.map((account) => ({ platform: account.platform, accountId: account.id }));
-    const groups = groupTargetsByShape(targetList, sourceAspect);
-
-    const posts: Array<{
-      id: string;
-      clipId: string;
-      status: string;
-      targets: typeof targetList;
-      aspect: string;
-      createdAt: string;
-    }> = [];
-
-    for (const group of groups) {
-      // A shaped group claims its render BEFORE the record is written, so
-      // the record can carry which render it waits on — that link is what
-      // lets a second publish racing onto the same render still be
-      // submitted when the one render finishes.
-      const claimed =
-        group.aspect === null ? null : await claimVariant(clipId, group.aspect, clip.focusPct);
-
-      const post = await insertPublishedPost({
+      const scheduled = await insertScheduledPost({
         userId,
         workspaceId,
         clipId,
-        zernioPostId: null,
         caption: body.caption,
-        targets: group.targets,
-        status: 'submitting',
-        variantId: claimed?.variant.id ?? null,
+        accountIds: body.accountIds ?? [],
+        scheduledAt: when,
       });
-
-      if (group.aspect === null) {
-        // The clip as shot is the right file — submit it now.
-        const { status } = await submitRecordedPost({
-          postId: post.id,
-          caption: body.caption,
-          targets: group.targets,
-          storageKey: clip.storageKey,
-        });
-        posts.push({
-          id: post.id,
-          clipId,
-          status,
-          targets: group.targets,
-          aspect: 'source',
-          createdAt: post.created_at.toISOString(),
-        });
-        continue;
+      try {
+        await enqueueScheduledPublish({ scheduledPostId: scheduled.id }, when);
+      } catch (cause) {
+        // No alarm, no promise: a row the queue will never fire would sit
+        // as "Scheduled" forever. Take it back and report the failure.
+        await cancelScheduledPost(scheduled.id, userId);
+        throw cause;
       }
-
-      // This shape needs a cut. If a file for exactly this shape and framing
-      // already exists, post it now; otherwise mark the post as waiting and
-      // queue the render — the worker submits every waiting post the moment
-      // the file is ready. Pressing Publish stays ONE act either way.
-      const variant = claimed!.variant;
-      if (variant.status === 'ready' && variant.storageKey) {
-        const { status } = await submitRecordedPost({
-          postId: post.id,
-          caption: body.caption,
-          targets: group.targets,
-          storageKey: variant.storageKey,
-        });
-        posts.push({
-          id: post.id,
-          clipId,
-          status,
-          targets: group.targets,
-          aspect: group.aspect,
-          createdAt: post.created_at.toISOString(),
-        });
-        continue;
-      }
-
-      await updatePublishedPost(post.id, { zernioPostId: null, status: 'rendering' });
-      await enqueueClipVariant({
-        clipId,
-        variantId: variant.id,
-        aspect: group.aspect,
-        focusPct: clip.focusPct,
-        postId: post.id,
-      });
-      logger.info('clip publish waiting on reframe', {
-        clipId,
-        aspect: group.aspect,
-        variantId: variant.id,
-        claimedFresh: claimed!.created,
-      });
-      posts.push({
-        id: post.id,
-        clipId,
-        status: 'rendering',
-        targets: group.targets,
-        aspect: group.aspect,
-        createdAt: post.created_at.toISOString(),
-      });
+      logger.info('clip publish scheduled', { clipId, scheduledAt: when.toISOString() });
+      return reply.code(202).send({ scheduled: serializeScheduledPost(scheduled) });
     }
 
-    logger.info('clip publish submitted', { clipId, targets: targets.length, posts: posts.length });
+    const posts = await executeClipPublish({
+      userId,
+      workspaceId,
+      clipId,
+      caption: body.caption,
+      accountIds: body.accountIds ?? null,
+    });
 
     // `post` keeps the old single-post shape for existing clients; `posts`
     // is the whole story, one entry per shape.
     return reply.code(202).send({ post: posts[0], posts });
   });
+
+  /** The publishes promised for later and not yet fired, soonest first. */
+  app.get('/api/scheduled-posts', { preHandler: requireSession }, async (request, reply) => {
+    const userId = requireUserId(request.principal);
+    if (!zernioConfigured()) return reply.send({ scheduled: [] });
+    const rows = await listWaitingScheduledPosts(userId);
+    return reply.send({
+      scheduled: rows.map((row) => ({ ...serializeScheduledPost(row), clipTitle: row.clip_description ?? null })),
+    });
+  });
+
+  /** Take back a promise not yet kept. Idempotent from the caller's side. */
+  app.delete('/api/scheduled-posts/:id', { preHandler: requireSession }, async (request, reply) => {
+    const userId = requireUserId(request.principal);
+    const { id } = parse(z.object({ id: z.string().uuid() }), request.params, 'path parameters');
+    const canceled = await cancelScheduledPost(id, userId);
+    if (!canceled) {
+      const existing = await getScheduledPost(id);
+      if (!existing || existing.user_id !== userId) throw HttpError.notFound('Scheduled post not found');
+      // Found but not cancelable: it already fired, failed, or was canceled.
+      // Saying which is the difference between "too late" and "already done".
+      throw HttpError.conflict(
+        existing.status === 'canceled'
+          ? 'This scheduled post was already canceled.'
+          : 'Too late to cancel — this post has already started going out.',
+      );
+    }
+    // Best-effort: the row's status is the truth the worker checks at fire
+    // time, so a job that outlives its canceled row fires into a no-op.
+    await removeScheduledPublishJob(id).catch(() => undefined);
+    return reply.send({ scheduled: serializeScheduledPost(canceled) });
+  });
+}
+
+/** How far ahead a publish can be promised. */
+const SCHEDULE_HORIZON_DAYS = 30;
+
+function serializeScheduledPost(row: ScheduledPostRow) {
+  return {
+    id: row.id,
+    clipId: row.clip_id,
+    caption: row.caption,
+    accountIds: row.account_ids,
+    scheduledAt: row.scheduled_at.toISOString(),
+    status: row.status,
+    error: row.error,
+  };
 }
