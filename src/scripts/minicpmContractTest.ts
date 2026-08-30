@@ -18,6 +18,7 @@
  * Nothing here writes to the database, and the signed URL is never printed.
  */
 import { env } from '../config/env.js';
+import { queryRows } from '../db/pool.js';
 import { getStorage } from '../services/storage/s3.js';
 
 const TEST_PROMPT = `Analyze this video segment.
@@ -29,10 +30,32 @@ Return:
 
 Do not invent events that are not observable.`;
 
+/**
+ * No argument? Pick a chunk ourselves: the shortest recent one, preferring
+ * 8-40s — a first contact should cost seconds of GPU, not two minutes. Falls
+ * back to the newest chunk of any length and says which it chose.
+ */
+async function pickChunk(): Promise<string | null> {
+  const rows = await queryRows<{ storage_key: string; duration_seconds: string }>(
+    `SELECT storage_key, duration_seconds FROM video_chunks
+      ORDER BY (duration_seconds BETWEEN 8 AND 40) DESC, created_at DESC
+      LIMIT 1`,
+  );
+  if (rows.length === 0) return null;
+  console.log(
+    `auto-picked chunk (${Number(rows[0]!.duration_seconds).toFixed(1)}s):`,
+    rows[0]!.storage_key,
+  );
+  return rows[0]!.storage_key;
+}
+
 async function main(): Promise<void> {
-  const storageKey = process.argv[2];
+  const storageKey = process.argv[2] ?? (await pickChunk());
   if (!storageKey) {
-    console.error('Usage: node dist/scripts/minicpmContractTest.js <chunk storage key>');
+    console.error(
+      'No chunk given and none found in the database.\n' +
+        'Usage: node dist/scripts/minicpmContractTest.js [chunk storage key]',
+    );
     process.exit(2);
   }
   if (!env.MINICPM_VIDEO_URL || !env.MODAL_PROXY_TOKEN_ID || !env.MODAL_PROXY_TOKEN_SECRET) {
