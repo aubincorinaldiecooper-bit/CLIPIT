@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { ResolvedSearchMode } from '../../domain/types.js';
 
 /**
@@ -7,6 +9,19 @@ import type { ResolvedSearchMode } from '../../domain/types.js';
  * categories anywhere in this file. The prompt only tells the model *how* to
  * report what it finds, never *what* to look for.
  */
+
+/**
+ * A content hash standing in for a prompt version number.
+ *
+ * Attached to every match and usage row so that, months later, "the
+ * timestamps got better in September" can be pinned on a wording change, a
+ * model change, or a configuration change — three different fixes. A hash
+ * needs no one to remember to bump anything: edit the prompt and every row
+ * written afterwards carries a different version.
+ */
+export function promptVersion(promptText: string): string {
+  return createHash('sha256').update(promptText).digest('hex').slice(0, 12);
+}
 
 export interface TranscriptLine {
   /** Seconds from the start of the chunk. */

@@ -13,6 +13,9 @@ interface ClipRow {
   focus_pct: number;
   start_seconds: number;
   end_seconds: number;
+  predicted_start_seconds: number | null;
+  predicted_end_seconds: number | null;
+  boundaries_edited_at: Date | null;
   storage_key: string | null;
   status: ClipStatus;
   error_message: string | null;
@@ -35,6 +38,9 @@ function mapClip(row: ClipRow): Clip {
     focusPct: Number(row.focus_pct ?? 50),
     startSeconds: row.start_seconds,
     endSeconds: row.end_seconds,
+    predictedStartSeconds: row.predicted_start_seconds ?? null,
+    predictedEndSeconds: row.predicted_end_seconds ?? null,
+    boundariesEditedAt: row.boundaries_edited_at ?? null,
     storageKey: row.storage_key,
     status: row.status,
     errorMessage: row.error_message,
@@ -57,14 +63,25 @@ export interface UpsertClipInput {
 /**
  * One clip per match. Re-generating an existing match resets it to `pending`
  * rather than creating a duplicate, which keeps `generate` idempotent.
+ *
+ * Two rules the ON CONFLICT branch holds:
+ *
+ * - `predicted_*` is written once, on first insert, and never again. It is
+ *   the model's answer frozen at the moment it was given — the ground truth
+ *   half of every boundary-accuracy number.
+ * - Boundaries someone has moved stay moved. Before `boundaries_edited_at`
+ *   existed, regenerating a match silently reset the clip to the prediction;
+ *   with editing in the product that would discard a person's correction —
+ *   and the measurement of it — on an idempotent retry.
  */
 export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> {
   const row = await queryOne<ClipRow>(
-    `INSERT INTO clips (video_id, clip_match_id, session_id, user_id, workspace_id, start_seconds, end_seconds, status)
-     VALUES ($1, $2, $3, $4, (SELECT workspace_id FROM videos WHERE id = $1), $5, $6, 'pending')
+    `INSERT INTO clips (video_id, clip_match_id, session_id, user_id, workspace_id,
+                        start_seconds, end_seconds, predicted_start_seconds, predicted_end_seconds, status)
+     VALUES ($1, $2, $3, $4, (SELECT workspace_id FROM videos WHERE id = $1), $5, $6, $5, $6, 'pending')
      ON CONFLICT (clip_match_id) WHERE derived_from_clip_id IS NULL DO UPDATE
-       SET start_seconds = EXCLUDED.start_seconds,
-           end_seconds = EXCLUDED.end_seconds,
+       SET start_seconds = CASE WHEN clips.boundaries_edited_at IS NULL THEN EXCLUDED.start_seconds ELSE clips.start_seconds END,
+           end_seconds = CASE WHEN clips.boundaries_edited_at IS NULL THEN EXCLUDED.end_seconds ELSE clips.end_seconds END,
            status = CASE WHEN clips.status = 'ready' THEN clips.status ELSE 'pending' END,
            error_message = CASE WHEN clips.status = 'ready' THEN clips.error_message ELSE NULL END,
            updated_at = now()
@@ -72,6 +89,34 @@ export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> 
     [input.videoId, input.clipMatchId, input.sessionId, input.userId ?? null, input.startSeconds, input.endSeconds],
   );
   return mapClip(row!);
+}
+
+/**
+ * The person's answer to the model's prediction: new boundaries, recorded as
+ * an edit, and the row set back to pending for the re-render that makes the
+ * file match. `predicted_*` is deliberately not in the SET list — this
+ * function is the reason it exists, and the one write that must never reach
+ * it. Runs only on root clips: a captioned copy inherits its footage from
+ * its source, and its boundaries with it.
+ */
+export async function setClipBoundaries(
+  clipId: string,
+  startSeconds: number,
+  endSeconds: number,
+): Promise<Clip | null> {
+  const row = await queryOne<ClipRow>(
+    `UPDATE clips
+        SET start_seconds = $2,
+            end_seconds = $3,
+            boundaries_edited_at = now(),
+            status = 'pending',
+            error_message = NULL,
+            updated_at = now()
+      WHERE id = $1 AND derived_from_clip_id IS NULL
+      RETURNING *`,
+    [clipId, startSeconds, endSeconds],
+  );
+  return row ? mapClip(row) : null;
 }
 
 /** Every clip file cut from this video, so they can be deleted with it. */
