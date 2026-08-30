@@ -297,11 +297,12 @@ function buildWhere(
 export interface QualitySection {
   momentsReturned: number;
   momentsWithFeedback: number;
-  thumbsUp: number;
-  thumbsDown: number;
-  /** thumbsUp / momentsWithFeedback. Null until anyone has said anything. */
-  thumbsUpRate: number | null;
-  thumbsDownRate: number | null;
+  /** Kept and skipped, in the product's own words. Keep = worth keeping. */
+  keeps: number;
+  skips: number;
+  /** keeps / momentsWithFeedback. Null until anyone has decided anything. */
+  keepRate: number | null;
+  skipRate: number | null;
   /** Rejection reasons, counted. Only rejections carry one. */
   reasons: Record<string, number>;
   /** Moments whose root clip actually rendered, over all returned moments. */
@@ -348,17 +349,17 @@ async function qualitySection(filters: EvaluationFilters): Promise<QualitySectio
 
   const moments = toNumber(totals?.moments);
   const withFeedback = toNumber(totals?.with_feedback);
-  const thumbsUp = toNumber(totals?.thumbs_up);
-  const thumbsDown = toNumber(totals?.thumbs_down);
+  const keeps = toNumber(totals?.thumbs_up);
+  const skips = toNumber(totals?.thumbs_down);
   const kept = toNumber(totals?.kept);
 
   return {
     momentsReturned: moments,
     momentsWithFeedback: withFeedback,
-    thumbsUp,
-    thumbsDown,
-    thumbsUpRate: withFeedback > 0 ? round4(thumbsUp / withFeedback) : null,
-    thumbsDownRate: withFeedback > 0 ? round4(thumbsDown / withFeedback) : null,
+    keeps,
+    skips,
+    keepRate: withFeedback > 0 ? round4(keeps / withFeedback) : null,
+    skipRate: withFeedback > 0 ? round4(skips / withFeedback) : null,
     reasons: Object.fromEntries(reasonRows.map((row) => [row.reason, toNumber(row.count)])),
     clipsKept: kept,
     acceptanceRate: moments > 0 ? round4(kept / moments) : null,
@@ -489,11 +490,12 @@ export interface BoundarySection {
   eligibleReviewedMoments: number;
   momentsNeverReviewed: number;
   /**
-   * "How often does Clipit get the moment right on the first try?"
-   * Approved with ZERO Re-clips, over eligible reviewed moments.
+   * "How often does Clipit get it right on the first try?"
+   * Initial versions KEPT with zero Re-clips, over eligible reviewed
+   * moments (explicit decision or at least one Re-clip).
    */
-  firstPassSuccesses: number;
-  firstPassSuccessRate: number | null;
+  firstPassKeeps: number;
+  firstPassKeepRate: number | null;
   /** Reviewed moments that asked for at least one Re-clip, over eligible. */
   momentsReclipped: number;
   reclipRate: number | null;
@@ -503,15 +505,16 @@ export interface BoundarySection {
    * judged is not counted as accepted — generating one is not acceptance.
    */
   reviewedReclips: number;
-  acceptedReclips: number;
-  reclipAcceptanceRate: number | null;
+  keptReclips: number;
+  /** Re-clip → Keep: does refinement actually fix the problem? */
+  reclipKeepRate: number | null;
   /**
    * Moments whose rejection said "Timing is off" ('bad_boundaries'), over
    * moments with explicit feedback. The live proxy for boundary quality.
    */
   momentsWithExplicitFeedback: number;
-  timingDownvotes: number;
-  timingDownvoteRate: number | null;
+  timingIssues: number;
+  timingIssueRate: number | null;
   /** How far Re-clips moved boundaries. A correction signal — never accuracy. */
   shifts: BoundaryShiftSummary;
 }
@@ -608,23 +611,23 @@ async function boundarySection(filters: EvaluationFilters): Promise<BoundarySect
   const firstPass = toNumber(totals?.first_pass);
   const reclipped = toNumber(totals?.reclipped);
   const reviewedReclips = toNumber(totals?.reviewed_reclips);
-  const acceptedReclips = toNumber(totals?.accepted_reclips);
+  const keptReclips = toNumber(totals?.accepted_reclips);
   const withFeedback = toNumber(totals?.with_feedback);
-  const timingDownvotes = toNumber(totals?.timing_downvotes);
+  const timingIssues = toNumber(totals?.timing_downvotes);
 
   return {
     eligibleReviewedMoments: eligible,
     momentsNeverReviewed: toNumber(totals?.never_reviewed),
-    firstPassSuccesses: firstPass,
-    firstPassSuccessRate: eligible > 0 ? round4(firstPass / eligible) : null,
+    firstPassKeeps: firstPass,
+    firstPassKeepRate: eligible > 0 ? round4(firstPass / eligible) : null,
     momentsReclipped: reclipped,
     reclipRate: eligible > 0 ? round4(reclipped / eligible) : null,
     reviewedReclips,
-    acceptedReclips,
-    reclipAcceptanceRate: reviewedReclips > 0 ? round4(acceptedReclips / reviewedReclips) : null,
+    keptReclips,
+    reclipKeepRate: reviewedReclips > 0 ? round4(keptReclips / reviewedReclips) : null,
     momentsWithExplicitFeedback: withFeedback,
-    timingDownvotes,
-    timingDownvoteRate: withFeedback > 0 ? round4(timingDownvotes / withFeedback) : null,
+    timingIssues,
+    timingIssueRate: withFeedback > 0 ? round4(timingIssues / withFeedback) : null,
     shifts: summariseBoundaryShifts(shifts),
   };
 }
@@ -920,7 +923,7 @@ export async function evaluationReport(filters: EvaluationFilters): Promise<Eval
   const notes = [
     'Observed miss rate counts explicit missed_moment rejections over searches with any moment feedback. It is behavioural evidence, not labelled recall.',
     'Boundary shift measures how far Re-clip moved the boundaries it reconsidered. It is the model correcting itself — a correction signal, never timestamp error or accuracy.',
-    "First-pass success counts moments approved with zero Re-clips, over moments a person reviewed (explicit feedback or at least one Re-clip). Unreviewed moments are excluded from the denominator, not assumed successful.",
+    'First-pass Keep rate counts initial versions kept with zero Re-clips, over moments a person reviewed (an explicit Keep/Skip, or at least one Re-clip). Unreviewed moments are excluded from the denominator, not assumed kept.',
     'Estimated Modal cost is measured GPU milliseconds × the configured rate. It excludes failed calls that never wrote a usage row, cold-start scheduling, and warm idle; the billed number on the Modal dashboard is the effective truth.',
     'Re-clip cost share compares the reclip stage against the analysis stages (indexing, search, reclip). Speech-to-text is reported in segments but is not moment analysis.',
   ];
