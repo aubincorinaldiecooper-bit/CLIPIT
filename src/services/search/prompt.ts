@@ -23,7 +23,7 @@ export const SYSTEM_PROMPT = [
   '- Report ONLY moments that match the user instruction. Do not invent moments.',
   '- Timestamps are in SECONDS FROM THE START OF THIS SEGMENT, not from the start of the video.',
   '- A moment must have end_seconds greater than start_seconds.',
-  '- Include the full moment: start slightly before it begins and end slightly after it resolves.',
+  '- Mark the exact matching moment: start when the requested event begins and end when it ends. Do not add lead-in, aftermath, or unrelated context.',
   '- confidence is your certainty from 0 to 1.',
   '- description is a terse label of at most 12 words, not a sentence or explanation.',
   '- Return only the JSON. Do not explain your reasoning, before or after it.',

@@ -16,11 +16,17 @@ import {
   setVideoStatus,
   updateVideoMedia,
 } from '../../db/repositories/videos.js';
-import { createClipRequest } from '../../db/repositories/clipRequests.js';
+import {
+  createClipRequest,
+  listClipRequestsForVideo,
+  listMatches,
+} from '../../db/repositories/clipRequests.js';
+import { listClipsForRequest } from '../../db/repositories/clips.js';
 import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import { serializeClipRequest, serializeVideo, serializeVideoWithPlayback, videoPosterUrl } from '../serializers.js';
+import type { Clip } from '../../domain/types.js';
 import { parse } from '../validation.js';
 
 const uuidSchema = z.string().uuid('must be a UUID');
@@ -454,6 +460,37 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const chunks = video.status === 'ready' ? await listChunks(videoId) : [];
     return reply.send({ video: await serializeVideoWithPlayback(video, chunks) });
+  });
+
+  /**
+   * Restores the conversation for a video, including found moments and any
+   * clips already cut from them. The database is the source of truth: leaving
+   * the page no longer means the browser has to remember every request id in
+   * order to put the chat back together.
+   */
+  app.get('/api/videos/:videoId/clip-requests', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+
+    const { videoId } = parse(z.object({ videoId: uuidSchema }), request.params, 'path parameters');
+    const video = await getVideo(videoId);
+    if (!video) throw HttpError.notFound('Video not found');
+    assertOwnership(request, video, 'Video');
+
+    const history = await listClipRequestsForVideo(videoId);
+    const clipRequests = await Promise.all(
+      history.map(async (clipRequest) => {
+        const [matches, clips] = await Promise.all([
+          listMatches(clipRequest.id),
+          listClipsForRequest(clipRequest.id),
+        ]);
+        const clipsByMatchId = new Map<string, Clip>(clips.map((clip) => [clip.clipMatchId, clip]));
+        return serializeClipRequest(clipRequest, matches, clipsByMatchId);
+      }),
+    );
+
+    return reply.send({ clipRequests });
   });
 
   /**

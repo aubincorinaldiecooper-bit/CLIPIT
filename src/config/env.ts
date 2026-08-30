@@ -262,7 +262,10 @@ const envSchema = z.object({
   PROXY_FPS: num(2, 0.5, 30),
   PROXY_CRF: int(30, 0, 51),
   PROXY_PRESET: z.string().default('veryfast'),
-  CLIP_PADDING_SECONDS: num(1.5, 0, 30),
+  // The model is responsible for the moment's boundaries. Adding another
+  // handle here made the rendered file longer than the timestamps shown in
+  // the result, and compounded the prompt's former request for context.
+  CLIP_PADDING_SECONDS: num(0, 0, 30),
   MIN_CLIP_SECONDS: num(2, 0.5, 600),
   MAX_CLIP_SECONDS: num(300, 1, 3_600),
   CLIP_VIDEO_CRF: int(20, 0, 51),

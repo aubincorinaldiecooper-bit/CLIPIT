@@ -135,7 +135,12 @@ export async function serializeMatch(match: ClipMatch, clip?: Clip | null) {
     // a reload should put the moment back exactly where the user left it, and
     // an approval that vanished on refresh would read as not having registered.
     feedback: match.feedback,
-    clip: clip ? { id: clip.id, status: clip.status } : null,
+    // A finished match carries the actual cut and its signed URL. Previously
+    // this contained only an id and status, which left a client with no media
+    // to put in the thumbnail player; its only playable URL was the parent
+    // source video. Keeping the full clip here makes the small player play the
+    // cut, while pending/failed clips still expose their useful state.
+    clip: clip ? await serializeClip(clip) : null,
   };
 }
 
