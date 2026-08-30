@@ -14,6 +14,7 @@ import {
 } from '../queues/index.js';
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
+import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVideo.js';
 import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
@@ -21,8 +22,10 @@ import { handleIndexing } from './handlers/indexing.js';
 import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
 import { handleClipVariant } from './handlers/clipVariant.js';
+import { handleReclip } from './handlers/reclip.js';
 import { handleThumbnailBackfill } from './handlers/thumbnailBackfill.js';
 import { handleRetention } from './handlers/retention.js';
+import { handleScheduledPublish } from './handlers/scheduledPublish.js';
 import { handleLearningReport } from './handlers/learningReport.js';
 
 /**
@@ -79,6 +82,18 @@ function startWorker<T>(name: string, processor: Processor<T>, concurrency: numb
   return worker;
 }
 
+/**
+ * Only the worker invokes MiniCPM, so only the worker demands the Modal
+ * token — the API never receives infrastructure credentials it does not use.
+ * Same rule as the binary checks below: fail at startup, loudly, not at the
+ * first video someone uploads.
+ */
+function checkVideoProviderConfig(): void {
+  if (env.VIDEO_PROVIDER === 'minicpm' && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
+    throw new Error('VIDEO_PROVIDER=minicpm requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker');
+  }
+}
+
 async function checkBinaries(): Promise<void> {
   const checks: Array<[string, () => Promise<unknown>]> = [
     ['ffmpeg/ffprobe', assertFfmpegAvailable],
@@ -108,8 +123,23 @@ async function main(): Promise<void> {
     indexing: env.INDEXING_ENABLED,
   });
 
+  checkVideoProviderConfig();
+
   await checkBinaries();
   await runMigrations();
+
+  // Metadata handles only: no `remote`, no inference, and no L4 wake-up.
+  // This must pass before queue consumers exist or the worker says it is ready.
+  if (env.VIDEO_PROVIDER === 'minicpm') {
+    await assertMiniCpmDeploymentAvailable();
+    logger.info('MiniCPM deployment available', {
+      provider: 'minicpm',
+      environment: env.MODAL_ENVIRONMENT,
+      app: env.MODAL_APP_NAME,
+      class: env.MODAL_CLASS_NAME,
+      method: 'analyze',
+    });
+  }
 
   startWorker(QUEUE_NAMES.ingestion, handleIngestion, env.INGESTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.preprocessing, handlePreprocessing, env.PREPROCESS_CONCURRENCY);
@@ -125,10 +155,15 @@ async function main(): Promise<void> {
   // the same source, and letting them compete for the same slots is what
   // keeps a burst of publishes from starving the cuts people are waiting on.
   startWorker(QUEUE_NAMES.clipVariant, handleClipVariant, env.CLIP_GENERATION_CONCURRENCY);
+  // One at a time on purpose: each Re-clip is a GPU call, and this worker
+  // must never be able to out-fan the MiniCPM concurrency budget on its own.
+  startWorker(QUEUE_NAMES.reclip, handleReclip, 1);
   // One at a time: the sweep is background work and must never take a slot
   // from a search or a clip someone is waiting on.
   startWorker(QUEUE_NAMES.thumbnailBackfill, handleThumbnailBackfill, 1);
   startWorker(QUEUE_NAMES.retention, handleRetention, 1);
+  // Promised publishes: one at a time is plenty — the alarm density is human.
+  startWorker(QUEUE_NAMES.scheduledPublish, handleScheduledPublish, 1);
   startWorker(QUEUE_NAMES.learningReport, handleLearningReport, 1);
 
   logger.info('worker ready', { queues: Object.values(QUEUE_NAMES) });

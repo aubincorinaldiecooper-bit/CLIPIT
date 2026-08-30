@@ -2,7 +2,10 @@ import { queryOne, queryRows } from '../pool.js';
 import { logger } from '../../lib/logger.js';
 
 /** What caused a model call. */
-export type UsageStage = 'transcription' | 'indexing' | 'search';
+// 'reclip' is its own stage on purpose: re-evaluation spend must never
+// blend into first-pass analysis, or the re-clip cost share — a business
+// number — stops existing.
+export type UsageStage = 'transcription' | 'indexing' | 'search' | 'reclip';
 
 export interface ModelTokenUsage {
   promptTokens: number;
@@ -12,6 +15,12 @@ export interface ModelTokenUsage {
   costUsd?: number | null;
   /** Wall-clock time for the request, when the caller measured it. */
   latencyMs?: number | null;
+  /** The provider's own measurements, verbatim (Modal: download_ms / inference_ms / total_ms). */
+  metrics?: Record<string, unknown> | null;
+  /** When the request left, so completion (created_at) and departure are both on record. */
+  startedAt?: Date | null;
+  /** Hash of the prompt the call was asked under — see prompt.ts promptVersion(). */
+  promptVersion?: string | null;
 }
 
 export interface RecordUsageInput extends ModelTokenUsage {
@@ -33,8 +42,9 @@ export async function recordModelUsage(input: RecordUsageInput): Promise<void> {
     await queryOne(
       `INSERT INTO model_usage
          (video_id, clip_request_id, provider, model, stage,
-          prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms,
+          metrics, started_at, prompt_version)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       [
         input.videoId ?? null,
         input.clipRequestId ?? null,
@@ -46,6 +56,9 @@ export async function recordModelUsage(input: RecordUsageInput): Promise<void> {
         input.totalTokens,
         input.costUsd ?? null,
         input.latencyMs ?? null,
+        input.metrics ? JSON.stringify(input.metrics) : null,
+        input.startedAt ?? null,
+        input.promptVersion ?? null,
       ],
     );
   } catch (error) {

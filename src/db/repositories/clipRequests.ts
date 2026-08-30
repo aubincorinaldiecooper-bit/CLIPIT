@@ -7,6 +7,7 @@ import type {
   ClipRequest,
   ClipRequestStatus,
   MatchFeedback,
+  MatchFeedbackReason,
   MatchSource,
   ResolvedSearchMode,
   SearchMode,
@@ -80,6 +81,23 @@ export async function createClipRequest(input: {
 export async function getClipRequest(requestId: string): Promise<ClipRequest | null> {
   const row = await queryOne<ClipRequestRow>('SELECT * FROM clip_requests WHERE id = $1', [requestId]);
   return row ? mapRequest(row) : null;
+}
+
+/**
+ * Every question asked about one video, in the order it appeared in the chat.
+ *
+ * This is deliberately scoped by the video at the repository boundary. The
+ * route checks ownership of that video before calling it, and callers never
+ * have to reconstruct a conversation from request ids kept in browser memory.
+ */
+export async function listClipRequestsForVideo(videoId: string): Promise<ClipRequest[]> {
+  const rows = await queryRows<ClipRequestRow>(
+    `SELECT * FROM clip_requests
+      WHERE video_id = $1
+      ORDER BY created_at ASC, id ASC`,
+    [videoId],
+  );
+  return rows.map(mapRequest);
 }
 
 export async function startClipRequest(
@@ -260,6 +278,13 @@ interface ClipMatchRow {
   quote: string | null;
   thumbnail_key: string | null;
   feedback: MatchFeedback | null;
+  feedback_reason: MatchFeedbackReason | null;
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  reclip_status: 'pending' | 'failed' | null;
+  reclip_error: string | null;
+  reclip_attempts: number | null;
   created_at: Date;
 }
 
@@ -278,6 +303,13 @@ function mapMatch(row: ClipMatchRow): ClipMatch {
     quote: row.quote,
     thumbnailKey: row.thumbnail_key ?? null,
     feedback: row.feedback ?? null,
+    feedbackReason: row.feedback_reason ?? null,
+    provider: row.provider ?? null,
+    model: row.model ?? null,
+    promptVersion: row.prompt_version ?? null,
+    reclipStatus: row.reclip_status ?? null,
+    reclipError: row.reclip_error ?? null,
+    reclipAttempts: row.reclip_attempts ?? 0,
     createdAt: row.created_at,
   };
 }
@@ -292,6 +324,14 @@ export interface NewClipMatch {
   confidence: number;
   source: MatchSource;
   quote?: string | null;
+  /**
+   * Which call produced this moment. Optional so callers that predate the
+   * evaluation layer still compile, but every live search path sets them —
+   * feedback can only be pinned on a model when the row names one.
+   */
+  provider?: string | null;
+  model?: string | null;
+  promptVersion?: string | null;
 }
 
 export async function insertMatches(requestId: string, matches: NewClipMatch[]): Promise<ClipMatch[]> {
@@ -312,16 +352,20 @@ export async function insertMatches(requestId: string, matches: NewClipMatch[]):
       match.confidence,
       match.source,
       match.quote ?? null,
+      match.provider ?? null,
+      match.model ?? null,
+      match.promptVersion ?? null,
     );
     values.push(
-      `($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`,
+      `($1, $${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}, $${base + 12})`,
     );
   }
 
   const rows = await queryRows<ClipMatchRow>(
     `INSERT INTO clip_matches (
        clip_request_id, chunk_id, local_start_seconds, local_end_seconds,
-       global_start_seconds, global_end_seconds, description, confidence, source, quote
+       global_start_seconds, global_end_seconds, description, confidence, source, quote,
+       provider, model, prompt_version
      ) VALUES ${values.join(', ')}
      RETURNING *`,
     params,
@@ -402,14 +446,20 @@ export async function setMatchFeedback(
   requestId: string,
   matchId: string,
   feedback: MatchFeedback | null,
+  reason: MatchFeedbackReason | null = null,
 ): Promise<ClipMatch | null> {
+  // A reason only ever accompanies a rejection. Clearing the verdict clears
+  // the reason with it, and approving does too — "approved, because the
+  // timing was off" is not a state this table should be able to describe.
+  const storedReason = feedback === 'rejected' ? reason : null;
   const row = await queryOne<ClipMatchRow>(
     `UPDATE clip_matches
         SET feedback = $3,
+            feedback_reason = $4,
             feedback_at = CASE WHEN $3::text IS NULL THEN NULL ELSE now() END
       WHERE clip_request_id = $1 AND id = $2
       RETURNING *`,
-    [requestId, matchId, feedback],
+    [requestId, matchId, feedback, storedReason],
   );
   return row ? mapMatch(row) : null;
 }

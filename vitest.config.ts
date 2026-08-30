@@ -13,5 +13,9 @@ export default defineConfig({
     include: ['test/**/*.test.ts'],
     setupFiles: ['test/setup.ts'],
     environment: 'node',
+    // Provider suites intentionally change process.env before importing the
+    // config singleton. Environment variables are process-global, so collect
+    // those files serially and let their afterAll hooks restore every change.
+    fileParallelism: false,
   },
 });

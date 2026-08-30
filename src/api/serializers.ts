@@ -1,6 +1,7 @@
 import { env } from '../config/env.js';
 import { getStorage } from '../services/storage/s3.js';
 import { formatTimecode } from '../services/timestamps.js';
+import { latestVersionsForMatches } from '../db/repositories/reclips.js';
 import type {
   ChunkDegradation,
   ChunkFailureCode,
@@ -9,6 +10,7 @@ import type {
   ClipRequest,
   Video,
   VideoChunk,
+  MomentVersion,
 } from '../domain/types.js';
 
 /** Shapes rows into the public API representation. Storage keys never leak. */
@@ -109,21 +111,28 @@ export function serializeVideo(video: Video, chunks?: VideoChunk[]) {
   };
 }
 
-export async function serializeMatch(match: ClipMatch, clip?: Clip | null) {
+export async function serializeMatch(match: ClipMatch, clip?: Clip | null, currentVersion?: MomentVersion | null) {
   // Signed like any other private object: the still lives in the same bucket
   // as the media it came from and must not be publicly readable.
   const thumbnailUrl = match.thumbnailKey
     ? await getStorage().createDownloadUrl(match.thumbnailKey)
     : null;
 
+  // What the person sees is the moment's CURRENT boundaries — after a
+  // Re-clip, the latest version's. The match row itself keeps the original
+  // first-pass prediction untouched; only the presentation moves.
+  const startSeconds = currentVersion?.startSeconds ?? match.globalStartSeconds;
+  const endSeconds = currentVersion?.endSeconds ?? match.globalEndSeconds;
+  const reclipCount = currentVersion && currentVersion.version > 1 ? currentVersion.version - 1 : 0;
+
   return {
     id: match.id,
     chunkId: match.chunkId,
-    startSeconds: match.globalStartSeconds,
-    endSeconds: match.globalEndSeconds,
-    startTimecode: formatTimecode(match.globalStartSeconds),
-    endTimecode: formatTimecode(match.globalEndSeconds),
-    durationSeconds: Number((match.globalEndSeconds - match.globalStartSeconds).toFixed(3)),
+    startSeconds,
+    endSeconds,
+    startTimecode: formatTimecode(startSeconds),
+    endTimecode: formatTimecode(endSeconds),
+    durationSeconds: Number((endSeconds - startSeconds).toFixed(3)),
     localStartSeconds: match.localStartSeconds,
     localEndSeconds: match.localEndSeconds,
     description: match.description,
@@ -135,7 +144,22 @@ export async function serializeMatch(match: ClipMatch, clip?: Clip | null) {
     // a reload should put the moment back exactly where the user left it, and
     // an approval that vanished on refresh would read as not having registered.
     feedback: match.feedback,
-    clip: clip ? { id: clip.id, status: clip.status } : null,
+    feedbackReason: match.feedbackReason,
+    // The Re-clip lifecycle, so a reload lands on the truth: how many
+    // re-evaluations this moment has spent, how many remain, whether one is
+    // running, and — when the last one failed — why, in words already safe
+    // to show.
+    reclipStatus: match.reclipStatus,
+    reclipError: match.reclipError,
+    reclipCount,
+    reclipsRemaining: Math.max(0, env.MAX_RECLIPS_PER_MOMENT - reclipCount),
+    reclippedAt: reclipCount > 0 && currentVersion ? currentVersion.createdAt.toISOString() : null,
+    // A finished match carries the actual cut and its signed URL. Previously
+    // this contained only an id and status, which left a client with no media
+    // to put in the thumbnail player; its only playable URL was the parent
+    // source video. Keeping the full clip here makes the small player play the
+    // cut, while pending/failed clips still expose their useful state.
+    clip: clip ? await serializeClip(clip) : null,
   };
 }
 
@@ -311,7 +335,16 @@ export async function serializeClipRequest(
     createdAt: request.createdAt.toISOString(),
     updatedAt: request.updatedAt.toISOString(),
     ...(matches
-      ? { matches: await Promise.all(matches.map((match) => serializeMatch(match, clipsByMatchId?.get(match.id) ?? null))) }
+      ? {
+          matches: await (async () => {
+            const versions = await latestVersionsForMatches(matches.map((match) => match.id));
+            return Promise.all(
+              matches.map((match) =>
+                serializeMatch(match, clipsByMatchId?.get(match.id) ?? null, versions.get(match.id) ?? null),
+              ),
+            );
+          })(),
+        }
       : {}),
   };
 }
@@ -412,6 +445,12 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
     endSeconds: clip.endSeconds,
     startTimecode: formatTimecode(clip.startSeconds),
     endTimecode: formatTimecode(clip.endSeconds),
+    // The model's original boundaries and whether the person has moved them
+    // — what the adjust control starts from, and how an edited clip is told
+    // apart from an untouched one.
+    predictedStartSeconds: clip.predictedStartSeconds,
+    predictedEndSeconds: clip.predictedEndSeconds,
+    boundariesEditedAt: clip.boundariesEditedAt ? clip.boundariesEditedAt.toISOString() : null,
     // The spec the editor saved, so re-opening the editor starts from it.
     captions: clip.captions ?? null,
     derivedFromClipId: clip.derivedFromClipId,

@@ -21,6 +21,14 @@ export interface NoteSearchResult {
   warnings: string[];
   /** How many lookups it took; one per batch of notes. */
   lookups: number;
+  /**
+   * Which service answered, for attribution on the stored matches. Notes
+   * lookups stay on the OpenRouter text lane under either video provider,
+   * and the rows should say so rather than inherit the video lane's name.
+   */
+  provider: string;
+  model: string;
+  promptVersion: string;
 }
 
 export interface NoteSearchInput {
@@ -46,7 +54,16 @@ function batchNotes(notes: NoteLine[], size: number): NoteLine[][] {
 }
 
 export async function searchNotes(input: NoteSearchInput): Promise<NoteSearchResult> {
-  if (input.notes.length === 0) return { matches: [], warnings: ['no notes for this video'], lookups: 0 };
+  if (input.notes.length === 0) {
+    return {
+      matches: [],
+      warnings: ['no notes for this video'],
+      lookups: 0,
+      provider: 'openrouter',
+      model: env.OPENROUTER_VIDEO_MODEL,
+      promptVersion: '',
+    };
+  }
 
   const batches = batchNotes(input.notes, env.NOTES_PER_LOOKUP);
 
@@ -64,11 +81,12 @@ export async function searchNotes(input: NoteSearchInput): Promise<NoteSearchRes
       ...(input.onUsage ? { onUsage: input.onUsage } : {}),
     });
 
-    return parseModelMatches(answer.content);
+    return { parsed: parseModelMatches(answer.content), answer };
   });
 
   const matches: ParsedMatch[] = [];
   const warnings: string[] = [];
+  let identity: { provider: string; model: string; promptVersion: string } | null = null;
 
   for (const [index, result] of results.entries()) {
     if (result.status === 'rejected') {
@@ -77,9 +95,21 @@ export async function searchNotes(input: NoteSearchInput): Promise<NoteSearchRes
       warnings.push(`notes batch ${index} failed: ${(result.reason as Error)?.message ?? 'unknown error'}`);
       continue;
     }
-    matches.push(...result.value.matches);
-    warnings.push(...result.value.warnings);
+    matches.push(...result.value.parsed.matches);
+    warnings.push(...result.value.parsed.warnings);
+    identity ??= {
+      provider: result.value.answer.provider,
+      model: result.value.answer.model,
+      promptVersion: result.value.answer.promptVersion,
+    };
   }
 
-  return { matches, warnings, lookups: batches.length };
+  return {
+    matches,
+    warnings,
+    lookups: batches.length,
+    provider: identity?.provider ?? 'openrouter',
+    model: identity?.model ?? env.OPENROUTER_VIDEO_MODEL,
+    promptVersion: identity?.promptVersion ?? '',
+  };
 }

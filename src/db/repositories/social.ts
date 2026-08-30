@@ -290,3 +290,11 @@ export async function listPublishedPosts(userId: string, limit = 50): Promise<Pu
     [userId, limit],
   );
 }
+
+/** Posts still mid-publish for a clip — what blocks deleting it. */
+export async function listActivePostsForClip(clipId: string): Promise<PublishedPostRow[]> {
+  return queryRows<PublishedPostRow>(
+    `SELECT * FROM published_posts WHERE clip_id = $1 AND status IN ('submitting', 'rendering')`,
+    [clipId],
+  );
+}

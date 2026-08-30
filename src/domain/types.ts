@@ -41,6 +41,36 @@ export type AnsweredFrom = 'notes' | 'footage';
  */
 export type MatchFeedback = 'approved' | 'rejected';
 
+/**
+ * Why a moment was waved away, when the person cared to say. Optional and
+ * only ever attached to a rejection: the interaction stays two buttons.
+ * 'missed_moment' is the one that matters most — a moment the model never
+ * returned has no card to thumbs-down, so "the thing I wanted isn't here"
+ * said on the wrong card is the closest live signal recall gets.
+ */
+export type MatchFeedbackReason =
+  | 'wrong_moment'
+  | 'missed_moment'
+  | 'bad_start'
+  | 'bad_end'
+  | 'bad_boundaries'
+  | 'not_relevant'
+  | 'duplicate'
+  | 'low_quality'
+  | 'other';
+
+export const MATCH_FEEDBACK_REASONS: readonly MatchFeedbackReason[] = [
+  'wrong_moment',
+  'missed_moment',
+  'bad_start',
+  'bad_end',
+  'bad_boundaries',
+  'not_relevant',
+  'duplicate',
+  'low_quality',
+  'other',
+] as const;
+
 export interface Session {
   id: string;
   userId: string | null;
@@ -269,6 +299,45 @@ export interface ClipMatch {
   thumbnailKey: string | null;
   /** Null until someone says. See `MatchFeedback`. */
   feedback: MatchFeedback | null;
+  /** Only ever present alongside a rejection. See `MatchFeedbackReason`. */
+  feedbackReason: MatchFeedbackReason | null;
+  /**
+   * Which call produced this moment. Null on rows written before the
+   * evaluation layer existed — reported as unsegmented, never guessed.
+   */
+  provider: string | null;
+  model: string | null;
+  promptVersion: string | null;
+  /**
+   * The Re-clip lifecycle. Null when nothing is happening; 'pending' while a
+   * re-evaluation is queued or running (it can take minutes on a cold GPU);
+   * 'failed' when the last attempt produced no new version. Success clears
+   * the status — the new version row is the record of success.
+   */
+  reclipStatus: 'pending' | 'failed' | null;
+  /** Why the last Re-clip failed, in words safe to show. */
+  reclipError: string | null;
+  /** Paid re-evaluation attempts spent, successful or not. Bounds GPU spend. */
+  reclipAttempts: number;
+  createdAt: Date;
+}
+
+/**
+ * One version of where a moment's boundaries sit. Version 1 is the model's
+ * first-pass prediction, copied from the match row the first time a Re-clip
+ * is requested; each Re-clip appends the next version. The match row itself
+ * is never updated — this table is why.
+ */
+export interface MomentVersion {
+  id: string;
+  matchId: string;
+  version: number;
+  trigger: 'initial' | 'reclip';
+  startSeconds: number;
+  endSeconds: number;
+  provider: string | null;
+  model: string | null;
+  promptVersion: string | null;
   createdAt: Date;
 }
 
@@ -288,6 +357,17 @@ export interface Clip {
   focusPct: number;
   startSeconds: number;
   endSeconds: number;
+  /**
+   * The boundaries the model predicted, frozen at generation time and never
+   * updated. start/end above become the person's final answer the moment
+   * they adjust the clip; the distance between the two is the timestamp
+   * accuracy measurement, so overwriting the prediction would destroy the
+   * only ground truth this product collects.
+   */
+  predictedStartSeconds: number | null;
+  predictedEndSeconds: number | null;
+  /** Set the first time someone moves this clip's boundaries. */
+  boundariesEditedAt: Date | null;
   storageKey: string | null;
   status: ClipStatus;
   errorMessage: string | null;

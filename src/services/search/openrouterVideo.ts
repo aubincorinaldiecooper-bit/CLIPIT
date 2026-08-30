@@ -5,7 +5,7 @@ import { ExternalServiceError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import type { ResolvedSearchMode } from '../../domain/types.js';
 import { parseModelMatches, type ParsedMatch } from './modelResponse.js';
-import { SYSTEM_PROMPT, buildInstructionBlock, buildTranscriptBlock, type TranscriptLine } from './prompt.js';
+import { SYSTEM_PROMPT, buildInstructionBlock, buildTranscriptBlock, promptVersion, type TranscriptLine } from './prompt.js';
 
 export type ContentPart =
   | { type: 'text'; text: string }
@@ -39,12 +39,27 @@ export interface VideoModelRequest {
    */
   purpose: 'search' | 'index' | 'notes';
   onUsage?: VideoUsageReporter;
+  /**
+   * Where the chunk lives in storage. The MiniCPM provider hands Modal a
+   * signed URL to it instead of base64 bytes; the OpenRouter path never reads
+   * this. Only calls that carry video set it.
+   */
+  videoStorageKey?: string;
 }
 
 export interface VideoModelAnswer {
   content: string;
   /** True when the answer only arrived after thinking was switched off. */
   reasoningDisabled: boolean;
+  /**
+   * Which lane answered and as what. Carried back so matches parsed from this
+   * answer can be attributed to the service that produced them — feedback on
+   * a moment is only evidence about a model if the row names the model.
+   */
+  provider: string;
+  model: string;
+  /** Hash of the system prompt this answer was asked under. */
+  promptVersion: string;
 }
 
 interface CompletionResponse {
@@ -84,6 +99,12 @@ export type VideoUsageReporter = (usage: {
   latencyMs: number;
   provider: string;
   model: string;
+  /** Whatever the provider measured about its own work, verbatim (Modal's download/inference/total ms live here). */
+  metrics?: Record<string, unknown> | null;
+  /** When the request left, so the worker owns a wall clock independent of the provider's. */
+  startedAt?: Date | null;
+  /** Hash of the system prompt the call was asked under. */
+  promptVersion?: string | null;
 }) => void;
 
 export interface VideoSearchInput {
@@ -93,6 +114,8 @@ export interface VideoSearchInput {
   chunkCount: number;
   chunkDurationSeconds: number;
   videoPath?: string;
+  /** Storage key of the same chunk, for providers that take a URL. */
+  videoStorageKey?: string;
   transcript: TranscriptLine[];
   /** Optional: called once per completed request with its tokens and cost. */
   onUsage?: VideoUsageReporter;
@@ -102,6 +125,10 @@ export interface VideoSearchResult {
   matches: ParsedMatch[];
   warnings: string[];
   rawResponse: string;
+  /** Which service produced these matches, for per-model attribution on the stored rows. */
+  provider: string;
+  model: string;
+  promptVersion: string;
   /**
    * True when the first attempt returned no answer and the chunk was recovered
    * by asking again with thinking switched off. The matches are real; what is
@@ -211,10 +238,17 @@ async function buildContent(input: VideoSearchInput): Promise<{ parts: ContentPa
 
   let videoBytes = 0;
   if (input.mode !== 'transcript') {
-    if (!input.videoPath) throw new Error('Actual video is required for visual search');
-    const video = await videoPartFromFile(input.videoPath);
-    videoBytes = video.bytes;
-    parts.push(video.part);
+    // MiniCPM carries the video as a signed URL to the chunk in storage, so
+    // base64-reading the file here would be megabytes of work the request
+    // never uses. The provider still requires the key — a video search with
+    // neither file nor key fails loudly either way.
+    const carriedByUrl = env.VIDEO_PROVIDER === 'minicpm' && Boolean(input.videoStorageKey);
+    if (!carriedByUrl) {
+      if (!input.videoPath) throw new Error('Actual video is required for visual search');
+      const video = await videoPartFromFile(input.videoPath);
+      videoBytes = video.bytes;
+      parts.push(video.part);
+    }
   }
 
   if (input.mode !== 'visual') {
@@ -388,8 +422,16 @@ async function requestCompletion(
           totalTokens,
           costUsd: typeof payload.usage.cost === 'number' ? payload.usage.cost : null,
           latencyMs,
-          provider: payload.provider ?? 'openrouter.ai',
+          // The LANE, matching what the matches carry — quality and cost must
+          // segment under the same name or neither can be compared to the
+          // other. Which vendor OpenRouter routed the call to is real
+          // information, but it is a detail of the call, so it rides in
+          // metrics instead of fragmenting the provider column.
+          provider: 'openrouter',
           model: env.OPENROUTER_VIDEO_MODEL,
+          metrics: payload.provider ? { served_by: payload.provider } : null,
+          startedAt: new Date(Date.now() - latencyMs),
+          promptVersion: promptVersion(input.systemPrompt),
         });
       }
     }
@@ -448,8 +490,14 @@ async function requestCompletion(
  * entire budget available for answering, the problem is not the budget.
  */
 async function completeOrAnswerWithoutThinking(input: VideoModelRequest): Promise<VideoModelAnswer> {
+  const identity = {
+    provider: 'openrouter',
+    model: env.OPENROUTER_VIDEO_MODEL,
+    promptVersion: promptVersion(input.systemPrompt),
+  };
+
   try {
-    return { content: await requestCompletion(input, 'budgeted'), reasoningDisabled: false };
+    return { content: await requestCompletion(input, 'budgeted'), reasoningDisabled: false, ...identity };
   } catch (error) {
     if (!isExhaustedAnswer(error)) throw error;
 
@@ -460,7 +508,7 @@ async function completeOrAnswerWithoutThinking(input: VideoModelRequest): Promis
       reason: (error as Error).message,
     });
 
-    return { content: await requestCompletion(input, 'off'), reasoningDisabled: true };
+    return { content: await requestCompletion(input, 'off'), reasoningDisabled: true, ...identity };
   }
 }
 
@@ -471,6 +519,26 @@ async function completeOrAnswerWithoutThinking(input: VideoModelRequest): Promis
  * waiting on beyond the configured concurrency.
  */
 export async function askVideoModel(input: VideoModelRequest): Promise<VideoModelAnswer> {
+  /**
+   * The provider seam. Notes lookups carry no video and stay on OpenRouter's
+   * text lane under either provider — the switch governs only calls that
+   * read actual footage. MiniCPM keeps its own queue, retries and cost
+   * accounting behind the same answer shape, so nothing above this line
+   * knows which service watched the video.
+   */
+  if (env.VIDEO_PROVIDER === 'minicpm' && input.purpose !== 'notes') {
+    if (!input.videoStorageKey) {
+      // A video call with no storage key cannot be sent by URL. Loud, not
+      // quiet: falling back to OpenRouter here would silently unmake the
+      // provider decision the configuration states.
+      throw new ExternalServiceError('minicpm-video', 'video call reached the MiniCPM provider without a storage key', {
+        retryable: false,
+      });
+    }
+    const { askMiniCpmVideo } = await import('./minicpmVideo.js');
+    return askMiniCpmVideo({ ...input, videoStorageKey: input.videoStorageKey });
+  }
+
   const limiter = input.purpose === 'notes' ? textLimiter : videoLimiter;
   return limiter.run(async () => {
     let lastError: unknown;
@@ -508,12 +576,16 @@ export async function searchVideoChunk(input: VideoSearchInput): Promise<VideoSe
     videoBytes,
     purpose: 'search',
     ...(input.onUsage ? { onUsage: input.onUsage } : {}),
+    ...(input.videoStorageKey ? { videoStorageKey: input.videoStorageKey } : {}),
   });
 
   const parsed = parseModelMatches(answer.content);
   return {
     ...parsed,
     rawResponse: answer.content,
+    provider: answer.provider,
+    model: answer.model,
+    promptVersion: answer.promptVersion,
     ...(answer.reasoningDisabled ? { reasoningDisabled: true } : {}),
   };
 }

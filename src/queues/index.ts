@@ -10,9 +10,11 @@ export const QUEUE_NAMES = {
   clipSearch: 'clip-search',
   clipGeneration: 'clip-generation',
   clipVariant: 'clip-variant',
+  reclip: 'moment-reclip',
   thumbnailBackfill: 'thumbnail-backfill',
   retention: 'footage-retention',
   learningReport: 'learning-report',
+  scheduledPublish: 'scheduled-publish',
 } as const;
 
 export interface IngestionJob {
@@ -49,6 +51,36 @@ export interface ClipGenerationJob {
    * never leave the database claiming captions the file does not have.
    */
   captions?: import('../services/media/captions.js').ClipCaption[];
+  /**
+   * Present when this render applies a Re-clip. Same principle as captions:
+   * the moment's new version and its cleared pending state become true only
+   * when the file that carries the new boundaries exists — a render that
+   * fails rolls the clip back to `previous` and records the failure instead.
+   */
+  reclip?: {
+    matchId: string;
+    startSeconds: number;
+    endSeconds: number;
+    provider: string | null;
+    model: string | null;
+    promptVersion: string | null;
+    previous: {
+      startSeconds: number;
+      endSeconds: number;
+      boundariesEditedAt: string | null;
+      status: 'ready' | 'failed';
+    };
+  };
+}
+
+/**
+ * Re-evaluate one moment's boundaries with wider context. One job per
+ * moment at a time — the stable id below and the pending claim in the
+ * database together make a double-tap harmless.
+ */
+export interface ReclipJob {
+  matchId: string;
+  clipRequestId: string;
 }
 
 /**
@@ -87,6 +119,15 @@ export interface ThumbnailBackfillJob {
   requestedAt: string;
 }
 
+/**
+ * Fire one promised publish at its chosen minute. The job is the alarm
+ * clock and nothing more: everything about WHAT goes out lives on the
+ * scheduled_posts row, re-read and re-validated when this fires.
+ */
+export interface ScheduledPublishJob {
+  scheduledPostId: string;
+}
+
 const defaultJobOptions: JobsOptions = {
   attempts: env.JOB_ATTEMPTS,
   backoff: { type: 'exponential', delay: env.JOB_BACKOFF_MS },
@@ -102,9 +143,11 @@ let queues: {
   clipSearch: Queue<ClipSearchJob>;
   clipGeneration: Queue<ClipGenerationJob>;
   clipVariant: Queue<ClipVariantJob>;
+  reclip: Queue<ReclipJob>;
   thumbnailBackfill: Queue<ThumbnailBackfillJob>;
   retention: Queue<RetentionJob>;
   learningReport: Queue<LearningReportJob>;
+  scheduledPublish: Queue<ScheduledPublishJob>;
 } | null = null;
 
 export function getQueues() {
@@ -118,6 +161,7 @@ export function getQueues() {
       clipSearch: new Queue<ClipSearchJob>(QUEUE_NAMES.clipSearch, { connection, defaultJobOptions }),
       clipGeneration: new Queue<ClipGenerationJob>(QUEUE_NAMES.clipGeneration, { connection, defaultJobOptions }),
       clipVariant: new Queue<ClipVariantJob>(QUEUE_NAMES.clipVariant, { connection, defaultJobOptions }),
+      reclip: new Queue<ReclipJob>(QUEUE_NAMES.reclip, { connection, defaultJobOptions }),
       thumbnailBackfill: new Queue<ThumbnailBackfillJob>(QUEUE_NAMES.thumbnailBackfill, {
         connection,
         defaultJobOptions,
@@ -126,6 +170,14 @@ export function getQueues() {
       learningReport: new Queue<LearningReportJob>(QUEUE_NAMES.learningReport, {
         connection,
         defaultJobOptions,
+      }),
+      scheduledPublish: new Queue<ScheduledPublishJob>(QUEUE_NAMES.scheduledPublish, {
+        connection,
+        // One delivery, no automatic retries: the handler records every
+        // outcome on the row itself, and a blind re-run minutes later could
+        // double-post to a real audience. The claim's quarantine reclaim is
+        // the deliberate second chance.
+        defaultJobOptions: { ...defaultJobOptions, attempts: 1 },
       }),
     };
   }
@@ -208,6 +260,16 @@ export async function enqueueClipGeneration(data: ClipGenerationJob): Promise<vo
 }
 
 /**
+ * One Re-clip job per moment, single attempt. The model call inside has its
+ * own bounded retries; letting BullMQ retry on top of that could spend the
+ * whole per-moment budget on one tap. A failure lands in reclip_status where
+ * the person can see it and decide.
+ */
+export async function enqueueReclip(data: ReclipJob): Promise<void> {
+  await addWithStableId(getQueues().reclip, 'reclip', data, `reclip-${data.matchId}`, { attempts: 1 });
+}
+
+/**
  * One job per variant row. The id is the row's, so two publishes racing for
  * the same shape queue one render between them — the row was claimed
  * atomically, and this keeps the work that follows just as single.
@@ -272,4 +334,30 @@ export async function closeQueues(): Promise<void> {
   if (!queues) return;
   await Promise.all(Object.values(queues).map((queue) => queue.close()));
   queues = null;
+}
+
+/**
+ * Set the alarm for one promised publish. The delay is computed here, from
+ * the promise's own clock — and clamped at zero so a promise validated a
+ * moment ago can never be rejected by BullMQ for being a millisecond old.
+ */
+export async function enqueueScheduledPublish(data: ScheduledPublishJob, fireAt: Date): Promise<void> {
+  const delay = Math.max(0, fireAt.getTime() - Date.now());
+  await addWithStableId(
+    getQueues().scheduledPublish,
+    'scheduled-publish',
+    data,
+    `schedpost-${data.scheduledPostId}`,
+    { delay },
+  );
+}
+
+/**
+ * Best-effort removal of a canceled promise's alarm. The row's status is
+ * what the worker trusts at fire time, so a job that survives this still
+ * fires into a no-op — this only saves the wasted wake-up.
+ */
+export async function removeScheduledPublishJob(scheduledPostId: string): Promise<void> {
+  const job = await getQueues().scheduledPublish.getJob(`schedpost-${scheduledPostId}`);
+  if (job) await job.remove().catch(() => undefined);
 }

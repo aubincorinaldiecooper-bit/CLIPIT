@@ -145,6 +145,7 @@ POST   /api/videos/:videoId/uploaded        signal that the upload finished
 GET    /api/videos/:videoId                 status, metadata, chunk grid
 
 POST   /api/videos/:videoId/clip-requests   start a search
+GET    /api/videos/:videoId/clip-requests   restore search/chat history for a video
 GET    /api/clip-requests/:requestId        search status, progress, matches
 
 POST   /api/clip-requests/:requestId/generate   render matches into clips

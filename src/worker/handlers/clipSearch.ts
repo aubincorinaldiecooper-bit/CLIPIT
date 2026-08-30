@@ -524,6 +524,15 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
 
   const chunkById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
 
+  // One search runs on one lane, so every stored match carries the same
+  // attribution; merging two of them loses nothing by taking the first's.
+  // Rows from before the evaluation layer carry none, and none is re-created.
+  const attribution = {
+    provider: stored[0]?.provider ?? null,
+    model: stored[0]?.model ?? null,
+    promptVersion: stored[0]?.promptVersion ?? null,
+  };
+
   const rows: NewClipMatch[] = merged.flatMap((match) => {
     const anchor = chunkById.get(match.chunkId);
     if (!anchor) return [];
@@ -539,6 +548,7 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
         confidence: match.confidence,
         source: match.source,
         quote: match.quote,
+        ...attribution,
       } satisfies NewClipMatch,
     ];
   });
@@ -743,6 +753,12 @@ async function answerFromNotes(input: {
       confidence: match.confidence,
       source: MATCH_SOURCE[mode],
       quote: match.quote,
+      // Attribution names the notes lane that actually answered, not the
+      // configured video provider — a thumbs-down on a notes answer is
+      // evidence about the notes lookup, and must not land on MiniCPM.
+      provider: result.provider,
+      model: result.model,
+      promptVersion: result.promptVersion || null,
     });
   }
 
@@ -870,6 +886,7 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
       chunkCount: input.chunkCount,
       chunkDurationSeconds: chunk.durationSeconds,
       videoPath: chunkPath,
+      videoStorageKey: chunk.storageKey,
       transcript: withTranscript ? transcript : [],
       onUsage: (usage) => {
         // Both attempts are billed, so both are tallied. A retry that recovers
@@ -1035,6 +1052,11 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
         // its matches "multimodal" would claim evidence the model never had.
         source: MATCH_SOURCE[degraded ? 'visual' : input.mode],
         quote: range.quote,
+        // Whichever service actually watched this chunk — the answer says,
+        // rather than the configuration being trusted to describe it.
+        provider: response.provider,
+        model: response.model,
+        promptVersion: response.promptVersion || null,
       } satisfies NewClipMatch,
     ];
   });

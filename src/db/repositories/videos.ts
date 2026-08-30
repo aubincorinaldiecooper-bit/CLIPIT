@@ -350,7 +350,17 @@ export async function markFootageExpired(videoId: string): Promise<void> {
 export async function setIndexStatus(
   videoId: string,
   status: IndexStatus,
-  options: { error?: string | null; sceneCount?: number; indexMs?: number } = {},
+  options: {
+    error?: string | null;
+    sceneCount?: number;
+    indexMs?: number;
+    /**
+     * The configuration this video was read under, snapshotted at read time.
+     * Settings drift; a row that says what was set when it was written is
+     * what keeps last month's numbers comparable to this month's.
+     */
+    analysisConfig?: Record<string, unknown>;
+  } = {},
 ): Promise<void> {
   await queryOne(
     `UPDATE videos
@@ -358,9 +368,17 @@ export async function setIndexStatus(
             index_error = $3,
             scene_count = COALESCE($4, scene_count),
             index_ms = COALESCE($5, index_ms),
+            analysis_config = COALESCE($6, analysis_config),
             updated_at = now()
       WHERE id = $1`,
-    [videoId, status, options.error ?? null, options.sceneCount ?? null, options.indexMs ?? null],
+    [
+      videoId,
+      status,
+      options.error ?? null,
+      options.sceneCount ?? null,
+      options.indexMs ?? null,
+      options.analysisConfig ? JSON.stringify(options.analysisConfig) : null,
+    ],
   );
 }
 

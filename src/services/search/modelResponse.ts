@@ -161,3 +161,40 @@ export function parseModelMatches(rawText: string): ParseResult {
 
   return { matches, warnings };
 }
+
+/**
+ * One pair of refined boundaries, validated with the same distrust as every
+ * other model answer. `null` means the answer was unusable — the caller
+ * treats that as a failed Re-clip, never as "no change".
+ */
+export function parseReclipBoundaries(
+  rawText: string,
+  segmentDurationSeconds: number,
+): { startSeconds: number; endSeconds: number } | null {
+  const json = extractJsonObject(rawText);
+  if (!json) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+
+  const start = Number((parsed as Record<string, unknown>).start_seconds);
+  const end = Number((parsed as Record<string, unknown>).end_seconds);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+
+  // Clamp into the segment rather than reject: a model answering 0.0 or a
+  // hair past the end is giving a usable boundary sloppily, and the clamp is
+  // exactly what a human editor would do with it.
+  const clampedStart = Math.min(Math.max(start, 0), segmentDurationSeconds);
+  const clampedEnd = Math.min(Math.max(end, 0), segmentDurationSeconds);
+  if (clampedEnd <= clampedStart) return null;
+
+  return {
+    startSeconds: Number(clampedStart.toFixed(3)),
+    endSeconds: Number(clampedEnd.toFixed(3)),
+  };
+}
