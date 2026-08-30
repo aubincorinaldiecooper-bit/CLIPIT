@@ -24,6 +24,7 @@ import { handleClipVariant } from './handlers/clipVariant.js';
 import { handleReclip } from './handlers/reclip.js';
 import { handleThumbnailBackfill } from './handlers/thumbnailBackfill.js';
 import { handleRetention } from './handlers/retention.js';
+import { handleScheduledPublish } from './handlers/scheduledPublish.js';
 import { handleLearningReport } from './handlers/learningReport.js';
 
 /**
@@ -147,6 +148,8 @@ async function main(): Promise<void> {
   // from a search or a clip someone is waiting on.
   startWorker(QUEUE_NAMES.thumbnailBackfill, handleThumbnailBackfill, 1);
   startWorker(QUEUE_NAMES.retention, handleRetention, 1);
+  // Promised publishes: one at a time is plenty — the alarm density is human.
+  startWorker(QUEUE_NAMES.scheduledPublish, handleScheduledPublish, 1);
   startWorker(QUEUE_NAMES.learningReport, handleLearningReport, 1);
 
   logger.info('worker ready', { queues: Object.values(QUEUE_NAMES) });

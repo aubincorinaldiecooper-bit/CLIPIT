@@ -4,12 +4,18 @@ import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
 import type { FastifyRequest } from 'fastify';
 import {
+  deleteClipRow,
   getClip,
+  listClipFamily,
   insertDerivedClip,
   listClipsForPrincipal,
   listWorkspacesForClip,
   setClipRenderPending,
+  setClipTitle,
 } from '../../db/repositories/clips.js';
+import { listActivePostsForClip } from '../../db/repositories/social.js';
+import { listWaitingScheduledPostsForClip } from '../../db/repositories/scheduledPosts.js';
+import { getStorage } from '../../services/storage/s3.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import { captionsSchema } from '../../services/media/captions.js';
 import { enqueueClipGeneration } from '../../queues/index.js';
@@ -184,5 +190,88 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
     await enqueueClipGeneration({ clipId: derived.id });
     logger.info('captioned copy queued', { clipId, derivedClipId: derived.id });
     return reply.code(202).send({ clip: await serializeClip(derived, false) });
+  });
+
+  /**
+   * Rename a clip. The name is the person's own and rides above the
+   * moment's description everywhere clips are listed; an empty string takes
+   * the custom name back and the description shows again. Owner-only — a
+   * room-mate can watch a shared clip, not rename it under its maker.
+   */
+  app.patch('/api/clips/:clipId', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+    const { clipId } = parse(
+      z.object({ clipId: z.string().uuid('must be a UUID') }),
+      request.params,
+      'path parameters',
+    );
+    const body = parse(z.object({ title: z.string().trim().max(200) }), request.body ?? {}, 'body');
+
+    const clip = await getClip(clipId);
+    if (!clip) throw HttpError.notFound('Clip not found');
+    assertOwnership(request, clip, 'Clip');
+
+    const updated = await setClipTitle(clipId, body.title === '' ? null : body.title);
+    if (!updated) throw HttpError.notFound('Clip not found');
+    return reply.send({ clip: await serializeClip(updated) });
+  });
+
+  /**
+   * Delete a clip, and with it every captioned copy made from it — a
+   * version of a clip you deleted is a version of nothing, and the schema
+   * cannot hold two originals for one moment anyway.
+   *
+   * Refused while anything still depends on the files: a publish being
+   * submitted or shaped right now, or a scheduled post waiting on any clip
+   * in the family — deleting under those would leave a promise that can
+   * only fail, hours later, for a reason the person deleted on purpose.
+   */
+  app.delete('/api/clips/:clipId', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+    const { clipId } = parse(
+      z.object({ clipId: z.string().uuid('must be a UUID') }),
+      request.params,
+      'path parameters',
+    );
+
+    const clip = await getClip(clipId);
+    if (!clip) throw HttpError.notFound('Clip not found');
+    assertOwnership(request, clip, 'Clip');
+
+    // The guards cover the whole family, not just the clip named: a
+    // captioned copy can be the one mid-publish, and deleting its parent
+    // takes it too.
+    const family = await listClipFamily(clipId);
+    for (const memberId of family) {
+      if ((await listActivePostsForClip(memberId)).length > 0) {
+        throw HttpError.conflict('This clip is being published right now. Try again in a minute.');
+      }
+      if ((await listWaitingScheduledPostsForClip(memberId)).length > 0) {
+        throw HttpError.conflict(
+          'This clip has a scheduled post waiting. Cancel the scheduled post first, then delete the clip.',
+        );
+      }
+    }
+
+    const removed = await deleteClipRow(clipId);
+    if (!removed) throw HttpError.notFound('Clip not found');
+
+    // Files after the rows, best-effort: an orphaned object costs pennies; a
+    // row for a file that is gone would keep a dead clip in the library.
+    for (const key of removed.storageKeys) {
+      await getStorage()
+        .remove(key)
+        .catch((cause: unknown) =>
+          logger.warn('clip file removal failed; object orphaned', { clipId, key, err: cause }),
+        );
+    }
+    logger.info('clip deleted', { clipId, clips: removed.deletedCount, files: removed.storageKeys.length });
+    // `deletedCount` is the whole family, so the caller can say "and its 2
+    // captioned copies" rather than implying one row went.
+    return reply.send({ deleted: true, deletedCount: removed.deletedCount });
   });
 }

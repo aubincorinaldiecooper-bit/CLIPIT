@@ -226,7 +226,7 @@ export async function listClipsForPrincipal(
   // clips must not shift under them, and "skip 60" does exactly that when
   // clip 61 arrives mid-scroll.
   const rows = await queryRows<ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }>(
-    `SELECT c.*, m.description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
+    `SELECT c.*, COALESCE(c.title, m.description) AS description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
        FROM clips c
        JOIN clip_matches m ON m.id = c.clip_match_id
        JOIN videos v ON v.id = c.video_id
@@ -258,7 +258,7 @@ export async function listWorkspaceClips(workspaceId: string, limit = 60): Promi
   const rows = await queryRows<
     ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }
   >(
-    `SELECT c.*, m.description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
+    `SELECT c.*, COALESCE(c.title, m.description) AS description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
        FROM workspace_clips s
        JOIN clips c ON c.id = s.clip_id
        JOIN clip_matches m ON m.id = c.clip_match_id
@@ -417,4 +417,73 @@ export async function setClipStatus(
       options.captions === undefined ? null : JSON.stringify(options.captions),
     ],
   );
+}
+
+/** Give a clip a name of the person's own. Null takes the name back. */
+export async function setClipTitle(clipId: string, title: string | null): Promise<Clip | null> {
+  const rows = await queryRows<ClipRow>(`UPDATE clips SET title = $2 WHERE id = $1 RETURNING *`, [clipId, title]);
+  return rows[0] ? mapClip(rows[0]) : null;
+}
+
+/**
+ * Remove a clip and every copy made from it.
+ *
+ * Captioned copies are children of their original (`derived_from_clip_id`),
+ * and the FK there is ON DELETE SET NULL — so deleting an original promotes
+ * each copy to an original. With two or more copies that violates
+ * `clips_original_per_match_idx` (one root per match), and the delete dies
+ * on a duplicate key. Codex caught this on CLIPIT#56.
+ *
+ * Rather than leave orphans or fail, the whole family goes: a captioned
+ * version of a clip you deleted is a version of nothing. The count comes
+ * back so the caller can say how many actually went.
+ */
+export async function deleteClipRow(
+  clipId: string,
+): Promise<{ storageKeys: string[]; deletedCount: number } | null> {
+  // The subtree, in case a copy was ever made from a copy.
+  const family = await queryRows<{ id: string }>(
+    `WITH RECURSIVE tree AS (
+       SELECT id FROM clips WHERE id = $1
+       UNION ALL
+       SELECT c.id FROM clips c JOIN tree t ON c.derived_from_clip_id = t.id
+     )
+     SELECT id FROM tree`,
+    [clipId],
+  );
+  if (family.length === 0) return null;
+  const ids = family.map((row) => row.id);
+
+  // Every file the family owns: the clips themselves and their platform
+  // cuts. Gathered BEFORE the delete, which takes the rows with it.
+  const variants = await queryRows<{ storage_key: string | null }>(
+    `SELECT storage_key FROM clip_variants WHERE clip_id = ANY($1::uuid[]) AND storage_key IS NOT NULL`,
+    [ids],
+  );
+  const deleted = await queryRows<{ storage_key: string | null }>(
+    `DELETE FROM clips WHERE id = ANY($1::uuid[]) RETURNING storage_key`,
+    [ids],
+  );
+  if (deleted.length === 0) return null;
+
+  return {
+    storageKeys: [...deleted, ...variants]
+      .map((row) => row.storage_key)
+      .filter((key): key is string => Boolean(key)),
+    deletedCount: deleted.length,
+  };
+}
+
+/** A clip and every copy descended from it — what a delete would take. */
+export async function listClipFamily(clipId: string): Promise<string[]> {
+  const rows = await queryRows<{ id: string }>(
+    `WITH RECURSIVE tree AS (
+       SELECT id FROM clips WHERE id = $1
+       UNION ALL
+       SELECT c.id FROM clips c JOIN tree t ON c.derived_from_clip_id = t.id
+     )
+     SELECT id FROM tree`,
+    [clipId],
+  );
+  return rows.map((row) => row.id);
 }
