@@ -13,6 +13,7 @@ import { Semaphore, sleep } from '../../lib/concurrency.js';
 import { ExternalServiceError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { getStorage } from '../storage/s3.js';
+import { promptVersion } from './prompt.js';
 import type { VideoModelAnswer, VideoModelRequest } from './openrouterVideo.js';
 
 /**
@@ -264,6 +265,9 @@ async function requestOnce(input: VideoModelRequest & { videoStorageKey: string 
 
   // Zero tokens with a null cost, not silence: the call happened, it held a
   // GPU for latencyMs, and the usage table is how anything is ever priced.
+  // The deployment's own measurements ride along verbatim — download_ms,
+  // inference_ms, total_ms — because cost-per-source-hour is computed from
+  // rows, and a number that only ever reached a log line prices nothing.
   input.onUsage?.({
     promptTokens: 0,
     completionTokens: 0,
@@ -272,6 +276,9 @@ async function requestOnce(input: VideoModelRequest & { videoStorageKey: string 
     latencyMs,
     provider: 'modal',
     model: payload?.model ?? 'openbmb/MiniCPM-V-4.6',
+    metrics: payload?.metrics ?? null,
+    startedAt: new Date(Date.now() - latencyMs),
+    promptVersion: promptVersion(input.systemPrompt),
   });
 
   // The same rule as the OpenRouter path: a blank answer must never parse as
@@ -280,7 +287,13 @@ async function requestOnce(input: VideoModelRequest & { videoStorageKey: string 
     throw new ExternalServiceError('minicpm-video', 'MiniCPM returned an empty result', { retryable: false });
   }
 
-  return { content, reasoningDisabled: false };
+  return {
+    content,
+    reasoningDisabled: false,
+    provider: 'modal',
+    model: payload?.model ?? 'openbmb/MiniCPM-V-4.6',
+    promptVersion: promptVersion(input.systemPrompt),
+  };
 }
 
 /**

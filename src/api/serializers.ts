@@ -135,6 +135,7 @@ export async function serializeMatch(match: ClipMatch, clip?: Clip | null) {
     // a reload should put the moment back exactly where the user left it, and
     // an approval that vanished on refresh would read as not having registered.
     feedback: match.feedback,
+    feedbackReason: match.feedbackReason,
     // A finished match carries the actual cut and its signed URL. Previously
     // this contained only an id and status, which left a client with no media
     // to put in the thumbnail player; its only playable URL was the parent
@@ -417,6 +418,12 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
     endSeconds: clip.endSeconds,
     startTimecode: formatTimecode(clip.startSeconds),
     endTimecode: formatTimecode(clip.endSeconds),
+    // The model's original boundaries and whether the person has moved them
+    // — what the adjust control starts from, and how an edited clip is told
+    // apart from an untouched one.
+    predictedStartSeconds: clip.predictedStartSeconds,
+    predictedEndSeconds: clip.predictedEndSeconds,
+    boundariesEditedAt: clip.boundariesEditedAt ? clip.boundariesEditedAt.toISOString() : null,
     // The spec the editor saved, so re-opening the editor starts from it.
     captions: clip.captions ?? null,
     derivedFromClipId: clip.derivedFromClipId,

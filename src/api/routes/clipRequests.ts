@@ -23,7 +23,7 @@ import {
   type SearchCoverage,
 } from '../serializers.js';
 import { parse } from '../validation.js';
-import type { Clip } from '../../domain/types.js';
+import { MATCH_FEEDBACK_REASONS, type Clip, type MatchFeedbackReason } from '../../domain/types.js';
 
 const uuidSchema = z.string().uuid('must be a UUID');
 
@@ -51,6 +51,14 @@ function explainNoMatches(coverage: SearchCoverage): string {
 const feedbackSchema = z.object({
   /** `null` clears an earlier verdict rather than recording a third state. */
   verdict: z.enum(['approved', 'rejected']).nullable(),
+  /**
+   * Optional, and only meaningful with a rejection: why this moment was
+   * waved away. The interaction stays two buttons — a reason is offered
+   * after a thumbs-down, never demanded. 'missed_moment' is the one that
+   * matters most: it is the closest live signal to "the moment I wanted
+   * was not found", which no per-moment thumbs-down can otherwise express.
+   */
+  reason: z.enum(MATCH_FEEDBACK_REASONS as [MatchFeedbackReason, ...MatchFeedbackReason[]]).nullish(),
 });
 
 const generateSchema = z
@@ -100,7 +108,7 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       request.params,
       'path parameters',
     );
-    const { verdict } = parse(feedbackSchema, request.body ?? {});
+    const { verdict, reason } = parse(feedbackSchema, request.body ?? {});
 
     const clipRequest = await getClipRequest(requestId);
     if (!clipRequest) throw HttpError.notFound('Clip request not found');
@@ -108,7 +116,7 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
 
     // Scoped to the request as well as the match, so a guessed id cannot mark
     // a moment belonging to someone else's search.
-    const match = await setMatchFeedback(requestId, matchId, verdict);
+    const match = await setMatchFeedback(requestId, matchId, verdict, reason ?? null);
     if (!match) throw HttpError.notFound('Match not found');
 
     return reply.send({ match: await serializeMatch(match) });

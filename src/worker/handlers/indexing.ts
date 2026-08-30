@@ -7,6 +7,7 @@ import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { describeVideoChunk } from '../../services/search/sceneIndex.js';
+import { INDEX_SYSTEM_PROMPT, promptVersion } from '../../services/search/prompt.js';
 import { resetVideoCallPeak, videoCallStats } from '../../services/search/openrouterVideo.js';
 import { UsageTally } from '../../services/usageTally.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
@@ -176,6 +177,17 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
       // Recorded exactly, so "did that change help?" is answerable from the
       // database rather than from whoever last read the logs.
       indexMs: Math.round(performance.now() - startedAt),
+      // The settings this read ran under, frozen with the result. When the
+      // chunk size or proxy spec changes, rows written before and after must
+      // stay tellable apart without consulting a deploy history.
+      analysisConfig: {
+        chunkSeconds: env.ANALYSIS_CHUNK_SECONDS,
+        proxyHeight: env.PROXY_HEIGHT,
+        proxyFps: env.PROXY_FPS,
+        videoProvider: env.VIDEO_PROVIDER,
+        videoModel: env.VIDEO_PROVIDER === 'minicpm' ? 'openbmb/MiniCPM-V-4.6' : env.OPENROUTER_VIDEO_MODEL,
+        indexPromptVersion: promptVersion(INDEX_SYSTEM_PROMPT),
+      },
     });
 
     // What reading this video cost, once, against what it saves every question

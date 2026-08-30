@@ -139,6 +139,27 @@ const envSchema = z.object({
    */
   MODAL_TOKEN_ID: z.string().trim().optional(),
   MODAL_TOKEN_SECRET: z.string().trim().optional(),
+  /**
+   * What one hour of the Modal L4 costs, in dollars — the single place a GPU
+   * price lives, for the estimated half of cost-per-source-hour.
+   *
+   * Deliberately no default. Modal's JS SDK exposes no supported billing API
+   * (checked against modal@0.10.0's exports: only an internal gRPC message,
+   * whose direct use Modal's own docs discourage), so estimates are computed
+   * from measured GPU time × this rate — and a rate nobody verified would
+   * quietly price everything wrong. Unset, estimated costs report "rate not
+   * configured" instead of a number. Set it from modal.com/pricing or the
+   * workspace's own billing page, and note the date in the dashboard note.
+   */
+  MODAL_L4_USD_PER_GPU_HOUR: z
+    .string()
+    .trim()
+    .optional()
+    .transform((value) => {
+      if (value === undefined || value === '') return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+    }),
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
   OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
   /**
@@ -252,6 +273,13 @@ const envSchema = z.object({
    * ran before accounts existed.
    */
   AUTH_BRIDGE_SECRET: z.string().trim().min(32).optional(),
+  /**
+   * Who may read the evaluation numbers: a comma-separated list of sign-in
+   * email addresses. The product has no admin role, and quality, cost and
+   * error rates are the owner's reading, not a user feature. Unset, the
+   * evaluation route answers 404 for everyone — absent, not merely locked.
+   */
+  EVAL_OWNER_EMAILS: z.string().trim().optional(),
   SESSION_TTL_SECONDS: int(2_592_000, 3_600, 31_536_000),
   /** When false, /api routes accept unauthenticated requests (local dev only). */
   REQUIRE_SESSION: bool(true),
