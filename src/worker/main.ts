@@ -14,6 +14,7 @@ import {
 } from '../queues/index.js';
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
+import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVideo.js';
 import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
@@ -126,6 +127,19 @@ async function main(): Promise<void> {
 
   await checkBinaries();
   await runMigrations();
+
+  // Metadata handles only: no `remote`, no inference, and no L4 wake-up.
+  // This must pass before queue consumers exist or the worker says it is ready.
+  if (env.VIDEO_PROVIDER === 'minicpm') {
+    await assertMiniCpmDeploymentAvailable();
+    logger.info('MiniCPM deployment available', {
+      provider: 'minicpm',
+      environment: env.MODAL_ENVIRONMENT,
+      app: env.MODAL_APP_NAME,
+      class: env.MODAL_CLASS_NAME,
+      method: 'analyze',
+    });
+  }
 
   startWorker(QUEUE_NAMES.ingestion, handleIngestion, env.INGESTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.preprocessing, handlePreprocessing, env.PREPROCESS_CONCURRENCY);

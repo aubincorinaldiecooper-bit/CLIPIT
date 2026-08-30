@@ -29,7 +29,8 @@ import type { VideoModelAnswer, VideoModelRequest } from './openrouterVideo.js';
  * There is no HTTP endpoint and no URL to protect. The path is
  *
  *     ModalClient (MODAL_TOKEN_ID / MODAL_TOKEN_SECRET, Clipit's own token)
- *       → app clipit-minicpm-v46 → class MiniCPMModel → analyze(video_url, prompt)
+ *       → environment main → app clipit-minicpm-v46
+ *       → class MiniCPMVideoService → analyze(video_url, prompt)
  *
  * and the deployed method answers `{ model, result, metrics }`, where
  * `result` is free text the existing parsers consume.
@@ -79,12 +80,13 @@ let methodCache: Promise<Function_> | null = null;
 function modalClient(): ModalClient {
   // Explicit credentials rather than ambient env reading, so custody is
   // visible here: this token is Clipit's, revocable on its own.
-  // No environment param on purpose: the SDK itself honours the standard
-  // MODAL_ENVIRONMENT variable when one is set, and inventing a second name
-  // for the same thing would be configuration nobody needs.
+  // Pass the environment explicitly. Production's deployment lives in
+  // `main`; relying on ambient SDK behaviour made that deployed class look
+  // absent even though the app, class and workspace token were correct.
   clientCache ??= new ModalClient({
     tokenId: env.MODAL_TOKEN_ID!,
     tokenSecret: env.MODAL_TOKEN_SECRET!,
+    environment: env.MODAL_ENVIRONMENT,
   });
   return clientCache;
 }
@@ -96,6 +98,34 @@ function lookupMethod(): Promise<Function_> {
     return instance.method(ANALYZE_METHOD);
   })();
   return methodCache;
+}
+
+/**
+ * Resolve the class and method handles without invoking `analyze`.
+ * Modal does not start the L4 until `remote` is called, so this is safe to run
+ * before queue consumers start and turns a bad identity into one startup
+ * error rather than one failure for every chunk.
+ */
+export async function assertMiniCpmDeploymentAvailable(): Promise<void> {
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
+    throw new ExternalServiceError('minicpm-video', 'MiniCPM provider is not configured', { retryable: false });
+  }
+
+  try {
+    await lookupMethod();
+  } catch (error) {
+    methodCache = null;
+    const failure = classify(error);
+    if (!failure.retryable) {
+      throw new ExternalServiceError(
+        'minicpm-video',
+        `MiniCPM deployment unavailable: ${env.MODAL_APP_NAME} / ${env.MODAL_CLASS_NAME} could not be resolved ` +
+          `(Modal environment: ${env.MODAL_ENVIRONMENT}). Check the Modal app, environment, and workspace credentials.`,
+        { retryable: false, cause: failure },
+      );
+    }
+    throw failure;
+  }
 }
 
 /** Test seam: forget the cached client and handle. */

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * Set before any src module loads: `env` is read once at import, and this
@@ -6,9 +6,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * file its own module registry, so switching the provider here cannot leak
  * into the OpenRouter tests.
  */
+const previousEnv = {
+  videoProvider: process.env.VIDEO_PROVIDER,
+  tokenId: process.env.MODAL_TOKEN_ID,
+  tokenSecret: process.env.MODAL_TOKEN_SECRET,
+  modalEnvironment: process.env.MODAL_ENVIRONMENT,
+  retries: process.env.MINICPM_MAX_RETRIES,
+};
+
 process.env.VIDEO_PROVIDER = 'minicpm';
 process.env.MODAL_TOKEN_ID = 'test-token-id';
 process.env.MODAL_TOKEN_SECRET = 'test-token-secret';
+process.env.MODAL_ENVIRONMENT = 'main';
 process.env.MINICPM_MAX_RETRIES = '1';
 
 /**
@@ -18,6 +27,10 @@ process.env.MINICPM_MAX_RETRIES = '1';
  * (cls.fromName → instance → method → remote) and the real error classes.
  */
 const remoteMock = vi.fn();
+const fromNameMock = vi.fn();
+const instanceMock = vi.fn();
+const methodMock = vi.fn();
+const constructedWith = vi.fn();
 
 vi.mock('modal', () => {
   class InternalFailure extends Error {}
@@ -27,12 +40,11 @@ vi.mock('modal', () => {
   class RemoteError extends Error {}
   class InvalidError extends Error {}
   class ModalClient {
+    constructor(options: unknown) {
+      constructedWith(options);
+    }
     cls = {
-      fromName: vi.fn().mockResolvedValue({
-        instance: vi.fn().mockResolvedValue({
-          method: vi.fn().mockReturnValue({ remote: remoteMock }),
-        }),
-      }),
+      fromName: fromNameMock,
     };
   }
   return { ModalClient, InternalFailure, FunctionTimeoutError, NotFoundError, ExecutionError, RemoteError, InvalidError };
@@ -40,6 +52,10 @@ vi.mock('modal', () => {
 
 beforeEach(async () => {
   remoteMock.mockReset();
+  fromNameMock.mockReset().mockResolvedValue({ instance: instanceMock });
+  instanceMock.mockReset().mockResolvedValue({ method: methodMock });
+  methodMock.mockReset().mockReturnValue({ remote: remoteMock });
+  constructedWith.mockClear();
   const { resetMiniCpmClient } = await import('../src/services/search/minicpmVideo.js');
   resetMiniCpmClient();
 });
@@ -48,7 +64,53 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+afterAll(() => {
+  restoreEnv('VIDEO_PROVIDER', previousEnv.videoProvider);
+  restoreEnv('MODAL_TOKEN_ID', previousEnv.tokenId);
+  restoreEnv('MODAL_TOKEN_SECRET', previousEnv.tokenSecret);
+  restoreEnv('MODAL_ENVIRONMENT', previousEnv.modalEnvironment);
+  restoreEnv('MINICPM_MAX_RETRIES', previousEnv.retries);
+  vi.resetModules();
+});
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
 describe('MiniCPM provider seam', () => {
+  it('preflights deployment metadata without invoking analyze or waking the GPU', async () => {
+    const { assertMiniCpmDeploymentAvailable } = await import('../src/services/search/minicpmVideo.js');
+
+    await expect(assertMiniCpmDeploymentAvailable()).resolves.toBeUndefined();
+
+    expect(constructedWith).toHaveBeenCalledWith({
+      tokenId: 'test-token-id',
+      tokenSecret: 'test-token-secret',
+      environment: 'main',
+    });
+    expect(fromNameMock).toHaveBeenCalledWith('clipit-minicpm-v46', 'MiniCPMVideoService');
+    expect(instanceMock).toHaveBeenCalledTimes(1);
+    expect(methodMock).toHaveBeenCalledWith('analyze');
+    expect(remoteMock).not.toHaveBeenCalled();
+  });
+
+  it('reports a missing deployment once as an actionable terminal configuration failure', async () => {
+    const modal = await import('modal');
+    fromNameMock.mockRejectedValue(new modal.NotFoundError("Class 'clipit-minicpm-v46/MiniCPMVideoService' not found"));
+    const { assertMiniCpmDeploymentAvailable } = await import('../src/services/search/minicpmVideo.js');
+
+    await expect(assertMiniCpmDeploymentAvailable()).rejects.toMatchObject({
+      retryable: false,
+      message: expect.stringMatching(
+        /MiniCPM deployment unavailable: clipit-minicpm-v46 \/ MiniCPMVideoService.*environment: main.*workspace credentials/,
+      ),
+    });
+    // Startup stops here: no analyze call and no per-chunk lookup loop.
+    expect(fromNameMock).toHaveBeenCalledTimes(1);
+    expect(remoteMock).not.toHaveBeenCalled();
+  });
+
   it('routes a video call through the Modal SDK and hands the result to the existing parser', async () => {
     remoteMock.mockResolvedValue({
       model: 'openbmb/MiniCPM-V-4.6',
@@ -213,7 +275,8 @@ describe('MiniCPM provider seam', () => {
   it('reads the deployment names from config with the deployed defaults', async () => {
     const { env } = await import('../src/config/env.js');
     expect(env.MODAL_APP_NAME).toBe('clipit-minicpm-v46');
-    expect(env.MODAL_CLASS_NAME).toBe('MiniCPMModel');
+    expect(env.MODAL_CLASS_NAME).toBe('MiniCPMVideoService');
+    expect(env.MODAL_ENVIRONMENT).toBe('main');
     expect(env.MINICPM_VIDEO_CONCURRENCY).toBe(1);
     expect(env.MINICPM_MAX_RETRIES).toBe(1); // pinned by this file's env setup
   });

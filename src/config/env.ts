@@ -115,7 +115,9 @@ const envSchema = z.object({
    * protect, and nothing to reach without the API token.
    */
   MODAL_APP_NAME: z.string().trim().default('clipit-minicpm-v46'),
-  MODAL_CLASS_NAME: z.string().trim().default('MiniCPMModel'),
+  MODAL_CLASS_NAME: z.string().trim().default('MiniCPMVideoService'),
+  /** The environment holding the deployed app; passed explicitly to Modal. */
+  MODAL_ENVIRONMENT: z.string().trim().default('main'),
   /**
    * One request's whole allowance, cold start included: Modal pulling the
    * model onto a GPU takes minutes when the app has scaled to zero, and a

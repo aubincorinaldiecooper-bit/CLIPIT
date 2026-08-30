@@ -78,11 +78,15 @@ async function main(): Promise<void> {
   console.log('chunk:', storageKey);
   console.log('chunk bytes:', head.sizeBytes);
   console.log('proxy spec:', `${env.PROXY_HEIGHT}p, ${env.PROXY_FPS} fps (from env — the chunk was cut from this proxy)`);
-  console.log('modal target:', `${env.MODAL_APP_NAME} / ${env.MODAL_CLASS_NAME} / analyze`);
+  console.log('modal target:', `${env.MODAL_ENVIRONMENT} / ${env.MODAL_APP_NAME} / ${env.MODAL_CLASS_NAME} / analyze`);
   console.log('client deadline:', `${env.MINICPM_REQUEST_TIMEOUT_SECONDS}s`);
   console.log('invoking once through the Modal SDK…');
 
-  const modal = new ModalClient({ tokenId: env.MODAL_TOKEN_ID, tokenSecret: env.MODAL_TOKEN_SECRET });
+  const modal = new ModalClient({
+    tokenId: env.MODAL_TOKEN_ID,
+    tokenSecret: env.MODAL_TOKEN_SECRET,
+    environment: env.MODAL_ENVIRONMENT,
+  });
 
   const startedAt = performance.now();
   try {
