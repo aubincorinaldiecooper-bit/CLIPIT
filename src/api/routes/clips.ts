@@ -8,6 +8,7 @@ import {
   insertDerivedClip,
   listClipsForPrincipal,
   listWorkspacesForClip,
+  restoreClipBoundaries,
   setClipBoundaries,
   setClipRenderPending,
 } from '../../db/repositories/clips.js';
@@ -169,7 +170,12 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
     await assertClipAccess(request, clip);
 
     if (clip.derivedFromClipId) {
-      throw HttpError.badRequest('Captioned copies follow their source clip — adjust the original instead.');
+      // Copies do NOT follow the original — each carries its own render.
+      // The message must not promise otherwise: adjusting the original
+      // fixes the original, and a copy made before that keeps its timing.
+      throw HttpError.badRequest(
+        'This is a captioned copy with its own render. Adjust the original clip — copies made before the change keep their old timing.',
+      );
     }
 
     // The same rule as replacing captions: only the person who cut it may
@@ -194,10 +200,31 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
       throw HttpError.badRequest('The clip cannot end after the video does.');
     }
 
+    // The update is the claim: it only lands on a row still `ready`, so of
+    // two racing edits exactly one gets through and the other is told the
+    // clip is busy — the status check above gave the friendly error, this
+    // gives the guarantee.
     const updated = await setClipBoundaries(clipId, body.startSeconds, body.endSeconds);
-    if (!updated) throw HttpError.notFound('Clip not found');
+    if (!updated) {
+      throw HttpError.conflict('This clip is still rendering — try again when it finishes.');
+    }
 
-    await enqueueClipGeneration({ clipId });
+    try {
+      await enqueueClipGeneration({ clipId });
+    } catch (cause) {
+      // No job means no re-render will ever come. Put the clip back exactly
+      // as the person could see it — old boundaries, old edit mark, ready —
+      // so the edit can simply be tried again, instead of the row waiting
+      // forever on a render nobody queued.
+      await restoreClipBoundaries(clipId, {
+        startSeconds: clip.startSeconds,
+        endSeconds: clip.endSeconds,
+        boundariesEditedAt: clip.boundariesEditedAt,
+      });
+      logger.error('boundary edit rolled back: re-render could not be queued', { clipId, err: cause });
+      throw HttpError.serviceUnavailable('The re-cut could not be queued. Nothing was changed — try again in a moment.');
+    }
+
     logger.info('clip boundaries edited', {
       clipId,
       predictedStartSeconds: updated.predictedStartSeconds,

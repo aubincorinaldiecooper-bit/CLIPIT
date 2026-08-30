@@ -181,6 +181,32 @@ describe('clip boundary persistence', () => {
     expect(result).toBeNull();
   });
 
+  it('setClipBoundaries claims the ready row atomically — the WHERE is the race guard', async () => {
+    queryOne.mockResolvedValue(null);
+    const { setClipBoundaries } = await import('../src/db/repositories/clips.js');
+
+    await setClipBoundaries('clip-1', 8, 21);
+    const [sql] = queryOne.mock.calls[0]! as [string];
+    // Two racing edits both passing an in-memory status check would share
+    // one queued render and desynchronise row from file. Only an UPDATE
+    // conditioned on status='ready' lets exactly one through.
+    expect(sql.slice(sql.indexOf('WHERE'))).toContain("status = 'ready'");
+  });
+
+  it('restoreClipBoundaries puts back exactly the pre-edit state, only on a pending row', async () => {
+    queryOne.mockResolvedValue({});
+    const { restoreClipBoundaries } = await import('../src/db/repositories/clips.js');
+
+    const editedAt = new Date('2026-08-29T00:00:00Z');
+    await restoreClipBoundaries('clip-1', { startSeconds: 10, endSeconds: 20, boundariesEditedAt: editedAt });
+    const [sql, params] = queryOne.mock.calls[0]! as [string, unknown[]];
+    expect(sql).toContain("status = 'ready'");
+    expect(sql.slice(sql.indexOf('WHERE'))).toContain("status = 'pending'");
+    // The prediction columns stay out of the restore too.
+    expect(sql).not.toContain('predicted_start_seconds');
+    expect(params).toEqual(['clip-1', 10, 20, editedAt]);
+  });
+
   it('regenerating a match keeps boundaries someone has already moved', async () => {
     queryOne.mockResolvedValue(clipRow);
     const { upsertClipForMatch } = await import('../src/db/repositories/clips.js');

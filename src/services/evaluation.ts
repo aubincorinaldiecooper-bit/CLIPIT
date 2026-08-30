@@ -117,6 +117,23 @@ export function summariseBoundaryErrors(errors: BoundaryError[]): BoundaryErrorS
 }
 
 /**
+ * Which of the four states a measured clip is in. One rule needs stating:
+ * a rejection wins over an edit. Someone can move a clip's boundaries and
+ * THEN throw the moment away, and a discarded moment is not a kept one —
+ * counting its boundaries as accuracy ground truth would score the model
+ * on a moment the person ultimately said was wrong.
+ */
+export function classifyClipState(input: {
+  edited: boolean;
+  feedback: string | null;
+}): 'rejected' | 'edited_and_kept' | 'accepted_without_edit' | 'generated_never_reviewed' {
+  if (input.feedback === 'rejected') return 'rejected';
+  if (input.edited) return 'edited_and_kept';
+  if (input.feedback === 'approved') return 'accepted_without_edit';
+  return 'generated_never_reviewed';
+}
+
+/**
  * Dollars per hour of source video. Null when there was no measured source
  * time — a rate over zero footage is not a small number, it is no number.
  */
@@ -448,9 +465,14 @@ async function timestampSection(filters: EvaluationFilters): Promise<TimestampSe
   const errors: BoundaryError[] = [];
 
   for (const row of rows) {
-    if (row.edited) {
+    const state = classifyClipState({ edited: row.edited, feedback: row.feedback });
+    if (state === 'rejected') {
+      rejected += 1;
+    } else if (state === 'edited_and_kept') {
       editedAndKept += 1;
-      // Ground truth: the person moved these boundaries on purpose.
+      // Ground truth: the person moved these boundaries on purpose AND kept
+      // the moment. An edited-then-rejected clip lands in `rejected` above
+      // and stays out of this sample.
       errors.push(
         boundaryErrors({
           predictedStartSeconds: toNumber(row.predicted_start),
@@ -459,9 +481,7 @@ async function timestampSection(filters: EvaluationFilters): Promise<TimestampSe
           finalEndSeconds: toNumber(row.final_end),
         }),
       );
-    } else if (row.feedback === 'rejected') {
-      rejected += 1;
-    } else if (row.feedback === 'approved') {
+    } else if (state === 'accepted_without_edit') {
       acceptedWithoutEdit += 1;
     } else {
       // No edit, no verdict. Not evidence of anything, and counted as such.
@@ -540,6 +560,28 @@ async function economicsSection(filters: EvaluationFilters): Promise<EconomicsSe
   if (filters.from) pushVideo('v.created_at >= ?', filters.from);
   if (filters.to) pushVideo('v.created_at < ?', filters.to);
   if (filters.durationBucket) pushVideo(`${DURATION_BUCKET_SQL} = ?`, filters.durationBucket);
+  // A lane filter must narrow the DENOMINATOR too: cost from one provider
+  // divided by hours every provider analyzed understates that provider's
+  // rate exactly when a comparison is being made. A video belongs to a lane
+  // when that lane's calls read it.
+  if (filters.provider) {
+    pushVideo(
+      `EXISTS (SELECT 1 FROM model_usage lu WHERE lu.video_id = v.id AND lu.stage = 'indexing' AND lu.provider = ?)`,
+      filters.provider,
+    );
+  }
+  if (filters.model) {
+    pushVideo(
+      `EXISTS (SELECT 1 FROM model_usage lu WHERE lu.video_id = v.id AND lu.stage = 'indexing' AND lu.model = ?)`,
+      filters.model,
+    );
+  }
+  if (filters.promptVersion) {
+    pushVideo(
+      `EXISTS (SELECT 1 FROM model_usage lu WHERE lu.video_id = v.id AND lu.stage = 'indexing' AND lu.prompt_version = ?)`,
+      filters.promptVersion,
+    );
+  }
 
   const videoTotals = await queryOne<{ videos: string; seconds: string; wall_ms: string }>(
     `SELECT count(*)::bigint AS videos,

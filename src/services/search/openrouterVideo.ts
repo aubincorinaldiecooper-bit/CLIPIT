@@ -422,8 +422,14 @@ async function requestCompletion(
           totalTokens,
           costUsd: typeof payload.usage.cost === 'number' ? payload.usage.cost : null,
           latencyMs,
-          provider: payload.provider ?? 'openrouter.ai',
+          // The LANE, matching what the matches carry — quality and cost must
+          // segment under the same name or neither can be compared to the
+          // other. Which vendor OpenRouter routed the call to is real
+          // information, but it is a detail of the call, so it rides in
+          // metrics instead of fragmenting the provider column.
+          provider: 'openrouter',
           model: env.OPENROUTER_VIDEO_MODEL,
+          metrics: payload.provider ? { served_by: payload.provider } : null,
           startedAt: new Date(Date.now() - latencyMs),
           promptVersion: promptVersion(input.systemPrompt),
         });

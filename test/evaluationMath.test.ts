@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   boundaryErrors,
+  classifyClipState,
   costPerSourceHour,
   percentile,
   summariseBoundaryErrors,
@@ -103,6 +104,22 @@ describe('percentile', () => {
     expect(percentile([7], 90)).toBe(7);
     expect(percentile([1, 9], 0)).toBe(1);
     expect(percentile([1, 9], 100)).toBe(9);
+  });
+});
+
+describe('classifyClipState', () => {
+  it('a rejection wins over an edit — a discarded moment is not ground truth', () => {
+    // Someone can adjust a clip's boundaries and THEN throw the moment away;
+    // its timing must not score the model on a moment the person said was wrong.
+    expect(classifyClipState({ edited: true, feedback: 'rejected' })).toBe('rejected');
+  });
+
+  it('maps the remaining states from the two facts', () => {
+    expect(classifyClipState({ edited: true, feedback: 'approved' })).toBe('edited_and_kept');
+    expect(classifyClipState({ edited: true, feedback: null })).toBe('edited_and_kept');
+    expect(classifyClipState({ edited: false, feedback: 'approved' })).toBe('accepted_without_edit');
+    expect(classifyClipState({ edited: false, feedback: null })).toBe('generated_never_reviewed');
+    expect(classifyClipState({ edited: false, feedback: 'rejected' })).toBe('rejected');
   });
 });
 

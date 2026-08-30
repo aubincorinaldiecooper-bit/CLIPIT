@@ -330,7 +330,12 @@ describe('OpenRouter actual-video search', () => {
       completionTokens: 20,
       totalTokens: 120,
       costUsd: 0.001,
-      provider: 'test-provider',
+      // The LANE, not the vendor OpenRouter routed to: usage rows and match
+      // rows must segment under the same provider name or the evaluation
+      // report can never line quality up against cost. The serving vendor
+      // is kept, as a detail of the call.
+      provider: 'openrouter',
+      metrics: { served_by: 'test-provider' },
       model: 'qwen/qwen3.6-flash',
     });
     expect((usage[0] as { latencyMs: number }).latencyMs).toBeGreaterThanOrEqual(0);

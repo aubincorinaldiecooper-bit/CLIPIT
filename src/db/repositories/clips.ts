@@ -98,6 +98,12 @@ export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> 
  * function is the reason it exists, and the one write that must never reach
  * it. Runs only on root clips: a captioned copy inherits its footage from
  * its source, and its boundaries with it.
+ *
+ * `status = 'ready'` in the WHERE is the claim, not a courtesy check: two
+ * edits racing past an in-memory status read would otherwise both write,
+ * share one queued render (stable job id), and leave the file cut from one
+ * set of boundaries while the row describes the other. The second edit
+ * finding no ready row is told to wait, which is the truth.
  */
 export async function setClipBoundaries(
   clipId: string,
@@ -112,11 +118,37 @@ export async function setClipBoundaries(
             status = 'pending',
             error_message = NULL,
             updated_at = now()
-      WHERE id = $1 AND derived_from_clip_id IS NULL
+      WHERE id = $1 AND derived_from_clip_id IS NULL AND status = 'ready'
       RETURNING *`,
     [clipId, startSeconds, endSeconds],
   );
   return row ? mapClip(row) : null;
+}
+
+/**
+ * Undoes a boundary edit whose re-render never made it into the queue.
+ *
+ * Without this, a queue outage in the moment between the claim above and
+ * the enqueue leaves the row `pending` forever: the file still shows the
+ * old cut, the row describes the new one, and every later edit is refused
+ * by the ready-claim. Putting the previous boundaries, edit mark and
+ * `ready` status back returns the clip to exactly the state the person
+ * could see — an edit that failed is an edit that did not happen.
+ */
+export async function restoreClipBoundaries(
+  clipId: string,
+  previous: { startSeconds: number; endSeconds: number; boundariesEditedAt: Date | null },
+): Promise<void> {
+  await queryOne(
+    `UPDATE clips
+        SET start_seconds = $2,
+            end_seconds = $3,
+            boundaries_edited_at = $4,
+            status = 'ready',
+            updated_at = now()
+      WHERE id = $1 AND status = 'pending'`,
+    [clipId, previous.startSeconds, previous.endSeconds, previous.boundariesEditedAt],
+  );
 }
 
 /** Every clip file cut from this video, so they can be deleted with it. */
