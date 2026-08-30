@@ -14,7 +14,7 @@ import { recordModelUsage } from '../../db/repositories/usage.js';
 import { appendScenes, clearScenes, type NewVideoScene } from '../../db/repositories/scenes.js';
 import { findUncoveredRanges } from '../../services/timestamps.js';
 import { getVideo, listChunks, setIndexStatus } from '../../db/repositories/videos.js';
-import { coolMiniCpm } from '../../services/search/minicpmVideo.js';
+import { coolMiniCpm, warmMiniCpm } from '../../services/search/minicpmVideo.js';
 import type { IndexingJob } from '../../queues/index.js';
 
 /**
@@ -49,6 +49,17 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
 
   const tally = new UsageTally();
   const startedAt = performance.now();
+  // Hold the GPU for the duration of THIS read.
+  //
+  // The upload already warmed it, but that warm and this cool live in
+  // different processes — the API reserves the upload, the worker does the
+  // reading — so they cannot share a count of what is in flight. With
+  // several videos queued, the first read to finish would otherwise drop
+  // the floor while the rest were still waiting their turn, and a read
+  // starting after the idle window had expired would pay the cold start
+  // again. Re-asserting here makes the rule exact: the floor is held while
+  // a read is running, and released when it ends.
+  void warmMiniCpm(`indexing-started:${videoId}`);
   // So the peak reported at the end belongs to this read.
   resetVideoCallPeak();
   await setIndexStatus(videoId, 'running', { sceneCount: 0 });
