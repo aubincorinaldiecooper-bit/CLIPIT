@@ -5,7 +5,7 @@
   "description": "Backend for user-directed AI video clipping (OpenRouter video understanding + FFmpeg)",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
