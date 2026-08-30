@@ -58,7 +58,12 @@ export function shouldMerge(
   if (union > options.maxDurationSeconds) return false;
 
   const gap = later.globalStartSeconds - earlier.globalEndSeconds;
-  if (gap >= 0) return gap <= options.gapSeconds;
+  // Adjacency is evidence of one event only when two independent chunk
+  // searches met at their boundary. Within one chunk, two nearby hits are two
+  // hits: merging them also keeps everything between them, which is exactly
+  // the unrelated footage a clip must not acquire. This additionally stops a
+  // run of close results from chaining into one very long clip.
+  if (gap >= 0) return earlier.chunkId !== later.chunkId && gap <= options.gapSeconds;
 
   const overlap = Math.min(earlier.globalEndSeconds, later.globalEndSeconds) - later.globalStartSeconds;
   const shorter = Math.min(duration(earlier), duration(later));
