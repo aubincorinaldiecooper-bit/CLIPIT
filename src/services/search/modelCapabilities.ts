@@ -240,7 +240,11 @@ function rankForReplacing(configured: string, candidates: string[]): string[] {
 export async function assertVideoInputSupported(): Promise<void> {
   // The probe asks OpenRouter about OpenRouter models. Under another video
   // provider its verdict is about a model that will not be called.
-  if (env.VIDEO_PROVIDER !== 'openrouter') return;
+  if (env.VIDEO_PROVIDER === 'minicpm') {
+    const { assertMiniCpmDeploymentAvailable } = await import('./minicpmVideo.js');
+    await assertMiniCpmDeploymentAvailable();
+    return;
+  }
   if ((await cachedVerdict()) !== 'no-video-endpoint') return;
 
   const model = env.OPENROUTER_VIDEO_MODEL;
