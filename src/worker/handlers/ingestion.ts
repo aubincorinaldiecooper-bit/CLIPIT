@@ -63,6 +63,9 @@ export async function handleIngestion(job: Job<IngestionJob>): Promise<void> {
 }
 
 async function ingestYoutube(job: Job<IngestionJob>, videoId: string, sourceUrl: string | null): Promise<void> {
+  if (!env.YOUTUBE_INGESTION_ENABLED) {
+    throw new Error('YouTube links are not accepted right now — upload the video file instead');
+  }
   if (!sourceUrl) throw new Error('YouTube source has no URL');
 
   const log = logger.child({ job: 'ingestion', videoId });
