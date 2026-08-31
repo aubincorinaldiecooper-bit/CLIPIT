@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { stat } from 'node:fs/promises';
 import { env } from '../../config/env.js';
 import { logger, type Logger } from '../../lib/logger.js';
 import { errorMessage } from '../../lib/errors.js';
@@ -16,6 +17,7 @@ import { runVerticalPipeline, VerticalPipelineFailure } from './verticalPipeline
 import { assembleDeck, deckMetrics, planDeck, type DeckOutcome, type PreparedCandidate } from './deckAssembly.js';
 import type { FailureStage, VerticalCandidate } from './verticalVisibility.js';
 import type { PlatformIntent } from '../search/platformIntent.js';
+import type { UsageTally } from '../usageTally.js';
 
 /**
  * From ranked candidates to a deck of finished, post-ready moments — or to
@@ -60,6 +62,14 @@ export interface OrchestrateInput {
   requestedCount: number;
   candidates: OrchestratorCandidate[];
   log: Logger;
+  /**
+   * The search's own cost tally. Composition calls are made inside the search
+   * job and are part of what that request cost; leaving them out would make
+   * the "clip search cost" line understate a vertical request by every
+   * framing call it paid for — and that line exists precisely to be priced
+   * from on its own.
+   */
+  tally: UsageTally;
 }
 
 /**
@@ -74,21 +84,37 @@ export interface OrchestrateInput {
 function compositionAsker(input: OrchestrateInput, canonicalKey: string, durationSeconds: number) {
   return async (canonicalPath: string) => {
     const parts: ContentPart[] = [{ type: 'text', text: COMPOSITION_INSTRUCTION }];
-    const videoPart = await videoPartFromFile(canonicalPath);
-    parts.push(videoPart.part);
+
+    // The MiniCPM lane sends a signed URL to videoStorageKey and reads only
+    // the text parts, so base64-encoding the clip for it produces a
+    // multi-megabyte string that is built and thrown away. One clip is
+    // nothing; a deck is that repeated for every candidate, inside a worker
+    // already running FFmpeg. The OpenRouter lane genuinely needs the bytes
+    // and still gets them.
+    const usesStorageKey = env.VIDEO_PROVIDER === 'minicpm';
+    let videoBytes: number;
+    if (usesStorageKey) {
+      videoBytes = (await stat(canonicalPath)).size;
+    } else {
+      const videoPart = await videoPartFromFile(canonicalPath);
+      parts.push(videoPart.part);
+      videoBytes = videoPart.bytes;
+    }
 
     const answer = await askVideoModel({
       chunkIndex: 0,
       chunkDurationSeconds: durationSeconds,
       systemPrompt: COMPOSITION_SYSTEM_PROMPT,
       parts,
-      videoBytes: videoPart.bytes,
+      videoBytes,
       purpose: 'search',
       videoStorageKey: canonicalKey,
       onUsage: (usage) => {
-        // Its own stage, for the same reason re-clip has one: what framing
-        // costs is a separate business number from what searching costs, and
-        // it only exists if the rows keep it apart.
+        // Counted in the request's total...
+        input.tally.add(usage);
+        // ...and stored under its own stage, for the same reason re-clip has
+        // one: what framing costs is a separate business number from what
+        // searching costs, and it only exists if the rows keep it apart.
         void recordModelUsage({
           ...usage,
           stage: 'composition',
@@ -122,6 +148,7 @@ async function prepareCandidate(
   const startedAt = performance.now();
   let clipId: string | null = null;
   let stage: FailureStage = 'canonical_generation';
+  let canonicalGenerationMs: number | null = null;
 
   try {
     const clip = await upsertClipForMatch({
@@ -163,7 +190,13 @@ async function prepareCandidate(
         paddingSeconds: env.CLIP_PADDING_SECONDS,
         videoDurationSeconds: input.videoDurationSeconds ?? Number.POSITIVE_INFINITY,
         minDurationSeconds: env.MIN_CLIP_SECONDS,
-        maxDurationSeconds: env.MAX_CLIP_SECONDS,
+        // The PLATFORM's ceiling, not the global one. Candidates were already
+        // filtered against it, and padding is the one thing that could push a
+        // 58-second moment past a 60-second limit after that check passed —
+        // rendering a clip TikTok would refuse, having explicitly filtered
+        // for clips TikTok would accept. Latent today (padding defaults to
+        // zero) and a real bug the moment anyone sets it.
+        maxDurationSeconds: input.intent.hardMaxSeconds,
       },
     );
 
@@ -185,7 +218,7 @@ async function prepareCandidate(
       durationSeconds: Number(cut.durationSeconds.toFixed(3)),
       sizeBytes: cut.sizeBytes,
     });
-    const canonicalGenerationMs = Math.round(performance.now() - startedAt);
+    canonicalGenerationMs = Math.round(performance.now() - startedAt);
 
     // Framing, derivative, poster. Every failure inside here arrives as a
     // VerticalPipelineFailure carrying the stage that gave way.
@@ -246,6 +279,7 @@ async function prepareCandidate(
       failureMessage: null,
       attemptNumber: attempt,
       totalAttempts: attempt,
+      canonicalGenerationMs,
       compositionDecisionMs: media.compositionDecisionMs,
       derivativeRenderMs: media.derivativeGenerationMs,
       posterGenerationMs: media.posterGenerationMs,
@@ -294,6 +328,9 @@ async function prepareCandidate(
       failureMessage: message.slice(0, 500),
       attemptNumber: attempt,
       totalAttempts: attempt,
+      // Whatever the cut cost before this attempt gave way — null when it
+      // fell over before the cut finished.
+      canonicalGenerationMs,
       compositionDecisionMs: null,
       derivativeRenderMs: null,
       posterGenerationMs: null,
@@ -337,11 +374,10 @@ export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<
     env.VERTICAL_MAX_RENDER_ATTEMPTS,
   );
 
-  const metrics = deckMetrics(outcome, startedAt, performance.now());
+  const metrics = deckMetrics(outcome, startedAt, performance.now(), input.candidates.length);
   input.log.info('vertical deck assembled', {
     platform: input.intent.platform,
     requested: input.requestedCount,
-    candidatePool: input.candidates.length,
     candidateCeiling: plan.candidateTarget,
     complete: outcome.complete,
     ...metrics,

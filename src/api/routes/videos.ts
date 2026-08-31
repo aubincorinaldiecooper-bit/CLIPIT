@@ -26,7 +26,13 @@ import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
 import { warmMiniCpm } from '../../services/search/minicpmVideo.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
-import { serializeClipRequest, serializeVideo, serializeVideoWithPlayback, videoPosterUrl } from '../serializers.js';
+import {
+  creatorVisibleMatches,
+  serializeClipRequest,
+  serializeVideo,
+  serializeVideoWithPlayback,
+  videoPosterUrl,
+} from '../serializers.js';
 import type { Clip } from '../../domain/types.js';
 import { parse } from '../validation.js';
 
@@ -497,11 +503,15 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const history = await listClipRequestsForVideo(videoId);
     const clipRequests = await Promise.all(
       history.map(async (clipRequest) => {
-        const [matches, clips] = await Promise.all([
+        const [allMatches, allClips] = await Promise.all([
           listMatches(clipRequest.id),
           listClipsForRequest(clipRequest.id),
         ]);
-        const clipsByMatchId = new Map<string, Clip>(clips.map((clip) => [clip.clipMatchId, clip]));
+        const clipsByMatchId = new Map<string, Clip>(allClips.map((clip) => [clip.clipMatchId, clip]));
+        // Same gate as the request route. History is still a creator-facing
+        // view, and an unfinished moment must not reappear in it just
+        // because it is being read from a different page.
+        const { matches } = creatorVisibleMatches(allMatches, clipsByMatchId);
         return serializeClipRequest(clipRequest, matches, clipsByMatchId);
       }),
     );

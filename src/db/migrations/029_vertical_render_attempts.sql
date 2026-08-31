@@ -74,7 +74,11 @@ CREATE TABLE vertical_render_attempts (
     total_attempts     INTEGER,
     recovered_at       TIMESTAMPTZ,
 
-    -- Where the time went.
+    -- Where the time went, per stage. canonical_generation_ms is here as well
+    -- as on the clip: the clip keeps the time of the cut it currently has,
+    -- while this keeps the time of THIS attempt, including attempts whose
+    -- clip was later overwritten or never finished at all.
+    canonical_generation_ms  INTEGER,
     composition_decision_ms  INTEGER,
     derivative_render_ms     INTEGER,
     poster_generation_ms     INTEGER,

@@ -35,6 +35,7 @@ export interface RecordAttemptInput {
   failureMessage: string | null;
   attemptNumber: number;
   totalAttempts: number | null;
+  canonicalGenerationMs: number | null;
   compositionDecisionMs: number | null;
   derivativeRenderMs: number | null;
   posterGenerationMs: number | null;
@@ -55,8 +56,8 @@ export async function recordVerticalRenderAttempt(input: RecordAttemptInput): Pr
         target_aspect, target_width, target_height, composition_mode,
         provider, model, outcome, failure_stage, failure_code, failure_message,
         attempt_number, total_attempts,
-        composition_decision_ms, derivative_render_ms, poster_generation_ms)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
+        canonical_generation_ms, composition_decision_ms, derivative_render_ms, poster_generation_ms)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
     [
       input.videoId, input.clipRequestId, input.matchId, input.clipId,
       input.workspaceId, input.sessionId,
@@ -67,7 +68,7 @@ export async function recordVerticalRenderAttempt(input: RecordAttemptInput): Pr
       input.failureStage, input.failureCode,
       input.failureMessage ? input.failureMessage.slice(0, 500) : null,
       input.attemptNumber, input.totalAttempts,
-      input.compositionDecisionMs, input.derivativeRenderMs, input.posterGenerationMs,
+      input.canonicalGenerationMs, input.compositionDecisionMs, input.derivativeRenderMs, input.posterGenerationMs,
     ],
   );
 }

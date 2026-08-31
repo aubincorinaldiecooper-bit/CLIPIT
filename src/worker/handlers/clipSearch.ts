@@ -460,7 +460,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // creator sees the whole set or nothing.
       if (needsVerticalDerivative(intent)) {
         deck = await buildVerticalDeck({
-          clipRequestId, request, video, intent, workDir: dir, log,
+          clipRequestId, request, video, intent, workDir: dir, log, tally,
         });
 
         // Candidates existed and we could not finish them. That is OUR
@@ -692,6 +692,7 @@ async function buildVerticalDeck(input: {
   intent: PlatformIntent;
   workDir: string;
   log: Logger;
+  tally: UsageTally;
 }): Promise<VerticalDeckResult> {
   const { clipRequestId, request, video, intent, log } = input;
   const empty = {
@@ -754,6 +755,7 @@ async function buildVerticalDeck(input: {
     requestedCount: intent.requestedCount,
     candidates,
     log,
+    tally: input.tally,
   });
 
   return {

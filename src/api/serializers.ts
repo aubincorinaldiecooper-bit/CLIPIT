@@ -3,6 +3,7 @@ import { getStorage } from '../services/storage/s3.js';
 import { formatTimecode } from '../services/timestamps.js';
 import { latestVersionsForMatches } from '../db/repositories/reclips.js';
 import { clipMediaContract } from './mediaContract.js';
+import { isCreatorVisible } from '../services/media/verticalVisibility.js';
 import type { CompositionMode } from '../services/media/composition.js';
 import type {
   ChunkDegradation,
@@ -413,6 +414,56 @@ export async function serializeLibraryClip(entry: {
     description: entry.description,
     thumbnailUrl,
     videoTitle: entry.videoTitle,
+  };
+}
+
+/**
+ * The gate between what the pipeline made and what a creator is shown.
+ *
+ * A post-ready request stores more matches than it ever intends to show. It
+ * over-fetches on purpose so one failed render does not cost a card, and the
+ * ones it never needed — plus the ones that failed — stay in the database as
+ * our record. None of them are the creator's answer.
+ *
+ * Without this, asking for three moments returns six: three finished cards,
+ * and three more with no playable vertical file behind them. That is the
+ * "backend processing state leaking out as a product state" the whole
+ * post-ready rule exists to prevent, and it is the LAST place it can be
+ * stopped — a client that forgets to filter must not be able to leak one.
+ *
+ * Decided from the DATA, never by re-reading the instruction. A correction
+ * ("are you sure?") stores those three words as its own instruction while the
+ * deck was built for the question before it, so parsing the text here would
+ * get the answer wrong exactly when it matters. The clip rows say what
+ * actually happened.
+ */
+export function creatorVisibleMatches(
+  matches: ClipMatch[],
+  clipsByMatchId: Map<string, Clip>,
+): { matches: ClipMatch[]; clips: Clip[]; withheld: number } {
+  const preRendered = [...clipsByMatchId.values()].some((clip) => clip.preRendered);
+  // Nothing pre-rendered means this request never went down the post-ready
+  // path, and its behaviour must not change by a single row.
+  if (!preRendered) {
+    return { matches, clips: [...clipsByMatchId.values()], withheld: 0 };
+  }
+
+  const visible = matches.filter((match) => {
+    const clip = clipsByMatchId.get(match.id);
+    if (!clip) return false;
+    return isCreatorVisible({
+      matchId: match.id,
+      derivativeStatus: clip.derivativeStatus ?? 'pending',
+      derivativeStorageKey: clip.derivativeStorageKey,
+      posterStorageKey: clip.posterStorageKey,
+      confidence: match.confidence,
+    });
+  });
+
+  return {
+    matches: visible,
+    clips: visible.map((match) => clipsByMatchId.get(match.id)!),
+    withheld: matches.length - visible.length,
   };
 }
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { assembleDeck, planDeck, type PreparedCandidate } from '../src/services/media/deckAssembly.js';
 import { keepAction, retentionClassFor } from '../src/services/media/keepApproval.js';
 import { clipMediaContract } from '../src/api/mediaContract.js';
+import { creatorVisibleMatches } from '../src/api/serializers.js';
 import { exceedsPlatformHardMax, resolvePlatformIntent, needsVerticalDerivative } from '../src/services/search/platformIntent.js';
 import type { VerticalCandidate } from '../src/services/media/verticalVisibility.js';
 
@@ -191,5 +192,83 @@ describe('what a client is told', () => {
     expect(media.url).not.toBe('https://example/vertical.mp4');
     expect(media.outputAspectRatio).toBe('16:9');
     expect(media.compositionMode).not.toBe('smart_crop');
+  });
+});
+
+describe('the gate between what was made and what is shown', () => {
+  const match = (id: string, confidence: number) => ({
+    id, confidence,
+    clipRequestId: 'r1', chunkId: 'c1', videoId: 'v1',
+    globalStartSeconds: 0, globalEndSeconds: 20,
+    localStartSeconds: 0, localEndSeconds: 20,
+    description: 'a moment', quote: null, source: 'visual' as const,
+    thumbnailKey: null, feedback: null, feedbackReason: null,
+    provider: null, model: null, promptVersion: null,
+    title: null, postIds: null,
+    createdAt: new Date(), updatedAt: new Date(),
+  });
+
+  const clip = (matchId: string, over: Record<string, unknown> = {}) => ({
+    id: `clip-${matchId}`, clipMatchId: matchId, videoId: 'v1',
+    sessionId: null, userId: null, workspaceId: null,
+    captions: null, derivedFromClipId: null, focusPct: 50,
+    startSeconds: 0, endSeconds: 20,
+    predictedStartSeconds: 0, predictedEndSeconds: 20, boundariesEditedAt: null,
+    storageKey: `clips/${matchId}.mp4`, status: 'ready' as const, errorMessage: null,
+    durationSeconds: 20, sizeBytes: 100,
+    derivativeStorageKey: `vertical/${matchId}.mp4`,
+    derivativeStatus: 'ready' as const,
+    posterStorageKey: `poster/${matchId}.jpg`,
+    posterTimestampSeconds: 5,
+    compositionMode: 'smart_crop',
+    sourceWidth: 1920, sourceHeight: 1080, outputWidth: 1080, outputHeight: 1920,
+    preRendered: true, approvedAt: null, retentionClass: 'temporary' as const,
+    createdAt: new Date(), updatedAt: new Date(),
+    ...over,
+  });
+
+  /**
+   * The failure this exists to prevent: a request that over-fetched six
+   * candidates to guarantee three cards returns all six, and the creator sees
+   * three finished moments next to three that play nothing.
+   */
+  it('shows only the moments that were actually finished', () => {
+    const matches = [match('a', 0.9), match('b', 0.8), match('c', 0.7), match('d', 0.6)];
+    const clips = new Map<string, any>([
+      ['a', clip('a')],
+      // Rendered and failed — suppressed, never shown.
+      ['b', clip('b', { derivativeStatus: 'failed', derivativeStorageKey: null })],
+      ['c', clip('c')],
+      // 'd' was never touched: the deck filled before it was reached.
+    ]);
+
+    const visible = creatorVisibleMatches(matches as any, clips);
+    expect(visible.matches.map((m) => m.id)).toEqual(['a', 'c']);
+    expect(visible.clips).toHaveLength(2);
+    expect(visible.withheld).toBe(2);
+  });
+
+  /** A row marked ready with no file is a bug, and must not reach anyone. */
+  it('trusts the file, not the status column', () => {
+    const clips = new Map<string, any>([['a', clip('a', { posterStorageKey: null })]]);
+    expect(creatorVisibleMatches([match('a', 0.9)] as any, clips).matches).toEqual([]);
+  });
+
+  /**
+   * Everything that is not the post-ready path must behave exactly as it did
+   * before this pipeline existed — including a request whose clips are still
+   * being cut, where a pending clip is a normal, visible state.
+   */
+  it('leaves the legacy path completely untouched', () => {
+    const matches = [match('a', 0.9), match('b', 0.8)];
+    const clips = new Map<string, any>([
+      ['a', clip('a', {
+        preRendered: false, derivativeStatus: null, derivativeStorageKey: null,
+        posterStorageKey: null, status: 'pending', storageKey: null,
+      })],
+    ]);
+    const visible = creatorVisibleMatches(matches as any, clips);
+    expect(visible.matches.map((m) => m.id)).toEqual(['a', 'b']);
+    expect(visible.withheld).toBe(0);
   });
 });

@@ -133,13 +133,28 @@ export async function assembleDeck(
  * need, plus everything suppressed. Generating before Keep is what makes this
  * measurable and what makes it matter.
  */
-export function deckMetrics(outcome: DeckOutcome, startedAtMs: number, nowMs: number) {
+export function deckMetrics(
+  outcome: DeckOutcome,
+  startedAtMs: number,
+  nowMs: number,
+  /** The ranked pool the deck could draw from, before any of it was touched. */
+  internalCandidateCount = outcome.candidatesRendered,
+) {
   const renderedButSkipped = outcome.surplus.length + outcome.suppressed.length;
   return {
     requestedResultCount: outcome.deck.length + (outcome.complete ? 0 : outcome.suppressed.length),
     readyResultCount: outcome.deck.length,
+    // How many candidates existed to choose from. Read next to
+    // candidatesRendered it answers "did we run out of moments, or did we run
+    // out of moments that would render?" — two very different problems.
+    internalCandidateCount,
     candidatesRendered: outcome.candidatesRendered,
     failedCandidateCount: outcome.suppressed.length,
+    // The same count named as what it MEANS: moments a creator wanted and did
+    // not get because we could not finish them. Kept alongside rather than
+    // instead of failedCandidateCount so neither name goes looking and finds
+    // nothing.
+    suppressedFailureCount: outcome.suppressed.length,
     backfillCount: outcome.backfillCount,
     renderedButSkippedCount: renderedButSkipped,
     renderedButSkippedRate:
