@@ -128,6 +128,34 @@ npm run typecheck
 Migrations run automatically when the API or worker starts, so a fresh deploy
 is usable without a manual step.
 
+### The smallest `.env` that boots
+
+Everything else in `.env.example` has a working default:
+
+```
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/clipit
+REDIS_URL=redis://127.0.0.1:6379
+AWS_ACCESS_KEY_ID=…
+AWS_SECRET_ACCESS_KEY=…
+BUCKET_NAME=clipit
+OPENROUTER_API_KEY=…
+```
+
+Against MinIO also set `AWS_ENDPOINT_URL=http://127.0.0.1:9000` and
+`S3_FORCE_PATH_STYLE=true`. MinIO rejects the CORS rule the API applies on
+boot; the log line is expected there and only affects browser uploads, which
+need the rule set with `mc` by hand.
+
+Ingestion and preprocessing work without a valid `OPENROUTER_API_KEY` — an
+upload still reaches `ready`. Transcription, indexing and search are the parts
+that fail with a `401` until a real one is set.
+
+### `yt-dlp` is required even if you only upload files
+
+The worker checks `ffmpeg`, `ffprobe` and `yt-dlp` at startup and exits if any
+is missing, so a machine without `yt-dlp` cannot run the pipeline at all — not
+only its YouTube half.
+
 ---
 
 ## API
