@@ -281,15 +281,23 @@ export interface CutClipOptions {
 export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: number; durationSeconds: number }> {
   const duration = Math.max(0.1, options.endSeconds - options.startSeconds);
 
+  // Input-seek to a keyframe before the requested start, then output-seek to
+  // the exact start. Without the output seek, `-t` measures from the keyframe,
+  // so a clip starting a few seconds after a keyframe ends a few seconds early
+  // — which cuts speakers off mid-sentence.
+  const preRollSeconds = Math.min(options.startSeconds, 10);
+  const coarseStartSeconds = Math.max(0, options.startSeconds - preRollSeconds);
+  const outputOffsetSeconds = options.startSeconds - coarseStartSeconds;
+  const outputEndSeconds = options.endSeconds - coarseStartSeconds;
+
   const args = [
     '-hide_banner',
     '-loglevel', 'error',
     '-y',
-    // Coarse input seek for speed, then an accurate output seek from the
-    // keyframe: fast on long sources without drifting off the requested start.
-    '-ss', options.startSeconds.toFixed(3),
+    '-ss', coarseStartSeconds.toFixed(3),
     '-i', options.inputPath,
-    '-t', duration.toFixed(3),
+    '-ss', outputOffsetSeconds.toFixed(3),
+    '-to', outputEndSeconds.toFixed(3),
     '-c:v', 'libx264',
     '-preset', env.CLIP_PRESET,
     '-crf', String(env.CLIP_VIDEO_CRF),
