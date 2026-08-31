@@ -1,6 +1,8 @@
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
-import { logger } from '../../lib/logger.js';
+import { logger, type Logger } from '../../lib/logger.js';
+import { getStorage } from '../../services/storage/s3.js';
+import { clearExpiredMedia, listUnkeptPreRenderedMedia } from '../../db/repositories/verticalMedia.js';
 import { listVideosWithUnreachableFootage } from '../../db/repositories/videos.js';
 import { expireVideoFootage } from '../../services/retention.js';
 import type { RetentionJob } from '../../queues/index.js';
@@ -58,5 +60,64 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
     objectsFailed,
     elapsedMs: Math.round(performance.now() - startedAt),
     ...(remaining > 0 ? { videosLeftForNextSweep: remaining } : {}),
+  });
+
+  await sweepUnkeptPreRenderedMedia(log);
+}
+
+/**
+ * Delete the moments we made and nobody kept.
+ *
+ * Rendering before Keep is what makes the deck appear finished the moment it
+ * appears at all. It has a bill attached: asking for three moments renders at
+ * least three, and only the ones somebody pressed Keep on were ever wanted.
+ * Without this, that bill is permanent and grows with every question asked.
+ *
+ * Narrow on purpose, and narrow in the QUERY rather than in a filter here:
+ * only rows this pipeline made, only ones never approved, only after the same
+ * idle period the footage sweep uses. A clip somebody kept, and every clip
+ * cut the old way, is invisible to it.
+ */
+async function sweepUnkeptPreRenderedMedia(log: Logger): Promise<void> {
+  const rows = await listUnkeptPreRenderedMedia(env.FOOTAGE_IDLE_SECONDS, env.RETENTION_VIDEO_LIMIT);
+  if (rows.length === 0) return;
+
+  const storage = getStorage();
+  const swept: string[] = [];
+  let objectsDeleted = 0;
+  let objectsFailed = 0;
+
+  for (const row of rows) {
+    const keys = [row.derivativeStorageKey, row.posterStorageKey, row.storageKey]
+      .filter((key): key is string => typeof key === 'string' && key.length > 0);
+
+    let allGone = true;
+    for (const key of keys) {
+      try {
+        await storage.remove(key);
+        objectsDeleted += 1;
+      } catch (error) {
+        objectsFailed += 1;
+        allGone = false;
+        // Never the key itself at warn level with a signed URL attached —
+        // this is an object path, and nothing here signs anything.
+        log.warn('could not delete an unkept rendered file', { clipId: row.clipId, err: error });
+      }
+    }
+
+    // The row is only cleared when the bytes are actually gone. Clearing it
+    // first would lose the pointer to an object that still exists and still
+    // costs money, with nothing left to find it by.
+    if (allGone) swept.push(row.clipId);
+  }
+
+  await clearExpiredMedia(swept);
+
+  log.info('unkept rendered media swept', {
+    clips: rows.length,
+    cleared: swept.length,
+    objectsDeleted,
+    objectsFailed,
+    idleSeconds: env.FOOTAGE_IDLE_SECONDS,
   });
 }

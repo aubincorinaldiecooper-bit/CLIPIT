@@ -52,6 +52,68 @@ const UNIT_SECONDS: Record<string, number> = {
   minute: 60, minutes: 60, min: 60, mins: 60,
 };
 
+/** Numbers people write as words. Stops at ten; past that they use digits. */
+const WORD_NUMBERS: Record<string, number> = {
+  one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  couple: 2, few: 3,
+};
+
+/**
+ * What the deck is made of, however the creator names it.
+ *
+ * "video" is deliberately absent. In "what happens in this video" it names
+ * the SOURCE, not something being asked for, and counting it would read an
+ * ordinary question as a request for one clip.
+ */
+const MOMENT_WORDS = 'moment|clip|cut|highlight|post|short|reel';
+
+/** "3 moments", "three funny clips", "a couple of highlights". */
+const COUNTED = new RegExp(
+  String.raw`\b(\d{1,3}|${Object.keys(WORD_NUMBERS).join('|')})\b`
+  // Up to three words of description may sit between the number and the
+  // noun: "3 really funny moments", "a couple of clips".
+  + String.raw`(?:\s+\w+){0,3}?\s+(?:${MOMENT_WORDS})s?\b`,
+  'i',
+);
+
+/** Any mention of the noun at all, so singular can be told from plural. */
+const BARE_NOUN = new RegExp(String.raw`\b(?:${MOMENT_WORDS})(s?)\b`, 'i');
+
+/** A number that is really a duration: "30 second clips" is ONE clip. */
+const DURATION_NUMBER = /\b\d+\s*(?:seconds?|secs?|minutes?|mins?)\b/i;
+
+/**
+ * "Find me 3 moments" — how many cards the deck should hold.
+ *
+ * Read from the request rather than fixed, because the number IS the request:
+ * asking for three and receiving one is a wrong answer, and asking for one
+ * and receiving three spends money on renders nobody agreed to. Returns null
+ * when the creator did not say, and the caller supplies its default.
+ *
+ * Two phrases this deliberately gets right, because both are common and both
+ * are expensive to misread:
+ *
+ *  - "a 30 second clip for TikTok" is ONE clip, not thirty. A number attached
+ *    to a duration unit belongs to parseExplicitDurationSeconds, never here.
+ *  - "the best moment", singular, is one — even with no number in it. Reading
+ *    that as the default three would render two clips nobody asked for.
+ */
+export function parseRequestedMomentCount(instruction: string): number | null {
+  const counted = instruction.match(COUNTED);
+  if (counted && !DURATION_NUMBER.test(counted[0])) {
+    const token = counted[1]!.toLowerCase();
+    const value = WORD_NUMBERS[token] ?? Number(token);
+    if (Number.isFinite(value) && value >= 1) return Math.floor(value);
+  }
+
+  // No number, but the noun itself can be singular or plural.
+  const bare = instruction.match(BARE_NOUN);
+  if (bare && !bare[1]) return 1;
+
+  return null;
+}
+
 /** "make it 30 seconds" — an explicit ask that outranks the default profile. */
 export function parseExplicitDurationSeconds(instruction: string): number | null {
   const match = instruction.match(/\b(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?)\b/i);
@@ -71,6 +133,8 @@ export interface PlatformIntent {
   hardMaxSeconds: number;
   /** The phrase that decided the framing, for the log line. */
   matchedPhrase: string | null;
+  /** How many moments the deck should hold. Never below one. */
+  requestedCount: number;
 }
 
 /**
@@ -84,6 +148,7 @@ export interface PlatformIntent {
 export function resolvePlatformIntent(
   instruction: string | null | undefined,
   globalMaxSeconds: number,
+  options: { defaultCount?: number; maxCount?: number } = {},
 ): PlatformIntent {
   const text = typeof instruction === 'string' ? instruction : '';
   const framing = presentationTargetFor(text);
@@ -109,6 +174,12 @@ export function resolvePlatformIntent(
     explicitDurationSeconds,
     hardMaxSeconds,
     matchedPhrase: framing.matched,
+    // Bounded on both sides: at least one, and never more than the pipeline
+    // is willing to render for a single request.
+    requestedCount: Math.min(
+      Math.max(1, parseRequestedMomentCount(text) ?? options.defaultCount ?? 3),
+      Math.max(1, options.maxCount ?? 8),
+    ),
   };
 }
 

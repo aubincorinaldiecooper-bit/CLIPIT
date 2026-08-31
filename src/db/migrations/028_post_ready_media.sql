@@ -48,3 +48,26 @@ ALTER TABLE clips
     ADD COLUMN IF NOT EXISTS poster_generation_ms      INTEGER,
     ADD COLUMN IF NOT EXISTS composition_decision_ms   INTEGER,
     ADD COLUMN IF NOT EXISTS derivative_generation_ms  INTEGER;
+
+-- Whether this clip was made BEFORE anyone chose it. That is the whole
+-- premise of the post-ready deck: the file exists by the time the card is
+-- seen, so Keep can no longer mean "generate this". A clip cut the old way,
+-- on a Keep press, is not pre-rendered and its Keep must keep working
+-- exactly as it does today.
+--
+-- retention_class defaults to 'owned' deliberately. Every clip that exists
+-- today was cut because somebody asked for it, and a default of 'temporary'
+-- would enrol the entire back catalogue in a sweep that deletes it.
+ALTER TABLE clips
+    ADD COLUMN IF NOT EXISTS pre_rendered    BOOLEAN     NOT NULL DEFAULT FALSE,
+    -- Set when Keep is pressed. Null means nobody has chosen this moment.
+    ADD COLUMN IF NOT EXISTS approved_at     TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS retention_class TEXT        NOT NULL DEFAULT 'owned'
+        CHECK (retention_class IN ('temporary', 'owned'));
+
+-- The retention sweep's only question: which pre-rendered files did nobody
+-- keep, and how long have they been sitting there. Partial, because the rows
+-- it must never touch are the overwhelming majority.
+CREATE INDEX IF NOT EXISTS clips_unkept_prerendered_idx
+    ON clips (created_at)
+    WHERE retention_class = 'temporary' AND pre_rendered = TRUE;

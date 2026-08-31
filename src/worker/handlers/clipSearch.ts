@@ -46,8 +46,16 @@ import {
   type NewClipMatch,
 } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, type ClipSearchJob } from '../../queues/index.js';
+import {
+  exceedsPlatformHardMax,
+  needsVerticalDerivative,
+  resolvePlatformIntent,
+  type PlatformIntent,
+} from '../../services/search/platformIntent.js';
+import { orchestrateVerticalDeck, type OrchestratorCandidate } from '../../services/media/verticalOrchestrator.js';
 import type {
   ChunkDegradation,
+  ClipRequest,
   ChunkFailureCode,
   MatchSource,
   ResolvedSearchMode,
@@ -111,6 +119,12 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   let chunkCount = 0;
   let searchMode: ResolvedSearchMode | null = null;
   let outcome: 'completed' | 'failed' = 'failed';
+  // What the request asked for, read once. Both the search and the render
+  // must never form separate opinions about whether this is a TikTok ask.
+  let intent = resolvePlatformIntent(request.instruction, env.MAX_CLIP_SECONDS, {
+    maxCount: env.VERTICAL_CANDIDATE_CEILING,
+  });
+  let deck: VerticalDeckResult | null = null;
 
   try {
     if (video.status !== 'ready') {
@@ -155,6 +169,13 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
       instruction = previous.instruction;
       correcting = true;
+      // "Are you sure?" names no platform. Reading the intent from those
+      // three words would answer a TikTok question with a list of
+      // timestamps — so the intent is re-read from the question actually
+      // being looked at again, exactly as the search itself is.
+      intent = resolvePlatformIntent(instruction, env.MAX_CLIP_SECONDS, {
+        maxCount: env.VERTICAL_CANDIDATE_CEILING,
+      });
       // The strongest signal there is — a person saying our answer was wrong.
       // Stored so it survives the footage and can be counted later.
       await recordSearchApproach(clipRequestId, { notesConsulted: false, correctionOf: previous.id });
@@ -433,6 +454,46 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // After aggregation, because merging rewrites match rows and their ids.
       await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
 
+      // A request that named a platform is not answered by a list of
+      // timestamps. It is answered by finished, postable files — so the deck
+      // is BUILT here, before the request is reported complete, and the
+      // creator sees the whole set or nothing.
+      if (needsVerticalDerivative(intent)) {
+        deck = await buildVerticalDeck({
+          clipRequestId, request, video, intent, workDir: dir, log,
+        });
+
+        // Candidates existed and we could not finish them. That is OUR
+        // failure, and it is reported as one. Completing the request with an
+        // empty deck would tell someone their video has no postable moments
+        // when the truth is that our pipeline fell over on moments we found.
+        //
+        // Not thrown: throwing re-runs the whole search, and the search half
+        // worked. Every retry worth making has already been made, per
+        // candidate, inside the deck assembly where it costs one render
+        // rather than a re-reading of the entire video.
+        if (!deck.complete && deck.candidatePool > 0) {
+          await finishClipRequest(
+            clipRequestId,
+            'failed',
+            'We found the moments but could not finish making them ready to post. Please try again.',
+          );
+          log.error('vertical deck incomplete', {
+            requested: intent.requestedCount,
+            ready: deck.readyCount,
+            candidatePool: deck.candidatePool,
+            suppressed: deck.suppressedCount,
+          });
+          // The job itself did what it was asked; the request carries the bad
+          // news. Marking it 'failed' here too would double-count it.
+          outcome = 'completed';
+          return;
+        }
+        // A pool of zero is not a failure. The search looked and found
+        // nothing this platform could take, and saying so plainly is the
+        // honest answer — the same one a non-platform search gives.
+      }
+
       await finishClipRequest(clipRequestId, 'completed', null, 'footage');
       const elapsedMs = Math.round(performance.now() - searchStartedAt);
 
@@ -440,6 +501,20 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         matches: finalCount,
         mergedFrom: totalMatches,
         failedChunks: failed,
+        // What the creator was actually given. A search that "completed" with
+        // three matches and no finished media is a different event from one
+        // that handed over three postable files, and the log must tell them
+        // apart.
+        ...(deck
+          ? {
+              platform: intent.platform,
+              requestedMoments: intent.requestedCount,
+              deckReady: deck.readyCount,
+              deckSuppressed: deck.suppressedCount,
+              deckRenderedButSkipped: deck.renderedButSkipped,
+              timeToCompleteDeckMs: deck.timeToCompleteDeckMs,
+            }
+          : {}),
         // Coverage, not just outcome: how much of the video was actually
         // examined, and how much of it with less than the intended evidence.
         chunksSearchedWithoutTranscript: degradations.length,
@@ -584,6 +659,113 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
  * merging rewrites match rows and their ids — anything extracted earlier would
  * be attached to rows that no longer exist.
  */
+/** What the deck build produced, for the caller's log line and its decision. */
+interface VerticalDeckResult {
+  complete: boolean;
+  readyCount: number;
+  /** How many ranked candidates the search actually had to work with. */
+  candidatePool: number;
+  suppressedCount: number;
+  renderedButSkipped: number;
+  /** Null when the deck never completed — there is no time-to-complete for it. */
+  timeToCompleteDeckMs: number | null;
+}
+
+/**
+ * Turn the moments the search found into finished, postable files.
+ *
+ * Runs inside the search job, before the request is reported complete, and
+ * that ordering is the product rule: the creator sees the whole deck at once
+ * or they see nothing, so there must be no window where the request says
+ * "done" and the media is still being made.
+ *
+ * Candidates are ranked by the model's own confidence and taken in that
+ * order. Anything longer than the platform will accept is dropped BEFORE it
+ * costs anything — rendering an 85-second clip only to discover TikTok
+ * refuses it spends a GPU call and an encode on something that was never
+ * eligible.
+ */
+async function buildVerticalDeck(input: {
+  clipRequestId: string;
+  request: ClipRequest;
+  video: Video;
+  intent: PlatformIntent;
+  workDir: string;
+  log: Logger;
+}): Promise<VerticalDeckResult> {
+  const { clipRequestId, request, video, intent, log } = input;
+  const empty = {
+    complete: false, readyCount: 0, candidatePool: 0,
+    suppressedCount: 0, renderedButSkipped: 0, timeToCompleteDeckMs: 0,
+  };
+
+  if (!video.originalStorageKey) {
+    log.warn('cannot build a vertical deck without the original source');
+    return empty;
+  }
+
+  const stored = await listMatches(clipRequestId);
+  const candidates: OrchestratorCandidate[] = stored
+    .filter((match) => !exceedsPlatformHardMax(
+      { startSeconds: match.globalStartSeconds, endSeconds: match.globalEndSeconds },
+      intent,
+    ))
+    // Best first. The deck stops as soon as enough are ready, so rank order
+    // decides which moments are paid for at all.
+    .sort((a, b) => b.confidence - a.confidence)
+    .map((match) => ({
+      matchId: match.id,
+      confidence: match.confidence,
+      startSeconds: match.globalStartSeconds,
+      endSeconds: match.globalEndSeconds,
+      derivativeStatus: 'pending' as const,
+      derivativeStorageKey: null,
+      posterStorageKey: null,
+    }));
+
+  if (candidates.length === 0) {
+    log.info('no eligible candidates for a vertical deck', {
+      storedMatches: stored.length,
+      hardMaxSeconds: intent.hardMaxSeconds,
+    });
+    return empty;
+  }
+
+  // One download for the whole deck. Every candidate is cut from the ORIGINAL
+  // source, never the analysis proxy — the proxy is small on purpose and
+  // posting a clip cut from it would send someone a downscaled video.
+  const sourcePath = path.join(
+    input.workDir,
+    `original${path.extname(video.originalStorageKey) || '.mp4'}`,
+  );
+  await getStorage().downloadToFile(video.originalStorageKey, sourcePath);
+
+  const { outcome, metrics } = await orchestrateVerticalDeck({
+    videoId: video.id,
+    clipRequestId,
+    sessionId: request.sessionId,
+    userId: request.userId,
+    workspaceId: request.workspaceId,
+    sourcePath,
+    workDir: input.workDir,
+    hasAudio: video.hasAudio ?? true,
+    videoDurationSeconds: video.durationSeconds ?? null,
+    intent,
+    requestedCount: intent.requestedCount,
+    candidates,
+    log,
+  });
+
+  return {
+    complete: outcome.complete,
+    readyCount: outcome.deck.length,
+    candidatePool: candidates.length,
+    suppressedCount: outcome.suppressed.length,
+    renderedButSkipped: outcome.surplus.length,
+    timeToCompleteDeckMs: metrics.timeToCompleteDeckMs,
+  };
+}
+
 async function attachSearchThumbnails(input: {
   clipRequestId: string;
   video: Video;

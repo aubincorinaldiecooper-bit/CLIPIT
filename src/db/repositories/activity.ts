@@ -45,7 +45,13 @@ export async function summariseActivity(principal: {
       params,
     ),
     queryOne<{ count: number }>(
-      `SELECT count(*)::int AS count FROM clips WHERE ${scope} AND status = 'ready'`,
+      // "Clips cut" means clips this person kept. The post-ready pipeline
+      // renders candidates before anyone chooses, so counting every ready row
+      // would tell someone they had cut seven clips in a session where they
+      // kept one.
+      `SELECT count(*)::int AS count FROM clips
+         WHERE ${scope} AND status = 'ready'
+           AND (pre_rendered = FALSE OR approved_at IS NOT NULL)`,
       params,
     ),
   ]);

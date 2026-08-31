@@ -24,6 +24,8 @@ export type DerivativeStatus = 'pending' | 'ready' | 'failed';
 
 /** Where a vertical render gave way. Structured so it can be grouped. */
 export type FailureStage =
+  /** Cutting the canonical excerpt — the step before any vertical work. */
+  | 'canonical_generation'
   | 'composition_decision'
   | 'composition_validation'
   | 'smart_crop_render'
@@ -142,6 +144,9 @@ export function candidateTargetFor(requested: number, overfetchRatio: number, ce
  */
 export function isRetryableFailure(stage: FailureStage): boolean {
   switch (stage) {
+    // The cut itself: a download that dropped, a disk that filled, an encoder
+    // that died. All transient, all worth one more go.
+    case 'canonical_generation':
     case 'composition_decision':
     case 'smart_crop_render':
     case 'blurred_background_render':

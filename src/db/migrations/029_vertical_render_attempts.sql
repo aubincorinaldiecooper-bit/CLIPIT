@@ -49,6 +49,11 @@ CREATE TABLE vertical_render_attempts (
     -- "where does this break most" has to be answerable by grouping.
     failure_stage      TEXT
                        CHECK (failure_stage IS NULL OR failure_stage IN (
+                         -- Cutting the canonical excerpt is inside this pipeline's
+                         -- responsibility: if that fails the candidate silently
+                         -- leaves the deck, and an unrecorded disappearance is the
+                         -- exact thing this table exists to prevent.
+                         'canonical_generation',
                          'composition_decision',
                          'composition_validation',
                          'smart_crop_render',

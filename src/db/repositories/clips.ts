@@ -21,6 +21,18 @@ interface ClipRow {
   error_message: string | null;
   duration_seconds: number | null;
   size_bytes: number | null;
+  derivative_storage_key: string | null;
+  derivative_status: 'pending' | 'ready' | 'failed' | null;
+  poster_storage_key: string | null;
+  poster_timestamp_seconds: number | string | null;
+  composition_mode: string | null;
+  source_width: number | null;
+  source_height: number | null;
+  output_width: number | null;
+  output_height: number | null;
+  pre_rendered: boolean | null;
+  approved_at: Date | null;
+  retention_class: 'temporary' | 'owned' | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -46,6 +58,24 @@ function mapClip(row: ClipRow): Clip {
     errorMessage: row.error_message,
     durationSeconds: row.duration_seconds,
     sizeBytes: row.size_bytes,
+    derivativeStorageKey: row.derivative_storage_key ?? null,
+    derivativeStatus: row.derivative_status ?? null,
+    posterStorageKey: row.poster_storage_key ?? null,
+    // NUMERIC comes back from pg as a string; the contract promises a number.
+    posterTimestampSeconds: row.poster_timestamp_seconds === null || row.poster_timestamp_seconds === undefined
+      ? null
+      : Number(row.poster_timestamp_seconds),
+    compositionMode: row.composition_mode ?? null,
+    sourceWidth: row.source_width ?? null,
+    sourceHeight: row.source_height ?? null,
+    outputWidth: row.output_width ?? null,
+    outputHeight: row.output_height ?? null,
+    preRendered: row.pre_rendered ?? false,
+    approvedAt: row.approved_at ?? null,
+    // Matches the column default: a clip nothing has said otherwise about is
+    // owned, so a reader that predates these columns cannot make an old clip
+    // look sweepable.
+    retentionClass: row.retention_class ?? 'owned',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -233,6 +263,17 @@ export async function listClipsForPrincipal(
       WHERE ${scope}
         AND c.status = 'ready'
         AND c.storage_key IS NOT NULL
+        -- A library holds what somebody chose.
+        --
+        -- The post-ready pipeline cuts every candidate it offers, before
+        -- anyone presses anything, so clip rows now exist for moments that
+        -- were shown and skipped. Without this line a creator who asked for
+        -- three and kept one would open their library and find seven —
+        -- including the ones they had just waved away.
+        --
+        -- Clips cut the old way are pre_rendered = FALSE and are entirely
+        -- unaffected: they only ever existed because someone asked for them.
+        AND (c.pre_rendered = FALSE OR c.approved_at IS NOT NULL)
         AND ($2::timestamptz IS NULL OR c.created_at < $2)
       ORDER BY c.created_at DESC
       LIMIT $3`,
