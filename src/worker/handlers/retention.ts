@@ -2,7 +2,7 @@ import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
 import { logger, type Logger } from '../../lib/logger.js';
 import { getStorage } from '../../services/storage/s3.js';
-import { clearExpiredMedia, listUnkeptPreRenderedMedia } from '../../db/repositories/verticalMedia.js';
+import { claimUnkeptPreRenderedMedia } from '../../db/repositories/verticalMedia.js';
 import { listVideosWithUnreachableFootage } from '../../db/repositories/videos.js';
 import { expireVideoFootage } from '../../services/retention.js';
 import type { RetentionJob } from '../../queues/index.js';
@@ -79,11 +79,12 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
  * cut the old way, is invisible to it.
  */
 async function sweepUnkeptPreRenderedMedia(log: Logger): Promise<void> {
-  const rows = await listUnkeptPreRenderedMedia(env.FOOTAGE_IDLE_SECONDS, env.RETENTION_VIDEO_LIMIT);
+  // Claims and clears the rows in one statement, then deletes their objects.
+  // See claimUnkeptPreRenderedMedia for why that order, and what it costs.
+  const rows = await claimUnkeptPreRenderedMedia(env.FOOTAGE_IDLE_SECONDS, env.RETENTION_VIDEO_LIMIT);
   if (rows.length === 0) return;
 
   const storage = getStorage();
-  const swept: string[] = [];
   let objectsDeleted = 0;
   let objectsFailed = 0;
 
@@ -91,31 +92,25 @@ async function sweepUnkeptPreRenderedMedia(log: Logger): Promise<void> {
     const keys = [row.derivativeStorageKey, row.posterStorageKey, row.storageKey]
       .filter((key): key is string => typeof key === 'string' && key.length > 0);
 
-    let allGone = true;
     for (const key of keys) {
       try {
         await storage.remove(key);
         objectsDeleted += 1;
       } catch (error) {
         objectsFailed += 1;
-        allGone = false;
-        // Never the key itself at warn level with a signed URL attached —
-        // this is an object path, and nothing here signs anything.
-        log.warn('could not delete an unkept rendered file', { clipId: row.clipId, err: error });
+        // The row no longer names this object, so nothing will retry it —
+        // said out loud because it is now an orphan only these logs can find.
+        log.warn('an unkept rendered file could not be deleted and is now orphaned', {
+          clipId: row.clipId,
+          videoId: row.videoId,
+          err: error,
+        });
       }
     }
-
-    // The row is only cleared when the bytes are actually gone. Clearing it
-    // first would lose the pointer to an object that still exists and still
-    // costs money, with nothing left to find it by.
-    if (allGone) swept.push(row.clipId);
   }
-
-  await clearExpiredMedia(swept);
 
   log.info('unkept rendered media swept', {
     clips: rows.length,
-    cleared: swept.length,
     objectsDeleted,
     objectsFailed,
     idleSeconds: env.FOOTAGE_IDLE_SECONDS,

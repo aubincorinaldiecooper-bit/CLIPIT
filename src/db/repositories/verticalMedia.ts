@@ -149,18 +149,32 @@ export interface ExpiredMediaRow {
 }
 
 /**
- * Pre-rendered moments nobody kept, old enough to stop paying for.
+ * CLAIM pre-rendered moments nobody kept, and hand back their file keys.
  *
- * Making media before Keep is a latency decision, and it has a bill attached:
- * asking for three moments renders at least three, and only the ones somebody
- * presses Keep on were ever wanted. Without this sweep that bill is permanent
+ * Making media before Keep is a latency decision with a bill attached: asking
+ * for three moments renders at least three, and only the ones somebody
+ * pressed Keep on were ever wanted. Without this sweep that bill is permanent
  * and grows with every question asked.
  *
- * Narrow by construction. Only rows this pipeline itself created
- * (pre_rendered), only ones never approved (retention_class 'temporary'), and
- * only after an idle period. Anything cut the old way is untouched.
+ * Claiming and clearing in ONE statement, rather than listing now and
+ * clearing after the deletes, closes a race that ends badly for a person.
+ * Keep landing between a plain list and the object deletion would promote the
+ * row to owned while the sweep deleted its files anyway — and the creator
+ * would be left holding a clip they had just chosen that no longer plays.
+ * Clearing the pointers first makes approveClip refuse (it requires a
+ * derivative key), so a Keep in that window is told the moment is not
+ * available instead of silently handing over a broken one.
+ *
+ * The cost of that ordering, stated plainly: if an object delete then fails,
+ * the row no longer names it and it is orphaned in storage. That is a bill we
+ * can find in the logs. A kept clip that does not play is not recoverable at
+ * all, so this is the right way round.
+ *
+ * Narrow by construction: only rows this pipeline made, only ones never
+ * approved, only after an idle period. Anything cut the old way is invisible
+ * to it.
  */
-export async function listUnkeptPreRenderedMedia(
+export async function claimUnkeptPreRenderedMedia(
   idleSeconds: number,
   limit: number,
 ): Promise<ExpiredMediaRow[]> {
@@ -171,14 +185,30 @@ export async function listUnkeptPreRenderedMedia(
     poster_storage_key: string | null;
     storage_key: string | null;
   }>(
-    `SELECT id, video_id, derivative_storage_key, poster_storage_key, storage_key
-       FROM clips
-      WHERE retention_class = 'temporary'
-        AND pre_rendered = TRUE
-        AND approved_at IS NULL
-        AND created_at < now() - make_interval(secs => $1)
-      ORDER BY created_at
-      LIMIT $2`,
+    `WITH claimed AS (
+       SELECT id, video_id, derivative_storage_key, poster_storage_key, storage_key
+         FROM clips
+        WHERE retention_class = 'temporary'
+          AND pre_rendered = TRUE
+          AND approved_at IS NULL
+          AND created_at < now() - make_interval(secs => $1)
+        ORDER BY created_at
+        LIMIT $2
+        -- Two sweeps running at once must not both claim the same row and
+        -- both try to delete the same objects.
+        FOR UPDATE SKIP LOCKED
+     ), cleared AS (
+       UPDATE clips
+          SET derivative_storage_key = NULL,
+              derivative_status      = NULL,
+              poster_storage_key     = NULL,
+              storage_key            = NULL,
+              updated_at             = now()
+         FROM claimed
+        WHERE clips.id = claimed.id
+     )
+     SELECT id, video_id, derivative_storage_key, poster_storage_key, storage_key
+       FROM claimed`,
     [idleSeconds, limit],
   );
   return rows.map((row) => ({
@@ -188,32 +218,4 @@ export async function listUnkeptPreRenderedMedia(
     posterStorageKey: row.poster_storage_key,
     storageKey: row.storage_key,
   }));
-}
-
-/**
- * Forget media that has been deleted.
- *
- * The clip ROW stays. It is the record that this moment was found and offered
- * and nobody wanted it — which is evidence about the search, and survives the
- * bytes it describes. Only the pointers to files that no longer exist are
- * cleared, so nothing downstream can hand out a key to a deleted object.
- *
- * The status column is left alone, exactly as clearClipKeysForVideo leaves it
- * for expired footage. A cleared key already makes the clip unplayable and
- * unshowable everywhere that reads one; inventing a new status would mean
- * teaching every existing reader about a state it has never seen.
- */
-export async function clearExpiredMedia(clipIds: string[]): Promise<void> {
-  if (clipIds.length === 0) return;
-  await query(
-    `UPDATE clips
-        SET derivative_storage_key = NULL,
-            derivative_status      = NULL,
-            poster_storage_key     = NULL,
-            storage_key            = NULL,
-            updated_at             = now()
-      WHERE id = ANY($1::uuid[])
-        AND approved_at IS NULL`,
-    [clipIds],
-  );
 }

@@ -476,6 +476,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           await finishClipRequest(
             clipRequestId,
             'failed',
+            // Only reachable now when renders actually failed: the deck asks
+            // for no more than the search could supply.
             'We found the moments but could not finish making them ready to post. Please try again.',
           );
           log.error('vertical deck incomplete', {
@@ -741,6 +743,22 @@ async function buildVerticalDeck(input: {
   );
   await getStorage().downloadToFile(video.originalStorageKey, sourcePath);
 
+  // Ask for what this video can actually supply.
+  //
+  // A video with two moments matching the question is not a pipeline failure,
+  // and must never be reported as one. Left uncapped, a three-moment request
+  // against a two-candidate pool renders both successfully, reports the deck
+  // incomplete, and tells the creator we could not make their moments ready
+  // to post — inviting a retry that will do exactly the same thing. Capping
+  // here means an incomplete deck genuinely means renders failed.
+  const requestedCount = Math.min(intent.requestedCount, candidates.length);
+  if (requestedCount < intent.requestedCount) {
+    log.info('fewer eligible moments than the creator asked for', {
+      asked: intent.requestedCount,
+      available: candidates.length,
+    });
+  }
+
   const { outcome, metrics } = await orchestrateVerticalDeck({
     videoId: video.id,
     clipRequestId,
@@ -752,7 +770,7 @@ async function buildVerticalDeck(input: {
     hasAudio: video.hasAudio ?? true,
     videoDurationSeconds: video.durationSeconds ?? null,
     intent,
-    requestedCount: intent.requestedCount,
+    requestedCount,
     candidates,
     log,
     tally: input.tally,

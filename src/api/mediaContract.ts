@@ -62,7 +62,17 @@ export function clipMediaContract(row: ClipMediaRow, wantsVertical: boolean): Cl
   const derivativeReady = row.derivativeStatus === 'ready' && Boolean(row.derivativeStorageKey);
 
   // Only a real, finished derivative may claim the playback slot.
-  const url = wantsVertical && derivativeReady ? row.derivativeUrl : row.canonicalUrl;
+  //
+  // For a vertical moment that has NO finished derivative, that slot is null —
+  // not the canonical clip. Handing back the landscape file here is the
+  // substitution this contract exists to forbid, and the comment above used to
+  // claim it did not happen while the code did it. A caller that genuinely
+  // wants the original framing asks for canonicalUrl by name; nothing gets it
+  // by accident, and nothing can play a 16:9 file believing it is the
+  // finished 9:16 result.
+  const url = wantsVertical
+    ? (derivativeReady ? row.derivativeUrl : null)
+    : row.canonicalUrl;
 
   const outputAspectRatio = wantsVertical && derivativeReady
     ? aspectRatioLabel(row.outputWidth, row.outputHeight) ?? '9:16'

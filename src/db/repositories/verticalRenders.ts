@@ -1,4 +1,5 @@
 import { queryRows } from '../pool.js';
+import { logger } from '../../lib/logger.js';
 import type { FailureStage } from '../../services/media/verticalVisibility.js';
 
 /**
@@ -48,6 +49,27 @@ export interface RecordAttemptInput {
  * hide a whole feature's data for weeks.
  */
 export async function recordVerticalRenderAttempt(input: RecordAttemptInput): Promise<void> {
+  try {
+    await writeAttempt(input);
+  } catch (error) {
+    // The comment above described this behaviour before the code had it.
+    // It matters most on the SUCCESS path: that call happens after the media
+    // exists and its ready state is persisted, so an insert that throws would
+    // send a finished, correct render into the failure path and could fail a
+    // whole deck because observability was unavailable — a migration not yet
+    // applied, a constraint mismatch, a transient error. Losing one row is
+    // bad; throwing away three finished clips to protect it is worse.
+    logger.error('could not record a vertical render attempt', {
+      matchId: input.matchId,
+      clipId: input.clipId,
+      outcome: input.outcome,
+      failureStage: input.failureStage,
+      err: error,
+    });
+  }
+}
+
+async function writeAttempt(input: RecordAttemptInput): Promise<void> {
   await queryRows(
     `INSERT INTO vertical_render_attempts
        (video_id, clip_request_id, match_id, clip_id, workspace_id, session_id,

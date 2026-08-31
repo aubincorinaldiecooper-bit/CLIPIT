@@ -9,7 +9,7 @@ import { cutClip } from './ffmpeg.js';
 import { applyClipPadding } from '../timestamps.js';
 import { upsertClipForMatch, setClipStatus } from '../../db/repositories/clips.js';
 import { setVerticalMedia, markVerticalFailed } from '../../db/repositories/verticalMedia.js';
-import { recordVerticalRenderAttempt } from '../../db/repositories/verticalRenders.js';
+import { markAttemptsRecovered, recordVerticalRenderAttempt } from '../../db/repositories/verticalRenders.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { askVideoModel, videoPartFromFile, type ContentPart } from '../search/openrouterVideo.js';
 import { COMPOSITION_SYSTEM_PROMPT, COMPOSITION_INSTRUCTION } from '../search/composition.js';
@@ -284,6 +284,19 @@ async function prepareCandidate(
       derivativeRenderMs: media.derivativeGenerationMs,
       posterGenerationMs: media.posterGenerationMs,
     });
+
+    // This attempt succeeded after an earlier one failed, so the earlier
+    // failure rows are marked recovered. Without this, retryRecoveryRate is
+    // computed from a column nothing ever sets and reads zero forever — a
+    // metric that reports "retries never help" while they are helping, which
+    // is worse than having no metric at all.
+    if (attempt > 1) {
+      await markAttemptsRecovered(candidate.matchId).catch((error) => {
+        input.log.error('could not mark earlier attempts recovered', {
+          matchId: candidate.matchId, err: error,
+        });
+      });
+    }
 
     return {
       ...base,

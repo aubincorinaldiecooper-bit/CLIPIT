@@ -189,7 +189,11 @@ describe('what a client is told', () => {
       { ...base, derivativeStatus: 'failed', derivativeStorageKey: null, derivativeUrl: null },
       true,
     );
-    expect(media.url).not.toBe('https://example/vertical.mp4');
+    // Null, not the landscape file. There is no finished vertical result, and
+    // saying so is the honest answer; handing back 16:9 in the slot a client
+    // plays from is the substitution the rule forbids.
+    expect(media.url).toBeNull();
+    expect(media.canonicalUrl).toBe('https://example/canonical.mp4');
     expect(media.outputAspectRatio).toBe('16:9');
     expect(media.compositionMode).not.toBe('smart_crop');
   });

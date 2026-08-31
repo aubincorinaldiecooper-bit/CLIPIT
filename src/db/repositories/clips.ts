@@ -189,18 +189,52 @@ export async function restoreClipBoundaries(
   );
 }
 
-/** Every clip file cut from this video, so they can be deleted with it. */
+/**
+ * Every clip file cut from this video, so they can be deleted with it.
+ *
+ * All three kinds: the canonical excerpt, the 9:16 derivative and the poster
+ * still. A vertical crop of someone's video is still their video, and a
+ * frame taken out of it is still a picture of it — leaving either behind
+ * when the footage is deleted keeps their material on our disks with no way
+ * for them to reach it, which is the exact thing the retention sweep exists
+ * to prevent. Approved media is included: this runs when the video itself is
+ * going, and nothing derived from it survives that.
+ */
 export async function listClipKeysForVideo(videoId: string): Promise<string[]> {
-  const rows = await queryRows<{ storage_key: string }>(
-    'SELECT storage_key FROM clips WHERE video_id = $1 AND storage_key IS NOT NULL',
+  const rows = await queryRows<{
+    storage_key: string | null;
+    derivative_storage_key: string | null;
+    poster_storage_key: string | null;
+  }>(
+    `SELECT storage_key, derivative_storage_key, poster_storage_key
+       FROM clips
+      WHERE video_id = $1
+        AND (storage_key IS NOT NULL
+             OR derivative_storage_key IS NOT NULL
+             OR poster_storage_key IS NOT NULL)`,
     [videoId],
   );
-  return rows.map((row) => row.storage_key);
+  return rows.flatMap((row) =>
+    [row.storage_key, row.derivative_storage_key, row.poster_storage_key]
+      .filter((key): key is string => typeof key === 'string' && key.length > 0),
+  );
 }
 
 /** Forgets where the clips were, once their bytes are gone. */
 export async function clearClipKeysForVideo(videoId: string): Promise<void> {
-  await queryOne('UPDATE clips SET storage_key = NULL, updated_at = now() WHERE video_id = $1', [videoId]);
+  // Every pointer the deletion above invalidated, not just the canonical one.
+  // A row still naming a derivative that no longer exists would hand a client
+  // a URL to nothing.
+  await queryOne(
+    `UPDATE clips
+        SET storage_key            = NULL,
+            derivative_storage_key = NULL,
+            derivative_status      = NULL,
+            poster_storage_key     = NULL,
+            updated_at             = now()
+      WHERE video_id = $1`,
+    [videoId],
+  );
 }
 
 /**

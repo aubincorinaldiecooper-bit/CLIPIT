@@ -64,9 +64,17 @@ describe('clipMediaContract — vertical', () => {
     expect(media.outputAspectRatio).toBe('16:9');
   });
 
+  /**
+   * This test used to assert `url` was the canonical clip — it pinned the
+   * exact substitution the contract forbids, because it was written to match
+   * the code rather than the rule. A vertical moment with no finished
+   * derivative has nothing to play, and that is what it must say.
+   */
   it('distrusts a ready label with no file behind it', () => {
     const media = clipMediaContract(row({ derivativeStorageKey: null }), true);
-    expect(media.url).toBe('https://cdn/canonical.mp4');
+    expect(media.url).toBeNull();
+    // Still reachable deliberately, by name, for a caller that wants it.
+    expect(media.canonicalUrl).toBe('https://cdn/canonical.mp4');
     expect(media.compositionMode).toBe('original');
   });
 });
