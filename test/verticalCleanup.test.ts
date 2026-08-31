@@ -214,10 +214,14 @@ describe('cleanup must not destroy media it did not create', () => {
     uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
 
     await expect(
-      runVerticalPipeline({ ...input, existingDerivativeKey: 'clips/video-1/clip-1-vertical.mp4' }),
+      runVerticalPipeline({
+        ...input,
+        currentDerivativeKey: async () => 'clips/video-1/clip-1-vertical.mp4',
+      }),
     ).rejects.toThrow(/derivative could not be stored/);
 
-    // Nothing deleted: the object at that key predates this attempt.
+    // Nothing deleted: the row still names that key, so the object there
+    // predates this attempt.
     expect(removed).toEqual([]);
   });
 
@@ -225,10 +229,48 @@ describe('cleanup must not destroy media it did not create', () => {
     uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
 
     await expect(
-      runVerticalPipeline({ ...input, existingDerivativeKey: null }),
+      runVerticalPipeline({ ...input, currentDerivativeKey: async () => null }),
     ).rejects.toThrow(/derivative could not be stored/);
 
     expect(removed).toHaveLength(1);
     expect(removed[0]).toContain('vertical');
+  });
+
+  /**
+   * The retention race. The sweep can clear this clip's keys and delete its
+   * objects while the render is in flight — so a decision made from the row
+   * as it looked before the cut began would say "it was already there" about
+   * an object that has since been collected, skip cleanup, and orphan
+   * whatever this attempt then wrote.
+   *
+   * Asking at the moment of failure sees the cleared row and cleans up.
+   */
+  it('cleans up when retention cleared the key mid-render', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(
+      runVerticalPipeline({
+        // The row named this key when the render started; by the time the
+        // upload failed, the sweep had cleared it.
+        ...input,
+        currentDerivativeKey: async () => null,
+      }),
+    ).rejects.toThrow(/derivative could not be stored/);
+
+    expect(removed).toHaveLength(1);
+  });
+
+  /** A failed read never leaves an object we may have created behind. */
+  it('cleans up when the key cannot be read at all', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(
+      runVerticalPipeline({
+        ...input,
+        currentDerivativeKey: async () => { throw new Error('database unavailable'); },
+      }),
+    ).rejects.toThrow(/derivative could not be stored/);
+
+    expect(removed).toHaveLength(1);
   });
 });

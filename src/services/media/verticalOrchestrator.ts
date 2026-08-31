@@ -7,7 +7,7 @@ import { getStorage } from '../storage/s3.js';
 import { clipKey } from '../storage/types.js';
 import { cutClip } from './ffmpeg.js';
 import { applyClipPadding } from '../timestamps.js';
-import { upsertClipForMatch, setClipStatus } from '../../db/repositories/clips.js';
+import { getClip, upsertClipForMatch, setClipStatus } from '../../db/repositories/clips.js';
 import { setVerticalMedia, markVerticalFailed } from '../../db/repositories/verticalMedia.js';
 import { markAttemptsRecovered, recordVerticalRenderAttempt } from '../../db/repositories/verticalRenders.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
@@ -226,11 +226,15 @@ async function prepareCandidate(
     // destroy known-good media to tidy up a file that may not even exist, and
     // S3 leaves the previous object intact when a PUT fails anyway. So the
     // cleanup only ever removes what this attempt could itself have created.
-    const canonicalExistedBefore = clip.storageKey === canonicalKey;
     try {
       await getStorage().uploadFile(canonicalKey, canonicalPath, 'video/mp4');
     } catch (error) {
-      if (!canonicalExistedBefore) {
+      // Asked NOW, not from the row read before the cut began. The retention
+      // sweep can clear this clip's keys and delete its objects mid-render,
+      // and a stale "it was already there" would then skip cleanup for an
+      // object only this attempt could have made.
+      const current = await getClip(clip.id).then((row) => row?.storageKey ?? null).catch(() => null);
+      if (current !== canonicalKey) {
         await discardUploadedObjects([canonicalKey], {
           videoId: input.videoId,
           clipId: clip.id,
@@ -269,8 +273,10 @@ async function prepareCandidate(
       workDir: input.workDir,
       hasAudio: input.hasAudio,
       askComposition: compositionAsker(input, canonicalKey, cut.durationSeconds),
-      // Same rule one layer down: the derivative key is deterministic too.
-      existingDerivativeKey: clip.derivativeStorageKey,
+      // Same rule one layer down, and asked the same way: at the moment of
+      // failure, from the row as it stands then.
+      currentDerivativeKey: async () =>
+        getClip(clip.id).then((row) => row?.derivativeStorageKey ?? null),
     });
 
     // READY is a PERSISTED fact, never an in-memory return value. A candidate

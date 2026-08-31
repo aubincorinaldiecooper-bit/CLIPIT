@@ -56,14 +56,24 @@ export interface VerticalPipelineInput {
   /** Asks MiniCPM about this exact moment. Injected so the pipeline is testable. */
   askComposition: (canonicalPath: string) => Promise<{ content: string | null; provider: string; model: string }>;
   /**
-   * The derivative key this clip ALREADY points at, if any.
+   * Reads the derivative key this clip points at RIGHT NOW.
    *
-   * The key is deterministic, so a retry writes to the same place. When the
-   * row already names it, whatever is there predates this attempt and must
-   * survive a failed re-upload — cleanup exists to collect what this attempt
-   * created, never to destroy media that was already good.
+   * The key is deterministic, so a retry writes where an earlier run wrote.
+   * When the row still names it, whatever is there predates this attempt and
+   * must survive a failed re-upload — cleanup collects what this attempt
+   * created, never media that was already good.
+   *
+   * A function rather than a value because the answer can change underneath
+   * us: the retention sweep can clear this clip's keys and delete its objects
+   * while the render is in flight. Deciding from a snapshot taken minutes
+   * earlier would then skip cleanup for an object only this attempt could
+   * have created, and leave it orphaned. Asked at the moment of failure, and
+   * only then, so the common path pays nothing.
+   *
+   * Injected rather than imported so this stays a media service with no
+   * database of its own.
    */
-  existingDerivativeKey?: string | null;
+  currentDerivativeKey?: () => Promise<string | null>;
 }
 
 export interface VerticalPipelineResult {
@@ -256,7 +266,13 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
     // ONLY when this attempt could have been what created it: if the row
     // already named this key, the object there is a working derivative from
     // an earlier run and removing it would break a clip that played fine.
-    if (input.existingDerivativeKey !== derivativeStorageKey) {
+    // If the read fails, fall back to cleaning up: an orphan we created is
+    // the thing this block exists to prevent, and a delete of a key we do not
+    // own is recoverable by the re-render that follows.
+    const currentKey = input.currentDerivativeKey
+      ? await input.currentDerivativeKey().catch(() => null)
+      : null;
+    if (currentKey !== derivativeStorageKey) {
       await discardUploadedObjects([derivativeStorageKey], {
         videoId: input.videoId,
         clipId: input.clipId,
