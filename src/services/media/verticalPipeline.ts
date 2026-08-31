@@ -74,6 +74,11 @@ export interface VerticalPipelineInput {
    * database of its own.
    */
   currentDerivativeKey?: () => Promise<string | null>;
+  /**
+   * What the row named when this attempt STARTED — the fallback when the
+   * read above cannot answer. See shouldDiscardOnUploadFailure.
+   */
+  snapshotDerivativeKey?: string | null;
 }
 
 export interface VerticalPipelineResult {
@@ -173,6 +178,42 @@ export async function decideComposition(
  * orphan, and the only thing standing between it and permanent invisibility is
  * this log line — so it names the clip, the video and the key.
  */
+/**
+ * Should the object at a deterministic key be deleted after a failed upload?
+ *
+ * The keys here are derived from ids, so a retry writes exactly where an
+ * earlier run wrote. Deleting one is destructive and deleting none leaks, and
+ * the right answer depends on TWO readings of the clip row: what it said when
+ * the attempt began, and what it says at the moment of failure. Written out
+ * as a table because getting it wrong in either direction has now happened
+ * three times:
+ *
+ *   snapshot        fresh read at failure     delete?
+ *   ────────────────────────────────────────────────────────────────────
+ *   not the key     not the key               YES — only we could have written it
+ *   not the key     the key                   no  — it is owned now
+ *   not the key     READ FAILED               YES — nobody owned it when we started
+ *   the key         not the key               YES — retention swept it; this is ours
+ *   the key         the key                   no  — it predates this attempt
+ *   the key         READ FAILED               NO  — unknown, and it was owned
+ *
+ * The last row is the one that matters most and the one I got wrong: an
+ * unavailable database must never authorise deleting media the snapshot
+ * showed we already had. Unknown means leave it alone — an orphan is a bill,
+ * a deleted clip is gone.
+ */
+export function shouldDiscardOnUploadFailure(input: {
+  key: string;
+  /** What the row named when this attempt began. */
+  snapshotKey: string | null;
+  /** What it names now — undefined when the read itself failed. */
+  currentKey: string | null | undefined;
+  readFailed: boolean;
+}): boolean {
+  const ownedNow = input.readFailed ? input.snapshotKey : (input.currentKey ?? null);
+  return ownedNow !== input.key;
+}
+
 export async function discardUploadedObjects(
   keys: Array<string | null | undefined>,
   context: { videoId: string; clipId: string; reason: string },
@@ -266,13 +307,20 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
     // ONLY when this attempt could have been what created it: if the row
     // already named this key, the object there is a working derivative from
     // an earlier run and removing it would break a clip that played fine.
-    // If the read fails, fall back to cleaning up: an orphan we created is
-    // the thing this block exists to prevent, and a delete of a key we do not
-    // own is recoverable by the re-render that follows.
-    const currentKey = input.currentDerivativeKey
-      ? await input.currentDerivativeKey().catch(() => null)
-      : null;
-    if (currentKey !== derivativeStorageKey) {
+    let currentKey: string | null | undefined;
+    let readFailed = false;
+    try {
+      currentKey = input.currentDerivativeKey ? await input.currentDerivativeKey() : null;
+    } catch {
+      readFailed = true;
+    }
+
+    if (shouldDiscardOnUploadFailure({
+      key: derivativeStorageKey,
+      snapshotKey: input.snapshotDerivativeKey ?? null,
+      currentKey,
+      readFailed,
+    })) {
       await discardUploadedObjects([derivativeStorageKey], {
         videoId: input.videoId,
         clipId: input.clipId,

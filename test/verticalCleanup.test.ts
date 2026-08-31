@@ -45,7 +45,7 @@ vi.mock('../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: errorLog, debug: vi.fn(), child: () => ({ info: vi.fn(), warn: vi.fn(), error: errorLog }) },
 }));
 
-const { runVerticalPipeline, VerticalPipelineFailure, discardUploadedObjects } =
+const { runVerticalPipeline, VerticalPipelineFailure, discardUploadedObjects, shouldDiscardOnUploadFailure } =
   await import('../src/services/media/verticalPipeline.js');
 
 const input = {
@@ -272,5 +272,48 @@ describe('cleanup must not destroy media it did not create', () => {
     ).rejects.toThrow(/derivative could not be stored/);
 
     expect(removed).toHaveLength(1);
+  });
+});
+
+describe('the whole decision table, one row at a time', () => {
+  const key = 'clips/v/c-vertical.mp4';
+  const decide = (snapshotKey: string | null, currentKey: string | null | undefined, readFailed = false) =>
+    shouldDiscardOnUploadFailure({ key, snapshotKey, currentKey, readFailed });
+
+  /**
+   * Written as six cases because getting it wrong in either direction has
+   * happened three times on this branch: deleting media we did not create,
+   * and leaking media we did.
+   */
+  it('deletes when nobody owned the key and still does not', () => {
+    expect(decide(null, null)).toBe(true);
+  });
+
+  it('spares it when the row owns it now', () => {
+    expect(decide(null, key)).toBe(false);
+  });
+
+  it('deletes on an unreadable row when the snapshot showed no owner', () => {
+    // Nothing was there when we started, so anything there now is ours.
+    expect(decide(null, undefined, true)).toBe(true);
+  });
+
+  it('deletes when retention swept the key mid-render', () => {
+    // The snapshot owned it; the sweep cleared it; what sits there is ours.
+    expect(decide(key, null)).toBe(true);
+  });
+
+  it('spares media that predates this attempt', () => {
+    expect(decide(key, key)).toBe(false);
+  });
+
+  /**
+   * The row that matters most, and the one I got wrong: an unavailable
+   * database must never authorise deleting media the snapshot showed we
+   * already had. Unknown means leave it alone — an orphan is a bill, a
+   * deleted clip is gone.
+   */
+  it('NEVER deletes on an unreadable row when the snapshot owned the key', () => {
+    expect(decide(key, undefined, true)).toBe(false);
   });
 });

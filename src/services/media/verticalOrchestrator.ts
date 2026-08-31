@@ -13,7 +13,12 @@ import { markAttemptsRecovered, recordVerticalRenderAttempt } from '../../db/rep
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { askVideoModel, videoPartFromFile, type ContentPart } from '../search/openrouterVideo.js';
 import { COMPOSITION_SYSTEM_PROMPT, COMPOSITION_INSTRUCTION } from '../search/composition.js';
-import { discardUploadedObjects, runVerticalPipeline, VerticalPipelineFailure } from './verticalPipeline.js';
+import {
+  discardUploadedObjects,
+  runVerticalPipeline,
+  shouldDiscardOnUploadFailure,
+  VerticalPipelineFailure,
+} from './verticalPipeline.js';
 import { assembleDeck, deckMetrics, planDeck, type DeckOutcome, type PreparedCandidate } from './deckAssembly.js';
 import type { FailureStage, VerticalCandidate } from './verticalVisibility.js';
 import type { PlatformIntent } from '../search/platformIntent.js';
@@ -229,12 +234,25 @@ async function prepareCandidate(
     try {
       await getStorage().uploadFile(canonicalKey, canonicalPath, 'video/mp4');
     } catch (error) {
-      // Asked NOW, not from the row read before the cut began. The retention
-      // sweep can clear this clip's keys and delete its objects mid-render,
-      // and a stale "it was already there" would then skip cleanup for an
-      // object only this attempt could have made.
-      const current = await getClip(clip.id).then((row) => row?.storageKey ?? null).catch(() => null);
-      if (current !== canonicalKey) {
+      // Both readings: what the row said when the cut began, and what it says
+      // now. The sweep can clear this clip mid-render, so a stale answer would
+      // skip cleanup for an object only this attempt made — and an
+      // unreachable database must not authorise deleting media the snapshot
+      // showed we had. See shouldDiscardOnUploadFailure for the full table.
+      let current: string | null | undefined;
+      let readFailed = false;
+      try {
+        current = (await getClip(clip.id))?.storageKey ?? null;
+      } catch {
+        readFailed = true;
+      }
+
+      if (shouldDiscardOnUploadFailure({
+        key: canonicalKey,
+        snapshotKey: clip.storageKey,
+        currentKey: current,
+        readFailed,
+      })) {
         await discardUploadedObjects([canonicalKey], {
           videoId: input.videoId,
           clipId: clip.id,
@@ -275,8 +293,8 @@ async function prepareCandidate(
       askComposition: compositionAsker(input, canonicalKey, cut.durationSeconds),
       // Same rule one layer down, and asked the same way: at the moment of
       // failure, from the row as it stands then.
-      currentDerivativeKey: async () =>
-        getClip(clip.id).then((row) => row?.derivativeStorageKey ?? null),
+      currentDerivativeKey: async () => (await getClip(clip.id))?.derivativeStorageKey ?? null,
+      snapshotDerivativeKey: clip.derivativeStorageKey,
     });
 
     // READY is a PERSISTED fact, never an in-memory return value. A candidate
