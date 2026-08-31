@@ -10,7 +10,7 @@ import {
 } from 'modal';
 import { env } from '../../config/env.js';
 import { Semaphore, sleep } from '../../lib/concurrency.js';
-import { ExternalServiceError } from '../../lib/errors.js';
+import { ExternalServiceError, errorMessage } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { getStorage } from '../storage/s3.js';
 import { promptVersion } from './prompt.js';
@@ -125,6 +125,97 @@ export async function assertMiniCpmDeploymentAvailable(): Promise<void> {
       );
     }
     throw failure;
+  }
+}
+
+/**
+ * Wake the GPU early, so a person is not paying the cold start with their
+ * attention.
+ *
+ * A container that has scaled to zero takes tens of seconds to come back:
+ * Modal has to place it on an L4 and `@modal.enter()` has to pull the model
+ * in. Measured once in production on 2026-08-30, that first call took 36
+ * seconds, and every second of it was spent AFTER the upload finished —
+ * exactly when someone is waiting to ask something.
+ *
+ * The fix is to overlap it with work already happening. Asking Modal to hold
+ * one container from the moment an upload STARTS means the model loads while
+ * the bytes are still being sent, and the first chunk finds a warm GPU.
+ *
+ * Deliberately `updateAutoscaler` rather than a dummy `analyze` call: a
+ * throwaway inference would burn real GPU seconds and put a junk row in the
+ * usage table. This asks Modal to keep a container, and nothing more.
+ *
+ * Fire-and-forget by contract — the caller must never await a person's upload
+ * on this. A failure here costs 36 seconds later, which is what we already
+ * had; it must never cost the upload itself.
+ */
+export async function warmMiniCpm(reason: string): Promise<void> {
+  if (env.VIDEO_PROVIDER !== 'minicpm') return;
+  if (!env.MINICPM_WARM_ON_UPLOAD) return;
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) return;
+
+  try {
+    const method = await lookupMethod();
+    await method.updateAutoscaler({
+      minContainers: 1,
+      // Modal's own idle timer is the safety net under our explicit cooling
+      // below: if this process dies before it can stand the container down,
+      // Modal still releases it rather than billing an idle L4 forever.
+      scaledownWindowMs: env.MINICPM_WARM_IDLE_SECONDS * 1000,
+    });
+    logger.info('MiniCPM warming', {
+      reason,
+      app: env.MODAL_APP_NAME,
+      idleSeconds: env.MINICPM_WARM_IDLE_SECONDS,
+    });
+  } catch (error) {
+    // Never surfaced to the caller: warming is an optimisation, and a person
+    // uploading a video must not see it fail.
+    logger.warn('MiniCPM warm-up failed; the first chunk will pay the cold start', {
+      reason,
+      err: errorMessage(error),
+    });
+  }
+}
+
+/**
+ * Stop HOLDING the GPU. Emphatically not the same as shutting it down.
+ *
+ * Reading a video is not the end of someone's session — it is the beginning
+ * of it. They are about to ask questions, and a question that has to go back
+ * to the footage would pay the whole cold start again if this killed the
+ * container outright.
+ *
+ * So cooling only removes the FLOOR. Modal keeps the container through its
+ * normal idle window (MINICPM_WARM_IDLE_SECONDS, re-asserted here so the
+ * intent survives however the app was last configured), which covers the
+ * minutes right after a read when questions actually arrive, and releases it
+ * once nobody is using it. That is what keeps a warmed GPU from becoming a
+ * standing bill without punishing the person who just uploaded.
+ *
+ * Safe when nothing was ever warmed, and safe to call twice.
+ */
+export async function coolMiniCpm(reason: string): Promise<void> {
+  if (env.VIDEO_PROVIDER !== 'minicpm') return;
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) return;
+
+  try {
+    const method = await lookupMethod();
+    await method.updateAutoscaler({
+      minContainers: 0,
+      scaledownWindowMs: env.MINICPM_WARM_IDLE_SECONDS * 1000,
+    });
+    logger.info('MiniCPM cooling — floor released, idle window still running', {
+      reason,
+      app: env.MODAL_APP_NAME,
+      idleSeconds: env.MINICPM_WARM_IDLE_SECONDS,
+    });
+  } catch (error) {
+    logger.warn('MiniCPM cool-down failed; Modal idle timer remains the backstop', {
+      reason,
+      err: errorMessage(error),
+    });
   }
 }
 
