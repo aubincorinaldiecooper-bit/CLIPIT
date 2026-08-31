@@ -943,7 +943,13 @@ async function buildVerticalDeck(input: {
   // did" is answered by an incomplete deck against this target. Atomicity
   // still applies to the effective deck: two moments appear together or not
   // at all, never one then two.
-  const effectiveDeckTarget = Math.min(intent.requestedCount, candidates.length);
+  // Three separate limits, and each is recorded as itself: what they asked
+  // for, what the video had, and what we are willing to render.
+  const effectiveDeckTarget = Math.min(
+    intent.requestedCount,
+    candidates.length,
+    intent.renderCeiling,
+  );
   await recordDeckAvailability(clipRequestId, {
     availableCandidateCount: candidates.length,
     effectiveDeckTarget,

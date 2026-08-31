@@ -535,16 +535,29 @@ export async function deleteClipRow(
     `SELECT storage_key FROM clip_variants WHERE clip_id = ANY($1::uuid[]) AND storage_key IS NOT NULL`,
     [ids],
   );
-  const deleted = await queryRows<{ storage_key: string | null }>(
-    `DELETE FROM clips WHERE id = ANY($1::uuid[]) RETURNING storage_key`,
+  const deleted = await queryRows<{
+    storage_key: string | null;
+    derivative_storage_key: string | null;
+    poster_storage_key: string | null;
+  }>(
+    // All three keys. Returning only the canonical one left the 9:16
+    // derivative and the poster in the bucket after the clip that named them
+    // was gone — unreferenced, uncollectable, and billed forever.
+    `DELETE FROM clips WHERE id = ANY($1::uuid[])
+      RETURNING storage_key, derivative_storage_key, poster_storage_key`,
     [ids],
   );
   if (deleted.length === 0) return null;
 
   return {
-    storageKeys: [...deleted, ...variants]
-      .map((row) => row.storage_key)
-      .filter((key): key is string => Boolean(key)),
+    storageKeys: [
+      ...deleted.flatMap((row) => [
+        row.storage_key,
+        row.derivative_storage_key,
+        row.poster_storage_key,
+      ]),
+      ...variants.map((row) => row.storage_key),
+    ].filter((key): key is string => Boolean(key)),
     deletedCount: deleted.length,
   };
 }

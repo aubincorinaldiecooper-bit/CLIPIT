@@ -246,7 +246,15 @@ export async function listMediaKeysForRequestMatches(clipRequestId: string): Pro
     `SELECT c.storage_key, c.derivative_storage_key, c.poster_storage_key
        FROM clips c
        JOIN clip_matches m ON m.id = c.clip_match_id
-      WHERE m.clip_request_id = $1`,
+      WHERE m.clip_request_id = $1
+        -- NEVER a moment the creator kept.
+        --
+        -- A stalled job can be redelivered after the request completed and
+        -- after someone pressed Keep, and this list feeds a delete. Without
+        -- this line a retry would reach into their library and destroy the
+        -- clips they had just chosen — the one outcome no amount of tidying
+        -- up is worth.
+        AND c.approved_at IS NULL`,
     [clipRequestId],
   );
   return rows.flatMap((row) =>

@@ -51,12 +51,23 @@ describe('resolvePlatformIntent requestedCount', () => {
   });
 
   /**
-   * A creator can ask for forty. The pipeline will not render forty — each
-   * one is a real GPU call and a real encode, and the ceiling is the bound
-   * that stops one sentence from spending the afternoon.
+   * A creator can ask for forty. The pipeline will not render forty — each is
+   * a real GPU call and a real encode, and the ceiling is what stops one
+   * sentence from spending the afternoon.
+   *
+   * But the ask and the bound are different facts and are kept apart. Folding
+   * the ceiling into requestedCount meant the request itself was recorded as
+   * having been for eight, and the number they actually said was gone. The
+   * ceiling now travels beside it and is applied where the deck target is
+   * worked out, alongside how many eligible moments the video turned out to
+   * have.
    */
-  it('never exceeds the render ceiling', () => {
-    expect(resolvePlatformIntent('find me 40 moments for tiktok', 60, { maxCount: 8 }).requestedCount).toBe(8);
+  it('keeps the ask and the render ceiling as separate facts', () => {
+    const intent = resolvePlatformIntent('find me 40 moments for tiktok', 60, { maxCount: 8 });
+    expect(intent.requestedCount).toBe(40);
+    expect(intent.renderCeiling).toBe(8);
+    // What actually gets built is the smallest of ask, availability and ceiling.
+    expect(Math.min(intent.requestedCount, 12, intent.renderCeiling)).toBe(8);
   });
 
   it('never drops below one', () => {
@@ -73,5 +84,44 @@ describe('resolvePlatformIntent requestedCount', () => {
     expect(intent.presentationTarget).toBe('vertical');
     expect(intent.requestedCount).toBe(3);
     expect(intent.hardMaxSeconds).toBe(60);
+  });
+});
+
+describe('phrasings that quietly produced the wrong deck', () => {
+  /**
+   * Each of these was found by an adversarial review of this branch, and each
+   * had a creator asking for one thing and the pipeline building another.
+   */
+  it('recognises the plural people actually type', () => {
+    // "tiktoks" failed the word boundary, so platform came back null, no deck
+    // was built at all, and an explicit TikTok request returned timestamps.
+    const intent = resolvePlatformIntent('give me 5 tiktoks from this video', 60);
+    expect(intent.platform).toBe('tiktok');
+    expect(intent.requestedCount).toBe(5);
+  });
+
+  /**
+   * "post" opens the sentence as a VERB. Read as a singular noun it pinned
+   * the whole deck to one card when five were asked for.
+   */
+  it('does not read a leading verb as a count of one', () => {
+    const intent = resolvePlatformIntent('post the 5 best bits to tiktok', 60);
+    expect(intent.requestedCount).toBe(5);
+  });
+
+  /** A word further along is still a noun, so this stays one moment. */
+  it('still reads a noun that is not the first word', () => {
+    expect(resolvePlatformIntent('clip this for tiktok', 60).requestedCount).toBe(1);
+  });
+
+  /**
+   * The render ceiling is what WE will make. Clamping the recorded ask to it
+   * meant a request for twelve was stored, reported and shown back as a
+   * request for eight, with nothing left saying otherwise.
+   */
+  it('records the number asked for, not the number we will make', () => {
+    const intent = resolvePlatformIntent('give me 12 clips for tiktok', 60, { maxCount: 8 });
+    expect(intent.requestedCount).toBe(12);
+    expect(intent.renderCeiling).toBe(8);
   });
 });
