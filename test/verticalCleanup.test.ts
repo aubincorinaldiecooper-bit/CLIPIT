@@ -197,3 +197,38 @@ describe('an upload that rejected may still have landed', () => {
     expect(removed[0]).toContain('vertical');
   });
 });
+
+describe('cleanup must not destroy media it did not create', () => {
+  /**
+   * The keys are deterministic — clips/<video>/<clip>-vertical.mp4 — so a
+   * retry writes to the same place a previous run wrote to.
+   *
+   * A clip whose canonical is fine and whose derivative failed gets retried.
+   * If the re-upload then rejects, deleting that key would destroy a working
+   * derivative from the earlier run to tidy up a file that may not even
+   * exist. S3 leaves the previous object intact when a PUT fails, so the old
+   * media is still good — and cleanup exists to collect what THIS attempt
+   * created, never to remove media that was already there.
+   */
+  it('leaves an existing derivative alone when the re-upload rejects', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(
+      runVerticalPipeline({ ...input, existingDerivativeKey: 'clips/video-1/clip-1-vertical.mp4' }),
+    ).rejects.toThrow(/derivative could not be stored/);
+
+    // Nothing deleted: the object at that key predates this attempt.
+    expect(removed).toEqual([]);
+  });
+
+  it('still cleans up when no object was there before', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(
+      runVerticalPipeline({ ...input, existingDerivativeKey: null }),
+    ).rejects.toThrow(/derivative could not be stored/);
+
+    expect(removed).toHaveLength(1);
+    expect(removed[0]).toContain('vertical');
+  });
+});

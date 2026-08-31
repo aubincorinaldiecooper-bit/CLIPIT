@@ -215,17 +215,28 @@ async function prepareCandidate(
 
     stage = 'storage_upload';
     const canonicalKey = clipKey(input.videoId, clip.id);
-    // Same uncertainty the poster upload already accounts for: a PUT can
-    // store the object and lose its response. Cleaning up only on a confirmed
+    // Same uncertainty the poster upload accounts for: a PUT can store the
+    // object and lose its response, so cleaning up only on a confirmed
     // success leaves the file behind exactly when the network is worst.
+    //
+    // But the key is DETERMINISTIC, and a retry re-uploads to it. If the row
+    // already points at this key, an object was there before this attempt
+    // started — a canonical clip that plays perfectly, whose derivative
+    // happened to fail. Deleting it because a re-upload rejected would
+    // destroy known-good media to tidy up a file that may not even exist, and
+    // S3 leaves the previous object intact when a PUT fails anyway. So the
+    // cleanup only ever removes what this attempt could itself have created.
+    const canonicalExistedBefore = clip.storageKey === canonicalKey;
     try {
       await getStorage().uploadFile(canonicalKey, canonicalPath, 'video/mp4');
     } catch (error) {
-      await discardUploadedObjects([canonicalKey], {
-        videoId: input.videoId,
-        clipId: clip.id,
-        reason: 'canonical_upload_failed',
-      });
+      if (!canonicalExistedBefore) {
+        await discardUploadedObjects([canonicalKey], {
+          videoId: input.videoId,
+          clipId: clip.id,
+          reason: 'canonical_upload_failed',
+        });
+      }
       throw error;
     }
     // The same shape as the derivative and poster below, one step earlier:
@@ -258,6 +269,8 @@ async function prepareCandidate(
       workDir: input.workDir,
       hasAudio: input.hasAudio,
       askComposition: compositionAsker(input, canonicalKey, cut.durationSeconds),
+      // Same rule one layer down: the derivative key is deterministic too.
+      existingDerivativeKey: clip.derivativeStorageKey,
     });
 
     // READY is a PERSISTED fact, never an in-memory return value. A candidate

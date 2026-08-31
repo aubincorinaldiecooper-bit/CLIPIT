@@ -274,18 +274,34 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       ? candidates
       : candidates.filter((match) => match.feedback !== 'rejected');
 
-    // The deck withheld everything — which is not the same as the creator
-    // waving everything away, and must not be reported as it.
+    // The deck withheld everything. That is not the creator waving everything
+    // away, and it is not one situation either — it is three, and each wants
+    // a different sentence.
     //
-    // A finished deck's unkept media expires by design a day later. After
-    // that the gate has nothing to release, and the all-rejected message
-    // below would tell someone they had thumbs-downed every moment they were
-    // shown. They did not; the files simply aged out. Telling them to undo a
-    // thumbs-down they never gave sends them looking for something that was
-    // never there.
+    // My first attempt at this fix collapsed them into one message and so
+    // swapped a false statement for a different false statement: a request
+    // where nothing ever fit the platform's limits was told its moments were
+    // "no longer available" and to ask again — inviting a retry that could
+    // only produce the same answer, for media that never existed.
     if (!body.matchIds?.length && candidates.length === 0 && all.length > 0) {
+      if (clipRequest.effectiveDeckTarget === 0) {
+        // Nothing the search found could be posted here — every moment was
+        // too long for the platform. A real answer about their video, and a
+        // retry cannot change it.
+        throw HttpError.unprocessable(
+          'None of the moments found fit that platform\'s length limits.',
+        );
+      }
+      if (clipRequest.deckCompletedAt) {
+        // A deck really was delivered; its unkept media has since expired,
+        // which is by design. Rebuilding is the right suggestion here.
+        throw HttpError.unprocessable(
+          'Those moments are no longer available to keep. Ask again to rebuild them.',
+        );
+      }
+      // Never completed — the deck failed or is still being made.
       throw HttpError.unprocessable(
-        'Those moments are no longer available to keep. Ask again to rebuild them.',
+        'Those moments are not ready to keep yet. Ask again to rebuild them.',
       );
     }
 

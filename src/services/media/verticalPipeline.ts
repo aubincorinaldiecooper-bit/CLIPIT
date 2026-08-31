@@ -55,6 +55,15 @@ export interface VerticalPipelineInput {
   hasAudio: boolean;
   /** Asks MiniCPM about this exact moment. Injected so the pipeline is testable. */
   askComposition: (canonicalPath: string) => Promise<{ content: string | null; provider: string; model: string }>;
+  /**
+   * The derivative key this clip ALREADY points at, if any.
+   *
+   * The key is deterministic, so a retry writes to the same place. When the
+   * row already names it, whatever is there predates this attempt and must
+   * survive a failed re-upload — cleanup exists to collect what this attempt
+   * created, never to destroy media that was already good.
+   */
+  existingDerivativeKey?: string | null;
 }
 
 export interface VerticalPipelineResult {
@@ -243,13 +252,17 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
     await getStorage().uploadFile(derivativeStorageKey, derivativePath, 'video/mp4');
   } catch (error) {
     // The upload rejected, which does not prove the object is absent — the
-    // bytes may have landed and only the response been lost. Its key is
-    // deterministic, so the safe side of that uncertainty is to delete it.
-    await discardUploadedObjects([derivativeStorageKey], {
-      videoId: input.videoId,
-      clipId: input.clipId,
-      reason: 'derivative_upload_failed',
-    });
+    // bytes may have landed and only the response been lost. Delete it, but
+    // ONLY when this attempt could have been what created it: if the row
+    // already named this key, the object there is a working derivative from
+    // an earlier run and removing it would break a clip that played fine.
+    if (input.existingDerivativeKey !== derivativeStorageKey) {
+      await discardUploadedObjects([derivativeStorageKey], {
+        videoId: input.videoId,
+        clipId: input.clipId,
+        reason: 'derivative_upload_failed',
+      });
+    }
     throw new VerticalPipelineFailure('storage_upload', 'derivative_upload_failed', 'The derivative could not be stored', error);
   }
 
