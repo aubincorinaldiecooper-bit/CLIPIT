@@ -692,14 +692,14 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
  * pipeline's own cleanup is: an orphan nobody names is an orphan forever.
  */
 async function clearPreviousAttempt(clipRequestId: string, log: Logger): Promise<void> {
-  let keys: string[] = [];
-  try {
-    keys = await listMediaKeysForRequestMatches(clipRequestId);
-  } catch (error) {
-    // Never block the search on this lookup — but say so, because proceeding
-    // means the cascade below may strand whatever it would have found.
-    log.error('could not read media keys before clearing matches', { err: error });
-  }
+  // If the keys cannot be read, the matches are NOT deleted.
+  //
+  // Proceeding would cascade away clip rows whose files we never learned the
+  // names of — turning a transient database fault into permanent orphans that
+  // nothing can ever collect. Failing here instead lets the job retry, which
+  // is the recoverable outcome: a retry re-reads the keys and clears properly,
+  // where an orphan is forever.
+  const keys = await listMediaKeysForRequestMatches(clipRequestId);
 
   if (keys.length > 0) {
     const storage = getStorage();
@@ -709,6 +709,10 @@ async function clearPreviousAttempt(clipRequestId: string, log: Logger): Promise
         await storage.remove(storageKey);
         deleted += 1;
       } catch (error) {
+        // Logged rather than thrown: the row is about to go either way, and
+        // refusing to clear it would wedge every future retry of this
+        // request. The key is named because that log line is the only thing
+        // that will ever find this object again.
         log.error('a previous attempt\'s file could not be deleted and is now an orphan', {
           clipRequestId, storageKey, err: error,
         });

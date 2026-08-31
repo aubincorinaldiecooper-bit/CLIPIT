@@ -177,3 +177,23 @@ describe('the canonical clip, one step earlier in the same function', () => {
     expect(removed).toEqual(['clips/video-1/clip-1.mp4']);
   });
 });
+
+describe('an upload that rejected may still have landed', () => {
+  /**
+   * Every upload in this pipeline now cleans up on rejection, not just the
+   * poster. A PUT can store the object and lose its response on the way back;
+   * treating a rejection as proof of absence leaves the file behind exactly
+   * when the network is already misbehaving. The keys are deterministic, so
+   * deleting one that was never written costs nothing.
+   */
+  it('discards the derivative when its own upload rejects', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(runVerticalPipeline(input)).rejects.toThrow(/derivative could not be stored/);
+
+    // Nothing was confirmed stored, and the key is cleaned up anyway.
+    expect(uploaded).toHaveLength(0);
+    expect(removed).toHaveLength(1);
+    expect(removed[0]).toContain('vertical');
+  });
+});

@@ -242,6 +242,14 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
   try {
     await getStorage().uploadFile(derivativeStorageKey, derivativePath, 'video/mp4');
   } catch (error) {
+    // The upload rejected, which does not prove the object is absent — the
+    // bytes may have landed and only the response been lost. Its key is
+    // deterministic, so the safe side of that uncertainty is to delete it.
+    await discardUploadedObjects([derivativeStorageKey], {
+      videoId: input.videoId,
+      clipId: input.clipId,
+      reason: 'derivative_upload_failed',
+    });
     throw new VerticalPipelineFailure('storage_upload', 'derivative_upload_failed', 'The derivative could not be stored', error);
   }
 

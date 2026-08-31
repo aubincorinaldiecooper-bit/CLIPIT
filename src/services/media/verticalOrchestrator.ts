@@ -215,7 +215,19 @@ async function prepareCandidate(
 
     stage = 'storage_upload';
     const canonicalKey = clipKey(input.videoId, clip.id);
-    await getStorage().uploadFile(canonicalKey, canonicalPath, 'video/mp4');
+    // Same uncertainty the poster upload already accounts for: a PUT can
+    // store the object and lose its response. Cleaning up only on a confirmed
+    // success leaves the file behind exactly when the network is worst.
+    try {
+      await getStorage().uploadFile(canonicalKey, canonicalPath, 'video/mp4');
+    } catch (error) {
+      await discardUploadedObjects([canonicalKey], {
+        videoId: input.videoId,
+        clipId: clip.id,
+        reason: 'canonical_upload_failed',
+      });
+      throw error;
+    }
     // The same shape as the derivative and poster below, one step earlier:
     // the file is in storage and the row that would name it has not been
     // written. If that write fails the object is unreachable — the clip row

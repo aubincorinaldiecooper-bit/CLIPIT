@@ -274,6 +274,21 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       ? candidates
       : candidates.filter((match) => match.feedback !== 'rejected');
 
+    // The deck withheld everything — which is not the same as the creator
+    // waving everything away, and must not be reported as it.
+    //
+    // A finished deck's unkept media expires by design a day later. After
+    // that the gate has nothing to release, and the all-rejected message
+    // below would tell someone they had thumbs-downed every moment they were
+    // shown. They did not; the files simply aged out. Telling them to undo a
+    // thumbs-down they never gave sends them looking for something that was
+    // never there.
+    if (!body.matchIds?.length && candidates.length === 0 && all.length > 0) {
+      throw HttpError.unprocessable(
+        'Those moments are no longer available to keep. Ask again to rebuild them.',
+      );
+    }
+
     // Telling someone to rephrase when the search worked and they simply waved
     // every result away would send them to fix the one thing that was fine.
     if (matches.length === 0 && all.length > 0) {
