@@ -4,23 +4,12 @@
 -- seconds. Everything here hangs off it as presentation, so nothing below can
 -- change what the moment IS.
 
--- FIRST, A BUG FIX.
---
--- Migration 003 wrote CHECK (stage IN ('transcription','indexing','search',
--- 'verification')), and the Re-clip work later added 'reclip' to the
--- TypeScript UsageStage without widening this constraint. recordModelUsage
--- catches its own errors and logs a warning, so every re-clip usage row since
--- has been rejected by the database and silently dropped — which means the
--- evaluation page's re-clip cost share has been computed from no rows at all.
--- An absence nobody verified, reported as a number.
---
--- 'verification' is kept: it predates this and dropping a value is not this
--- migration's business. 'composition' is added for the targeted MiniCPM call
--- that decides vertical framing.
-ALTER TABLE model_usage DROP CONSTRAINT IF EXISTS model_usage_stage_check;
-ALTER TABLE model_usage
-    ADD CONSTRAINT model_usage_stage_check
-    CHECK (stage IN ('transcription', 'indexing', 'search', 'verification', 'reclip', 'composition'));
+-- The model_usage stage constraint that this work needed is NOT here. It was
+-- split into its own hotfix (027_usage_stage_constraint.sql, merged ahead of
+-- this branch) because it fixes a live bug — every re-clip cost row was being
+-- rejected by Postgres and dropped — and that had no reason to wait on a
+-- media pipeline. 027 already allows 'composition', so this migration needs
+-- no constraint change of its own.
 
 -- The poster: a real frame chosen from inside the clip, not the browser's
 -- guess at frame zero. Null when extraction failed — the clip is still
