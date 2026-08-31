@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
 import { evaluationReport } from '../../services/evaluation.js';
+import { verticalRenderMetrics } from '../../db/repositories/verticalRenders.js';
 import { requireSession } from '../auth.js';
 import { enforceRateLimits, MINUTE } from '../rateLimit.js';
 import { parse } from '../validation.js';
@@ -27,6 +28,10 @@ const querySchema = z.object({
   durationBucket: z.enum(['under_5m', '5m_to_20m', '20m_to_60m', 'over_60m']).optional(),
   /** Usage lane: first-pass analysis or Re-clip re-evaluation. */
   stage: z.enum(['initial', 'reclip']).optional(),
+});
+
+const verticalQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(90).default(7),
 });
 
 function ownerEmails(): string[] {
@@ -54,5 +59,33 @@ export async function registerEvaluationRoutes(app: FastifyInstance): Promise<vo
     }
 
     return reply.send(await evaluationReport(filters));
+  });
+
+  /**
+   * What the post-ready pipeline is actually doing — including everything
+   * creators never see.
+   *
+   * The product rule is that a moment whose render failed simply is not in
+   * the deck: no error card, no retry button, no landscape substitute. That
+   * is right for the creator and dangerous for us, because a pipeline
+   * silently dropping a third of its candidates looks, from outside, exactly
+   * like a video that only had two good moments in it. This route is the
+   * inside view, and it is the only place that distinction is visible.
+   *
+   * Same locked door as the evaluation report above.
+   */
+  app.get('/api/evaluation/vertical', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+
+    const owners = ownerEmails();
+    const email = request.principal?.email?.trim().toLowerCase() ?? null;
+    if (owners.length === 0 || !email || !owners.includes(email)) {
+      throw HttpError.notFound('Not found');
+    }
+
+    const { days } = parse(verticalQuerySchema, request.query ?? {}, 'query parameters');
+    return reply.send(await verticalRenderMetrics(days));
   });
 }

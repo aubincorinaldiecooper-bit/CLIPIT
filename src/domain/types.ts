@@ -372,6 +372,27 @@ export interface Clip {
   status: ClipStatus;
   errorMessage: string | null;
   durationSeconds: number | null;
+  /**
+   * How this moment is presented, as opposed to what it is. Everything below
+   * describes a SEPARATE 9:16 file and a still from it; the canonical clip
+   * above keeps its own framing and its own key, and nothing here can change
+   * which seconds of footage the moment covers.
+   */
+  derivativeStorageKey: string | null;
+  derivativeStatus: 'pending' | 'ready' | 'failed' | null;
+  posterStorageKey: string | null;
+  posterTimestampSeconds: number | null;
+  compositionMode: string | null;
+  /** Measured, so the shape a client is told is the file's real shape. */
+  sourceWidth: number | null;
+  sourceHeight: number | null;
+  outputWidth: number | null;
+  outputHeight: number | null;
+  /** True when the media was made before anyone chose this moment. */
+  preRendered: boolean;
+  /** Set on Keep. Null means nobody has chosen it. */
+  approvedAt: Date | null;
+  retentionClass: 'temporary' | 'owned';
   sizeBytes: number | null;
   createdAt: Date;
   updatedAt: Date;

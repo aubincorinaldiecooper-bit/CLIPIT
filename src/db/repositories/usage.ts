@@ -4,8 +4,11 @@ import { logger } from '../../lib/logger.js';
 /** What caused a model call. */
 // 'reclip' is its own stage on purpose: re-evaluation spend must never
 // blend into first-pass analysis, or the re-clip cost share — a business
-// number — stops existing.
-export type UsageStage = 'transcription' | 'indexing' | 'search' | 'reclip';
+// number — stops existing. 'composition' is separate for the same reason:
+// what it costs to decide how a moment should be FRAMED is a different
+// question from what it costs to FIND it, and the answer only exists if the
+// rows keep them apart.
+export type UsageStage = 'transcription' | 'indexing' | 'search' | 'reclip' | 'composition';
 
 export interface ModelTokenUsage {
   promptTokens: number;

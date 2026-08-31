@@ -96,3 +96,17 @@ export function reclipWindowKey(videoId: string, matchId: string): string {
 export function clipKey(videoId: string, clipId: string): string {
   return `${StoragePrefix.clips}/${videoId}/${clipId}.mp4`;
 }
+
+/**
+ * The 9:16 publishing derivative for a clip. A SEPARATE object from the
+ * canonical clip, which keeps its own key and its original framing — the
+ * derivative never overwrites the excerpt it was made from.
+ */
+export function verticalDerivativeKey(videoId: string, clipId: string): string {
+  return `${StoragePrefix.clips}/${videoId}/${clipId}-vertical.mp4`;
+}
+
+/** The poster still for a clip: a real frame chosen from inside it. */
+export function clipPosterKey(videoId: string, clipId: string): string {
+  return `posters/${videoId}/${clipId}.jpg`;
+}

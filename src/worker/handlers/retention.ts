@@ -1,6 +1,8 @@
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
-import { logger } from '../../lib/logger.js';
+import { logger, type Logger } from '../../lib/logger.js';
+import { getStorage } from '../../services/storage/s3.js';
+import { claimUnkeptPreRenderedMedia } from '../../db/repositories/verticalMedia.js';
 import { listVideosWithUnreachableFootage } from '../../db/repositories/videos.js';
 import { expireVideoFootage } from '../../services/retention.js';
 import type { RetentionJob } from '../../queues/index.js';
@@ -58,5 +60,59 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
     objectsFailed,
     elapsedMs: Math.round(performance.now() - startedAt),
     ...(remaining > 0 ? { videosLeftForNextSweep: remaining } : {}),
+  });
+
+  await sweepUnkeptPreRenderedMedia(log);
+}
+
+/**
+ * Delete the moments we made and nobody kept.
+ *
+ * Rendering before Keep is what makes the deck appear finished the moment it
+ * appears at all. It has a bill attached: asking for three moments renders at
+ * least three, and only the ones somebody pressed Keep on were ever wanted.
+ * Without this, that bill is permanent and grows with every question asked.
+ *
+ * Narrow on purpose, and narrow in the QUERY rather than in a filter here:
+ * only rows this pipeline made, only ones never approved, only after the same
+ * idle period the footage sweep uses. A clip somebody kept, and every clip
+ * cut the old way, is invisible to it.
+ */
+async function sweepUnkeptPreRenderedMedia(log: Logger): Promise<void> {
+  // Claims and clears the rows in one statement, then deletes their objects.
+  // See claimUnkeptPreRenderedMedia for why that order, and what it costs.
+  const rows = await claimUnkeptPreRenderedMedia(env.FOOTAGE_IDLE_SECONDS, env.RETENTION_VIDEO_LIMIT);
+  if (rows.length === 0) return;
+
+  const storage = getStorage();
+  let objectsDeleted = 0;
+  let objectsFailed = 0;
+
+  for (const row of rows) {
+    const keys = [row.derivativeStorageKey, row.posterStorageKey, row.storageKey]
+      .filter((key): key is string => typeof key === 'string' && key.length > 0);
+
+    for (const key of keys) {
+      try {
+        await storage.remove(key);
+        objectsDeleted += 1;
+      } catch (error) {
+        objectsFailed += 1;
+        // The row no longer names this object, so nothing will retry it —
+        // said out loud because it is now an orphan only these logs can find.
+        log.warn('an unkept rendered file could not be deleted and is now orphaned', {
+          clipId: row.clipId,
+          videoId: row.videoId,
+          err: error,
+        });
+      }
+    }
+  }
+
+  log.info('unkept rendered media swept', {
+    clips: rows.length,
+    objectsDeleted,
+    objectsFailed,
+    idleSeconds: env.FOOTAGE_IDLE_SECONDS,
   });
 }

@@ -2,6 +2,9 @@ import { env } from '../config/env.js';
 import { getStorage } from '../services/storage/s3.js';
 import { formatTimecode } from '../services/timestamps.js';
 import { latestVersionsForMatches } from '../db/repositories/reclips.js';
+import { clipMediaContract } from './mediaContract.js';
+import { isCreatorVisible } from '../services/media/verticalVisibility.js';
+import type { CompositionMode } from '../services/media/composition.js';
 import type {
   ChunkDegradation,
   ChunkFailureCode,
@@ -414,10 +417,72 @@ export async function serializeLibraryClip(entry: {
   };
 }
 
+/**
+ * The gate between what the pipeline made and what a creator is shown.
+ *
+ * A post-ready request stores more matches than it ever intends to show. It
+ * over-fetches on purpose so one failed render does not cost a card, and the
+ * ones it never needed — plus the ones that failed — stay in the database as
+ * our record. None of them are the creator's answer.
+ *
+ * Without this, asking for three moments returns six: three finished cards,
+ * and three more with no playable vertical file behind them. That is the
+ * "backend processing state leaking out as a product state" the whole
+ * post-ready rule exists to prevent, and it is the LAST place it can be
+ * stopped — a client that forgets to filter must not be able to leak one.
+ *
+ * Decided from the DATA, never by re-reading the instruction. A correction
+ * ("are you sure?") stores those three words as its own instruction while the
+ * deck was built for the question before it, so parsing the text here would
+ * get the answer wrong exactly when it matters. The clip rows say what
+ * actually happened.
+ */
+export function creatorVisibleMatches(
+  matches: ClipMatch[],
+  clipsByMatchId: Map<string, Clip>,
+): { matches: ClipMatch[]; clips: Clip[]; withheld: number } {
+  const preRendered = [...clipsByMatchId.values()].some((clip) => clip.preRendered);
+  // Nothing pre-rendered means this request never went down the post-ready
+  // path, and its behaviour must not change by a single row.
+  if (!preRendered) {
+    return { matches, clips: [...clipsByMatchId.values()], withheld: 0 };
+  }
+
+  const visible = matches.filter((match) => {
+    const clip = clipsByMatchId.get(match.id);
+    if (!clip) return false;
+    return isCreatorVisible({
+      matchId: match.id,
+      derivativeStatus: clip.derivativeStatus ?? 'pending',
+      derivativeStorageKey: clip.derivativeStorageKey,
+      posterStorageKey: clip.posterStorageKey,
+      confidence: match.confidence,
+    });
+  });
+
+  return {
+    matches: visible,
+    clips: visible.map((match) => clipsByMatchId.get(match.id)!),
+    withheld: matches.length - visible.length,
+  };
+}
+
 export async function serializeClip(clip: Clip, includeUrl = true) {
   let url: string | null = null;
   let downloadUrl: string | null = null;
   let urlExpiresAt: string | null = null;
+  let derivativeUrl: string | null = null;
+  let posterUrl: string | null = null;
+
+  // The 9:16 file and its still, signed only when they really exist. Asking
+  // for a URL to a key that is null would sign a path to nothing, and the
+  // client would get a link that 404s instead of an honest absence.
+  if (includeUrl && clip.derivativeStatus === 'ready' && clip.derivativeStorageKey) {
+    derivativeUrl = await getStorage().createDownloadUrl(clip.derivativeStorageKey);
+  }
+  if (includeUrl && clip.posterStorageKey) {
+    posterUrl = await getStorage().createDownloadUrl(clip.posterStorageKey);
+  }
 
   if (includeUrl && clip.status === 'ready' && clip.storageKey) {
     // Two URLs for the same object, differing only in disposition. Inline
@@ -459,6 +524,37 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
     url,
     downloadUrl,
     urlExpiresAt,
+    /**
+     * What to actually show. One block, built in one place, so no route can
+     * form its own opinion about whether a moment is vertical.
+     *
+     * `media.url` is the 9:16 derivative only when that derivative genuinely
+     * exists. It never silently falls back to the landscape file — that
+     * substitution is exactly what the post-ready rule forbids, and a
+     * serializer is precisely where it would happen without anyone deciding
+     * to.
+     */
+    media: clipMediaContract(
+      {
+        canonicalUrl: url,
+        derivativeUrl,
+        derivativeStorageKey: clip.derivativeStorageKey,
+        derivativeStatus: clip.derivativeStatus,
+        posterUrl,
+        posterStorageKey: clip.posterStorageKey,
+        posterTimestampSeconds: clip.posterTimestampSeconds,
+        sourceWidth: clip.sourceWidth,
+        sourceHeight: clip.sourceHeight,
+        outputWidth: clip.outputWidth,
+        outputHeight: clip.outputHeight,
+        compositionMode: clip.compositionMode as CompositionMode | null,
+      },
+      // A clip made by the post-ready pipeline was made FOR a vertical
+      // request. The row itself says so; no caller has to remember to.
+      clip.preRendered,
+    ),
+    /** Set when someone pressed Keep. Null means it is still on offer. */
+    approvedAt: clip.approvedAt ? clip.approvedAt.toISOString() : null,
     createdAt: clip.createdAt.toISOString(),
     updatedAt: clip.updatedAt.toISOString(),
   };
