@@ -288,7 +288,6 @@ export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: num
   const preRollSeconds = Math.min(options.startSeconds, 10);
   const coarseStartSeconds = Math.max(0, options.startSeconds - preRollSeconds);
   const outputOffsetSeconds = options.startSeconds - coarseStartSeconds;
-  const outputEndSeconds = options.endSeconds - coarseStartSeconds;
 
   const args = [
     '-hide_banner',
@@ -297,7 +296,9 @@ export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: num
     '-ss', coarseStartSeconds.toFixed(3),
     '-i', options.inputPath,
     '-ss', outputOffsetSeconds.toFixed(3),
-    '-to', outputEndSeconds.toFixed(3),
+    // `-t` enforces the minimum-duration clamp (the `Math.max(0.1, …)`
+    // above) and still stops at the exact end when no clamp was applied.
+    '-t', duration.toFixed(3),
     '-c:v', 'libx264',
     '-preset', env.CLIP_PRESET,
     '-crf', String(env.CLIP_VIDEO_CRF),
