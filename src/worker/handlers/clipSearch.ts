@@ -269,11 +269,20 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           readComplete: false,
         });
 
-        if (answered > 0) {
-          log.info('answered from the part read so far', {
-            readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
-            ofSeconds: Math.round(video.durationSeconds ?? 0),
-          });
+        if (answered.matchCount > 0) {
+          if (answered.deckCompleted) {
+            log.info('answered from the part read so far', {
+              matches: answered.matchCount,
+              readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
+              ofSeconds: Math.round(video.durationSeconds ?? 0),
+            });
+          } else {
+            log.error('notes answered but the deck could not be finished', {
+              matches: answered.matchCount,
+              readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
+              ofSeconds: Math.round(video.durationSeconds ?? 0),
+            });
+          }
           outcome = 'completed';
           searchMode = desired.mode;
           chunkCount = 0;
@@ -355,7 +364,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         readComplete: true,
       });
 
-      if (answered > 0) {
+      if (answered.matchCount > 0) {
         outcome = 'completed';
         searchMode = resolved.mode;
         chunkCount = 0;
@@ -734,9 +743,10 @@ async function clearPreviousAttempt(clipRequestId: string, log: Logger): Promise
  * Reading from memory is still the right architecture and is untouched: the
  * notes decide WHICH moments, exactly as before, and the deck is built from
  * whatever they found. What changed is only that answering fast no longer
- * means answering with less.
+ * means answering with less. Exported for focused tests of the request/deck
+ * boundary.
  */
-async function completeRequestWithDeck(input: {
+export async function completeRequestWithDeck(input: {
   clipRequestId: string;
   request: ClipRequest;
   video: Video;
@@ -1056,7 +1066,7 @@ async function answerFromNotes(input: {
    * must not be reported in the same words.
    */
   readComplete: boolean;
-}): Promise<number> {
+}): Promise<{ matchCount: number; deckCompleted: boolean }> {
   const { clipRequestId, request, intent, video, chunks, instruction, mode, tally, log, readComplete } = input;
   const startedAt = performance.now();
 
@@ -1082,7 +1092,7 @@ async function answerFromNotes(input: {
     })),
   ].sort((a, b) => a.startSeconds - b.startSeconds);
 
-  if (notes.length === 0) return 0;
+  if (notes.length === 0) return { matchCount: 0, deckCompleted: false };
 
   await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
   await clearPreviousAttempt(clipRequestId, log);
@@ -1168,7 +1178,7 @@ async function answerFromNotes(input: {
   // Nothing remembered. Left unfinished on purpose: the caller reads the video
   // itself before anyone is told this video does not contain what they asked
   // for.
-  if (found.length === 0) return 0;
+  if (found.length === 0) return { matchCount: 0, deckCompleted: false };
 
   /**
    * Name the stretches the notes never covered.
@@ -1221,6 +1231,7 @@ async function answerFromNotes(input: {
   await insertMatches(clipRequestId, found);
   const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
 
+  let deckCompleted = false;
   await withWorkDir(`notes-${clipRequestId}`, async (dir) => {
     await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
 
@@ -1228,18 +1239,25 @@ async function answerFromNotes(input: {
     // WHICH moments, exactly as they always have; the deck is built from what
     // they found, and the request is completed by the same helper the footage
     // path uses so the two can never drift apart on what a creator is owed.
-    await completeRequestWithDeck({
+    const completed = await completeRequestWithDeck({
       clipRequestId, request, video, intent, workDir: dir, log, tally, answeredFrom: 'notes',
     });
+    deckCompleted = completed.completed;
   });
 
-  log.info('answered from memory', {
+  const answerLog = {
     matches: finalCount,
+    deckCompleted,
     elapsedMs: Math.round(performance.now() - startedAt),
     ...tally.summary(),
-  });
+  };
+  if (deckCompleted) {
+    log.info('answered from memory', answerLog);
+  } else {
+    log.error('answered from memory but could not finish the deck', answerLog);
+  }
 
-  return finalCount;
+  return { matchCount: finalCount, deckCompleted };
 }
 
 async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClipMatch[]> {
