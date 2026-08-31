@@ -113,6 +113,17 @@ welcome") are de-duplicated word-by-word before storage.
 Requires Node 22, PostgreSQL, Redis, `ffmpeg`, `ffprobe`, and `yt-dlp` on PATH,
 plus an S3-compatible bucket (MinIO works).
 
+### MiniCPM candidate concurrency
+
+`MINICPM_VIDEO_CONCURRENCY` controls only Clipit's private Modal RPC fan-out;
+it does not create remote GPU capacity. The deployed `MiniCPMModel` currently
+uses `max_containers=1`, so benchmark `MINICPM_VIDEO_CONCURRENCY=1` first. To
+benchmark a value of `2`, separately change the Modal notebook class decorator
+from `max_containers=1` to `max_containers=2` and redeploy that same private
+class/app, then set `MINICPM_VIDEO_CONCURRENCY=2` on the backend. Do not add an
+HTTP endpoint. Both settings remain compatible with Modal scale-to-zero and
+the notebook's configured idle timeout.
+
 ```bash
 npm install
 cp .env.example .env      # fill in the credentials

@@ -7,6 +7,7 @@ import { withWorkDir } from '../../lib/workdir.js';
 import { mapWithConcurrency } from '../../lib/concurrency.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { attachThumbnails } from '../../services/media/thumbnails.js';
+import { cutClip } from '../../services/media/ffmpeg.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { UsageTally } from '../../services/usageTally.js';
 import {
@@ -18,7 +19,9 @@ import {
 import { searchNotes } from '../../services/search/noteSearch.js';
 import { isCorrection } from '../../services/search/rescanPolicy.js';
 import { assertVideoInputSupported } from '../../services/search/modelCapabilities.js';
-import { resolveSearchMode } from '../../services/search/instructionMode.js';
+import { classifyInstruction, resolveSearchMode } from '../../services/search/instructionMode.js';
+import { classifyCreatorSearchIntent, isFastCandidateIntent, snapRangeToTranscript } from '../../services/search/recommendationIntent.js';
+import { exceedsPlatformHardMax, resolvePlatformOutput, type ActivePlatformOutput } from '../../services/search/platformOutput.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
 import type { NoteLine, TranscriptLine } from '../../services/search/prompt.js';
 import {
@@ -177,6 +180,36 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     });
 
     const waitedMs = job.data.waitedMs ?? 0;
+    const creatorIntent = classifyCreatorSearchIntent(
+      instruction,
+      classifyInstruction(instruction).visualScore,
+      request.mode,
+    );
+    const platformOutput = resolvePlatformOutput(instruction, env.MAX_CLIP_SECONDS);
+
+    // Creator recommendations need the transcript and a handful of targeted
+    // visual checks, not the complete persistent visual memory. This branch is
+    // deliberately before every index wait: indexing remains useful, but runs
+    // independently and cannot gate the first recommendation.
+    if (!correcting && transcriptReady && isFastCandidateIntent(creatorIntent)) {
+      const answered = await answerFromFastCandidates({
+        clipRequestId,
+        video,
+        chunks,
+        instruction,
+        mode: desired.mode,
+        platformOutput,
+        tally,
+        log,
+        requestStartedAt: searchStartedAt,
+      });
+      if (answered > 0) {
+        outcome = 'completed';
+        searchMode = desired.mode;
+        chunkCount = Math.min(answered, 5);
+        return;
+      }
+    }
 
     /**
      * Waiting for the video to finish being read.
@@ -270,6 +303,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       rationale: resolved.rationale,
       chunks: chunks.length,
       instruction,
+      creatorIntent,
+      platformRequested: platformOutput?.platform ?? null,
+      platformDurationTarget: platformOutput?.profile ?? null,
       ...(correcting ? { correctionOf: request.instruction } : {}),
     });
 
@@ -335,7 +371,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
     await withWorkDir(`search-${clipRequestId}`, async (dir) => {
       const results = await mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY, async (chunk) => {
-        const found = await searchSingleChunk({
+        const reported = await searchSingleChunk({
           chunk,
           chunkCount: chunks.length,
           instruction,
@@ -357,6 +393,18 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
             await recordChunkDegraded(clipRequestId, degradation);
           },
         });
+        const found = reported.filter((match) => !exceedsPlatformHardMax(
+          { startSeconds: match.globalStartSeconds, endSeconds: match.globalEndSeconds },
+          platformOutput,
+        ));
+        if (found.length !== reported.length) {
+          log.warn('discarded overlong platform result after server validation', {
+            platformRequested: platformOutput?.platform,
+            platformHardMaxSeconds: platformOutput?.hardMaxSeconds,
+            discarded: reported.length - found.length,
+            path: 'full_visual_search',
+          });
+        }
 
         if (found.length > 0) await insertMatches(clipRequestId, found);
         await recordChunkCompleted(clipRequestId);
@@ -428,7 +476,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // Chunks were searched independently, so the same moment can appear
       // twice — including as two pieces either side of a chunk boundary. Fold
       // duplicates together before the search is reported complete.
-      const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
+      const finalCount = await aggregateStoredMatches(clipRequestId, chunks, platformOutput?.hardMaxSeconds);
 
       // After aggregation, because merging rewrites match rows and their ids.
       await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
@@ -499,7 +547,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
  * local range extends past that chunk's end, which is the honest description of
  * what was found. Clips are always cut using the global range.
  */
-async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[]): Promise<number> {
+async function aggregateStoredMatches(
+  clipRequestId: string,
+  chunks: VideoChunk[],
+  maxDurationSeconds = env.MAX_CLIP_SECONDS,
+): Promise<number> {
   const stored = await listMatches(clipRequestId);
   if (stored.length <= 1) return stored.length;
 
@@ -516,7 +568,7 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
     {
       gapSeconds: env.MATCH_MERGE_GAP_SECONDS,
       minOverlapRatio: env.MATCH_MERGE_MIN_OVERLAP_RATIO,
-      maxDurationSeconds: env.MAX_CLIP_SECONDS,
+      maxDurationSeconds,
     },
   );
 
@@ -632,6 +684,189 @@ const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
   transcript: 'transcript',
   both: 'multimodal',
 };
+
+/** Transcript shortlist -> only the containing footage windows -> validated results. */
+async function answerFromFastCandidates(input: {
+  clipRequestId: string;
+  video: Video;
+  chunks: VideoChunk[];
+  instruction: string;
+  mode: ResolvedSearchMode;
+  platformOutput: ActivePlatformOutput | null;
+  tally: UsageTally;
+  log: Logger;
+  requestStartedAt: number;
+}): Promise<number> {
+  const selectionStartedAt = performance.now();
+  const transcript = await listTranscriptSegments(input.video.id);
+  if (transcript.length === 0) return 0;
+
+  const selection = await searchNotes({
+    instruction: `${input.instruction}\nSelect 3 to 5 strongest self-contained candidate moments from the transcript. `
+      + 'Return source timestamps, prefer complete thoughts, and do not invent visual evidence.',
+    notes: transcript.map((segment) => ({
+      startSeconds: segment.startSeconds,
+      endSeconds: segment.endSeconds,
+      description: `"${segment.text}"`,
+      kind: 'said' as const,
+    })),
+    onUsage: (usage) => {
+      input.tally.add(usage);
+      void recordModelUsage({ ...usage, stage: 'search', videoId: input.video.id, clipRequestId: input.clipRequestId });
+    },
+  });
+  const candidates = selection.matches
+    .filter((candidate) => candidate.endSeconds > candidate.startSeconds)
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 5);
+
+  input.log.info('fast candidates selected', {
+    path: 'fast_candidate',
+    candidateCount: candidates.length,
+    candidateSelectionMs: Math.round(performance.now() - selectionStartedAt),
+    transcriptReadyToCandidatesMs: Math.round(performance.now() - selectionStartedAt),
+    platformRequested: input.platformOutput?.platform ?? null,
+    platformDurationTarget: input.platformOutput?.profile ?? null,
+  });
+  if (candidates.length === 0) return 0;
+
+  await startClipRequest(input.clipRequestId, { chunksTotal: candidates.length, resolvedMode: input.mode });
+  await deleteMatches(input.clipRequestId);
+  const found: NewClipMatch[] = [];
+
+  // MiniCPM's limiter remains the authority on actual GPU fan-out. Candidate
+  // work uses the same provider seam as indexing and ordinary footage search.
+  const verified = await mapWithConcurrency(candidates, env.MINICPM_VIDEO_CONCURRENCY, async (candidate, candidateIndex) => {
+    const chunk = input.chunks.find((item) => candidate.startSeconds < item.globalEndSeconds
+      && candidate.endSeconds > item.globalStartSeconds);
+    if (!chunk) return null;
+
+    let focus = { startSeconds: candidate.startSeconds, endSeconds: candidate.endSeconds };
+    let attempts = 0;
+    let chosen: NewClipMatch | null = null;
+    while (attempts < 2) {
+      attempts += 1;
+      const durationBefore = focus.endSeconds - focus.startSeconds;
+      const target = input.platformOutput?.explicitDurationSeconds === null && input.platformOutput
+        ? `Target ${input.platformOutput.profile.targetMinSeconds}-${input.platformOutput.profile.targetMaxSeconds}s; hard maximum ${input.platformOutput.hardMaxSeconds}s.`
+        : input.platformOutput?.explicitDurationSeconds
+          ? `The user explicitly requested about ${input.platformOutput.explicitDurationSeconds}s; do not apply the platform recommendation default.`
+          : 'Prefer a concise, complete creator-ready moment.';
+      const verifyStartedAt = performance.now();
+      const localFocusStart = Math.max(0, focus.startSeconds - chunk.globalStartSeconds);
+      const localFocusEnd = Math.min(chunk.durationSeconds, focus.endSeconds - chunk.globalStartSeconds);
+      const contextStart = Math.max(0, localFocusStart - 10);
+      const contextEnd = Math.min(chunk.durationSeconds, localFocusEnd + 10);
+      const candidateDir = path.join(env.WORK_DIR, `fast-${input.clipRequestId}-${candidateIndex}-${attempts}`);
+      const sourcePath = path.join(candidateDir, 'source-chunk.mp4');
+      const targetedPath = path.join(candidateDir, 'targeted-window.mp4');
+      const targetedStorageKey = `proxies/${input.video.id}/targeted/${input.clipRequestId}-${candidateIndex}-${attempts}.mp4`;
+      await getStorage().downloadToFile(chunk.storageKey, sourcePath);
+      await cutClip({
+        inputPath: sourcePath,
+        outputPath: targetedPath,
+        startSeconds: contextStart,
+        endSeconds: contextEnd,
+        hasAudio: input.video.hasAudio ?? true,
+      });
+      await getStorage().uploadFile(targetedStorageKey, targetedPath, 'video/mp4');
+      const targetedChunk: VideoChunk = {
+        ...chunk,
+        storageKey: targetedStorageKey,
+        globalStartSeconds: chunk.globalStartSeconds + contextStart,
+        globalEndSeconds: chunk.globalStartSeconds + contextEnd,
+        durationSeconds: contextEnd - contextStart,
+      };
+      let matches: NewClipMatch[];
+      try {
+        matches = await searchSingleChunk({
+        chunk: targetedChunk,
+        chunkCount: input.chunks.length,
+        instruction: `Visually verify and tighten ONLY the candidate at local ${(localFocusStart - contextStart).toFixed(1)}-${(localFocusEnd - contextStart).toFixed(1)}s. `
+          + `Ignore unrelated moments outside this targeted window. `
+          + `Return the single strongest self-contained sub-moment. ${target}`,
+        mode: 'both',
+        videoId: input.video.id,
+        clipRequestId: input.clipRequestId,
+        workDir: path.join(env.WORK_DIR, `fast-${input.clipRequestId}-${candidateIndex}-${attempts}`),
+        tally: input.tally,
+        log: input.log,
+        onAnsweredWithoutThinking: () => undefined,
+        onDegraded: async () => undefined,
+        });
+      } finally {
+        await getStorage().remove(targetedStorageKey).catch((error) => {
+          input.log.warn('could not remove targeted verification window', { candidateIndex, err: error });
+        });
+      }
+      const overlap = matches
+        .filter((match) => match.globalEndSeconds >= focus.startSeconds - 10 && match.globalStartSeconds <= focus.endSeconds + 10)
+        .sort((a, b) => b.confidence - a.confidence)[0] ?? null;
+      input.log.info('targeted candidate verified', {
+        path: 'fast_candidate',
+        candidateIndex,
+        targetedVerificationMs: Math.round(performance.now() - verifyStartedAt),
+        candidateDurationBeforeRefinement: Number(durationBefore.toFixed(3)),
+        refinementAttempts: attempts,
+      });
+      if (!overlap) break;
+      focus = { startSeconds: overlap.globalStartSeconds, endSeconds: overlap.globalEndSeconds };
+      if (!exceedsPlatformHardMax(focus, input.platformOutput)) {
+        const nearby = transcript.filter((segment) => segment.endSeconds >= focus.startSeconds - 3
+          && segment.startSeconds <= focus.endSeconds + 3);
+        const snapped = snapRangeToTranscript(focus, nearby);
+        if (!exceedsPlatformHardMax(snapped, input.platformOutput)) {
+          const remapped = mapGlobalRangeToChunk(chunk, snapped, {
+            minDurationSeconds: env.MIN_CLIP_SECONDS,
+            maxDurationSeconds: env.MAX_CLIP_SECONDS,
+          });
+          chosen = remapped ? {
+            ...overlap,
+            localStartSeconds: remapped.localStartSeconds,
+            localEndSeconds: remapped.localEndSeconds,
+            globalStartSeconds: remapped.globalStartSeconds,
+            globalEndSeconds: remapped.globalEndSeconds,
+          } : overlap;
+        } else {
+          chosen = overlap;
+        }
+        break;
+      }
+      // Never return the overlong result. The next pass asks inside the same
+      // candidate for its strongest sub-moment; after pass two it is dropped.
+    }
+    input.log.info('targeted candidate final', {
+      path: 'fast_candidate',
+      candidateIndex,
+      platformRequested: input.platformOutput?.platform ?? null,
+      finalDuration: chosen ? Number((chosen.globalEndSeconds - chosen.globalStartSeconds).toFixed(3)) : null,
+      refinementAttempts: attempts,
+    });
+    return chosen;
+  });
+
+  for (const result of verified) {
+    if (result.status === 'fulfilled' && result.value) found.push(result.value);
+  }
+  if (found.length === 0) return 0;
+  await insertMatches(input.clipRequestId, found);
+  const count = await aggregateStoredMatches(
+    input.clipRequestId,
+    input.chunks,
+    input.platformOutput?.hardMaxSeconds,
+  );
+  await withWorkDir(`fast-thumbs-${input.clipRequestId}`, async (dir) => {
+    await attachSearchThumbnails({ clipRequestId: input.clipRequestId, video: input.video, workDir: dir, log: input.log });
+  });
+  await finishClipRequest(input.clipRequestId, 'completed', null, 'footage');
+  input.log.info('first useful result', {
+    path: 'fast_candidate',
+    matches: count,
+    timeToFirstUsefulResultMs: Math.round(performance.now() - input.requestStartedAt),
+    indexStatus: input.video.indexStatus,
+  });
+  return count;
+}
 
 
 /**
