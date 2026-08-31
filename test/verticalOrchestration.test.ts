@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { assembleDeck, deckCompletion, planDeck, type PreparedCandidate } from '../src/services/media/deckAssembly.js';
 import { keepAction, retentionClassFor } from '../src/services/media/keepApproval.js';
@@ -414,5 +416,40 @@ describe('an absence we never verified', () => {
   it('a short deck that stands is complete', () => {
     expect(deckCompletion({ complete: true, effectiveDeckTarget: 2, sourceUnavailable: false }).kind)
       .toBe('complete');
+  });
+});
+
+describe('a retry must never reach into the library', () => {
+  /**
+   * The shape of the bug this replaced, stated as the rule it broke.
+   *
+   * clips.clip_match_id is ON DELETE CASCADE. A stalled search job can be
+   * redelivered AFTER the request completed and after somebody pressed Keep,
+   * and the retry clears the previous attempt's matches. Two wrong answers
+   * were tried before the right one:
+   *
+   *   1. delete every match  → the kept clip's row cascades away. Their
+   *      library entry is gone.
+   *   2. spare the kept FILES but still delete the match → the row still
+   *      cascades, the clip still vanishes, and the files that were carefully
+   *      preserved are now referenced by nothing. Worse than (1).
+   *
+   * Only keeping the MATCH keeps the clip, and only keeping the clip keeps
+   * its files reachable. They are one decision, not three.
+   */
+  it('is one decision: keep the match, keep the clip, keep its files', () => {
+    // A guard test over the SQL itself — the NOT EXISTS is what makes all
+    // three true, and deleting it silently reintroduces the library loss.
+    const sql = readFileSync(
+      path.join(__dirname, '..', 'src/db/repositories/verticalMedia.ts'),
+      'utf8',
+    );
+    const clear = sql.slice(sql.indexOf('export async function clearUnkeptMatchesForRequest'));
+    expect(clear).toContain('NOT EXISTS');
+    expect(clear).toContain('approved_at IS NOT NULL');
+    // And it must be one statement: a separate read and delete lets an
+    // approval land between them.
+    expect(clear).toContain('WITH doomed AS');
+    expect(clear).toContain('DELETE FROM clip_matches');
   });
 });

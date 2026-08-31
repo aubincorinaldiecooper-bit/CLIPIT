@@ -222,39 +222,51 @@ export async function claimUnkeptPreRenderedMedia(
 
 
 /**
- * Every stored object belonging to the clips of one request's matches.
+ * Clear a previous attempt's matches and hand back the files they held —
+ * in ONE statement, and never touching a moment the creator kept.
  *
- * Read BEFORE those matches are deleted, because clips.clip_match_id is
- * ON DELETE CASCADE: dropping the matches drops the clip rows with them, and
- * every collector in this system finds objects by reading keys off a clip row
- * — the unkept-media sweep and the video-level footage expiry alike. A row
- * deleted while its files exist takes the only map to them.
+ * Three things have to be true together, and getting any one of them alone is
+ * worse than useless:
  *
- * That was harmless while clips were created only by the Keep endpoint, which
- * cannot run before a search completes. It stopped being harmless when the
- * search itself began rendering media: a retried job re-runs from the top,
- * clears the previous attempt's matches, and would cascade away the rows of
- * three finished moments whose nine objects then sit in the bucket, billed
- * monthly, findable only by listing the whole prefix.
+ *  - The keys must be read BEFORE the rows go. clips.clip_match_id is
+ *    ON DELETE CASCADE, and every collector in this system finds objects by
+ *    reading keys off a clip row, so a row deleted while its files exist
+ *    takes the only map to them.
+ *  - Kept moments must keep their ROWS, not just their files. Sparing the
+ *    files while the cascade still took the rows was my own first attempt at
+ *    this: the clip vanished from the creator's library and the files I had
+ *    carefully preserved became unreachable. Worse than deleting both.
+ *  - The read and the delete must not be two round trips. An approval landing
+ *    between them would be read as unkept and then cascaded away.
+ *
+ * The NOT EXISTS keeps a match whose clip somebody approved, so the cascade
+ * never reaches it. One statement narrows the approval race to the width of
+ * a single snapshot rather than a network gap — it does not eliminate it, and
+ * closing it entirely would need SERIALIZABLE or an explicit lock ordering
+ * shared with approveClip.
  */
-export async function listMediaKeysForRequestMatches(clipRequestId: string): Promise<string[]> {
+export async function clearUnkeptMatchesForRequest(clipRequestId: string): Promise<string[]> {
   const rows = await queryRows<{
     storage_key: string | null;
     derivative_storage_key: string | null;
     poster_storage_key: string | null;
   }>(
-    `SELECT c.storage_key, c.derivative_storage_key, c.poster_storage_key
-       FROM clips c
-       JOIN clip_matches m ON m.id = c.clip_match_id
-      WHERE m.clip_request_id = $1
-        -- NEVER a moment the creator kept.
-        --
-        -- A stalled job can be redelivered after the request completed and
-        -- after someone pressed Keep, and this list feeds a delete. Without
-        -- this line a retry would reach into their library and destroy the
-        -- clips they had just chosen — the one outcome no amount of tidying
-        -- up is worth.
-        AND c.approved_at IS NULL`,
+    `WITH doomed AS (
+       SELECT m.id AS match_id
+         FROM clip_matches m
+        WHERE m.clip_request_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM clips k
+             WHERE k.clip_match_id = m.id AND k.approved_at IS NOT NULL
+          )
+     ), files AS (
+       SELECT c.storage_key, c.derivative_storage_key, c.poster_storage_key
+         FROM clips c
+         JOIN doomed d ON d.match_id = c.clip_match_id
+     ), removed AS (
+       DELETE FROM clip_matches WHERE id IN (SELECT match_id FROM doomed)
+     )
+     SELECT storage_key, derivative_storage_key, poster_storage_key FROM files`,
     [clipRequestId],
   );
   return rows.flatMap((row) =>

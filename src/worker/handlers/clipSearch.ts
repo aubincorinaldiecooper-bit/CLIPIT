@@ -31,7 +31,6 @@ import { getVideo, listChunks } from '../../db/repositories/videos.js';
 import { listTranscriptSegments, listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
 import { listScenes, sceneProgress } from '../../db/repositories/scenes.js';
 import {
-  deleteMatches,
   finishClipRequest,
   getClipRequest,
   getPreviousClipRequest,
@@ -57,7 +56,7 @@ import {
 } from '../../services/search/platformIntent.js';
 import { orchestrateVerticalDeck, type OrchestratorCandidate } from '../../services/media/verticalOrchestrator.js';
 import { deckCompletion } from '../../services/media/deckAssembly.js';
-import { listMediaKeysForRequestMatches } from '../../db/repositories/verticalMedia.js';
+import { clearUnkeptMatchesForRequest } from '../../db/repositories/verticalMedia.js';
 import type {
   ChunkDegradation,
   ClipRequest,
@@ -654,6 +653,11 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
   // are stale. That used to be free — clips came only from the Keep endpoint,
   // which cannot run before the search completes — and is not free now that
   // the search renders its own media.
+  // A match whose clip somebody kept survives this, by design — its row is
+  // their library entry. On a retry that means a kept moment can end up
+  // alongside a freshly merged one covering the same seconds: a duplicate in
+  // the deck, which is a great deal better than reaching into someone's
+  // library and deleting what they chose.
   await clearPreviousAttempt(clipRequestId, logger.child({ clipRequestId }));
   await insertMatches(clipRequestId, rows);
 
@@ -701,38 +705,36 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
  * pipeline's own cleanup is: an orphan nobody names is an orphan forever.
  */
 async function clearPreviousAttempt(clipRequestId: string, log: Logger): Promise<void> {
-  // If the keys cannot be read, the matches are NOT deleted.
+  // Clears the matches and returns the files they held, in one statement, and
+  // never touches a moment the creator kept — see clearUnkeptMatchesForRequest
+  // for why all three of those have to be true together.
   //
-  // Proceeding would cascade away clip rows whose files we never learned the
-  // names of — turning a transient database fault into permanent orphans that
-  // nothing can ever collect. Failing here instead lets the job retry, which
-  // is the recoverable outcome: a retry re-reads the keys and clears properly,
-  // where an orphan is forever.
-  const keys = await listMediaKeysForRequestMatches(clipRequestId);
+  // If it throws, nothing is deleted and the job retries. That is the
+  // recoverable outcome: proceeding blind would cascade away clip rows whose
+  // files we never learned the names of, and an orphan is forever.
+  const keys = await clearUnkeptMatchesForRequest(clipRequestId);
+  if (keys.length === 0) return;
 
-  if (keys.length > 0) {
-    const storage = getStorage();
-    let deleted = 0;
-    for (const storageKey of keys) {
-      try {
-        await storage.remove(storageKey);
-        deleted += 1;
-      } catch (error) {
-        // Logged rather than thrown: the row is about to go either way, and
-        // refusing to clear it would wedge every future retry of this
-        // request. The key is named because that log line is the only thing
-        // that will ever find this object again.
-        log.error('a previous attempt\'s file could not be deleted and is now an orphan', {
-          clipRequestId, storageKey, err: error,
-        });
-      }
+  const storage = getStorage();
+  let deleted = 0;
+  for (const storageKey of keys) {
+    try {
+      await storage.remove(storageKey);
+      deleted += 1;
+    } catch (error) {
+      // Logged rather than thrown: the rows are already gone, so refusing
+      // here would wedge every future retry of this request and change
+      // nothing. The key is named because that log line is now the only
+      // thing that can ever find this object again.
+      log.error('a previous attempt\'s file could not be deleted and is now an orphan', {
+        clipRequestId, storageKey, err: error,
+      });
     }
-    log.info('reclaimed media from a previous attempt before clearing its matches', {
-      clipRequestId, objects: keys.length, deleted,
-    });
   }
 
-  await deleteMatches(clipRequestId);
+  log.info('reclaimed media from a previous attempt', {
+    clipRequestId, objects: keys.length, deleted,
+  });
 }
 
 /**
