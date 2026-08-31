@@ -395,3 +395,130 @@ export async function assertFfmpegAvailable(): Promise<void> {
   await run(env.FFMPEG_PATH, ['-version'], { timeoutMs: 15_000 });
   await run(env.FFPROBE_PATH, ['-version'], { timeoutMs: 15_000 });
 }
+
+/**
+ * Render the vertical publishing asset: a real 1080x1920 MP4.
+ *
+ * Two shapes, one encode path, so the delivery settings cannot drift apart
+ * between them:
+ *
+ *  SMART CROP — MiniCPM judged a crop safe and planReframe computed WHICH
+ *  source pixels survive. Those pixels are cut, then scaled to the delivery
+ *  size. The scale adds no detail and this function does not pretend it does;
+ *  it produces the file the platforms require.
+ *
+ *  BLURRED BACKGROUND — the whole frame is kept. A blurred, over-scaled copy
+ *  fills the canvas behind it so no black bar survives, and the complete
+ *  source frame sits centred and uncropped on top. This is the safe mode:
+ *  nothing the camera recorded is discarded.
+ *
+ * Audio is carried through in both. A silent vertical clip would be a
+ * different, useless artefact, and `-an` here would be an easy accident.
+ *
+ * setsar=1 is not decoration: a source with a non-square pixel aspect would
+ * otherwise arrive at 1080x1920 storage dimensions while displaying as
+ * something else, and every check downstream would read the right numbers off
+ * a wrong-looking file.
+ */
+export interface VerticalRenderOptions {
+  inputPath: string;
+  outputPath: string;
+  hasAudio: boolean;
+  /** Output geometry. Fixed by the platform contract, passed in for testability. */
+  delivery: { width: number; height: number };
+  /** From planReframe. Null renders the blurred-background composition. */
+  cropFilter: string | null;
+  /** Blur strength for the background layer. */
+  blurSigma?: number;
+}
+
+export async function renderVerticalDerivative(
+  options: VerticalRenderOptions,
+): Promise<{ sizeBytes: number; durationSeconds: number; width: number; height: number }> {
+  const { width, height } = options.delivery;
+  const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', options.inputPath];
+
+  if (options.cropFilter) {
+    // Crop the chosen source window, then scale it up to delivery size.
+    args.push('-vf', `${options.cropFilter},scale=${width}:${height},setsar=1`);
+  } else {
+    const sigma = options.blurSigma ?? 24;
+    args.push(
+      '-filter_complex',
+      [
+        `[0:v]split=2[bg][fg]`,
+        // increase=cover the canvas, crop the overflow, blur hard enough to
+        // read as texture rather than as a second, confusing video.
+        `[bg]scale=${width}:${height}:force_original_aspect_ratio=increase,` +
+          `crop=${width}:${height},gblur=sigma=${sigma}[bgblur]`,
+        // decrease=the WHOLE frame fits. Nothing is cropped away.
+        `[fg]scale=${width}:${height}:force_original_aspect_ratio=decrease[fgfit]`,
+        `[bgblur][fgfit]overlay=(W-w)/2:(H-h)/2,setsar=1[v]`,
+      ].join(';'),
+      '-map', '[v]',
+    );
+    if (options.hasAudio) args.push('-map', '0:a?');
+  }
+
+  args.push(
+    '-c:v', 'libx264',
+    '-preset', env.CLIP_PRESET,
+    '-crf', String(env.CLIP_VIDEO_CRF),
+    '-pix_fmt', 'yuv420p',
+    '-profile:v', 'high',
+    '-level', '4.1',
+  );
+
+  if (options.hasAudio) args.push('-c:a', 'aac', '-b:a', env.CLIP_AUDIO_BITRATE, '-ac', '2');
+  else args.push('-an');
+
+  args.push('-movflags', '+faststart', options.outputPath);
+
+  await run(env.FFMPEG_PATH, args, { timeoutMs: 60 * 60 * 1000 });
+
+  const [info, probe] = await Promise.all([stat(options.outputPath), ffprobe(options.outputPath)]);
+  // Report what was actually written, not what was requested — the caller
+  // persists this as the file's geometry and must not record an intention.
+  return {
+    sizeBytes: info.size,
+    durationSeconds: probe.durationSeconds,
+    width: probe.width ?? width,
+    height: probe.height ?? height,
+  };
+}
+
+/**
+ * Build a tiny synthetic source: colour bars with a tone, at a chosen size.
+ *
+ * For integration tests that need real footage without committing a media
+ * fixture to the repository. Deterministic, a couple of kilobytes, and it
+ * carries an audio stream so "audio survives the render" is actually testable
+ * rather than assumed.
+ */
+export async function createSyntheticSource(
+  outputPath: string,
+  options: { width: number; height: number; seconds: number },
+): Promise<void> {
+  await run(
+    env.FFMPEG_PATH,
+    [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `testsrc=size=${options.width}x${options.height}:rate=25:duration=${options.seconds}`,
+      '-f', 'lavfi', '-i', `sine=frequency=440:duration=${options.seconds}`,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '64k', '-shortest',
+      outputPath,
+    ],
+    { timeoutMs: 120_000 },
+  );
+}
+
+/** Does this file carry an audio stream? Used to prove audio survived a render. */
+export async function hasAudioStream(filePath: string): Promise<boolean> {
+  const { stdout } = await run(
+    env.FFPROBE_PATH,
+    ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', filePath],
+    { timeoutMs: 30_000 },
+  );
+  return stdout.trim().length > 0;
+}
