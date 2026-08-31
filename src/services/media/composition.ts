@@ -141,13 +141,40 @@ export function blurredBackgroundFilter(canvas: { width: number; height: number 
 }
 
 /**
- * The canvas a blurred-background composition is rendered onto.
+ * THE DELIVERY GEOMETRY. Fixed, and not the model's to choose.
  *
- * Follows this codebase's standing rule (services/media/reframe.ts): never
- * upscale. The canvas is as tall as the source and only as wide as 9:16 needs,
- * so every pixel in the output is a pixel the camera actually recorded. A
- * 1920x1080 source composes onto 608x1080, not 1080x1920 — the latter would
- * invent more than half its pixels and platforms accept the former.
+ * 9:16 at 1080x1920 for TikTok, Reels and Shorts. MiniCPM is asked what
+ * belongs inside the frame, never what shape the frame should be — the shape
+ * is a platform fact, and asking a model to restate it would be paying for an
+ * answer we already have.
+ *
+ * AN INTENTIONAL REVERSAL, recorded here because it overrides a documented
+ * decision. services/media/reframe.ts says never upscale: "padding a frame to
+ * a standard 1080x1920 would only invent pixels the camera never saw." That
+ * reasoning is correct about SOURCE SELECTION and wrong about DELIVERY. The
+ * owner's call (2026-08-31) separates the two:
+ *
+ *   source-space crop  — WHICH pixels are used. planReframe still decides
+ *                        this, still never upscales, and a 1920x1080 source
+ *                        still yields a ~606x1080 crop of real pixels.
+ *   delivery encode    — HOW the publishing file is written. Scaled to
+ *                        1080x1920 because that is what the platforms want.
+ *
+ * Scaling adds no detail and this comment will not pretend otherwise. It
+ * produces the required asset; the information in it is whatever the crop
+ * captured.
+ */
+export const VERTICAL_DELIVERY = { width: 1080, height: 1920 } as const;
+
+/**
+ * The SOURCE-SPACE canvas a blurred-background composition is built on,
+ * before the delivery scale.
+ *
+ * Follows reframe.ts's rule for source selection: never upscale. The canvas is
+ * as tall as the source and only as wide as 9:16 needs, so every pixel
+ * composed here is one the camera actually recorded. A 1920x1080 source
+ * composes onto 606x1080 — and is then scaled to VERTICAL_DELIVERY for the
+ * publishing file, which is the encode, not the selection.
  */
 export function verticalCanvasFor(source: { width: number; height: number }, targetRatio = 9 / 16): {
   width: number;
@@ -168,4 +195,38 @@ export function verticalCanvasFor(source: { width: number; height: number }, tar
     return { width: cappedWidth, height: even(cappedWidth / targetRatio) };
   }
   return { width, height };
+}
+
+/**
+ * The canvas a blurred-background composition is rendered onto.
+/**
+ * Is the source-space crop strong enough to be worth delivering?
+ *
+ * A 640x360 landscape source cropped to 9:16 leaves roughly 202x360 real
+ * pixels, which then has to be scaled up more than fivefold in area to reach
+ * 1080x1920. MiniCPM can be perfectly right that the crop is SEMANTICALLY
+ * safe — the subject really is centred, nothing important is lost — and the
+ * result still be a soft, unpostable clip. Those are two different questions
+ * and this answers only the second.
+ *
+ * Deterministic arithmetic, not vision. The order is deliberate:
+ *
+ *   MiniCPM says the crop is safe  (meaning)
+ *   planReframe computes the crop  (geometry)
+ *   this guard weighs the crop     (quality)
+ *   too weak → blurred_background  (which uses the FULL frame, so a low-res
+ *                                   source keeps every pixel it has)
+ *
+ * The threshold is the crop's WIDTH, because width is what a 9:16 cut of a
+ * landscape frame spends. 540 is half the delivery width: below it, more than
+ * half of every horizontal pixel in the output is interpolated. Configurable,
+ * because the right number is a judgement about how soft is too soft.
+ */
+export function cropMeetsQualityFloor(
+  crop: { width: number; height: number },
+  minCropWidth: number,
+): boolean {
+  if (!Number.isFinite(crop.width) || !Number.isFinite(crop.height)) return false;
+  if (crop.width < 2 || crop.height < 2) return false;
+  return crop.width >= minCropWidth;
 }

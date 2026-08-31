@@ -3,6 +3,7 @@ import {
   aspectRatioLabel,
   blurredBackgroundFilter,
   focusPctForCrop,
+  cropMeetsQualityFloor,
   posterOffsetSeconds,
   verticalCanvasFor,
 } from '../src/services/media/composition.js';
@@ -207,5 +208,44 @@ describe('planReframe still owns the crop arithmetic', () => {
     const right = planReframe({ aspect: '9:16', focusPct: 100 }, { width: 1920, height: 1080 });
     expect(left.filter).toContain(':0:0');
     expect(right.filter).toContain(`:${1920 - 606}:0`);
+  });
+});
+
+describe('VERTICAL_DELIVERY — the shape is a platform fact, not a model output', () => {
+  it('is fixed at 1080x1920', async () => {
+    const { VERTICAL_DELIVERY } = await import('../src/services/media/composition.js');
+    expect(VERTICAL_DELIVERY).toEqual({ width: 1080, height: 1920 });
+    expect(VERTICAL_DELIVERY.width / VERTICAL_DELIVERY.height).toBeCloseTo(9 / 16, 6);
+  });
+
+  it('is separate from the source crop: 1920x1080 still crops ~606x1080 of REAL pixels', () => {
+    // The reversal is only about delivery. Source selection still never
+    // upscales, so the crop is unchanged and the scale-up is honest about
+    // adding no detail.
+    const plan = planReframe({ aspect: '9:16', focusPct: 50 }, { width: 1920, height: 1080 });
+    expect(plan.outputWidth).toBe(606);
+    expect(plan.outputHeight).toBe(1080);
+  });
+});
+
+describe('cropMeetsQualityFloor — semantically safe is not the same as sharp enough', () => {
+  it('passes a full-HD landscape crop', () => {
+    // 1920x1080 -> 606x1080 of real pixels, comfortably above the floor.
+    expect(cropMeetsQualityFloor({ width: 606, height: 1080 }, 540)).toBe(true);
+  });
+
+  it('fails a 640x360 source, where the crop is ~202px and would be scaled fivefold', () => {
+    expect(cropMeetsQualityFloor({ width: 202, height: 360 }, 540)).toBe(false);
+  });
+
+  it('is arithmetic, not vision — it never overrides WHY, only HOW sharp', () => {
+    // Exactly at the floor passes; one pixel under does not.
+    expect(cropMeetsQualityFloor({ width: 540, height: 960 }, 540)).toBe(true);
+    expect(cropMeetsQualityFloor({ width: 539, height: 960 }, 540)).toBe(false);
+  });
+
+  it('refuses a degenerate crop outright', () => {
+    expect(cropMeetsQualityFloor({ width: 0, height: 0 }, 540)).toBe(false);
+    expect(cropMeetsQualityFloor({ width: Number.NaN, height: 1080 }, 540)).toBe(false);
   });
 });

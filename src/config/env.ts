@@ -152,6 +152,30 @@ const envSchema = z.object({
    */
   MINICPM_WARM_IDLE_SECONDS: int(300, 30, 3600),
   /**
+   * The narrowest source-space 9:16 crop still worth delivering as a
+   * smart_crop, in pixels of real source width.
+   *
+   * MiniCPM answers whether a crop is semantically safe; this answers whether
+   * it is sharp enough. A 640x360 source crops to about 202px wide, which has
+   * to be scaled more than fivefold in area to reach 1080x1920 — the meaning
+   * survives and the picture does not. Below this, blurred_background is used
+   * instead, which keeps the whole frame and so keeps every pixel a low-res
+   * source actually has.
+   *
+   * 540 is half the 1080 delivery width: under it, more than half of every
+   * horizontal pixel in the output is interpolated. A judgement, hence a knob.
+   */
+  VERTICAL_MIN_CROP_WIDTH: int(540, 64, 1080),
+  /**
+   * How many extra candidates to prepare per requested moment, so one media
+   * failure does not shrink the deck. Every extra is a real clip cut, a real
+   * GPU call and a real encode, so it is bounded twice — by ratio and ceiling.
+   */
+  VERTICAL_CANDIDATE_OVERFETCH: num(1.7, 1, 4),
+  VERTICAL_CANDIDATE_CEILING: int(8, 1, 24),
+  /** Bounded automatic retries per candidate. Creators never retry our faults. */
+  VERTICAL_MAX_RENDER_ATTEMPTS: int(2, 1, 5),
+  /**
    * How much footage around a moment a Re-clip re-examines. The point of the
    * window is boundary reconsideration — enough room before the hook and
    * after the payoff to move either edge meaningfully, without re-reading
