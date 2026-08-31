@@ -329,6 +329,30 @@ export async function serializeClipRequest(
       }))
       .sort((a, b) => a.startSeconds - b.startSeconds),
     progress: clipRequestProgress(request),
+    /**
+     * What was asked for, what the video had, and what came back.
+     *
+     * Present only for requests that owe a finished deck. `available` below
+     * `requested` is a fact about the footage, not a failure — a creator who
+     * asks for three and is offered two should be told their video had two,
+     * and this is what lets the interface say that instead of implying we
+     * dropped one.
+     *
+     * `complete` is the same gate the matches above passed through, restated
+     * so a client can tell "still assembling" from "assembled, and this is
+     * all of it" without inferring anything from the array length.
+     */
+    ...(request.presentationTarget === 'vertical'
+      ? {
+          deck: {
+            requestedResultCount: request.requestedResultCount,
+            availableCandidateCount: request.availableCandidateCount,
+            effectiveDeckTarget: request.effectiveDeckTarget,
+            readyResultCount: matches?.length ?? 0,
+            complete: request.deckCompletedAt !== null,
+          },
+        }
+      : {}),
     // Surfaced so a partially failed search is visible rather than silent.
     failedChunks: request.chunkErrors.slice(0, 20),
     // The same facts as failedChunks, expressed as what the user actually
@@ -420,34 +444,46 @@ export async function serializeLibraryClip(entry: {
 /**
  * The gate between what the pipeline made and what a creator is shown.
  *
- * A post-ready request stores more matches than it ever intends to show. It
- * over-fetches on purpose so one failed render does not cost a card, and the
- * ones it never needed — plus the ones that failed — stay in the database as
- * our record. None of them are the creator's answer.
+ * SET-level, not card-level, and that distinction is the entire point.
  *
- * Without this, asking for three moments returns six: three finished cards,
- * and three more with no playable vertical file behind them. That is the
- * "backend processing state leaking out as a product state" the whole
- * post-ready rule exists to prevent, and it is the LAST place it can be
- * stopped — a client that forgets to filter must not be able to leak one.
+ * Filtering finished clips one at a time still lets a polling client watch the
+ * deck build itself: one card, then two, then three. The rule is that a
+ * creator who asks for three postable moments sees NOTHING until all three
+ * are finished, and then sees them together. So the question asked here is
+ * not "is this clip ready?" but "does this request's whole deck stand?".
  *
- * Decided from the DATA, never by re-reading the instruction. A correction
- * ("are you sure?") stores those three words as its own instruction while the
- * deck was built for the question before it, so parsing the text here would
- * get the answer wrong exactly when it matters. The clip rows say what
- * actually happened.
+ * The answer comes from the REQUEST ROW, never from inspecting clips. Three
+ * reasons it has to:
+ *
+ *  - It must survive process boundaries. The worker that assembled the deck
+ *    may be gone; a different API instance answers the poll.
+ *  - "Some clip has preRendered = true" cannot distinguish a deck mid-assembly
+ *    from a finished one, which is exactly the distinction that matters.
+ *  - A correction ("are you sure?") stores those three words as its own
+ *    instruction while the deck belongs to the question before it, so
+ *    re-reading the text would be wrong precisely when it matters most.
+ *
+ * A request that owes no deck passes through untouched — every non-platform
+ * flow behaves exactly as it did before any of this existed.
  */
-export function creatorVisibleMatches(
+export function creatorVisibleDeck(
+  request: Pick<ClipRequest, 'presentationTarget' | 'deckCompletedAt' | 'effectiveDeckTarget'>,
   matches: ClipMatch[],
   clipsByMatchId: Map<string, Clip>,
 ): { matches: ClipMatch[]; clips: Clip[]; withheld: number } {
-  const preRendered = [...clipsByMatchId.values()].some((clip) => clip.preRendered);
-  // Nothing pre-rendered means this request never went down the post-ready
-  // path, and its behaviour must not change by a single row.
-  if (!preRendered) {
+  if (request.presentationTarget !== 'vertical') {
     return { matches, clips: [...clipsByMatchId.values()], withheld: 0 };
   }
 
+  // Assembling, or failed. Both are "there is no finished set", and a creator
+  // sees the same thing in both cases: nothing yet.
+  if (!request.deckCompletedAt) {
+    return { matches: [], clips: [], withheld: matches.length };
+  }
+
+  // The deck stands. Release it whole — still checking each clip's FILES
+  // rather than trusting the flag alone, because a released deck whose media
+  // went missing underneath must not hand out a card that plays nothing.
   const visible = matches.filter((match) => {
     const clip = clipsByMatchId.get(match.id);
     if (!clip) return false;
@@ -459,6 +495,15 @@ export function creatorVisibleMatches(
       confidence: match.confidence,
     });
   });
+
+  // Belt and braces: if the completed deck cannot be served in full, serve
+  // none of it. Half a deck is the one thing this must never produce, and a
+  // shortfall here means something deleted media out from under a finished
+  // request — worth refusing loudly rather than papering over.
+  const target = request.effectiveDeckTarget ?? visible.length;
+  if (visible.length < target) {
+    return { matches: [], clips: [], withheld: matches.length };
+  }
 
   return {
     matches: visible,

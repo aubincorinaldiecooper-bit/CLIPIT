@@ -136,6 +136,46 @@ export async function decideComposition(
  * differently from its own video is a small lie that shows up immediately in
  * a grid.
  */
+/**
+ * Delete objects this pipeline uploaded, when the work they belong to did not
+ * finish.
+ *
+ * The invariant: every derivative and poster this pipeline uploads ends up
+ * either referenced by its clip row, or deleted before the failure is
+ * reported. Nothing in between.
+ *
+ * The in-between state is the dangerous one and it is not hypothetical: the
+ * derivative uploads, then the poster extraction fails, and the object sits in
+ * storage with its key recorded nowhere. The retention sweep cannot help —
+ * that sweep works from keys ON clip rows, and this key never reached one. An
+ * object nothing references is an object nothing will ever collect.
+ *
+ * Best-effort but never silent. If the delete itself fails there really is an
+ * orphan, and the only thing standing between it and permanent invisibility is
+ * this log line — so it names the clip, the video and the key.
+ */
+export async function discardUploadedObjects(
+  keys: Array<string | null | undefined>,
+  context: { videoId: string; clipId: string; reason: string },
+): Promise<void> {
+  const present = keys.filter((key): key is string => typeof key === 'string' && key.length > 0);
+  if (present.length === 0) return;
+
+  const storage = getStorage();
+  for (const storageKey of present) {
+    try {
+      await storage.remove(storageKey);
+      logger.info('discarded a partially uploaded object', { ...context, storageKey });
+    } catch (error) {
+      logger.error('could not discard a partially uploaded object — it is now an orphan', {
+        ...context,
+        storageKey,
+        err: error,
+      });
+    }
+  }
+}
+
 export async function runVerticalPipeline(input: VerticalPipelineInput): Promise<VerticalPipelineResult> {
   let probe;
   try {
@@ -205,28 +245,47 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
     throw new VerticalPipelineFailure('storage_upload', 'derivative_upload_failed', 'The derivative could not be stored', error);
   }
 
-  // The poster comes from the derivative: it must show the frame the creator
-  // will actually post, not the wider one it was cut from.
+  // From here on the derivative EXISTS in storage while its key exists
+  // nowhere else. Every exit from this block therefore takes it back out
+  // again before reporting the failure — otherwise the object is stranded
+  // where no sweep can find it.
   const posterStartedAt = performance.now();
   const posterTimestampSeconds = posterOffsetSeconds(rendered.durationSeconds);
   const posterPath = path.join(input.workDir, `${input.clipId}-poster.jpg`);
-  let posterWritten = false;
-  try {
-    posterWritten = await extractFrameAt(derivativePath, posterTimestampSeconds, posterPath, VERTICAL_DELIVERY.width);
-  } catch (error) {
-    throw new VerticalPipelineFailure('poster_generation', 'poster_failed', 'The poster frame could not be extracted', error);
-  }
-  if (!posterWritten) {
-    // extractFrameAt exits 0 without a file when the seek lands past the last
-    // decodable frame, so the result is confirmed rather than assumed.
-    throw new VerticalPipelineFailure('poster_generation', 'poster_empty', 'The poster frame extracted to nothing');
-  }
-
   const posterStorageKey = clipPosterKey(input.videoId, input.clipId);
+  let posterUploaded = false;
+
   try {
-    await getStorage().uploadFile(posterStorageKey, posterPath, 'image/jpeg');
+    // The poster comes from the derivative: it must show the frame the
+    // creator will actually post, not the wider one it was cut from.
+    let posterWritten = false;
+    try {
+      posterWritten = await extractFrameAt(derivativePath, posterTimestampSeconds, posterPath, VERTICAL_DELIVERY.width);
+    } catch (error) {
+      throw new VerticalPipelineFailure('poster_generation', 'poster_failed', 'The poster frame could not be extracted', error);
+    }
+    if (!posterWritten) {
+      // extractFrameAt exits 0 without a file when the seek lands past the
+      // last decodable frame, so the result is confirmed rather than assumed.
+      throw new VerticalPipelineFailure('poster_generation', 'poster_empty', 'The poster frame extracted to nothing');
+    }
+
+    try {
+      await getStorage().uploadFile(posterStorageKey, posterPath, 'image/jpeg');
+      posterUploaded = true;
+    } catch (error) {
+      throw new VerticalPipelineFailure('storage_upload', 'poster_upload_failed', 'The poster could not be stored', error);
+    }
   } catch (error) {
-    throw new VerticalPipelineFailure('storage_upload', 'poster_upload_failed', 'The poster could not be stored', error);
+    await discardUploadedObjects(
+      [derivativeStorageKey, posterUploaded ? posterStorageKey : null],
+      {
+        videoId: input.videoId,
+        clipId: input.clipId,
+        reason: error instanceof VerticalPipelineFailure ? error.code : 'unexpected',
+      },
+    );
+    throw error;
   }
   const posterGenerationMs = Math.round(performance.now() - posterStartedAt);
 

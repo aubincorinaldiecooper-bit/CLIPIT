@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { assembleDeck, planDeck, type PreparedCandidate } from '../src/services/media/deckAssembly.js';
 import { keepAction, retentionClassFor } from '../src/services/media/keepApproval.js';
 import { clipMediaContract } from '../src/api/mediaContract.js';
-import { creatorVisibleMatches } from '../src/api/serializers.js';
+import { creatorVisibleDeck } from '../src/api/serializers.js';
 import { exceedsPlatformHardMax, resolvePlatformIntent, needsVerticalDerivative } from '../src/services/search/platformIntent.js';
 import type { VerticalCandidate } from '../src/services/media/verticalVisibility.js';
 
@@ -78,8 +78,8 @@ describe('the request that started this: "Find me 3 moments I can post on TikTok
 
     expect(outcome.complete).toBe(true);
     expect(outcome.deck.map((d) => d.matchId)).toEqual(['a', 'c', 'd']);
-    expect(outcome.suppressed.map((d) => d.matchId)).toEqual(['b']);
-    expect(outcome.backfillCount).toBeGreaterThan(0);
+    expect(outcome.failed.map((d) => d.matchId)).toEqual(['b']);
+    expect(outcome.backfillCount).toBe(1);
   });
 
   /**
@@ -199,7 +199,7 @@ describe('what a client is told', () => {
   });
 });
 
-describe('the gate between what was made and what is shown', () => {
+describe('atomic reveal at the API boundary — a polling client sees 0, then all', () => {
   const match = (id: string, confidence: number) => ({
     id, confidence,
     clipRequestId: 'r1', chunkId: 'c1', videoId: 'v1',
@@ -212,7 +212,7 @@ describe('the gate between what was made and what is shown', () => {
     createdAt: new Date(), updatedAt: new Date(),
   });
 
-  const clip = (matchId: string, over: Record<string, unknown> = {}) => ({
+  const readyClip = (matchId: string, over: Record<string, unknown> = {}) => ({
     id: `clip-${matchId}`, clipMatchId: matchId, videoId: 'v1',
     sessionId: null, userId: null, workspaceId: null,
     captions: null, derivedFromClipId: null, focusPct: 50,
@@ -231,31 +231,82 @@ describe('the gate between what was made and what is shown', () => {
     ...over,
   });
 
-  /**
-   * The failure this exists to prevent: a request that over-fetched six
-   * candidates to guarantee three cards returns all six, and the creator sees
-   * three finished moments next to three that play nothing.
-   */
-  it('shows only the moments that were actually finished', () => {
-    const matches = [match('a', 0.9), match('b', 0.8), match('c', 0.7), match('d', 0.6)];
-    const clips = new Map<string, any>([
-      ['a', clip('a')],
-      // Rendered and failed — suppressed, never shown.
-      ['b', clip('b', { derivativeStatus: 'failed', derivativeStorageKey: null })],
-      ['c', clip('c')],
-      // 'd' was never touched: the deck filled before it was reached.
-    ]);
+  /** The request row as the API reads it while a deck is being built. */
+  const assembling = {
+    presentationTarget: 'vertical' as const,
+    deckCompletedAt: null,
+    effectiveDeckTarget: 3,
+  };
+  const completed = { ...assembling, deckCompletedAt: new Date() };
 
-    const visible = creatorVisibleMatches(matches as any, clips);
-    expect(visible.matches.map((m) => m.id)).toEqual(['a', 'c']);
-    expect(visible.clips).toHaveLength(2);
-    expect(visible.withheld).toBe(2);
+  const matches = [match('a', 0.9), match('b', 0.8), match('c', 0.7)];
+
+  /**
+   * The exact sequence a frontend produces by polling every second while the
+   * deck renders. Card-level filtering would return 1, then 2, then 3 — the
+   * deck assembling itself in public, which is the thing the rule forbids.
+   */
+  it('returns nothing while the deck is still being assembled', () => {
+    // Clip 1 finished. Two still rendering.
+    let clips = new Map<string, any>([['a', readyClip('a')]]);
+    expect(creatorVisibleDeck(assembling, matches as any, clips).matches).toEqual([]);
+    expect(creatorVisibleDeck(assembling, matches as any, clips).clips).toEqual([]);
+
+    // Clip 2 finished. Still not the set.
+    clips = new Map<string, any>([['a', readyClip('a')], ['b', readyClip('b')]]);
+    expect(creatorVisibleDeck(assembling, matches as any, clips).matches).toEqual([]);
+
+    // Clip 3 finished, but the request has not been marked complete yet —
+    // the media exists and the gate has not opened, so still nothing.
+    clips = new Map<string, any>([
+      ['a', readyClip('a')], ['b', readyClip('b')], ['c', readyClip('c')],
+    ]);
+    expect(creatorVisibleDeck(assembling, matches as any, clips).matches).toEqual([]);
   });
 
-  /** A row marked ready with no file is a bug, and must not reach anyone. */
-  it('trusts the file, not the status column', () => {
-    const clips = new Map<string, any>([['a', clip('a', { posterStorageKey: null })]]);
-    expect(creatorVisibleMatches([match('a', 0.9)] as any, clips).matches).toEqual([]);
+  it('returns the complete deck together the moment the gate opens', () => {
+    const clips = new Map<string, any>([
+      ['a', readyClip('a')], ['b', readyClip('b')], ['c', readyClip('c')],
+    ]);
+    const visible = creatorVisibleDeck(completed, matches as any, clips);
+    expect(visible.matches.map((m) => m.id)).toEqual(['a', 'b', 'c']);
+    expect(visible.clips).toHaveLength(3);
+    expect(visible.withheld).toBe(0);
+  });
+
+  /**
+   * Two finished, the deck failed. The creator gets nothing — not the two
+   * that happened to work. A partial deck is never an answer.
+   */
+  it('returns nothing when the deck failed, even with finished clips behind it', () => {
+    const clips = new Map<string, any>([['a', readyClip('a')], ['b', readyClip('b')]]);
+    // deckCompletedAt stays null on failure — same state as still assembling.
+    const visible = creatorVisibleDeck(assembling, matches as any, clips);
+    expect(visible.matches).toEqual([]);
+    expect(visible.clips).toEqual([]);
+  });
+
+  /**
+   * The gate says complete but the media is gone underneath. Something
+   * deleted it out from under a finished request; serving what is left would
+   * hand over a short deck, so none of it goes.
+   */
+  it('refuses to serve a completed deck that cannot be served in full', () => {
+    const clips = new Map<string, any>([
+      ['a', readyClip('a')],
+      ['b', readyClip('b', { derivativeStorageKey: null, derivativeStatus: 'failed' })],
+      ['c', readyClip('c')],
+    ]);
+    expect(creatorVisibleDeck(completed, matches as any, clips).matches).toEqual([]);
+  });
+
+  /** A short pool is a complete deck at its own size. */
+  it('releases a two-moment deck together when two was all the video had', () => {
+    const shortDeck = { presentationTarget: 'vertical' as const, deckCompletedAt: new Date(), effectiveDeckTarget: 2 };
+    const twoMatches = [match('a', 0.9), match('b', 0.8)];
+    const clips = new Map<string, any>([['a', readyClip('a')], ['b', readyClip('b')]]);
+    const visible = creatorVisibleDeck(shortDeck, twoMatches as any, clips);
+    expect(visible.matches.map((m) => m.id)).toEqual(['a', 'b']);
   });
 
   /**
@@ -264,14 +315,14 @@ describe('the gate between what was made and what is shown', () => {
    * being cut, where a pending clip is a normal, visible state.
    */
   it('leaves the legacy path completely untouched', () => {
-    const matches = [match('a', 0.9), match('b', 0.8)];
+    const legacy = { presentationTarget: null, deckCompletedAt: null, effectiveDeckTarget: null };
     const clips = new Map<string, any>([
-      ['a', clip('a', {
+      ['a', readyClip('a', {
         preRendered: false, derivativeStatus: null, derivativeStorageKey: null,
         posterStorageKey: null, status: 'pending', storageKey: null,
       })],
     ]);
-    const visible = creatorVisibleMatches(matches as any, clips);
+    const visible = creatorVisibleDeck(legacy, [match('a', 0.9), match('b', 0.8)] as any, clips);
     expect(visible.matches.map((m) => m.id)).toEqual(['a', 'b']);
     expect(visible.withheld).toBe(0);
   });

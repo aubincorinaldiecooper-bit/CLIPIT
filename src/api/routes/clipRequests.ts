@@ -19,7 +19,7 @@ import { enqueueClipGeneration, enqueueReclip } from '../../queues/index.js';
 import { assertOwnership, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import {
-  creatorVisibleMatches,
+  creatorVisibleDeck,
   searchCoverage,
   serializeClip,
   serializeClipRequest,
@@ -92,7 +92,7 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
     // A post-ready request renders more candidates than it shows, so the
     // answer is the finished set — not everything the search happened to
     // store. Requests that never pre-rendered anything are untouched.
-    const visible = creatorVisibleMatches(allMatches, clipsByMatchId);
+    const visible = creatorVisibleDeck(clipRequest, allMatches, clipsByMatchId);
     if (visible.withheld > 0) {
       logger.info('withheld unfinished moments from a creator response', {
         requestId, shown: visible.matches.length, withheld: visible.withheld,
@@ -101,7 +101,7 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
 
     return reply.send({
       clipRequest: await serializeClipRequest(clipRequest, visible.matches, clipsByMatchId),
-      clips: await Promise.all(visible.clips.map((clip) => serializeClip(clip))),
+      clips: await Promise.all(visible.clips.map((clip: Clip) => serializeClip(clip))),
     });
   });
 

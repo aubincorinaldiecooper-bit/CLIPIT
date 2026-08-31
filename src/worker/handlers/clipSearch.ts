@@ -40,8 +40,11 @@ import {
   recordChunkCompleted,
   recordChunkDegraded,
   recordChunkFailure,
+  recordDeckAvailability,
+  recordDeckPlan,
   recordSearchApproach,
   recordUncertainMatches,
+  markDeckComplete,
   startClipRequest,
   type NewClipMatch,
 } from '../../db/repositories/clipRequests.js';
@@ -185,6 +188,27 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       });
     }
 
+    // Declare what this request owes BEFORE any path can answer it.
+    //
+    // The ordering is load-bearing, not tidiness. The creator-facing gate asks
+    // the request row "do you owe a finished deck, and does it stand yet?" If
+    // that first answer were still unwritten while clips were becoming ready,
+    // a client polling in the gap would fall through to the legacy path and be
+    // handed one finished card — the progressive reveal the whole rule forbids,
+    // appearing only under timing nobody tests for.
+    //
+    // It sits above the notes path deliberately. Answering from memory is a
+    // real answer and reaches finishClipRequest on its own; if the plan were
+    // recorded further down, a question answered from the notes would never be
+    // marked as owing a deck at all.
+    //
+    // It also CLEARS any previous completion, so a retrying job cannot serve
+    // last run's finished deck while it rebuilds this one.
+    await recordDeckPlan(clipRequestId, {
+      presentationTarget: needsVerticalDerivative(intent) ? 'vertical' : 'original',
+      requestedResultCount: intent.requestedCount,
+    });
+
     // Decide what to search. A transcript that is still being built is worth a
     // bounded wait, because falling back to visual-only silently would give the
     // user a worse answer for a spoken-word instruction.
@@ -232,6 +256,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       if (readSoFar.count > 0) {
         const answered = await answerFromNotes({
           clipRequestId,
+          request,
+          intent,
           video,
           chunks,
           instruction,
@@ -316,6 +342,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     if (notesAvailable) {
       const answered = await answerFromNotes({
         clipRequestId,
+        request,
+        intent,
         video,
         chunks,
         instruction,
@@ -345,6 +373,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // it is the only one that runs when the notes came up empty.
     // Clear anything from a previous attempt so a retry cannot double-insert.
     await deleteMatches(clipRequestId);
+
+    // (the deck plan is declared earlier — see above, before the notes path)
 
     chunkCount = chunks.length;
     searchMode = resolved.mode;
@@ -458,45 +488,21 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // timestamps. It is answered by finished, postable files — so the deck
       // is BUILT here, before the request is reported complete, and the
       // creator sees the whole set or nothing.
-      if (needsVerticalDerivative(intent)) {
-        deck = await buildVerticalDeck({
-          clipRequestId, request, video, intent, workDir: dir, log, tally,
-        });
-
-        // Candidates existed and we could not finish them. That is OUR
-        // failure, and it is reported as one. Completing the request with an
-        // empty deck would tell someone their video has no postable moments
-        // when the truth is that our pipeline fell over on moments we found.
-        //
-        // Not thrown: throwing re-runs the whole search, and the search half
-        // worked. Every retry worth making has already been made, per
-        // candidate, inside the deck assembly where it costs one render
-        // rather than a re-reading of the entire video.
-        if (!deck.complete && deck.candidatePool > 0) {
-          await finishClipRequest(
-            clipRequestId,
-            'failed',
-            // Only reachable now when renders actually failed: the deck asks
-            // for no more than the search could supply.
-            'We found the moments but could not finish making them ready to post. Please try again.',
-          );
-          log.error('vertical deck incomplete', {
-            requested: intent.requestedCount,
-            ready: deck.readyCount,
-            candidatePool: deck.candidatePool,
-            suppressed: deck.suppressedCount,
-          });
-          // The job itself did what it was asked; the request carries the bad
-          // news. Marking it 'failed' here too would double-count it.
-          outcome = 'completed';
-          return;
-        }
-        // A pool of zero is not a failure. The search looked and found
-        // nothing this platform could take, and saying so plainly is the
-        // honest answer — the same one a non-platform search gives.
+      //
+      // Not thrown on failure: throwing re-runs the whole search, and the
+      // search half worked. Every retry worth making has already been made,
+      // per candidate, inside the deck assembly where it costs one render
+      // rather than a re-reading of the entire video.
+      const finished = await completeRequestWithDeck({
+        clipRequestId, request, video, intent, workDir: dir, log, tally, answeredFrom: 'footage',
+      });
+      deck = finished.deck;
+      if (!finished.completed) {
+        // The job did what it was asked; the request carries the bad news.
+        // Marking the job failed too would double-count it.
+        outcome = 'completed';
+        return;
       }
-
-      await finishClipRequest(clipRequestId, 'completed', null, 'footage');
       const elapsedMs = Math.round(performance.now() - searchStartedAt);
 
       log.info('clip search complete', {
@@ -510,10 +516,12 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         ...(deck
           ? {
               platform: intent.platform,
-              requestedMoments: intent.requestedCount,
-              deckReady: deck.readyCount,
-              deckSuppressed: deck.suppressedCount,
-              deckRenderedButSkipped: deck.renderedButSkipped,
+              requestedResultCount: intent.requestedCount,
+              availableCandidateCount: deck.availableCandidateCount,
+              effectiveDeckTarget: deck.effectiveDeckTarget,
+              readyResultCount: deck.readyCount,
+              failedCandidateCount: deck.failedCandidateCount,
+              renderedButSkippedCount: deck.renderedButSkippedCount,
               timeToCompleteDeckMs: deck.timeToCompleteDeckMs,
             }
           : {}),
@@ -661,14 +669,90 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
  * merging rewrites match rows and their ids — anything extracted earlier would
  * be attached to rows that no longer exist.
  */
+/**
+ * Finish a request the same way whichever path answered it.
+ *
+ * Two paths reach a completed request: the notes, and the footage. Both owe
+ * the creator the same thing. Before this existed only the footage path built
+ * a deck, so a TikTok question that the notes could answer returned a list of
+ * timestamps and no media at all — the fast path quietly opting out of the
+ * product rule, and only for the videos we had already read.
+ *
+ * Reading from memory is still the right architecture and is untouched: the
+ * notes decide WHICH moments, exactly as before, and the deck is built from
+ * whatever they found. What changed is only that answering fast no longer
+ * means answering with less.
+ */
+async function completeRequestWithDeck(input: {
+  clipRequestId: string;
+  request: ClipRequest;
+  video: Video;
+  intent: PlatformIntent;
+  workDir: string;
+  log: Logger;
+  tally: UsageTally;
+  answeredFrom: 'notes' | 'footage';
+}): Promise<{ completed: boolean; deck: VerticalDeckResult | null }> {
+  const { clipRequestId, intent, log } = input;
+
+  if (!needsVerticalDerivative(intent)) {
+    await finishClipRequest(clipRequestId, 'completed', null, input.answeredFrom);
+    return { completed: true, deck: null };
+  }
+
+  const deck = await buildVerticalDeck({
+    clipRequestId,
+    request: input.request,
+    video: input.video,
+    intent,
+    workDir: input.workDir,
+    log,
+    tally: input.tally,
+  });
+
+  // Candidates existed and we could not finish them. That is OUR failure and
+  // it is reported as one. Completing with an empty deck would tell someone
+  // their video has no postable moments when the truth is that our pipeline
+  // fell over on moments we found.
+  if (!deck.complete && deck.effectiveDeckTarget > 0) {
+    await finishClipRequest(
+      clipRequestId,
+      'failed',
+      'We found the moments but could not finish making them ready to post. Please try again.',
+    );
+    log.error('vertical deck incomplete', {
+      answeredFrom: input.answeredFrom,
+      requested: intent.requestedCount,
+      available: deck.availableCandidateCount,
+      effectiveDeckTarget: deck.effectiveDeckTarget,
+      ready: deck.readyCount,
+      failed: deck.failedCandidateCount,
+    });
+    return { completed: false, deck };
+  }
+
+  // The gate opens. Every moment in the effective deck is finished and its row
+  // written, so the set can be released — all of it, at once. Before this line
+  // a poll sees nothing; after it, everything.
+  //
+  // It also opens on a legitimately EMPTY deck (nothing this platform could
+  // take). That is a finished answer too, and leaving the gate shut would
+  // leave a completed request looking forever like one still assembling.
+  await markDeckComplete(clipRequestId);
+  await finishClipRequest(clipRequestId, 'completed', null, input.answeredFrom);
+  return { completed: true, deck };
+}
+
 /** What the deck build produced, for the caller's log line and its decision. */
 interface VerticalDeckResult {
   complete: boolean;
   readyCount: number;
-  /** How many ranked candidates the search actually had to work with. */
-  candidatePool: number;
-  suppressedCount: number;
-  renderedButSkipped: number;
+  /** Eligible moments the search found for this platform. */
+  availableCandidateCount: number;
+  /** min(requested, available) — the deck actually attempted. */
+  effectiveDeckTarget: number;
+  failedCandidateCount: number;
+  renderedButSkippedCount: number;
   /** Null when the deck never completed — there is no time-to-complete for it. */
   timeToCompleteDeckMs: number | null;
 }
@@ -697,9 +781,9 @@ async function buildVerticalDeck(input: {
   tally: UsageTally;
 }): Promise<VerticalDeckResult> {
   const { clipRequestId, request, video, intent, log } = input;
-  const empty = {
-    complete: false, readyCount: 0, candidatePool: 0,
-    suppressedCount: 0, renderedButSkipped: 0, timeToCompleteDeckMs: 0,
+  const empty: VerticalDeckResult = {
+    complete: false, readyCount: 0, availableCandidateCount: 0, effectiveDeckTarget: 0,
+    failedCandidateCount: 0, renderedButSkippedCount: 0, timeToCompleteDeckMs: null,
   };
 
   if (!video.originalStorageKey) {
@@ -731,6 +815,10 @@ async function buildVerticalDeck(input: {
       storedMatches: stored.length,
       hardMaxSeconds: intent.hardMaxSeconds,
     });
+    await recordDeckAvailability(clipRequestId, {
+      availableCandidateCount: 0,
+      effectiveDeckTarget: 0,
+    });
     return empty;
   }
 
@@ -743,19 +831,29 @@ async function buildVerticalDeck(input: {
   );
   await getStorage().downloadToFile(video.originalStorageKey, sourcePath);
 
-  // Ask for what this video can actually supply.
+  // The EFFECTIVE deck: what this video can actually supply.
   //
-  // A video with two moments matching the question is not a pipeline failure,
-  // and must never be reported as one. Left uncapped, a three-moment request
+  // A video with two moments matching the question is not a pipeline failure
+  // and must never be reported as one. Uncapped, a three-moment request
   // against a two-candidate pool renders both successfully, reports the deck
   // incomplete, and tells the creator we could not make their moments ready
-  // to post — inviting a retry that will do exactly the same thing. Capping
-  // here means an incomplete deck genuinely means renders failed.
-  const requestedCount = Math.min(intent.requestedCount, candidates.length);
-  if (requestedCount < intent.requestedCount) {
+  // to post — inviting a retry that would do exactly the same thing.
+  //
+  // Capping splits the two questions cleanly. "Fewer moments existed" is
+  // answered by availableCandidateCount; "we could not finish the ones that
+  // did" is answered by an incomplete deck against this target. Atomicity
+  // still applies to the effective deck: two moments appear together or not
+  // at all, never one then two.
+  const effectiveDeckTarget = Math.min(intent.requestedCount, candidates.length);
+  await recordDeckAvailability(clipRequestId, {
+    availableCandidateCount: candidates.length,
+    effectiveDeckTarget,
+  });
+  if (effectiveDeckTarget < intent.requestedCount) {
     log.info('fewer eligible moments than the creator asked for', {
-      asked: intent.requestedCount,
+      requested: intent.requestedCount,
       available: candidates.length,
+      effectiveDeckTarget,
     });
   }
 
@@ -770,7 +868,8 @@ async function buildVerticalDeck(input: {
     hasAudio: video.hasAudio ?? true,
     videoDurationSeconds: video.durationSeconds ?? null,
     intent,
-    requestedCount,
+    requestedResultCount: intent.requestedCount,
+    effectiveDeckTarget,
     candidates,
     log,
     tally: input.tally,
@@ -779,9 +878,10 @@ async function buildVerticalDeck(input: {
   return {
     complete: outcome.complete,
     readyCount: outcome.deck.length,
-    candidatePool: candidates.length,
-    suppressedCount: outcome.suppressed.length,
-    renderedButSkipped: outcome.surplus.length,
+    availableCandidateCount: candidates.length,
+    effectiveDeckTarget,
+    failedCandidateCount: metrics.failedCandidateCount,
+    renderedButSkippedCount: metrics.renderedButSkippedCount,
     timeToCompleteDeckMs: metrics.timeToCompleteDeckMs,
   };
 }
@@ -855,6 +955,8 @@ const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
  */
 async function answerFromNotes(input: {
   clipRequestId: string;
+  request: ClipRequest;
+  intent: PlatformIntent;
   video: Video;
   chunks: VideoChunk[];
   instruction: string;
@@ -868,7 +970,7 @@ async function answerFromNotes(input: {
    */
   readComplete: boolean;
 }): Promise<number> {
-  const { clipRequestId, video, chunks, instruction, mode, tally, log, readComplete } = input;
+  const { clipRequestId, request, intent, video, chunks, instruction, mode, tally, log, readComplete } = input;
   const startedAt = performance.now();
 
   // Memory is both halves: what was seen, and what was said. A spoken question
@@ -1034,9 +1136,15 @@ async function answerFromNotes(input: {
 
   await withWorkDir(`notes-${clipRequestId}`, async (dir) => {
     await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
-  });
 
-  await finishClipRequest(clipRequestId, 'completed', null, 'notes');
+    // Answering fast must not mean answering with less. The notes decided
+    // WHICH moments, exactly as they always have; the deck is built from what
+    // they found, and the request is completed by the same helper the footage
+    // path uses so the two can never drift apart on what a creator is owed.
+    await completeRequestWithDeck({
+      clipRequestId, request, video, intent, workDir: dir, log, tally, answeredFrom: 'notes',
+    });
+  });
 
   log.info('answered from memory', {
     matches: finalCount,

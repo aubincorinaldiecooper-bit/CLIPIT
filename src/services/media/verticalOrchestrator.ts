@@ -13,7 +13,7 @@ import { markAttemptsRecovered, recordVerticalRenderAttempt } from '../../db/rep
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { askVideoModel, videoPartFromFile, type ContentPart } from '../search/openrouterVideo.js';
 import { COMPOSITION_SYSTEM_PROMPT, COMPOSITION_INSTRUCTION } from '../search/composition.js';
-import { runVerticalPipeline, VerticalPipelineFailure } from './verticalPipeline.js';
+import { discardUploadedObjects, runVerticalPipeline, VerticalPipelineFailure } from './verticalPipeline.js';
 import { assembleDeck, deckMetrics, planDeck, type DeckOutcome, type PreparedCandidate } from './deckAssembly.js';
 import type { FailureStage, VerticalCandidate } from './verticalVisibility.js';
 import type { PlatformIntent } from '../search/platformIntent.js';
@@ -59,7 +59,10 @@ export interface OrchestrateInput {
   hasAudio: boolean;
   videoDurationSeconds: number | null;
   intent: PlatformIntent;
-  requestedCount: number;
+  /** Exactly what the creator asked for, before any availability cap. */
+  requestedResultCount: number;
+  /** What is actually obtainable: min(requested, available). */
+  effectiveDeckTarget: number;
   candidates: OrchestratorCandidate[];
   log: Logger;
   /**
@@ -236,24 +239,43 @@ async function prepareCandidate(
     // whose state could not be written must not become a card whose readiness
     // nothing can vouch for after this process exits.
     stage = 'serialization';
-    await setVerticalMedia(clip.id, {
-      compositionMode: media.compositionMode,
-      focalX: media.focalX,
-      focalY: media.focalY,
-      derivativeStorageKey: media.derivativeStorageKey,
-      posterStorageKey: media.posterStorageKey,
-      posterTimestampSeconds: media.posterTimestampSeconds,
-      sourceWidth: media.sourceWidth,
-      sourceHeight: media.sourceHeight,
-      outputWidth: media.outputWidth,
-      outputHeight: media.outputHeight,
-      canonicalGenerationMs,
-      compositionDecisionMs: media.compositionDecisionMs,
-      derivativeGenerationMs: media.derivativeGenerationMs,
-      posterGenerationMs: media.posterGenerationMs,
-      // Made before anyone chose it, so it is temporary until they do.
-      retentionClass: 'temporary',
-    });
+    // The third orphan path, and the least obvious: both objects are in
+    // storage and correct, and the row that would point at them fails to
+    // write. Without this the media exists, nothing references it, and the
+    // retention sweep — which works from keys ON clip rows — can never see
+    // it. The candidate fails either way; the question is only whether it
+    // fails cleanly.
+    try {
+      await setVerticalMedia(clip.id, {
+        compositionMode: media.compositionMode,
+        focalX: media.focalX,
+        focalY: media.focalY,
+        derivativeStorageKey: media.derivativeStorageKey,
+        posterStorageKey: media.posterStorageKey,
+        posterTimestampSeconds: media.posterTimestampSeconds,
+        sourceWidth: media.sourceWidth,
+        sourceHeight: media.sourceHeight,
+        outputWidth: media.outputWidth,
+        outputHeight: media.outputHeight,
+        canonicalGenerationMs,
+        compositionDecisionMs: media.compositionDecisionMs,
+        derivativeGenerationMs: media.derivativeGenerationMs,
+        posterGenerationMs: media.posterGenerationMs,
+        // Made before anyone chose it, so it is temporary until they do.
+        retentionClass: 'temporary',
+      });
+    } catch (error) {
+      await discardUploadedObjects(
+        [media.derivativeStorageKey, media.posterStorageKey],
+        { videoId: input.videoId, clipId: clip.id, reason: 'persist_failed' },
+      );
+      throw new VerticalPipelineFailure(
+        'serialization',
+        'persist_failed',
+        'The finished media could not be recorded',
+        error,
+      );
+    }
 
     await recordVerticalRenderAttempt({
       videoId: input.videoId,
@@ -378,7 +400,7 @@ export interface OrchestrationResult {
  */
 export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<OrchestrationResult> {
   const startedAt = performance.now();
-  const plan = planDeck(input.requestedCount, env.VERTICAL_CANDIDATE_OVERFETCH, env.VERTICAL_CANDIDATE_CEILING);
+  const plan = planDeck(input.effectiveDeckTarget, env.VERTICAL_CANDIDATE_OVERFETCH, env.VERTICAL_CANDIDATE_CEILING);
 
   const outcome = await assembleDeck(
     input.candidates,
@@ -387,10 +409,12 @@ export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<
     env.VERTICAL_MAX_RENDER_ATTEMPTS,
   );
 
-  const metrics = deckMetrics(outcome, startedAt, performance.now(), input.candidates.length);
+  const metrics = deckMetrics(outcome, startedAt, performance.now(), {
+    requestedResultCount: input.requestedResultCount,
+    internalCandidateCount: input.candidates.length,
+  });
   input.log.info('vertical deck assembled', {
     platform: input.intent.platform,
-    requested: input.requestedCount,
     candidateCeiling: plan.candidateTarget,
     complete: outcome.complete,
     ...metrics,

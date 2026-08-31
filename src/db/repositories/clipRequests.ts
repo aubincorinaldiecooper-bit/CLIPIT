@@ -32,6 +32,11 @@ interface ClipRequestRow {
   chunk_degradations: ChunkDegradation[] | null;
   answered_from: AnsweredFrom | null;
   uncertain_matches: UncertainMatch[] | null;
+  presentation_target: 'original' | 'vertical' | null;
+  requested_result_count: number | null;
+  available_candidate_count: number | null;
+  effective_deck_target: number | null;
+  deck_completed_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -55,6 +60,11 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     chunkErrors: row.chunk_errors ?? [],
     answeredFrom: row.answered_from ?? null,
     uncertainMatches: row.uncertain_matches ?? [],
+    presentationTarget: row.presentation_target ?? null,
+    requestedResultCount: row.requested_result_count ?? null,
+    availableCandidateCount: row.available_candidate_count ?? null,
+    effectiveDeckTarget: row.effective_deck_target ?? null,
+    deckCompletedAt: row.deck_completed_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -208,6 +218,70 @@ export async function recordSearchApproach(
             updated_at = now()
       WHERE id = $1`,
     [requestId, input.notesConsulted, input.correctionOf ?? null],
+  );
+}
+
+/**
+ * Declare that this request owes a post-ready deck — before a single
+ * candidate is rendered.
+ *
+ * The ordering is the whole point. If the target were written after the first
+ * clip finished, a client polling in that gap would see a request that does
+ * not yet know it is a deck request, fall through to the legacy path, and be
+ * handed one finished card. That is the progressive reveal the rule forbids,
+ * and it would appear only under load, only sometimes.
+ *
+ * deck_completed_at is CLEARED here on purpose. A retrying job re-plans and
+ * re-renders, and serving the previous run's finished deck while the new one
+ * is mid-flight would show a set that no longer matches the clips underneath.
+ */
+export async function recordDeckPlan(
+  requestId: string,
+  plan: { presentationTarget: 'original' | 'vertical'; requestedResultCount: number },
+): Promise<void> {
+  await queryOne(
+    `UPDATE clip_requests
+        SET presentation_target      = $2,
+            requested_result_count   = $3,
+            available_candidate_count = NULL,
+            effective_deck_target    = NULL,
+            deck_completed_at        = NULL,
+            updated_at               = now()
+      WHERE id = $1`,
+    [requestId, plan.presentationTarget, plan.requestedResultCount],
+  );
+}
+
+/**
+ * What the search actually turned up, and the deck size that follows from it.
+ *
+ * Recorded even when it is smaller than the ask: "you wanted three, your video
+ * had two" is a fact about their footage and has to stay legible as that,
+ * rather than being flattened into a failure or silently rounded away.
+ */
+export async function recordDeckAvailability(
+  requestId: string,
+  counts: { availableCandidateCount: number; effectiveDeckTarget: number },
+): Promise<void> {
+  await queryOne(
+    `UPDATE clip_requests
+        SET available_candidate_count = $2,
+            effective_deck_target     = $3,
+            updated_at                = now()
+      WHERE id = $1`,
+    [requestId, counts.availableCandidateCount, counts.effectiveDeckTarget],
+  );
+}
+
+/**
+ * The gate opens. Called only once every moment in the effective deck is
+ * finished AND persisted, so there is no instant in which this says yes and
+ * the clips behind it are not there.
+ */
+export async function markDeckComplete(requestId: string): Promise<void> {
+  await queryOne(
+    'UPDATE clip_requests SET deck_completed_at = now(), updated_at = now() WHERE id = $1',
+    [requestId],
   );
 }
 
