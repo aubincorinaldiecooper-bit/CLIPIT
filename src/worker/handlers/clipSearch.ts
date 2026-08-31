@@ -57,6 +57,7 @@ import {
 } from '../../services/search/platformIntent.js';
 import { orchestrateVerticalDeck, type OrchestratorCandidate } from '../../services/media/verticalOrchestrator.js';
 import { deckCompletion } from '../../services/media/deckAssembly.js';
+import { listMediaKeysForRequestMatches } from '../../db/repositories/verticalMedia.js';
 import type {
   ChunkDegradation,
   ClipRequest,
@@ -372,8 +373,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     resetVideoCallPeak();
     // Reading the footage is the only path that can report a real absence, so
     // it is the only one that runs when the notes came up empty.
-    // Clear anything from a previous attempt so a retry cannot double-insert.
-    await deleteMatches(clipRequestId);
+    // Clear anything from a previous attempt so a retry cannot double-insert,
+    // taking its rendered media with it rather than orphaning it.
+    await clearPreviousAttempt(clipRequestId, log);
 
     // (the deck plan is declared earlier — see above, before the notes path)
 
@@ -639,9 +641,11 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
     ];
   });
 
-  // Safe to replace: clips are only created from the generate endpoint, which
-  // cannot run until the search reports complete.
-  await deleteMatches(clipRequestId);
+  // Merging rewrites match rows and their ids, so the clips of the old ids
+  // are stale. That used to be free — clips came only from the Keep endpoint,
+  // which cannot run before the search completes — and is not free now that
+  // the search renders its own media.
+  await clearPreviousAttempt(clipRequestId, logger.child({ clipRequestId }));
   await insertMatches(clipRequestId, rows);
 
   logger.info('merged overlapping matches', {
@@ -670,6 +674,54 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
  * merging rewrites match rows and their ids — anything extracted earlier would
  * be attached to rows that no longer exist.
  */
+/**
+ * Clear a previous attempt's matches, reclaiming any media they hold first.
+ *
+ * clips.clip_match_id is ON DELETE CASCADE, so deleting matches deletes the
+ * clip rows under them — and every collector in this system finds objects by
+ * reading keys off a clip row. Dropping the rows first would leave the files
+ * with nothing pointing at them: not the unkept-media sweep, not the
+ * video-level footage expiry, nothing but a listing of the whole bucket.
+ *
+ * This was safe while clips came only from the Keep endpoint, which cannot
+ * run before a search completes. It stopped being safe when the search itself
+ * started rendering: a retried job re-runs from the top, and the deck the
+ * previous attempt finished would become nine unreferenced objects.
+ *
+ * Best-effort on the deletes and loud when they fail, for the same reason the
+ * pipeline's own cleanup is: an orphan nobody names is an orphan forever.
+ */
+async function clearPreviousAttempt(clipRequestId: string, log: Logger): Promise<void> {
+  let keys: string[] = [];
+  try {
+    keys = await listMediaKeysForRequestMatches(clipRequestId);
+  } catch (error) {
+    // Never block the search on this lookup — but say so, because proceeding
+    // means the cascade below may strand whatever it would have found.
+    log.error('could not read media keys before clearing matches', { err: error });
+  }
+
+  if (keys.length > 0) {
+    const storage = getStorage();
+    let deleted = 0;
+    for (const storageKey of keys) {
+      try {
+        await storage.remove(storageKey);
+        deleted += 1;
+      } catch (error) {
+        log.error('a previous attempt\'s file could not be deleted and is now an orphan', {
+          clipRequestId, storageKey, err: error,
+        });
+      }
+    }
+    log.info('reclaimed media from a previous attempt before clearing its matches', {
+      clipRequestId, objects: keys.length, deleted,
+    });
+  }
+
+  await deleteMatches(clipRequestId);
+}
+
 /**
  * Finish a request the same way whichever path answered it.
  *
@@ -1033,7 +1085,7 @@ async function answerFromNotes(input: {
   if (notes.length === 0) return 0;
 
   await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
-  await deleteMatches(clipRequestId);
+  await clearPreviousAttempt(clipRequestId, log);
 
   const result = await searchNotes({
     instruction,

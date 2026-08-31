@@ -160,3 +160,20 @@ describe('the third path: both objects stored, the row that names them fails', (
     expect(remove).not.toHaveBeenCalled();
   });
 });
+
+describe('the canonical clip, one step earlier in the same function', () => {
+  /**
+   * The same shape as the derivative and the poster: the file lands in
+   * storage, the row that would name it fails to write, and nothing can find
+   * it again. The clip ROW survives here — it just has no key on it — so this
+   * one is invisible even to a per-clip inspection, and only a listing of the
+   * bucket would ever turn it up.
+   */
+  it('discards the canonical upload when its row fails to write', async () => {
+    await discardUploadedObjects(
+      ['clips/video-1/clip-1.mp4'],
+      { videoId: 'video-1', clipId: 'clip-1', reason: 'canonical_persist_failed' },
+    );
+    expect(removed).toEqual(['clips/video-1/clip-1.mp4']);
+  });
+});

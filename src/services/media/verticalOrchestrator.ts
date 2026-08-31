@@ -216,11 +216,24 @@ async function prepareCandidate(
     stage = 'storage_upload';
     const canonicalKey = clipKey(input.videoId, clip.id);
     await getStorage().uploadFile(canonicalKey, canonicalPath, 'video/mp4');
-    await setClipStatus(clip.id, 'ready', {
-      storageKey: canonicalKey,
-      durationSeconds: Number(cut.durationSeconds.toFixed(3)),
-      sizeBytes: cut.sizeBytes,
-    });
+    // The same shape as the derivative and poster below, one step earlier:
+    // the file is in storage and the row that would name it has not been
+    // written. If that write fails the object is unreachable — the clip row
+    // survives without a key, so no sweep and no video deletion can find it.
+    try {
+      await setClipStatus(clip.id, 'ready', {
+        storageKey: canonicalKey,
+        durationSeconds: Number(cut.durationSeconds.toFixed(3)),
+        sizeBytes: cut.sizeBytes,
+      });
+    } catch (error) {
+      await discardUploadedObjects([canonicalKey], {
+        videoId: input.videoId,
+        clipId: clip.id,
+        reason: 'canonical_persist_failed',
+      });
+      throw error;
+    }
     canonicalGenerationMs = Math.round(performance.now() - startedAt);
 
     // Framing, derivative, poster. Every failure inside here arrives as a

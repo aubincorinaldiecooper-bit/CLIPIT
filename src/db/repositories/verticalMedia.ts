@@ -219,3 +219,38 @@ export async function claimUnkeptPreRenderedMedia(
     storageKey: row.storage_key,
   }));
 }
+
+
+/**
+ * Every stored object belonging to the clips of one request's matches.
+ *
+ * Read BEFORE those matches are deleted, because clips.clip_match_id is
+ * ON DELETE CASCADE: dropping the matches drops the clip rows with them, and
+ * every collector in this system finds objects by reading keys off a clip row
+ * — the unkept-media sweep and the video-level footage expiry alike. A row
+ * deleted while its files exist takes the only map to them.
+ *
+ * That was harmless while clips were created only by the Keep endpoint, which
+ * cannot run before a search completes. It stopped being harmless when the
+ * search itself began rendering media: a retried job re-runs from the top,
+ * clears the previous attempt's matches, and would cascade away the rows of
+ * three finished moments whose nine objects then sit in the bucket, billed
+ * monthly, findable only by listing the whole prefix.
+ */
+export async function listMediaKeysForRequestMatches(clipRequestId: string): Promise<string[]> {
+  const rows = await queryRows<{
+    storage_key: string | null;
+    derivative_storage_key: string | null;
+    poster_storage_key: string | null;
+  }>(
+    `SELECT c.storage_key, c.derivative_storage_key, c.poster_storage_key
+       FROM clips c
+       JOIN clip_matches m ON m.id = c.clip_match_id
+      WHERE m.clip_request_id = $1`,
+    [clipRequestId],
+  );
+  return rows.flatMap((row) =>
+    [row.storage_key, row.derivative_storage_key, row.poster_storage_key]
+      .filter((key): key is string => typeof key === 'string' && key.length > 0),
+  );
+}

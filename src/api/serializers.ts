@@ -527,15 +527,23 @@ export function creatorVisibleDeck(
     return clip ? clipIsShowable(match, clip) : false;
   });
 
-  // Belt and braces: if the completed deck cannot be served in full, serve
-  // none of it. Half a deck is the one thing this must never produce, and a
-  // shortfall here means something deleted media out from under a finished
-  // request — worth refusing loudly rather than papering over.
-  const target = request.effectiveDeckTarget ?? visible.length;
-  if (visible.length < target) {
-    return { matches: [], clips: [], withheld: matches.length };
-  }
-
+  // Deliberately NOT re-checked against effectiveDeckTarget.
+  //
+  // An earlier version refused to serve a released deck whose visible count
+  // had fallen below its original target, on the theory that a shortfall
+  // meant something had deleted media out from under a finished request. But
+  // the commonest cause of that shortfall is the system working exactly as
+  // designed: the creator Keeps one moment, and a day later the retention
+  // sweep collects the ones they did not keep — which is the whole point of
+  // rendering before Keep being affordable. Comparing against the original
+  // target then hid the entire conversation, including the moment they chose
+  // and which still plays perfectly well from their library.
+  //
+  // The atomic promise is about the REVEAL, and it is already kept above:
+  // deck_completed_at is written only when every moment in the effective deck
+  // is finished and stored, so a polling client sees nothing and then sees
+  // all of them. What survives afterwards is a question about the passage of
+  // time, and answering it with what still exists is the truthful answer.
   return {
     matches: visible,
     clips: visible.map((match) => clipsByMatchId.get(match.id)!),

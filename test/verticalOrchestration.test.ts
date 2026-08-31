@@ -287,17 +287,25 @@ describe('atomic reveal at the API boundary — a polling client sees 0, then al
   });
 
   /**
-   * The gate says complete but the media is gone underneath. Something
-   * deleted it out from under a finished request; serving what is left would
-   * hand over a short deck, so none of it goes.
+   * A released deck ages, and that is not corruption.
+   *
+   * The creator Keeps one moment; a day later the retention sweep collects
+   * the two they did not keep — exactly what makes rendering before Keep
+   * affordable. Measuring what is left against the original target would read
+   * that normal lifecycle as media vanishing from under a finished request
+   * and hide the whole conversation, including the moment they chose, which
+   * still plays perfectly from their library.
    */
-  it('refuses to serve a completed deck that cannot be served in full', () => {
+  it('still shows the moment the creator kept after the others were swept', () => {
     const clips = new Map<string, any>([
-      ['a', readyClip('a')],
-      ['b', readyClip('b', { derivativeStorageKey: null, derivativeStatus: 'failed' })],
-      ['c', readyClip('c')],
+      // Kept: approved, owned, files intact.
+      ['a', readyClip('a', { approvedAt: new Date(), retentionClass: 'owned' })],
+      // Swept: never kept, keys cleared by the retention sweep.
+      ['b', readyClip('b', { derivativeStorageKey: null, derivativeStatus: null, posterStorageKey: null, storageKey: null })],
+      ['c', readyClip('c', { derivativeStorageKey: null, derivativeStatus: null, posterStorageKey: null, storageKey: null })],
     ]);
-    expect(creatorVisibleDeck(completed, matches as any, clips).matches).toEqual([]);
+    const visible = creatorVisibleDeck(completed, matches as any, clips);
+    expect(visible.matches.map((m) => m.id)).toEqual(['a']);
   });
 
   /** A short pool is a complete deck at its own size. */
