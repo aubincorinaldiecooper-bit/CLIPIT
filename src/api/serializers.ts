@@ -466,11 +466,49 @@ export async function serializeLibraryClip(entry: {
  * A request that owes no deck passes through untouched — every non-platform
  * flow behaves exactly as it did before any of this existed.
  */
+/** Does this moment have real, finished media behind it? */
+function clipIsShowable(match: ClipMatch, clip: Clip): boolean {
+  return isCreatorVisible({
+    matchId: match.id,
+    derivativeStatus: clip.derivativeStatus ?? 'pending',
+    derivativeStorageKey: clip.derivativeStorageKey,
+    posterStorageKey: clip.posterStorageKey,
+    confidence: match.confidence,
+  });
+}
+
 export function creatorVisibleDeck(
   request: Pick<ClipRequest, 'presentationTarget' | 'deckCompletedAt' | 'effectiveDeckTarget'>,
   matches: ClipMatch[],
   clipsByMatchId: Map<string, Clip>,
 ): { matches: ClipMatch[]; clips: Clip[]; withheld: number } {
+  // A request from BEFORE set-level tracking existed.
+  //
+  // Migration 030 adds these columns nullable and does not backfill, so every
+  // vertical request created while 028/029 were live — media already rendered,
+  // overfetch candidates and failures among it — carries a null target. Read
+  // as "owes no deck", those rows would hand back every match and clip,
+  // including cards that play nothing. That is a regression against the gate
+  // this replaced, and it lands on real rows the moment 030 ships.
+  //
+  // So a null target falls back to the rule those rows were BUILT under:
+  // card-level readiness, from the clips themselves. It is weaker than the
+  // set-level guarantee and deliberately not dressed up as it — the
+  // set-level truth was never recorded for them and cannot be invented now.
+  if (request.presentationTarget === null) {
+    const preRendered = [...clipsByMatchId.values()].some((clip) => clip.preRendered);
+    if (!preRendered) return { matches, clips: [...clipsByMatchId.values()], withheld: 0 };
+    const legacyVisible = matches.filter((match) => {
+      const clip = clipsByMatchId.get(match.id);
+      return clip ? clipIsShowable(match, clip) : false;
+    });
+    return {
+      matches: legacyVisible,
+      clips: legacyVisible.map((match) => clipsByMatchId.get(match.id)!),
+      withheld: matches.length - legacyVisible.length,
+    };
+  }
+
   if (request.presentationTarget !== 'vertical') {
     return { matches, clips: [...clipsByMatchId.values()], withheld: 0 };
   }
@@ -486,14 +524,7 @@ export function creatorVisibleDeck(
   // went missing underneath must not hand out a card that plays nothing.
   const visible = matches.filter((match) => {
     const clip = clipsByMatchId.get(match.id);
-    if (!clip) return false;
-    return isCreatorVisible({
-      matchId: match.id,
-      derivativeStatus: clip.derivativeStatus ?? 'pending',
-      derivativeStorageKey: clip.derivativeStorageKey,
-      posterStorageKey: clip.posterStorageKey,
-      confidence: match.confidence,
-    });
+    return clip ? clipIsShowable(match, clip) : false;
   });
 
   // Belt and braces: if the completed deck cannot be served in full, serve

@@ -95,16 +95,29 @@ describe('a derivative already in storage when a later step fails', () => {
     expect(removed).toEqual(uploaded);
   });
 
-  it('takes the derivative back out when the poster UPLOAD fails', async () => {
-    // First upload (derivative) succeeds; the second (poster) does not.
+  /**
+   * A rejected upload does not prove the object is absent.
+   *
+   * The PUT can reach the bucket and store the object while the response is
+   * lost coming back — a timeout, a reset connection. Cleaning up only what
+   * we saw succeed would leave exactly the unreferenced file this block
+   * exists to prevent, and it would happen precisely when the network is
+   * already misbehaving. So once an upload has been ATTEMPTED its key is
+   * cleaned up regardless; deleting a key that was never written is harmless.
+   */
+  it('removes the poster key too when its upload failed but may have landed', async () => {
+    // First upload (derivative) succeeds; the second (poster) rejects.
     uploadFile.mockImplementationOnce(async (key: string) => { uploaded.push(key); });
-    uploadFile.mockImplementationOnce(async () => { throw new Error('bucket refused'); });
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
 
     await expect(runVerticalPipeline(input)).rejects.toThrow(/could not be stored/);
 
-    // Only the derivative ever landed, and it is gone again.
+    // Only the derivative is known to have landed...
     expect(uploaded).toHaveLength(1);
-    expect(removed).toEqual(uploaded);
+    // ...but BOTH keys are cleaned up, because the poster's fate is unknown.
+    expect(removed).toHaveLength(2);
+    expect(removed[0]).toContain('vertical');
+    expect(removed[1]).toContain('poster');
   });
 
   /**

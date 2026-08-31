@@ -314,6 +314,29 @@ describe('atomic reveal at the API boundary — a polling client sees 0, then al
    * before this pipeline existed — including a request whose clips are still
    * being cut, where a pending clip is a normal, visible state.
    */
+  /**
+   * Rows that predate set-level tracking.
+   *
+   * Migration 030 adds its columns nullable and does not backfill, so a
+   * vertical request created while 028/029 were live carries a null target
+   * with real pre-rendered clips behind it — overfetch and failures included.
+   * Read as "owes no deck" it would hand every one of them back, which is a
+   * regression against the gate this replaced, on rows that will genuinely
+   * exist the moment 030 ships.
+   */
+  it('still filters a pre-migration vertical request with a null target', () => {
+    const preMigration = { presentationTarget: null, deckCompletedAt: null, effectiveDeckTarget: null };
+    const clips = new Map<string, any>([
+      ['a', readyClip('a')],
+      // Rendered and failed — must not reappear just because the row is old.
+      ['b', readyClip('b', { derivativeStatus: 'failed', derivativeStorageKey: null })],
+      // 'c' was never prepared at all.
+    ]);
+    const visible = creatorVisibleDeck(preMigration, matches as any, clips);
+    expect(visible.matches.map((m) => m.id)).toEqual(['a']);
+    expect(visible.withheld).toBe(2);
+  });
+
   it('leaves the legacy path completely untouched', () => {
     const legacy = { presentationTarget: null, deckCompletedAt: null, effectiveDeckTarget: null };
     const clips = new Map<string, any>([

@@ -253,7 +253,15 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
   const posterTimestampSeconds = posterOffsetSeconds(rendered.durationSeconds);
   const posterPath = path.join(input.workDir, `${input.clipId}-poster.jpg`);
   const posterStorageKey = clipPosterKey(input.videoId, input.clipId);
-  let posterUploaded = false;
+  // ATTEMPTED, not succeeded, and the difference is a real orphan.
+  //
+  // A PUT can reach the bucket and store the object while the response is
+  // lost on the way back — a timeout, a reset connection. uploadFile rejects,
+  // the object exists, and a flag set only on success would leave its key out
+  // of the cleanup below: exactly the unreferenced file this whole block is
+  // here to prevent. Deleting a key that was never written is harmless, so
+  // the safe side of that uncertainty is to always try.
+  let posterUploadAttempted = false;
 
   try {
     // The poster comes from the derivative: it must show the frame the
@@ -271,14 +279,14 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
     }
 
     try {
+      posterUploadAttempted = true;
       await getStorage().uploadFile(posterStorageKey, posterPath, 'image/jpeg');
-      posterUploaded = true;
     } catch (error) {
       throw new VerticalPipelineFailure('storage_upload', 'poster_upload_failed', 'The poster could not be stored', error);
     }
   } catch (error) {
     await discardUploadedObjects(
-      [derivativeStorageKey, posterUploaded ? posterStorageKey : null],
+      [derivativeStorageKey, posterUploadAttempted ? posterStorageKey : null],
       {
         videoId: input.videoId,
         clipId: input.clipId,
