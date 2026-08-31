@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assembleDeck, planDeck, type PreparedCandidate } from '../src/services/media/deckAssembly.js';
+import { assembleDeck, deckCompletion, planDeck, type PreparedCandidate } from '../src/services/media/deckAssembly.js';
 import { keepAction, retentionClassFor } from '../src/services/media/keepApproval.js';
 import { clipMediaContract } from '../src/api/mediaContract.js';
 import { creatorVisibleDeck } from '../src/api/serializers.js';
@@ -325,5 +325,63 @@ describe('atomic reveal at the API boundary — a polling client sees 0, then al
     const visible = creatorVisibleDeck(legacy, [match('a', 0.9), match('b', 0.8)] as any, clips);
     expect(visible.matches.map((m) => m.id)).toEqual(['a', 'b']);
     expect(visible.withheld).toBe(0);
+  });
+});
+
+describe('an absence we never verified', () => {
+  /**
+   * The distinction this holds open, in the creator's own terms:
+   *
+   *   "We looked, and this platform could take none of what your video has."
+   *   "Your video's footage is gone, so we could not look at all."
+   *
+   * Both end with zero finished moments and an effective target of zero. Only
+   * one is a statement about their video. Reporting the second as the first
+   * tells someone their footage has nothing postable in it on the strength of
+   * an examination that never happened — the failure this codebase keeps
+   * circling, and the reason these are separate outcomes rather than one
+   * empty count.
+   */
+  const empty = { complete: false, effectiveDeckTarget: 0, sourceUnavailable: false };
+
+  it('calls missing footage what it is, not an empty video', () => {
+    expect(deckCompletion({ ...empty, sourceUnavailable: true }).kind).toBe('source_unavailable');
+  });
+
+  /**
+   * Why the flag has to exist at all.
+   *
+   * A missing source produces a zero effective target, and the render-failure
+   * branch only fires above zero — so with nothing else to catch it, a
+   * request whose footage vanished falls straight through to "complete" and
+   * is reported as a finished, empty answer. Deleting the check makes this
+   * test fail, which is the point of it.
+   */
+  it('is not swallowed by the zero-target path into a finished empty answer', () => {
+    const gone = { ...empty, sourceUnavailable: true };
+    // The branch that catches our own render failures cannot see this one.
+    expect(gone.effectiveDeckTarget > 0).toBe(false);
+    // And yet it must not be reported as a finished answer.
+    expect(deckCompletion(gone).kind).not.toBe('complete');
+  });
+
+  it('an empty pool we actually examined is a finished answer', () => {
+    expect(deckCompletion(empty).kind).toBe('complete');
+  });
+
+  it('moments found and not finished is our failure', () => {
+    expect(deckCompletion({ complete: false, effectiveDeckTarget: 3, sourceUnavailable: false }).kind)
+      .toBe('render_failed');
+  });
+
+  it('a deck that stands is complete', () => {
+    expect(deckCompletion({ complete: true, effectiveDeckTarget: 3, sourceUnavailable: false }).kind)
+      .toBe('complete');
+  });
+
+  /** A short deck that stands is complete too — two, when two was all there was. */
+  it('a short deck that stands is complete', () => {
+    expect(deckCompletion({ complete: true, effectiveDeckTarget: 2, sourceUnavailable: false }).kind)
+      .toBe('complete');
   });
 });

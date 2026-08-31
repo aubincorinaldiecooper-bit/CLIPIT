@@ -202,3 +202,48 @@ export function deckMetrics(
     timeToCompleteDeckMs: outcome.complete ? Math.max(0, Math.round(nowMs - startedAtMs)) : null,
   };
 }
+
+
+/**
+ * How a request that owed a deck should be finished.
+ *
+ * Pure, and separate from the worker, because this is a DECISION and the
+ * decisions in this codebase get tests that run without a queue, a database
+ * or a frame of video. It is also the decision most worth pinning: every
+ * branch here is a different sentence said to a creator about their own
+ * footage, and three of them are easy to confuse.
+ */
+export type DeckCompletion =
+  /** The footage was gone before anything could be judged. We never looked. */
+  | { kind: 'source_unavailable' }
+  /** Moments were found and we could not finish them. Our failure, not theirs. */
+  | { kind: 'render_failed' }
+  /** The effective deck stands — including, legitimately, an empty one. */
+  | { kind: 'complete' };
+
+export function deckCompletion(deck: {
+  complete: boolean;
+  effectiveDeckTarget: number;
+  sourceUnavailable: boolean;
+}): DeckCompletion {
+  // Consulted at all, which is what matters: without this branch a missing
+  // source falls through to 'complete' below, because it produces a zero
+  // target and the render-failure check requires a target above zero. The
+  // creator would then be told their video has no postable moments on the
+  // strength of an examination that never happened.
+  //
+  // Checked first is defensive rather than load-bearing — a missing source
+  // always yields a zero target today, so the branch below would not claim it
+  // either way. It sits here so that stays true if a future change ever gives
+  // an unavailable source a non-zero target.
+  if (deck.sourceUnavailable) return { kind: 'source_unavailable' };
+
+  // Candidates existed and could not be finished.
+  if (!deck.complete && deck.effectiveDeckTarget > 0) return { kind: 'render_failed' };
+
+  // Either a real deck, or an honest empty one: the search looked and this
+  // platform could take none of what it found. Both are finished answers, and
+  // both open the gate — leaving it shut would make a completed request look
+  // forever like one still assembling.
+  return { kind: 'complete' };
+}

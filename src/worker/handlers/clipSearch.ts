@@ -56,6 +56,7 @@ import {
   type PlatformIntent,
 } from '../../services/search/platformIntent.js';
 import { orchestrateVerticalDeck, type OrchestratorCandidate } from '../../services/media/verticalOrchestrator.js';
+import { deckCompletion } from '../../services/media/deckAssembly.js';
 import type {
   ChunkDegradation,
   ClipRequest,
@@ -710,11 +711,28 @@ async function completeRequestWithDeck(input: {
     tally: input.tally,
   });
 
+  const completion = deckCompletion(deck);
+
+  // The footage is gone. The moments are real and we cannot cut them, so the
+  // creator is told that — not that their video had nothing in it.
+  if (completion.kind === 'source_unavailable') {
+    await finishClipRequest(
+      clipRequestId,
+      'failed',
+      'The original video is no longer available, so these moments could not be made ready to post.',
+    );
+    log.error('vertical deck abandoned: the source footage is gone', {
+      answeredFrom: input.answeredFrom,
+      videoId: input.video.id,
+    });
+    return { completed: false, deck };
+  }
+
   // Candidates existed and we could not finish them. That is OUR failure and
   // it is reported as one. Completing with an empty deck would tell someone
   // their video has no postable moments when the truth is that our pipeline
   // fell over on moments we found.
-  if (!deck.complete && deck.effectiveDeckTarget > 0) {
+  if (completion.kind === 'render_failed') {
     await finishClipRequest(
       clipRequestId,
       'failed',
@@ -755,6 +773,16 @@ interface VerticalDeckResult {
   renderedButSkippedCount: number;
   /** Null when the deck never completed — there is no time-to-complete for it. */
   timeToCompleteDeckMs: number | null;
+  /**
+   * The source footage was gone before a single candidate could be considered.
+   *
+   * Kept apart from an empty candidate pool, because the two say opposite
+   * things about the creator's video. An empty pool means we looked and this
+   * platform could take none of what we found. This means we never looked at
+   * all — and reporting it as the former tells someone their video has no
+   * postable moments on the strength of an examination that never happened.
+   */
+  sourceUnavailable: boolean;
 }
 
 /**
@@ -784,11 +812,16 @@ async function buildVerticalDeck(input: {
   const empty: VerticalDeckResult = {
     complete: false, readyCount: 0, availableCandidateCount: 0, effectiveDeckTarget: 0,
     failedCandidateCount: 0, renderedButSkippedCount: 0, timeToCompleteDeckMs: null,
+    sourceUnavailable: false,
   };
 
   if (!video.originalStorageKey) {
+    // Nothing can be cut, so nothing can be judged eligible. Reported as its
+    // own outcome rather than as an empty deck: the moments the search found
+    // are real, and answering "your video has none" because the footage
+    // expired would be an absence we never verified.
     log.warn('cannot build a vertical deck without the original source');
-    return empty;
+    return { ...empty, sourceUnavailable: true };
   }
 
   const stored = await listMatches(clipRequestId);
@@ -883,6 +916,8 @@ async function buildVerticalDeck(input: {
     failedCandidateCount: metrics.failedCandidateCount,
     renderedButSkippedCount: metrics.renderedButSkippedCount,
     timeToCompleteDeckMs: metrics.timeToCompleteDeckMs,
+    // The source was there — whatever else happened, it was not this.
+    sourceUnavailable: false,
   };
 }
 
