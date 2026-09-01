@@ -7,13 +7,18 @@ import { getStorage } from '../storage/s3.js';
 import { clipKey } from '../storage/types.js';
 import { cutClip } from './ffmpeg.js';
 import { applyClipPadding } from '../timestamps.js';
-import { upsertClipForMatch, setClipStatus } from '../../db/repositories/clips.js';
+import { getClip, upsertClipForMatch, setClipStatus } from '../../db/repositories/clips.js';
 import { setVerticalMedia, markVerticalFailed } from '../../db/repositories/verticalMedia.js';
 import { markAttemptsRecovered, recordVerticalRenderAttempt } from '../../db/repositories/verticalRenders.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { askVideoModel, videoPartFromFile, type ContentPart } from '../search/openrouterVideo.js';
 import { COMPOSITION_SYSTEM_PROMPT, COMPOSITION_INSTRUCTION } from '../search/composition.js';
-import { runVerticalPipeline, VerticalPipelineFailure } from './verticalPipeline.js';
+import {
+  discardUploadedObjects,
+  runVerticalPipeline,
+  shouldDiscardOnUploadFailure,
+  VerticalPipelineFailure,
+} from './verticalPipeline.js';
 import { assembleDeck, deckMetrics, planDeck, type DeckOutcome, type PreparedCandidate } from './deckAssembly.js';
 import type { FailureStage, VerticalCandidate } from './verticalVisibility.js';
 import type { PlatformIntent } from '../search/platformIntent.js';
@@ -59,9 +64,19 @@ export interface OrchestrateInput {
   hasAudio: boolean;
   videoDurationSeconds: number | null;
   intent: PlatformIntent;
-  requestedCount: number;
+  /** Exactly what the creator asked for, before any availability cap. */
+  requestedResultCount: number;
+  /** What is actually obtainable: min(requested, available). */
+  effectiveDeckTarget: number;
   candidates: OrchestratorCandidate[];
   log: Logger;
+  /**
+   * When the creator's wait for this deck began.
+   *
+   * Started here, the clock missed the entire source download that precedes
+   * it — for a 2GB original, a minute of real waiting reported as zero.
+   */
+  startedAtMs: number;
   /**
    * The search's own cost tally. Composition calls are made inside the search
    * job and are part of what that request cost; leaving them out would make
@@ -126,6 +141,45 @@ function compositionAsker(input: OrchestrateInput, canonicalKey: string, duratio
 
     return { content: answer.content, provider: answer.provider, model: answer.model };
   };
+}
+
+/**
+ * Discard objects this attempt created — and only those.
+ *
+ * Every cleanup path in this file goes through here. They did not, and the
+ * cost of that was a run of bugs all wearing the same shape: the upload
+ * failure learned the ownership rule while the persistence failure eight
+ * lines below it kept deleting whatever sat at the key, including a canonical
+ * clip that played perfectly and a row still pointing at it.
+ *
+ * The rule itself lives in shouldDiscardOnUploadFailure, written as a table.
+ * This just makes sure nothing decides for itself.
+ */
+async function discardWhatThisAttemptMade(
+  clipId: string,
+  entries: Array<{ key: string | null; snapshotKey: string | null; read: () => Promise<string | null> }>,
+  context: { videoId: string; clipId: string; reason: string },
+): Promise<void> {
+  for (const entry of entries) {
+    if (!entry.key) continue;
+
+    let currentKey: string | null | undefined;
+    let readFailed = false;
+    try {
+      currentKey = await entry.read();
+    } catch {
+      readFailed = true;
+    }
+
+    if (shouldDiscardOnUploadFailure({
+      key: entry.key,
+      snapshotKey: entry.snapshotKey,
+      currentKey,
+      readFailed,
+    })) {
+      await discardUploadedObjects([entry.key], context);
+    }
+  }
 }
 
 /**
@@ -212,12 +266,64 @@ async function prepareCandidate(
 
     stage = 'storage_upload';
     const canonicalKey = clipKey(input.videoId, clip.id);
-    await getStorage().uploadFile(canonicalKey, canonicalPath, 'video/mp4');
-    await setClipStatus(clip.id, 'ready', {
-      storageKey: canonicalKey,
-      durationSeconds: Number(cut.durationSeconds.toFixed(3)),
-      sizeBytes: cut.sizeBytes,
-    });
+    // Same uncertainty the poster upload accounts for: a PUT can store the
+    // object and lose its response, so cleaning up only on a confirmed
+    // success leaves the file behind exactly when the network is worst.
+    //
+    // But the key is DETERMINISTIC, and a retry re-uploads to it. If the row
+    // already points at this key, an object was there before this attempt
+    // started — a canonical clip that plays perfectly, whose derivative
+    // happened to fail. Deleting it because a re-upload rejected would
+    // destroy known-good media to tidy up a file that may not even exist, and
+    // S3 leaves the previous object intact when a PUT fails anyway. So the
+    // cleanup only ever removes what this attempt could itself have created.
+    try {
+      await getStorage().uploadFile(canonicalKey, canonicalPath, 'video/mp4');
+    } catch (error) {
+      await discardWhatThisAttemptMade(
+        clip.id,
+        [{
+          key: canonicalKey,
+          snapshotKey: clip.storageKey,
+          read: async () => (await getClip(clip.id))?.storageKey ?? null,
+        }],
+        { videoId: input.videoId, clipId: clip.id, reason: 'canonical_upload_failed' },
+      );
+      throw error;
+    }
+    // The file is in storage and the row that would name it has not been
+    // written yet. Two ways that goes wrong, and both are failures:
+    //
+    //  - the write throws
+    //  - the write succeeds and matches NOTHING, because a concurrent retry
+    //    or a deleted video took the clip away. That returns happily and
+    //    would otherwise leave the object referenced by no row at all.
+    //
+    // Either way the discard goes through the same ownership rule as the
+    // upload above. Deleting unconditionally here was its own bug: on a retry
+    // whose canonical already existed, a failed row write destroyed a clip
+    // that played perfectly and left the surviving row pointing at nothing.
+    try {
+      const wrote = await setClipStatus(clip.id, 'ready', {
+        storageKey: canonicalKey,
+        durationSeconds: Number(cut.durationSeconds.toFixed(3)),
+        sizeBytes: cut.sizeBytes,
+      });
+      if (!wrote) {
+        throw new Error(`Clip ${clip.id} no longer exists — its canonical cut has nowhere to be recorded`);
+      }
+    } catch (error) {
+      await discardWhatThisAttemptMade(
+        clip.id,
+        [{
+          key: canonicalKey,
+          snapshotKey: clip.storageKey,
+          read: async () => (await getClip(clip.id))?.storageKey ?? null,
+        }],
+        { videoId: input.videoId, clipId: clip.id, reason: 'canonical_persist_failed' },
+      );
+      throw error;
+    }
     canonicalGenerationMs = Math.round(performance.now() - startedAt);
 
     // Framing, derivative, poster. Every failure inside here arrives as a
@@ -230,30 +336,67 @@ async function prepareCandidate(
       workDir: input.workDir,
       hasAudio: input.hasAudio,
       askComposition: compositionAsker(input, canonicalKey, cut.durationSeconds),
+      // Same rule one layer down, and asked the same way: at the moment of
+      // failure, from the row as it stands then.
+      currentDerivativeKey: async () => (await getClip(clip.id))?.derivativeStorageKey ?? null,
+      snapshotDerivativeKey: clip.derivativeStorageKey,
     });
 
     // READY is a PERSISTED fact, never an in-memory return value. A candidate
     // whose state could not be written must not become a card whose readiness
     // nothing can vouch for after this process exits.
     stage = 'serialization';
-    await setVerticalMedia(clip.id, {
-      compositionMode: media.compositionMode,
-      focalX: media.focalX,
-      focalY: media.focalY,
-      derivativeStorageKey: media.derivativeStorageKey,
-      posterStorageKey: media.posterStorageKey,
-      posterTimestampSeconds: media.posterTimestampSeconds,
-      sourceWidth: media.sourceWidth,
-      sourceHeight: media.sourceHeight,
-      outputWidth: media.outputWidth,
-      outputHeight: media.outputHeight,
-      canonicalGenerationMs,
-      compositionDecisionMs: media.compositionDecisionMs,
-      derivativeGenerationMs: media.derivativeGenerationMs,
-      posterGenerationMs: media.posterGenerationMs,
-      // Made before anyone chose it, so it is temporary until they do.
-      retentionClass: 'temporary',
-    });
+    // The third orphan path, and the least obvious: both objects are in
+    // storage and correct, and the row that would point at them fails to
+    // write. Without this the media exists, nothing references it, and the
+    // retention sweep — which works from keys ON clip rows — can never see
+    // it. The candidate fails either way; the question is only whether it
+    // fails cleanly.
+    try {
+      await setVerticalMedia(clip.id, {
+        compositionMode: media.compositionMode,
+        focalX: media.focalX,
+        focalY: media.focalY,
+        derivativeStorageKey: media.derivativeStorageKey,
+        posterStorageKey: media.posterStorageKey,
+        posterTimestampSeconds: media.posterTimestampSeconds,
+        sourceWidth: media.sourceWidth,
+        sourceHeight: media.sourceHeight,
+        outputWidth: media.outputWidth,
+        outputHeight: media.outputHeight,
+        canonicalGenerationMs,
+        compositionDecisionMs: media.compositionDecisionMs,
+        derivativeGenerationMs: media.derivativeGenerationMs,
+        posterGenerationMs: media.posterGenerationMs,
+        // Made before anyone chose it, so it is temporary until they do.
+        retentionClass: 'temporary',
+      });
+    } catch (error) {
+      // Both keys are deterministic too, so a retry can be re-uploading over
+      // media an earlier run made and a surviving row still names.
+      await discardWhatThisAttemptMade(
+        clip.id,
+        [
+          {
+            key: media.derivativeStorageKey,
+            snapshotKey: clip.derivativeStorageKey,
+            read: async () => (await getClip(clip.id))?.derivativeStorageKey ?? null,
+          },
+          {
+            key: media.posterStorageKey,
+            snapshotKey: clip.posterStorageKey,
+            read: async () => (await getClip(clip.id))?.posterStorageKey ?? null,
+          },
+        ],
+        { videoId: input.videoId, clipId: clip.id, reason: 'persist_failed' },
+      );
+      throw new VerticalPipelineFailure(
+        'serialization',
+        'persist_failed',
+        'The finished media could not be recorded',
+        error,
+      );
+    }
 
     await recordVerticalRenderAttempt({
       videoId: input.videoId,
@@ -377,8 +520,8 @@ export interface OrchestrationResult {
  * a partial one even by mistake.
  */
 export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<OrchestrationResult> {
-  const startedAt = performance.now();
-  const plan = planDeck(input.requestedCount, env.VERTICAL_CANDIDATE_OVERFETCH, env.VERTICAL_CANDIDATE_CEILING);
+  const startedAt = input.startedAtMs;
+  const plan = planDeck(input.effectiveDeckTarget, env.VERTICAL_CANDIDATE_OVERFETCH, env.VERTICAL_CANDIDATE_CEILING);
 
   const outcome = await assembleDeck(
     input.candidates,
@@ -387,10 +530,12 @@ export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<
     env.VERTICAL_MAX_RENDER_ATTEMPTS,
   );
 
-  const metrics = deckMetrics(outcome, startedAt, performance.now(), input.candidates.length);
+  const metrics = deckMetrics(outcome, startedAt, performance.now(), {
+    requestedResultCount: input.requestedResultCount,
+    internalCandidateCount: input.candidates.length,
+  });
   input.log.info('vertical deck assembled', {
     platform: input.intent.platform,
-    requested: input.requestedCount,
     candidateCeiling: plan.candidateTarget,
     complete: outcome.complete,
     ...metrics,

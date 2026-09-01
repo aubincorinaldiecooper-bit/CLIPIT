@@ -40,7 +40,14 @@ export interface VerticalMediaInput {
  * reason to create one and rely on being caught.
  */
 export async function setVerticalMedia(clipId: string, input: VerticalMediaInput): Promise<void> {
-  await query(
+  // The row count is checked, not discarded.
+  //
+  // The clip can be gone by the time this runs — the video deleted mid-render,
+  // or a concurrent retry having cleared the matches this clip hung from. The
+  // UPDATE then matches nothing and returns perfectly happily, and the deck
+  // records a candidate as READY whose media is referenced by no row at all:
+  // a card that cannot be served, and two orphaned objects.
+  const result = await query(
     `UPDATE clips
         SET derivative_storage_key   = $2,
             derivative_status        = 'ready',
@@ -84,6 +91,10 @@ export async function setVerticalMedia(clipId: string, input: VerticalMediaInput
       input.retentionClass,
     ],
   );
+
+  if (result.rowCount === 0) {
+    throw new Error(`Clip ${clipId} no longer exists — its finished media has nowhere to be recorded`);
+  }
 }
 
 /**
@@ -218,4 +229,76 @@ export async function claimUnkeptPreRenderedMedia(
     posterStorageKey: row.poster_storage_key,
     storageKey: row.storage_key,
   }));
+}
+
+
+/**
+ * Clear a previous attempt's matches and hand back the files they held —
+ * in ONE statement, and never touching a moment the creator kept.
+ *
+ * Three things have to be true together, and getting any one of them alone is
+ * worse than useless:
+ *
+ *  - The keys must be read BEFORE the rows go. clips.clip_match_id is
+ *    ON DELETE CASCADE, and every collector in this system finds objects by
+ *    reading keys off a clip row, so a row deleted while its files exist
+ *    takes the only map to them.
+ *  - Kept moments must keep their ROWS, not just their files. Sparing the
+ *    files while the cascade still took the rows was my own first attempt at
+ *    this: the clip vanished from the creator's library and the files I had
+ *    carefully preserved became unreachable. Worse than deleting both.
+ *  - The read and the delete must not be two round trips. An approval landing
+ *    between them would be read as unkept and then cascaded away.
+ *
+ * The NOT EXISTS keeps a match whose clip somebody approved, so the cascade
+ * never reaches it. One statement narrows the approval race to the width of
+ * a single snapshot rather than a network gap — it does not eliminate it, and
+ * closing it entirely would need SERIALIZABLE or an explicit lock ordering
+ * shared with approveClip.
+ */
+export async function clearUnkeptMatchesForRequest(
+  clipRequestId: string,
+  /**
+   * The attempt that planned this deck. Null skips the fence, for callers
+   * that run before any planning.
+   *
+   * Without it, a stalled worker resuming after its replacement had already
+   * planned and rendered would clear the NEWER run's matches and delete its
+   * media — the token fenced only the release, so everything before it stayed
+   * open to a run that had already lost.
+   */
+  attemptId: string | null,
+): Promise<string[]> {
+  const rows = await queryRows<{
+    storage_key: string | null;
+    derivative_storage_key: string | null;
+    poster_storage_key: string | null;
+  }>(
+    `WITH doomed AS (
+       SELECT m.id AS match_id
+         FROM clip_matches m
+        WHERE m.clip_request_id = $1
+          -- Only the attempt that currently owns this request may clear it.
+          AND ($2::uuid IS NULL OR EXISTS (
+            SELECT 1 FROM clip_requests r
+             WHERE r.id = $1 AND r.deck_attempt_id = $2::uuid
+          ))
+          AND NOT EXISTS (
+            SELECT 1 FROM clips k
+             WHERE k.clip_match_id = m.id AND k.approved_at IS NOT NULL
+          )
+     ), files AS (
+       SELECT c.storage_key, c.derivative_storage_key, c.poster_storage_key
+         FROM clips c
+         JOIN doomed d ON d.match_id = c.clip_match_id
+     ), removed AS (
+       DELETE FROM clip_matches WHERE id IN (SELECT match_id FROM doomed)
+     )
+     SELECT storage_key, derivative_storage_key, poster_storage_key FROM files`,
+    [clipRequestId, attemptId],
+  );
+  return rows.flatMap((row) =>
+    [row.storage_key, row.derivative_storage_key, row.poster_storage_key]
+      .filter((key): key is string => typeof key === 'string' && key.length > 0),
+  );
 }

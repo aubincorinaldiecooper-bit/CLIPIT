@@ -27,7 +27,7 @@ import { warmMiniCpm } from '../../services/search/minicpmVideo.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import {
-  creatorVisibleMatches,
+  creatorVisibleDeck,
   serializeClipRequest,
   serializeVideo,
   serializeVideoWithPlayback,
@@ -514,7 +514,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
         // Same gate as the request route. History is still a creator-facing
         // view, and an unfinished moment must not reappear in it just
         // because it is being read from a different page.
-        const { matches } = creatorVisibleMatches(allMatches, clipsByMatchId);
+        const { matches } = creatorVisibleDeck(clipRequest, allMatches, clipsByMatchId);
         return serializeClipRequest(clipRequest, matches, clipsByMatchId);
       }),
     );

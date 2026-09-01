@@ -55,6 +55,30 @@ export interface VerticalPipelineInput {
   hasAudio: boolean;
   /** Asks MiniCPM about this exact moment. Injected so the pipeline is testable. */
   askComposition: (canonicalPath: string) => Promise<{ content: string | null; provider: string; model: string }>;
+  /**
+   * Reads the derivative key this clip points at RIGHT NOW.
+   *
+   * The key is deterministic, so a retry writes where an earlier run wrote.
+   * When the row still names it, whatever is there predates this attempt and
+   * must survive a failed re-upload — cleanup collects what this attempt
+   * created, never media that was already good.
+   *
+   * A function rather than a value because the answer can change underneath
+   * us: the retention sweep can clear this clip's keys and delete its objects
+   * while the render is in flight. Deciding from a snapshot taken minutes
+   * earlier would then skip cleanup for an object only this attempt could
+   * have created, and leave it orphaned. Asked at the moment of failure, and
+   * only then, so the common path pays nothing.
+   *
+   * Injected rather than imported so this stays a media service with no
+   * database of its own.
+   */
+  currentDerivativeKey?: () => Promise<string | null>;
+  /**
+   * What the row named when this attempt STARTED — the fallback when the
+   * read above cannot answer. See shouldDiscardOnUploadFailure.
+   */
+  snapshotDerivativeKey?: string | null;
 }
 
 export interface VerticalPipelineResult {
@@ -136,6 +160,82 @@ export async function decideComposition(
  * differently from its own video is a small lie that shows up immediately in
  * a grid.
  */
+/**
+ * Delete objects this pipeline uploaded, when the work they belong to did not
+ * finish.
+ *
+ * The invariant: every derivative and poster this pipeline uploads ends up
+ * either referenced by its clip row, or deleted before the failure is
+ * reported. Nothing in between.
+ *
+ * The in-between state is the dangerous one and it is not hypothetical: the
+ * derivative uploads, then the poster extraction fails, and the object sits in
+ * storage with its key recorded nowhere. The retention sweep cannot help —
+ * that sweep works from keys ON clip rows, and this key never reached one. An
+ * object nothing references is an object nothing will ever collect.
+ *
+ * Best-effort but never silent. If the delete itself fails there really is an
+ * orphan, and the only thing standing between it and permanent invisibility is
+ * this log line — so it names the clip, the video and the key.
+ */
+/**
+ * Should the object at a deterministic key be deleted after a failed upload?
+ *
+ * The keys here are derived from ids, so a retry writes exactly where an
+ * earlier run wrote. Deleting one is destructive and deleting none leaks, and
+ * the right answer depends on TWO readings of the clip row: what it said when
+ * the attempt began, and what it says at the moment of failure. Written out
+ * as a table because getting it wrong in either direction has now happened
+ * three times:
+ *
+ *   snapshot        fresh read at failure     delete?
+ *   ────────────────────────────────────────────────────────────────────
+ *   not the key     not the key               YES — only we could have written it
+ *   not the key     the key                   no  — it is owned now
+ *   not the key     READ FAILED               YES — nobody owned it when we started
+ *   the key         not the key               YES — retention swept it; this is ours
+ *   the key         the key                   no  — it predates this attempt
+ *   the key         READ FAILED               NO  — unknown, and it was owned
+ *
+ * The last row is the one that matters most and the one I got wrong: an
+ * unavailable database must never authorise deleting media the snapshot
+ * showed we already had. Unknown means leave it alone — an orphan is a bill,
+ * a deleted clip is gone.
+ */
+export function shouldDiscardOnUploadFailure(input: {
+  key: string;
+  /** What the row named when this attempt began. */
+  snapshotKey: string | null;
+  /** What it names now — undefined when the read itself failed. */
+  currentKey: string | null | undefined;
+  readFailed: boolean;
+}): boolean {
+  const ownedNow = input.readFailed ? input.snapshotKey : (input.currentKey ?? null);
+  return ownedNow !== input.key;
+}
+
+export async function discardUploadedObjects(
+  keys: Array<string | null | undefined>,
+  context: { videoId: string; clipId: string; reason: string },
+): Promise<void> {
+  const present = keys.filter((key): key is string => typeof key === 'string' && key.length > 0);
+  if (present.length === 0) return;
+
+  const storage = getStorage();
+  for (const storageKey of present) {
+    try {
+      await storage.remove(storageKey);
+      logger.info('discarded a partially uploaded object', { ...context, storageKey });
+    } catch (error) {
+      logger.error('could not discard a partially uploaded object — it is now an orphan', {
+        ...context,
+        storageKey,
+        err: error,
+      });
+    }
+  }
+}
+
 export async function runVerticalPipeline(input: VerticalPipelineInput): Promise<VerticalPipelineResult> {
   let probe;
   try {
@@ -202,31 +302,83 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
   try {
     await getStorage().uploadFile(derivativeStorageKey, derivativePath, 'video/mp4');
   } catch (error) {
+    // The upload rejected, which does not prove the object is absent — the
+    // bytes may have landed and only the response been lost. Delete it, but
+    // ONLY when this attempt could have been what created it: if the row
+    // already named this key, the object there is a working derivative from
+    // an earlier run and removing it would break a clip that played fine.
+    let currentKey: string | null | undefined;
+    let readFailed = false;
+    try {
+      currentKey = input.currentDerivativeKey ? await input.currentDerivativeKey() : null;
+    } catch {
+      readFailed = true;
+    }
+
+    if (shouldDiscardOnUploadFailure({
+      key: derivativeStorageKey,
+      snapshotKey: input.snapshotDerivativeKey ?? null,
+      currentKey,
+      readFailed,
+    })) {
+      await discardUploadedObjects([derivativeStorageKey], {
+        videoId: input.videoId,
+        clipId: input.clipId,
+        reason: 'derivative_upload_failed',
+      });
+    }
     throw new VerticalPipelineFailure('storage_upload', 'derivative_upload_failed', 'The derivative could not be stored', error);
   }
 
-  // The poster comes from the derivative: it must show the frame the creator
-  // will actually post, not the wider one it was cut from.
+  // From here on the derivative EXISTS in storage while its key exists
+  // nowhere else. Every exit from this block therefore takes it back out
+  // again before reporting the failure — otherwise the object is stranded
+  // where no sweep can find it.
   const posterStartedAt = performance.now();
   const posterTimestampSeconds = posterOffsetSeconds(rendered.durationSeconds);
   const posterPath = path.join(input.workDir, `${input.clipId}-poster.jpg`);
-  let posterWritten = false;
-  try {
-    posterWritten = await extractFrameAt(derivativePath, posterTimestampSeconds, posterPath, VERTICAL_DELIVERY.width);
-  } catch (error) {
-    throw new VerticalPipelineFailure('poster_generation', 'poster_failed', 'The poster frame could not be extracted', error);
-  }
-  if (!posterWritten) {
-    // extractFrameAt exits 0 without a file when the seek lands past the last
-    // decodable frame, so the result is confirmed rather than assumed.
-    throw new VerticalPipelineFailure('poster_generation', 'poster_empty', 'The poster frame extracted to nothing');
-  }
-
   const posterStorageKey = clipPosterKey(input.videoId, input.clipId);
+  // ATTEMPTED, not succeeded, and the difference is a real orphan.
+  //
+  // A PUT can reach the bucket and store the object while the response is
+  // lost on the way back — a timeout, a reset connection. uploadFile rejects,
+  // the object exists, and a flag set only on success would leave its key out
+  // of the cleanup below: exactly the unreferenced file this whole block is
+  // here to prevent. Deleting a key that was never written is harmless, so
+  // the safe side of that uncertainty is to always try.
+  let posterUploadAttempted = false;
+
   try {
-    await getStorage().uploadFile(posterStorageKey, posterPath, 'image/jpeg');
+    // The poster comes from the derivative: it must show the frame the
+    // creator will actually post, not the wider one it was cut from.
+    let posterWritten = false;
+    try {
+      posterWritten = await extractFrameAt(derivativePath, posterTimestampSeconds, posterPath, VERTICAL_DELIVERY.width);
+    } catch (error) {
+      throw new VerticalPipelineFailure('poster_generation', 'poster_failed', 'The poster frame could not be extracted', error);
+    }
+    if (!posterWritten) {
+      // extractFrameAt exits 0 without a file when the seek lands past the
+      // last decodable frame, so the result is confirmed rather than assumed.
+      throw new VerticalPipelineFailure('poster_generation', 'poster_empty', 'The poster frame extracted to nothing');
+    }
+
+    try {
+      posterUploadAttempted = true;
+      await getStorage().uploadFile(posterStorageKey, posterPath, 'image/jpeg');
+    } catch (error) {
+      throw new VerticalPipelineFailure('storage_upload', 'poster_upload_failed', 'The poster could not be stored', error);
+    }
   } catch (error) {
-    throw new VerticalPipelineFailure('storage_upload', 'poster_upload_failed', 'The poster could not be stored', error);
+    await discardUploadedObjects(
+      [derivativeStorageKey, posterUploadAttempted ? posterStorageKey : null],
+      {
+        videoId: input.videoId,
+        clipId: input.clipId,
+        reason: error instanceof VerticalPipelineFailure ? error.code : 'unexpected',
+      },
+    );
+    throw error;
   }
   const posterGenerationMs = Math.round(performance.now() - posterStartedAt);
 

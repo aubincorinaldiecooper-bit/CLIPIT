@@ -1,0 +1,367 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * Every object this pipeline uploads must end up either referenced by its clip
+ * row, or deleted before the failure is reported. Nothing in between.
+ *
+ * The in-between state is not hypothetical and it is not self-healing. The
+ * derivative uploads, the poster then fails, and a multi-megabyte object sits
+ * in storage with its key recorded nowhere. The retention sweep cannot reach
+ * it — that sweep works from keys ON clip rows, and this key never got to one.
+ * An object nothing references is an object nothing will ever collect, and it
+ * is billed monthly, forever.
+ *
+ * These three tests are the three ways to reach that state.
+ */
+
+const uploaded: string[] = [];
+const removed: string[] = [];
+let removeThrows = false;
+
+const uploadFile = vi.fn(async (key: string) => { uploaded.push(key); });
+const remove = vi.fn(async (key: string) => {
+  if (removeThrows) throw new Error('bucket refused the delete');
+  removed.push(key);
+});
+
+vi.mock('../src/services/storage/s3.js', () => ({
+  getStorage: () => ({ uploadFile, remove }),
+}));
+
+// The encoder is not what these tests are about; each one fails a specific
+// step and asserts what happened to the bytes already in storage.
+const renderVerticalDerivative = vi.fn(async () => ({ width: 1080, height: 1920, durationSeconds: 20, sizeBytes: 5_000 }));
+const extractFrameAt = vi.fn(async () => true);
+const ffprobe = vi.fn(async () => ({ width: 1920, height: 1080, durationSeconds: 20 }));
+
+vi.mock('../src/services/media/ffmpeg.js', () => ({
+  renderVerticalDerivative,
+  extractFrameAt,
+  ffprobe,
+}));
+
+const errorLog = vi.fn();
+vi.mock('../src/lib/logger.js', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: errorLog, debug: vi.fn(), child: () => ({ info: vi.fn(), warn: vi.fn(), error: errorLog }) },
+}));
+
+const { runVerticalPipeline, VerticalPipelineFailure, discardUploadedObjects, shouldDiscardOnUploadFailure } =
+  await import('../src/services/media/verticalPipeline.js');
+
+const input = {
+  videoId: 'video-1',
+  clipId: 'clip-1',
+  canonicalPath: '/tmp/clip-1.mp4',
+  workDir: '/tmp',
+  hasAudio: true,
+  // Answers with a safe crop so the pipeline takes its normal path.
+  askComposition: async () => ({
+    content: JSON.stringify({ mode: 'smart_crop', focal_x: 0.5, focal_y: 0.5, crop_safe: true }),
+    provider: 'modal',
+    model: 'openbmb/MiniCPM-V-4.6',
+  }),
+};
+
+beforeEach(() => {
+  uploaded.length = 0;
+  removed.length = 0;
+  removeThrows = false;
+  vi.clearAllMocks();
+  renderVerticalDerivative.mockResolvedValue({ width: 1080, height: 1920, durationSeconds: 20, sizeBytes: 5_000 });
+  extractFrameAt.mockResolvedValue(true);
+  ffprobe.mockResolvedValue({ width: 1920, height: 1080, durationSeconds: 20 });
+});
+
+describe('a derivative already in storage when a later step fails', () => {
+  it('takes the derivative back out when poster GENERATION throws', async () => {
+    extractFrameAt.mockRejectedValueOnce(new Error('ffmpeg died'));
+
+    await expect(runVerticalPipeline(input)).rejects.toThrow(VerticalPipelineFailure);
+
+    expect(uploaded).toHaveLength(1);
+    // The exact object that was uploaded is the exact object deleted.
+    expect(removed).toEqual(uploaded);
+  });
+
+  /**
+   * The quieter version: ffmpeg exits 0 but writes no file, because the seek
+   * landed past the last decodable frame. Nothing threw, and the derivative
+   * would still be stranded.
+   */
+  it('takes the derivative back out when the poster extracts to nothing', async () => {
+    extractFrameAt.mockResolvedValueOnce(false);
+
+    await expect(runVerticalPipeline(input)).rejects.toThrow(/extracted to nothing/);
+    expect(removed).toEqual(uploaded);
+  });
+
+  /**
+   * A rejected upload does not prove the object is absent.
+   *
+   * The PUT can reach the bucket and store the object while the response is
+   * lost coming back — a timeout, a reset connection. Cleaning up only what
+   * we saw succeed would leave exactly the unreferenced file this block
+   * exists to prevent, and it would happen precisely when the network is
+   * already misbehaving. So once an upload has been ATTEMPTED its key is
+   * cleaned up regardless; deleting a key that was never written is harmless.
+   */
+  it('removes the poster key too when its upload failed but may have landed', async () => {
+    // First upload (derivative) succeeds; the second (poster) rejects.
+    uploadFile.mockImplementationOnce(async (key: string) => { uploaded.push(key); });
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(runVerticalPipeline(input)).rejects.toThrow(/could not be stored/);
+
+    // Only the derivative is known to have landed...
+    expect(uploaded).toHaveLength(1);
+    // ...but BOTH keys are cleaned up, because the poster's fate is unknown.
+    expect(removed).toHaveLength(2);
+    expect(removed[0]).toContain('vertical');
+    expect(removed[1]).toContain('poster');
+  });
+
+  /**
+   * Cleanup is best-effort — it must never mask the original failure — but it
+   * is never silent. If the delete fails there really is an orphan, and this
+   * log line is the only thing that will ever name it.
+   */
+  it('reports an orphan loudly when the cleanup delete itself fails', async () => {
+    extractFrameAt.mockRejectedValueOnce(new Error('ffmpeg died'));
+    removeThrows = true;
+
+    // The ORIGINAL failure still surfaces — cleanup does not replace it.
+    await expect(runVerticalPipeline(input)).rejects.toThrow(VerticalPipelineFailure);
+
+    expect(errorLog).toHaveBeenCalled();
+    const [message, context] = errorLog.mock.calls.at(-1)!;
+    expect(String(message)).toMatch(/orphan/i);
+    expect(context).toMatchObject({ videoId: 'video-1', clipId: 'clip-1' });
+    // The key is named, because it is now the only way to find the object.
+    expect(String((context as { storageKey: string }).storageKey)).toContain('clip-1');
+  });
+});
+
+describe('the third path: both objects stored, the row that names them fails', () => {
+  /**
+   * The least obvious leak, and the one the pipeline itself cannot see. The
+   * media is finished and correct; persistence fails; the orchestrator is the
+   * only place that knows both keys and that nothing recorded them.
+   */
+  it('discards both objects when persistence fails after upload', async () => {
+    await discardUploadedObjects(
+      ['vertical/clip-1.mp4', 'posters/clip-1.jpg'],
+      { videoId: 'video-1', clipId: 'clip-1', reason: 'persist_failed' },
+    );
+    expect(removed).toEqual(['vertical/clip-1.mp4', 'posters/clip-1.jpg']);
+  });
+
+  it('skips absent keys rather than deleting nothing loudly', async () => {
+    await discardUploadedObjects([null, undefined, ''], { videoId: 'v', clipId: 'c', reason: 'none' });
+    expect(remove).not.toHaveBeenCalled();
+  });
+});
+
+describe('the canonical clip, one step earlier in the same function', () => {
+  /**
+   * The same shape as the derivative and the poster: the file lands in
+   * storage, the row that would name it fails to write, and nothing can find
+   * it again. The clip ROW survives here — it just has no key on it — so this
+   * one is invisible even to a per-clip inspection, and only a listing of the
+   * bucket would ever turn it up.
+   */
+  it('discards the canonical upload when its row fails to write', async () => {
+    await discardUploadedObjects(
+      ['clips/video-1/clip-1.mp4'],
+      { videoId: 'video-1', clipId: 'clip-1', reason: 'canonical_persist_failed' },
+    );
+    expect(removed).toEqual(['clips/video-1/clip-1.mp4']);
+  });
+});
+
+describe('an upload that rejected may still have landed', () => {
+  /**
+   * Every upload in this pipeline now cleans up on rejection, not just the
+   * poster. A PUT can store the object and lose its response on the way back;
+   * treating a rejection as proof of absence leaves the file behind exactly
+   * when the network is already misbehaving. The keys are deterministic, so
+   * deleting one that was never written costs nothing.
+   */
+  it('discards the derivative when its own upload rejects', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(runVerticalPipeline(input)).rejects.toThrow(/derivative could not be stored/);
+
+    // Nothing was confirmed stored, and the key is cleaned up anyway.
+    expect(uploaded).toHaveLength(0);
+    expect(removed).toHaveLength(1);
+    expect(removed[0]).toContain('vertical');
+  });
+});
+
+describe('cleanup must not destroy media it did not create', () => {
+  /**
+   * The keys are deterministic — clips/<video>/<clip>-vertical.mp4 — so a
+   * retry writes to the same place a previous run wrote to.
+   *
+   * A clip whose canonical is fine and whose derivative failed gets retried.
+   * If the re-upload then rejects, deleting that key would destroy a working
+   * derivative from the earlier run to tidy up a file that may not even
+   * exist. S3 leaves the previous object intact when a PUT fails, so the old
+   * media is still good — and cleanup exists to collect what THIS attempt
+   * created, never to remove media that was already there.
+   */
+  it('leaves an existing derivative alone when the re-upload rejects', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(
+      runVerticalPipeline({
+        ...input,
+        currentDerivativeKey: async () => 'clips/video-1/clip-1-vertical.mp4',
+      }),
+    ).rejects.toThrow(/derivative could not be stored/);
+
+    // Nothing deleted: the row still names that key, so the object there
+    // predates this attempt.
+    expect(removed).toEqual([]);
+  });
+
+  it('still cleans up when no object was there before', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(
+      runVerticalPipeline({ ...input, currentDerivativeKey: async () => null }),
+    ).rejects.toThrow(/derivative could not be stored/);
+
+    expect(removed).toHaveLength(1);
+    expect(removed[0]).toContain('vertical');
+  });
+
+  /**
+   * The retention race. The sweep can clear this clip's keys and delete its
+   * objects while the render is in flight — so a decision made from the row
+   * as it looked before the cut began would say "it was already there" about
+   * an object that has since been collected, skip cleanup, and orphan
+   * whatever this attempt then wrote.
+   *
+   * Asking at the moment of failure sees the cleared row and cleans up.
+   */
+  it('cleans up when retention cleared the key mid-render', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(
+      runVerticalPipeline({
+        // The row named this key when the render started; by the time the
+        // upload failed, the sweep had cleared it.
+        ...input,
+        currentDerivativeKey: async () => null,
+      }),
+    ).rejects.toThrow(/derivative could not be stored/);
+
+    expect(removed).toHaveLength(1);
+  });
+
+  /** A failed read never leaves an object we may have created behind. */
+  it('cleans up when the key cannot be read at all', async () => {
+    uploadFile.mockImplementationOnce(async () => { throw new Error('connection reset'); });
+
+    await expect(
+      runVerticalPipeline({
+        ...input,
+        currentDerivativeKey: async () => { throw new Error('database unavailable'); },
+      }),
+    ).rejects.toThrow(/derivative could not be stored/);
+
+    expect(removed).toHaveLength(1);
+  });
+});
+
+describe('the whole decision table, one row at a time', () => {
+  const key = 'clips/v/c-vertical.mp4';
+  const decide = (snapshotKey: string | null, currentKey: string | null | undefined, readFailed = false) =>
+    shouldDiscardOnUploadFailure({ key, snapshotKey, currentKey, readFailed });
+
+  /**
+   * Written as six cases because getting it wrong in either direction has
+   * happened three times on this branch: deleting media we did not create,
+   * and leaking media we did.
+   */
+  it('deletes when nobody owned the key and still does not', () => {
+    expect(decide(null, null)).toBe(true);
+  });
+
+  it('spares it when the row owns it now', () => {
+    expect(decide(null, key)).toBe(false);
+  });
+
+  it('deletes on an unreadable row when the snapshot showed no owner', () => {
+    // Nothing was there when we started, so anything there now is ours.
+    expect(decide(null, undefined, true)).toBe(true);
+  });
+
+  it('deletes when retention swept the key mid-render', () => {
+    // The snapshot owned it; the sweep cleared it; what sits there is ours.
+    expect(decide(key, null)).toBe(true);
+  });
+
+  it('spares media that predates this attempt', () => {
+    expect(decide(key, key)).toBe(false);
+  });
+
+  /**
+   * The row that matters most, and the one I got wrong: an unavailable
+   * database must never authorise deleting media the snapshot showed we
+   * already had. Unknown means leave it alone — an orphan is a bill, a
+   * deleted clip is gone.
+   */
+  it('NEVER deletes on an unreadable row when the snapshot owned the key', () => {
+    expect(decide(key, undefined, true)).toBe(false);
+  });
+});
+
+describe('every cleanup path obeys the same ownership rule', () => {
+  /**
+   * The bug this exists to stop recurring: the upload-failure path learned
+   * the ownership rule and the persistence-failure path eight lines below it
+   * did not, so a retry whose canonical already existed had that working clip
+   * deleted when its row write failed — leaving the surviving row pointing at
+   * nothing.
+   *
+   * A guard over the source, because the failure mode is "one branch was
+   * missed", and only reading them all can catch that.
+   */
+  it('no discard in the orchestrator decides for itself', () => {
+    const src = readFileSync(
+      path.join(__dirname, '..', 'src/services/media/verticalOrchestrator.ts'),
+      'utf8',
+    );
+    // Exactly one place deletes anything, and it is the helper that applies
+    // the ownership table. A second call site is how the last three bugs got
+    // in: one branch learned the rule and its sibling did not.
+    const direct = src.split('\n').filter((line) => line.includes('await discardUploadedObjects('));
+    expect(direct).toHaveLength(1);
+
+    // ...and that one call sits inside the helper, after the rule is applied.
+    const helper = src.slice(
+      src.indexOf('async function discardWhatThisAttemptMade'),
+      src.indexOf('Take one candidate all the way to READY'),
+    );
+    expect(helper).toContain('shouldDiscardOnUploadFailure');
+    expect(helper).toContain('await discardUploadedObjects(');
+  });
+
+  /**
+   * A zero-row write is a failure, not a success. The clip can be deleted
+   * mid-render by a concurrent retry, and an UPDATE that matches nothing
+   * returns perfectly happily.
+   */
+  it('treats a persist that matched no row as a failure', () => {
+    const src = readFileSync(
+      path.join(__dirname, '..', 'src/services/media/verticalOrchestrator.ts'),
+      'utf8',
+    );
+    expect(src).toContain('const wrote = await setClipStatus');
+    expect(src).toContain('if (!wrote)');
+  });
+});
