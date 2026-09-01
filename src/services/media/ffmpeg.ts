@@ -102,6 +102,7 @@ export async function createAnalysisProxy(
       '-loglevel', 'error',
       '-y',
       '-i', inputPath,
+      '-map', '0:v:0',
       '-vf', `scale=-2:${env.PROXY_HEIGHT}:flags=bicubic`,
       '-r', String(env.PROXY_FPS),
       '-c:v', 'libx264',
@@ -113,6 +114,8 @@ export async function createAnalysisProxy(
       '-keyint_min', String(gopFrames),
       '-sc_threshold', '0',
       '-an',
+      '-sn',
+      '-dn',
       '-movflags', '+faststart',
       outputPath,
     ],
@@ -148,7 +151,10 @@ export async function splitIntoChunks(
       '-y',
       '-i', proxyPath,
       '-c', 'copy',
-      '-map', '0',
+      '-map', '0:v:0',
+      '-an',
+      '-sn',
+      '-dn',
       '-f', 'segment',
       '-segment_time', String(chunkSeconds),
       '-reset_timestamps', '1',
@@ -227,10 +233,13 @@ export async function extractAudioSegments(
       '-y',
       '-i', inputPath,
       '-vn',
+      '-map', '0:a:0',
       '-ac', '1',
       '-ar', '16000',
       '-c:a', 'libmp3lame',
       '-b:a', env.TRANSCRIBE_AUDIO_BITRATE,
+      '-sn',
+      '-dn',
       '-f', 'segment',
       '-segment_time', String(segmentSeconds),
       '-reset_timestamps', '1',
@@ -281,15 +290,25 @@ export interface CutClipOptions {
 export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: number; durationSeconds: number }> {
   const duration = Math.max(0.1, options.endSeconds - options.startSeconds);
 
+  // Input-seek to a keyframe before the requested start, then output-seek to
+  // the exact start. Without the output seek, `-t` measures from the keyframe,
+  // so a clip starting a few seconds after a keyframe ends a few seconds early
+  // — which cuts speakers off mid-sentence.
+  const preRollSeconds = Math.min(options.startSeconds, 10);
+  const coarseStartSeconds = Math.max(0, options.startSeconds - preRollSeconds);
+  const outputOffsetSeconds = options.startSeconds - coarseStartSeconds;
+
   const args = [
     '-hide_banner',
     '-loglevel', 'error',
     '-y',
-    // Coarse input seek for speed, then an accurate output seek from the
-    // keyframe: fast on long sources without drifting off the requested start.
-    '-ss', options.startSeconds.toFixed(3),
+    '-ss', coarseStartSeconds.toFixed(3),
     '-i', options.inputPath,
+    '-ss', outputOffsetSeconds.toFixed(3),
+    // `-t` enforces the minimum-duration clamp (the `Math.max(0.1, …)`
+    // above) and still stops at the exact end when no clamp was applied.
     '-t', duration.toFixed(3),
+    '-map', '0:v:0',
     '-c:v', 'libx264',
     '-preset', env.CLIP_PRESET,
     '-crf', String(env.CLIP_VIDEO_CRF),
@@ -303,12 +322,12 @@ export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: num
   }
 
   if (options.hasAudio) {
-    args.push('-c:a', 'aac', '-b:a', env.CLIP_AUDIO_BITRATE, '-ac', '2');
+    args.push('-map', '0:a:0?', '-c:a', 'aac', '-b:a', env.CLIP_AUDIO_BITRATE, '-ac', '2');
   } else {
     args.push('-an');
   }
 
-  args.push('-movflags', '+faststart', options.outputPath);
+  args.push('-sn', '-dn', '-movflags', '+faststart', options.outputPath);
 
   await run(env.FFMPEG_PATH, args, { timeoutMs: 60 * 60 * 1000 });
 
@@ -441,12 +460,14 @@ export async function renderVerticalDerivative(
   if (options.cropFilter) {
     // Crop the chosen source window, then scale it up to delivery size.
     args.push('-vf', `${options.cropFilter},scale=${width}:${height},setsar=1`);
+    args.push('-map', '0:v:0');
+    if (options.hasAudio) args.push('-map', '0:a:0?');
   } else {
     const sigma = options.blurSigma ?? 24;
     args.push(
       '-filter_complex',
       [
-        `[0:v]split=2[bg][fg]`,
+        `[0:v:0]split=2[bg][fg]`,
         // increase=cover the canvas, crop the overflow, blur hard enough to
         // read as texture rather than as a second, confusing video.
         `[bg]scale=${width}:${height}:force_original_aspect_ratio=increase,` +
@@ -457,7 +478,7 @@ export async function renderVerticalDerivative(
       ].join(';'),
       '-map', '[v]',
     );
-    if (options.hasAudio) args.push('-map', '0:a?');
+    if (options.hasAudio) args.push('-map', '0:a:0?');
   }
 
   args.push(
@@ -472,7 +493,7 @@ export async function renderVerticalDerivative(
   if (options.hasAudio) args.push('-c:a', 'aac', '-b:a', env.CLIP_AUDIO_BITRATE, '-ac', '2');
   else args.push('-an');
 
-  args.push('-movflags', '+faststart', options.outputPath);
+  args.push('-sn', '-dn', '-movflags', '+faststart', options.outputPath);
 
   await run(env.FFMPEG_PATH, args, { timeoutMs: 60 * 60 * 1000 });
 
