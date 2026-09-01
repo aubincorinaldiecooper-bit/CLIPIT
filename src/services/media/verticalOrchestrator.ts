@@ -144,6 +144,45 @@ function compositionAsker(input: OrchestrateInput, canonicalKey: string, duratio
 }
 
 /**
+ * Discard objects this attempt created — and only those.
+ *
+ * Every cleanup path in this file goes through here. They did not, and the
+ * cost of that was a run of bugs all wearing the same shape: the upload
+ * failure learned the ownership rule while the persistence failure eight
+ * lines below it kept deleting whatever sat at the key, including a canonical
+ * clip that played perfectly and a row still pointing at it.
+ *
+ * The rule itself lives in shouldDiscardOnUploadFailure, written as a table.
+ * This just makes sure nothing decides for itself.
+ */
+async function discardWhatThisAttemptMade(
+  clipId: string,
+  entries: Array<{ key: string | null; snapshotKey: string | null; read: () => Promise<string | null> }>,
+  context: { videoId: string; clipId: string; reason: string },
+): Promise<void> {
+  for (const entry of entries) {
+    if (!entry.key) continue;
+
+    let currentKey: string | null | undefined;
+    let readFailed = false;
+    try {
+      currentKey = await entry.read();
+    } catch {
+      readFailed = true;
+    }
+
+    if (shouldDiscardOnUploadFailure({
+      key: entry.key,
+      snapshotKey: entry.snapshotKey,
+      currentKey,
+      readFailed,
+    })) {
+      await discardUploadedObjects([entry.key], context);
+    }
+  }
+}
+
+/**
  * Take one candidate all the way to READY, or fail it with a named stage.
  *
  * Idempotent by construction, at two levels. upsertClipForMatch returns the
@@ -241,49 +280,48 @@ async function prepareCandidate(
     try {
       await getStorage().uploadFile(canonicalKey, canonicalPath, 'video/mp4');
     } catch (error) {
-      // Both readings: what the row said when the cut began, and what it says
-      // now. The sweep can clear this clip mid-render, so a stale answer would
-      // skip cleanup for an object only this attempt made — and an
-      // unreachable database must not authorise deleting media the snapshot
-      // showed we had. See shouldDiscardOnUploadFailure for the full table.
-      let current: string | null | undefined;
-      let readFailed = false;
-      try {
-        current = (await getClip(clip.id))?.storageKey ?? null;
-      } catch {
-        readFailed = true;
-      }
-
-      if (shouldDiscardOnUploadFailure({
-        key: canonicalKey,
-        snapshotKey: clip.storageKey,
-        currentKey: current,
-        readFailed,
-      })) {
-        await discardUploadedObjects([canonicalKey], {
-          videoId: input.videoId,
-          clipId: clip.id,
-          reason: 'canonical_upload_failed',
-        });
-      }
+      await discardWhatThisAttemptMade(
+        clip.id,
+        [{
+          key: canonicalKey,
+          snapshotKey: clip.storageKey,
+          read: async () => (await getClip(clip.id))?.storageKey ?? null,
+        }],
+        { videoId: input.videoId, clipId: clip.id, reason: 'canonical_upload_failed' },
+      );
       throw error;
     }
-    // The same shape as the derivative and poster below, one step earlier:
-    // the file is in storage and the row that would name it has not been
-    // written. If that write fails the object is unreachable — the clip row
-    // survives without a key, so no sweep and no video deletion can find it.
+    // The file is in storage and the row that would name it has not been
+    // written yet. Two ways that goes wrong, and both are failures:
+    //
+    //  - the write throws
+    //  - the write succeeds and matches NOTHING, because a concurrent retry
+    //    or a deleted video took the clip away. That returns happily and
+    //    would otherwise leave the object referenced by no row at all.
+    //
+    // Either way the discard goes through the same ownership rule as the
+    // upload above. Deleting unconditionally here was its own bug: on a retry
+    // whose canonical already existed, a failed row write destroyed a clip
+    // that played perfectly and left the surviving row pointing at nothing.
     try {
-      await setClipStatus(clip.id, 'ready', {
+      const wrote = await setClipStatus(clip.id, 'ready', {
         storageKey: canonicalKey,
         durationSeconds: Number(cut.durationSeconds.toFixed(3)),
         sizeBytes: cut.sizeBytes,
       });
+      if (!wrote) {
+        throw new Error(`Clip ${clip.id} no longer exists — its canonical cut has nowhere to be recorded`);
+      }
     } catch (error) {
-      await discardUploadedObjects([canonicalKey], {
-        videoId: input.videoId,
-        clipId: clip.id,
-        reason: 'canonical_persist_failed',
-      });
+      await discardWhatThisAttemptMade(
+        clip.id,
+        [{
+          key: canonicalKey,
+          snapshotKey: clip.storageKey,
+          read: async () => (await getClip(clip.id))?.storageKey ?? null,
+        }],
+        { videoId: input.videoId, clipId: clip.id, reason: 'canonical_persist_failed' },
+      );
       throw error;
     }
     canonicalGenerationMs = Math.round(performance.now() - startedAt);
@@ -334,8 +372,22 @@ async function prepareCandidate(
         retentionClass: 'temporary',
       });
     } catch (error) {
-      await discardUploadedObjects(
-        [media.derivativeStorageKey, media.posterStorageKey],
+      // Both keys are deterministic too, so a retry can be re-uploading over
+      // media an earlier run made and a surviving row still names.
+      await discardWhatThisAttemptMade(
+        clip.id,
+        [
+          {
+            key: media.derivativeStorageKey,
+            snapshotKey: clip.derivativeStorageKey,
+            read: async () => (await getClip(clip.id))?.derivativeStorageKey ?? null,
+          },
+          {
+            key: media.posterStorageKey,
+            snapshotKey: clip.posterStorageKey,
+            read: async () => (await getClip(clip.id))?.posterStorageKey ?? null,
+          },
+        ],
         { videoId: input.videoId, clipId: clip.id, reason: 'persist_failed' },
       );
       throw new VerticalPipelineFailure(

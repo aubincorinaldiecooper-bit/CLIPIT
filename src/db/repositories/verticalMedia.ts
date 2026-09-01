@@ -256,7 +256,19 @@ export async function claimUnkeptPreRenderedMedia(
  * closing it entirely would need SERIALIZABLE or an explicit lock ordering
  * shared with approveClip.
  */
-export async function clearUnkeptMatchesForRequest(clipRequestId: string): Promise<string[]> {
+export async function clearUnkeptMatchesForRequest(
+  clipRequestId: string,
+  /**
+   * The attempt that planned this deck. Null skips the fence, for callers
+   * that run before any planning.
+   *
+   * Without it, a stalled worker resuming after its replacement had already
+   * planned and rendered would clear the NEWER run's matches and delete its
+   * media — the token fenced only the release, so everything before it stayed
+   * open to a run that had already lost.
+   */
+  attemptId: string | null,
+): Promise<string[]> {
   const rows = await queryRows<{
     storage_key: string | null;
     derivative_storage_key: string | null;
@@ -266,6 +278,11 @@ export async function clearUnkeptMatchesForRequest(clipRequestId: string): Promi
        SELECT m.id AS match_id
          FROM clip_matches m
         WHERE m.clip_request_id = $1
+          -- Only the attempt that currently owns this request may clear it.
+          AND ($2::uuid IS NULL OR EXISTS (
+            SELECT 1 FROM clip_requests r
+             WHERE r.id = $1 AND r.deck_attempt_id = $2::uuid
+          ))
           AND NOT EXISTS (
             SELECT 1 FROM clips k
              WHERE k.clip_match_id = m.id AND k.approved_at IS NOT NULL
@@ -278,7 +295,7 @@ export async function clearUnkeptMatchesForRequest(clipRequestId: string): Promi
        DELETE FROM clip_matches WHERE id IN (SELECT match_id FROM doomed)
      )
      SELECT storage_key, derivative_storage_key, poster_storage_key FROM files`,
-    [clipRequestId],
+    [clipRequestId, attemptId],
   );
   return rows.flatMap((row) =>
     [row.storage_key, row.derivative_storage_key, row.poster_storage_key]

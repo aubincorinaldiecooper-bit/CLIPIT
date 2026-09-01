@@ -471,8 +471,14 @@ export async function setClipStatus(
     /** Written only when provided — on the success of the render that used it. */
     captions?: unknown;
   } = {},
-): Promise<void> {
-  await queryOne(
+): Promise<boolean> {
+  // Reports whether a row was actually there.
+  //
+  // A concurrent retry or a deleted video can take the clip out from under a
+  // render in flight. The UPDATE then matches nothing and returns perfectly
+  // happily, and a caller that assumed success would leave its uploaded
+  // objects referenced by no row at all.
+  const row = await queryOne<{ id: string }>(
     `UPDATE clips
         SET status = $2,
             error_message = $3,
@@ -481,7 +487,8 @@ export async function setClipStatus(
             size_bytes = COALESCE($6, size_bytes),
             captions = COALESCE($7::jsonb, captions),
             updated_at = now()
-      WHERE id = $1`,
+      WHERE id = $1
+      RETURNING id`,
     [
       clipId,
       status,
@@ -492,6 +499,7 @@ export async function setClipStatus(
       options.captions === undefined ? null : JSON.stringify(options.captions),
     ],
   );
+  return row !== null;
 }
 
 /** Give a clip a name of the person's own. Null takes the name back. */

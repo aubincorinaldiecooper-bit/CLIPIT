@@ -268,14 +268,17 @@ export async function recordDeckPlan(
 export async function recordDeckAvailability(
   requestId: string,
   counts: { availableCandidateCount: number; effectiveDeckTarget: number },
+  /** Fenced like the gate: a superseded attempt must not rewrite these. */
+  attemptId: string | null,
 ): Promise<void> {
   await queryOne(
     `UPDATE clip_requests
         SET available_candidate_count = $2,
             effective_deck_target     = $3,
             updated_at                = now()
-      WHERE id = $1`,
-    [requestId, counts.availableCandidateCount, counts.effectiveDeckTarget],
+      WHERE id = $1
+        AND ($4::uuid IS NULL OR deck_attempt_id = $4::uuid)`,
+    [requestId, counts.availableCandidateCount, counts.effectiveDeckTarget, attemptId],
   );
 }
 

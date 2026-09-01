@@ -35,7 +35,7 @@ const upsertClipForMatch = vi.fn(async () => ({
   derivativeStorageKey: null,
   posterStorageKey: null,
 }));
-const setClipStatus = vi.fn(async () => undefined);
+const setClipStatus = vi.fn(async () => true);
 vi.mock('../src/db/repositories/clips.js', () => ({
   upsertClipForMatch,
   setClipStatus,

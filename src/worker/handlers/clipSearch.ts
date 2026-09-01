@@ -388,7 +388,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // it is the only one that runs when the notes came up empty.
     // Clear anything from a previous attempt so a retry cannot double-insert,
     // taking its rendered media with it rather than orphaning it.
-    await clearPreviousAttempt(clipRequestId, log);
+    await clearPreviousAttempt(clipRequestId, log, deckAttemptId);
 
     // (the deck plan is declared earlier — see above, before the notes path)
 
@@ -495,7 +495,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // Chunks were searched independently, so the same moment can appear
       // twice — including as two pieces either side of a chunk boundary. Fold
       // duplicates together before the search is reported complete.
-      const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
+      const finalCount = await aggregateStoredMatches(clipRequestId, chunks, deckAttemptId);
 
       // After aggregation, because merging rewrites match rows and their ids.
       await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
@@ -604,7 +604,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
  * local range extends past that chunk's end, which is the honest description of
  * what was found. Clips are always cut using the global range.
  */
-async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[]): Promise<number> {
+async function aggregateStoredMatches(
+  clipRequestId: string,
+  chunks: VideoChunk[],
+  deckAttemptId: string | null,
+): Promise<number> {
   const stored = await listMatches(clipRequestId);
   if (stored.length <= 1) return stored.length;
 
@@ -667,7 +671,7 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
   // alongside a freshly merged one covering the same seconds: a duplicate in
   // the deck, which is a great deal better than reaching into someone's
   // library and deleting what they chose.
-  await clearPreviousAttempt(clipRequestId, logger.child({ clipRequestId }));
+  await clearPreviousAttempt(clipRequestId, logger.child({ clipRequestId }), deckAttemptId);
   await insertMatches(clipRequestId, rows);
 
   logger.info('merged overlapping matches', {
@@ -713,7 +717,12 @@ async function aggregateStoredMatches(clipRequestId: string, chunks: VideoChunk[
  * Best-effort on the deletes and loud when they fail, for the same reason the
  * pipeline's own cleanup is: an orphan nobody names is an orphan forever.
  */
-async function clearPreviousAttempt(clipRequestId: string, log: Logger): Promise<void> {
+async function clearPreviousAttempt(
+  clipRequestId: string,
+  log: Logger,
+  /** Fenced: a superseded run must not clear the work of the run that replaced it. */
+  attemptId: string | null,
+): Promise<void> {
   // Clears the matches and returns the files they held, in one statement, and
   // never touches a moment the creator kept — see clearUnkeptMatchesForRequest
   // for why all three of those have to be true together.
@@ -721,7 +730,7 @@ async function clearPreviousAttempt(clipRequestId: string, log: Logger): Promise
   // If it throws, nothing is deleted and the job retries. That is the
   // recoverable outcome: proceeding blind would cascade away clip rows whose
   // files we never learned the names of, and an orphan is forever.
-  const keys = await clearUnkeptMatchesForRequest(clipRequestId);
+  const keys = await clearUnkeptMatchesForRequest(clipRequestId, attemptId);
   if (keys.length === 0) return;
 
   const storage = getStorage();
@@ -790,6 +799,7 @@ export async function completeRequestWithDeck(input: {
     workDir: input.workDir,
     log,
     tally: input.tally,
+    deckAttemptId: input.deckAttemptId,
     // Passed in rather than started inside: the whole original source is
     // downloaded before a single candidate renders, and a clock started after
     // it reported a wait that no creator ever had. A 2GB source is a minute
@@ -908,6 +918,8 @@ async function buildVerticalDeck(input: {
   tally: UsageTally;
   /** When the creator's wait began — before the source download, not after. */
   startedAtMs: number;
+  /** Fenced: a superseded run must not rewrite this request's deck facts. */
+  deckAttemptId: string | null;
 }): Promise<VerticalDeckResult> {
   const { clipRequestId, request, video, intent, log } = input;
   const empty: VerticalDeckResult = {
@@ -952,7 +964,7 @@ async function buildVerticalDeck(input: {
     await recordDeckAvailability(clipRequestId, {
       availableCandidateCount: 0,
       effectiveDeckTarget: 0,
-    });
+    }, input.deckAttemptId);
     return empty;
   }
 
@@ -988,7 +1000,7 @@ async function buildVerticalDeck(input: {
   await recordDeckAvailability(clipRequestId, {
     availableCandidateCount: candidates.length,
     effectiveDeckTarget,
-  });
+  }, input.deckAttemptId);
   if (effectiveDeckTarget < intent.requestedCount) {
     log.info('fewer eligible moments than the creator asked for', {
       requested: intent.requestedCount,
@@ -1143,7 +1155,7 @@ async function answerFromNotes(input: {
   if (notes.length === 0) return { matchCount: 0, deckCompleted: false };
 
   await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
-  await clearPreviousAttempt(clipRequestId, log);
+  await clearPreviousAttempt(clipRequestId, log, input.deckAttemptId);
 
   const result = await searchNotes({
     instruction,
@@ -1277,7 +1289,7 @@ async function answerFromNotes(input: {
   }
 
   await insertMatches(clipRequestId, found);
-  const finalCount = await aggregateStoredMatches(clipRequestId, chunks);
+  const finalCount = await aggregateStoredMatches(clipRequestId, chunks, input.deckAttemptId);
 
   let deckCompleted = false;
   await withWorkDir(`notes-${clipRequestId}`, async (dir) => {
