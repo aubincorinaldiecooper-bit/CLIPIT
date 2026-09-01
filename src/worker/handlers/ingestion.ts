@@ -14,9 +14,10 @@ import { enqueuePreprocessing, type IngestionJob } from '../../queues/index.js';
 /**
  * Brings the source bytes under our control.
  *
- * Uploads are already in storage (the client PUT them directly), so this only
- * confirms the object exists. YouTube sources are fetched with yt-dlp, along
- * with their captions when available.
+ * New direct uploads skip this job because the completion request has already
+ * confirmed the object exists. The upload branch remains for jobs queued by
+ * an older API instance during a rolling deploy. YouTube sources are fetched
+ * with yt-dlp, along with their captions when available.
  */
 export async function handleIngestion(job: Job<IngestionJob>): Promise<void> {
   const { videoId } = job.data;

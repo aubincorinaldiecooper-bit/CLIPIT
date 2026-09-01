@@ -22,7 +22,7 @@ import {
   listMatches,
 } from '../../db/repositories/clipRequests.js';
 import { listClipsForRequest } from '../../db/repositories/clips.js';
-import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
+import { enqueueClipSearch, enqueueIngestion, enqueuePreprocessing } from '../../queues/index.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import { serializeClipRequest, serializeVideo, serializeVideoWithPlayback, videoPosterUrl } from '../serializers.js';
@@ -370,9 +370,22 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     }
 
     await updateVideoMedia(videoId, { sizeBytes: object.sizeBytes });
-    await setVideoStatus(videoId, 'queued');
-    await enqueueIngestion({ videoId });
-    logger.info('upload completed, ingestion queued', { videoId, sizeBytes: object.sizeBytes });
+
+    // The browser upload is already in our storage, and the HEAD above has
+    // just confirmed both that it exists and how large it is. Sending it
+    // through ingestion used to repeat that same HEAD in another worker job,
+    // leaving the screen at "Waiting to start" until two separate queues had
+    // taken their turns. YouTube still needs ingestion because its bytes have
+    // not been fetched; a completed direct upload can start preparation now.
+    await setVideoStatus(videoId, 'preprocessing');
+    try {
+      await enqueuePreprocessing({ videoId });
+    } catch (error) {
+      const message = `Could not start video preparation: ${error instanceof Error ? error.message : String(error)}`;
+      await setVideoStatus(videoId, 'failed', message);
+      throw error;
+    }
+    logger.info('upload completed, preprocessing queued', { videoId, sizeBytes: object.sizeBytes });
 
     const updated = await getVideo(videoId);
     return reply.send({ video: serializeVideo(updated!) });

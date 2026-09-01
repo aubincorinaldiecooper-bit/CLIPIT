@@ -187,10 +187,11 @@ curl -X PUT "$UPLOAD_URL" -H 'Content-Type: video/mp4' --upload-file stream.mp4
 curl -sX POST $API/api/videos/$VIDEO_ID/uploaded -H "Authorization: Bearer $TOKEN"
 ```
 
-`/uploaded` verifies the object is really in storage before queueing, and is
-idempotent — calling it again once the pipeline has started just reports
-current state. It is the only way an upload enters the pipeline; reading
-`GET /api/videos/:videoId` has no side effects.
+`/uploaded` verifies the object is really in storage and sends it straight to
+preparation, without making it wait in a second queue just to verify the same
+object again. It is idempotent — calling it again once the pipeline has started
+just reports current state. It is the only way an upload enters the pipeline;
+reading `GET /api/videos/:videoId` has no side effects.
 
 **3. Wait for preprocessing.** Poll until `status` is `ready`.
 
@@ -302,7 +303,7 @@ the server process and are never returned by any endpoint.
 
 | Queue | Work |
 | --- | --- |
-| `video-ingestion` | confirm the upload, or download with yt-dlp (+ captions) |
+| `video-ingestion` | download YouTube footage with yt-dlp (+ captions); also finish direct-upload jobs left by an older API instance during a deploy |
 | `video-preprocessing` | ffprobe, build the proxy, cut analysis chunks |
 | `video-transcription` | parse captions, or extract audio once and run STT |
 | `clip-search` | fan out over chunks, call Qwen with actual MP4s, store matches |
