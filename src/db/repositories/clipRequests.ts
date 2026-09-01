@@ -251,10 +251,22 @@ export async function recordSearchApproach(
  * what being superseded should mean.
  */
 export async function claimClipRequestAttempt(requestId: string): Promise<string | null> {
+  // Never over a finished answer.
+  //
+  // handleClipSearch reads the request and returns early if it is already
+  // completed, but another delivery can finish it in the gap between that
+  // read and this claim. An unconditional claim would then hand this stale
+  // delivery ownership of a request that is already answered, and every
+  // fence downstream would dutifully let it overwrite that answer.
+  //
+  // 'failed' and 'searching' stay claimable: a retry may legitimately
+  // re-attempt a failed request, and superseding a running one is the whole
+  // point of last-claimer-wins.
   const row = await queryOne<{ deck_attempt_id: string }>(
     `UPDATE clip_requests
         SET deck_attempt_id = gen_random_uuid(), updated_at = now()
       WHERE id = $1
+        AND status <> 'completed'
       RETURNING deck_attempt_id`,
     [requestId],
   );

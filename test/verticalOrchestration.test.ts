@@ -595,3 +595,31 @@ describe('a delivery holds its claim before anything can fail', () => {
       .toBeLessThan(handler.indexOf('const video = await getVideo(request.videoId)'));
   });
 });
+
+describe('a claim must not be taken over a finished answer', () => {
+  /**
+   * handleClipSearch reads the request and returns early when it is already
+   * completed — but another delivery can finish it in the gap between that
+   * read and the claim. An unconditional claim handed the stale delivery
+   * ownership of an answered request, and every fence downstream would then
+   * dutifully let it overwrite that answer.
+   *
+   * The fences are only as good as the claim they check against, which is
+   * the thing I missed when adding it.
+   */
+  it('refuses on completed, allows on searching, pending and failed', () => {
+    const src = readFileSync(
+      path.join(__dirname, '..', 'src/db/repositories/clipRequests.ts'),
+      'utf8',
+    );
+    const claim = src.slice(
+      src.indexOf('export async function claimClipRequestAttempt'),
+      src.indexOf('export async function recordDeckPlan'),
+    );
+    expect(claim).toContain("status <> 'completed'");
+    // Nothing narrower: a retry may legitimately re-attempt a failed request,
+    // and superseding a running one is the point of last-claimer-wins.
+    expect(claim).not.toContain("status = 'pending'");
+    expect(claim).not.toContain("status <> 'failed'");
+  });
+});

@@ -114,7 +114,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   // record its own failure if a dead run had left a token behind.
   const deckAttemptId = await claimClipRequestAttempt(clipRequestId);
   if (!deckAttemptId) {
-    log.warn('clip request disappeared before it could be claimed');
+    // Gone, or finished by another delivery between the read above and this
+    // claim. Either way this delivery has nothing to say about it.
+    log.info('clip request is no longer claimable; another delivery owns the answer');
     return;
   }
 
