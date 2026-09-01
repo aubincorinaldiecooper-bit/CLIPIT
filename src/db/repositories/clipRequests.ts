@@ -267,6 +267,12 @@ export async function claimClipRequestAttempt(requestId: string): Promise<string
         SET deck_attempt_id = gen_random_uuid(), updated_at = now()
       WHERE id = $1
         AND status <> 'completed'
+        -- And never over a deck already released to the creator. The release
+        -- and the status now move together, so this should be unreachable —
+        -- it stays because it was reachable for exactly as long as they were
+        -- two writes, and the next person to split them deserves a guard
+        -- rather than a bug.
+        AND deck_completed_at IS NULL
       RETURNING deck_attempt_id`,
     [requestId],
   );
@@ -304,6 +310,38 @@ export async function recordDeckPlan(
  * had two" is a fact about their footage and has to stay legible as that,
  * rather than being flattened into a failure or silently rounded away.
  */
+/**
+ * Open the gate AND finish the request, in one statement.
+ *
+ * These used to be two writes, and I said the fence made that benign. It did
+ * not. Between them the deck was released to the creator while the request
+ * still said 'searching', and a claim guarded only on status could seize a
+ * request whose deck was already on screen — then clear it and rebuild it
+ * underneath them.
+ *
+ * One statement, so there is no instant in which a deck is released and the
+ * request does not say so. Fenced to the attempt that planned it, like every
+ * other write this delivery makes.
+ */
+export async function releaseDeckAndComplete(
+  requestId: string,
+  attemptId: string,
+  answeredFrom: AnsweredFrom,
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
+    `UPDATE clip_requests
+        SET deck_completed_at = now(),
+            status            = 'completed',
+            error_message     = NULL,
+            answered_from     = COALESCE($3, answered_from),
+            updated_at        = now()
+      WHERE id = $1 AND deck_attempt_id = $2
+      RETURNING id`,
+    [requestId, attemptId, answeredFrom],
+  );
+  return row !== null;
+}
+
 export async function recordDeckAvailability(
   requestId: string,
   counts: { availableCandidateCount: number; effectiveDeckTarget: number },
@@ -326,27 +364,6 @@ export async function recordDeckAvailability(
  * finished AND persisted, so there is no instant in which this says yes and
  * the clips behind it are not there.
  */
-export async function markDeckComplete(requestId: string, attemptId: string): Promise<boolean> {
-  // Fenced to the attempt that planned this deck.
-  //
-  // A stalled job is redelivered while the first run is still assembling. The
-  // second run re-plans — taking a new token — clears the first run's work and
-  // renders its own deck. The first run, still executing and unaware it was
-  // superseded, would otherwise reach this line and open the creator-facing
-  // gate over the second run's half-built deck: the progressive reveal the
-  // whole set-level rule exists to forbid.
-  //
-  // A superseded run matches no row and changes nothing, which is exactly
-  // right. The caller is told, so it can say so rather than assume it won.
-  const row = await queryOne<{ id: string }>(
-    `UPDATE clip_requests
-        SET deck_completed_at = now(), updated_at = now()
-      WHERE id = $1 AND deck_attempt_id = $2
-      RETURNING id`,
-    [requestId, attemptId],
-  );
-  return row !== null;
-}
 
 export async function finishClipRequest(
   requestId: string,

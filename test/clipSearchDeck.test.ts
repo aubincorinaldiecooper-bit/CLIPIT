@@ -12,7 +12,7 @@ const listMatches = vi.fn(async () => [{
   globalEndSeconds: 30,
 }]);
 const finishClipRequest = vi.fn(async () => true);
-const markDeckComplete = vi.fn(async () => true);
+const releaseDeckAndComplete = vi.fn(async () => true);
 const recordDeckAvailability = vi.fn(async () => undefined);
 const downloadToFile = vi.fn(async () => undefined);
 
@@ -29,7 +29,7 @@ vi.mock('../src/db/repositories/clipRequests.js', () => ({
   recordDeckPlan: vi.fn(),
   recordSearchApproach: vi.fn(),
   recordUncertainMatches: vi.fn(),
-  markDeckComplete,
+  releaseDeckAndComplete,
   startClipRequest: vi.fn(),
 }));
 
@@ -114,13 +114,12 @@ describe('the deck gate every finished request passes through', () => {
 
     expect(result.completed).toBe(true);
     expect(orchestrateVerticalDeck).toHaveBeenCalled();
-    // Fenced: the gate opens only for the attempt that planned this deck.
-    expect(markDeckComplete).toHaveBeenCalledWith('request-1', 'attempt-1');
-    // Fenced: the terminal write names the attempt that owns this deck, so a
-    // superseded delivery cannot stamp its outcome over a newer run's.
-    expect(finishClipRequest).toHaveBeenCalledWith(
-      'request-1', 'completed', null, 'notes', 'attempt-1',
-    );
+    // Released and completed in ONE fenced statement. As two writes there was
+    // an instant where the deck was on the creator's screen and the request
+    // still said 'searching' — which a stale delivery could claim into and
+    // rebuild underneath them.
+    expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'notes');
+    expect(finishClipRequest).not.toHaveBeenCalled();
   });
 
   it('fails without opening the gate when the original source is missing', async () => {
@@ -145,7 +144,7 @@ describe('the deck gate every finished request passes through', () => {
       null,
       'attempt-1',
     );
-    expect(markDeckComplete).not.toHaveBeenCalled();
+    expect(releaseDeckAndComplete).not.toHaveBeenCalled();
     expect(orchestrateVerticalDeck).not.toHaveBeenCalled();
   });
 
@@ -180,7 +179,7 @@ describe('the deck gate every finished request passes through', () => {
       null,
       'attempt-1',
     );
-    expect(markDeckComplete).not.toHaveBeenCalled();
+    expect(releaseDeckAndComplete).not.toHaveBeenCalled();
   });
 });
 
@@ -195,7 +194,7 @@ describe('a superseded attempt stands down', () => {
    * same partial reveal by a different route.
    */
   it('neither opens the gate nor completes the request', async () => {
-    markDeckComplete.mockResolvedValueOnce(false as never);
+    releaseDeckAndComplete.mockResolvedValueOnce(false as never);
     finishClipRequest.mockClear();
 
     const result = await completeRequestWithDeck({

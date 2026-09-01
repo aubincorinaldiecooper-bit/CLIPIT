@@ -44,7 +44,7 @@ import {
   recordDeckPlan,
   recordSearchApproach,
   recordUncertainMatches,
-  markDeckComplete,
+  releaseDeckAndComplete,
   startClipRequest,
   type NewClipMatch,
 } from '../../db/repositories/clipRequests.js';
@@ -893,17 +893,20 @@ export async function completeRequestWithDeck(input: {
   // then report the request complete either — the run that replaced it owns
   // that, and saying so here would finish a request over someone else's
   // half-built deck.
-  const opened = input.deckAttemptId
-    ? await markDeckComplete(clipRequestId, input.deckAttemptId)
+  // Released and completed together. As two writes there was an instant in
+  // which the deck was on the creator's screen while the request still said
+  // 'searching', and a stale delivery could claim it there and rebuild it
+  // underneath them.
+  const released = input.deckAttemptId
+    ? await releaseDeckAndComplete(clipRequestId, input.deckAttemptId, input.answeredFrom)
     : false;
-  if (!opened) {
+  if (!released) {
     log.warn('deck attempt was superseded before it could be released', {
       clipRequestId, answeredFrom: input.answeredFrom,
     });
     return { completed: false, deck };
   }
 
-  await finishClipRequest(clipRequestId, 'completed', null, input.answeredFrom, input.deckAttemptId);
   return { completed: true, deck };
 }
 

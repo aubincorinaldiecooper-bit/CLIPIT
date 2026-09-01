@@ -471,11 +471,19 @@ describe('a superseded attempt must not open the gate', () => {
       path.join(__dirname, '..', 'src/db/repositories/clipRequests.ts'),
       'utf8',
     );
-    const mark = src.slice(src.indexOf('export async function markDeckComplete'));
-    expect(mark).toContain('deck_attempt_id = $2');
-    // And it must report whether it won, so a superseded run can stand down
-    // rather than assume it completed the request.
-    expect(mark).toContain('RETURNING id');
+    const release = src.slice(
+      src.indexOf('export async function releaseDeckAndComplete'),
+      src.indexOf('export async function recordDeckAvailability'),
+    );
+    expect(release).toContain('deck_attempt_id = $2');
+    // It must report whether it won, so a superseded run stands down rather
+    // than assuming it completed the request.
+    expect(release).toContain('RETURNING id');
+    // And it must open the gate and finish the request TOGETHER — as two
+    // writes there was an instant where the deck was released and the request
+    // did not say so, which a stale delivery could claim into.
+    expect(release).toContain('deck_completed_at = now()');
+    expect(release).toContain("status            = 'completed'");
 
     // The token is minted by the CLAIM taken on the way in, not by planning —
     // planning happens after four checks that can fail, and minting there
