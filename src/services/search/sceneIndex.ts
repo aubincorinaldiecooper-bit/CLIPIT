@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { env } from '../../config/env.js';
-import { extractJsonObject } from './modelResponse.js';
+import { parseModelJson, REPAIRED_JSON_WARNING } from './modelResponse.js';
 import { askVideoModel, videoPartFromFile, type VideoUsageReporter } from './openrouterVideo.js';
 import { buildIndexInstruction, INDEX_SYSTEM_PROMPT } from './prompt.js';
 
@@ -58,15 +58,18 @@ const MAX_DESCRIPTION_CHARS = 2000;
  */
 export function parseModelScenes(rawText: string, chunkDurationSeconds: number): Omit<DescribeResult, 'rawResponse'> {
   const warnings: string[] = [];
-  const json = extractJsonObject(rawText ?? '');
-  if (!json) return { scenes: [], warnings: ['response contained no JSON object'] };
-
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(json);
-  } catch {
-    return { scenes: [], warnings: ['response JSON failed to parse'] };
+  const result = parseModelJson(rawText ?? '');
+  if (!result.ok) {
+    return {
+      scenes: [],
+      warnings: [result.stage === 'extract' ? 'response contained no JSON object' : 'response JSON failed to parse'],
+    };
   }
+  // Recovered, not fine: the repair keeps the chunk's minutes of footage from
+  // being recorded as unreadable, and this warning keeps the model's
+  // misbehaviour from being recorded as health.
+  if (result.repaired) warnings.push(REPAIRED_JSON_WARNING);
+  const parsedJson: unknown = result.value;
 
   const envelope = rawIndexSchema.safeParse(parsedJson);
   // `scenes` is nullish in the schema so a null does not fail the whole parse

@@ -46,6 +46,86 @@ export interface ParseResult {
   warnings: string[];
 }
 
+/**
+ * Repair the one malformation MiniCPM has actually produced: a fullwidth
+ * colon standing in for the `":` that should close a key name.
+ *
+ * Seen in production on 2026-09-01 (video 05e8510c, chunks 0 and 4): the
+ * model wrote `"description："The segment shows...` where JSON needs
+ * `"description":"The segment shows...`. One character, two visible
+ * symptoms. When the response happens to start and end with braces, the
+ * whole thing reaches JSON.parse and fails there. When there is any prose
+ * around it, the malformation desyncs the brace-scanner's string tracking —
+ * the value's own quoted words ("MIAMI") flip it in and out of strings at
+ * the wrong places — and extraction reports no JSON object at all. Either
+ * way the chunk was recorded as unreadable and its minutes of footage went
+ * undescribed over a punctuation mark.
+ *
+ * The pattern is deliberately tight: a word character, the fullwidth colon,
+ * an immediately following ASCII quote. Inside any VALID string value an
+ * unescaped `"` cannot legally follow anything, so this sequence cannot
+ * occur in well-formed JSON — which is what makes the substitution safe. A
+ * fullwidth colon in ordinary description text ("比分：3-2") is untouched:
+ * repair only runs after a straight parse has already failed, and the
+ * pattern will not match there.
+ *
+ * Deliberately NOT handled: fullwidth commas, fullwidth quotes, and the
+ * `"："` variant with the key quote intact — none observed, and their
+ * substitutions are not provably safe. Extend this only with a production
+ * payload in hand and a test pinning it.
+ */
+export function repairFullwidthJsonSeparators(text: string): string {
+  return text.replace(/([A-Za-z0-9_])："/g, '$1":"');
+}
+
+export type ModelJsonResult =
+  | { ok: true; value: unknown; repaired: boolean }
+  | { ok: false; stage: 'extract' | 'parse' };
+
+/**
+ * Extract and parse a model response, repairing the known malformation once.
+ *
+ * One implementation for all three parsers (matches, scenes, re-clip
+ * boundaries), so none of them can drift into tolerating something the
+ * others reject. `repaired` is reported back because recovering must not
+ * hide the signal: the model is still misbehaving, and the warning that
+ * says so is how anyone finds out.
+ */
+export function parseModelJson(rawText: string): ModelJsonResult {
+  const text = rawText ?? '';
+
+  const attempt = (candidate: string): { value: unknown } | { stage: 'extract' | 'parse' } => {
+    const json = extractJsonObject(candidate);
+    if (!json) return { stage: 'extract' };
+    try {
+      return { value: JSON.parse(json) };
+    } catch {
+      return { stage: 'parse' };
+    }
+  };
+
+  const straight = attempt(text);
+  if ('value' in straight) return { ok: true, value: straight.value, repaired: false };
+
+  // The repair runs on the WHOLE response and the attempt re-runs from
+  // extraction, never on the extracted slice alone. The malformation desyncs
+  // the extractor's string tracking, so the slice it returns can be bogus in
+  // three different ways — it fails to parse, it is cut short at a briefly
+  // balanced point, or there is no slice at all — and repairing a bogus
+  // slice repairs the wrong text. Repairing the response and re-reading it
+  // handles all three the same way.
+  const fixed = repairFullwidthJsonSeparators(text);
+  if (fixed !== text) {
+    const retried = attempt(fixed);
+    if ('value' in retried) return { ok: true, value: retried.value, repaired: true };
+  }
+
+  return { ok: false, stage: straight.stage };
+}
+
+/** The warning recovery adds, so the model's misbehaviour stays visible in logs. */
+export const REPAIRED_JSON_WARNING = 'response JSON repaired: fullwidth colon after a key name';
+
 /** Pulls the first balanced JSON object out of a possibly chatty response. */
 export function extractJsonObject(text: string): string | null {
   const trimmed = text.trim();
@@ -106,21 +186,19 @@ function clampConfidence(value: number): number {
 export function parseModelMatches(rawText: string): ParseResult {
   const warnings: string[] = [];
 
-  const json = extractJsonObject(rawText ?? '');
-  if (!json) {
-    // "no matches" is a legitimate, common answer in plain prose.
-    if (/\bno\b.*\b(match|moment|instance|occurrence)/i.test(rawText ?? '')) {
-      return { matches: [], warnings: ['model answered in prose with no matches'] };
+  const result = parseModelJson(rawText ?? '');
+  if (!result.ok) {
+    if (result.stage === 'extract') {
+      // "no matches" is a legitimate, common answer in plain prose.
+      if (/\bno\b.*\b(match|moment|instance|occurrence)/i.test(rawText ?? '')) {
+        return { matches: [], warnings: ['model answered in prose with no matches'] };
+      }
+      return { matches: [], warnings: ['response contained no JSON object'] };
     }
-    return { matches: [], warnings: ['response contained no JSON object'] };
-  }
-
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(json);
-  } catch {
     return { matches: [], warnings: ['response JSON failed to parse'] };
   }
+  if (result.repaired) warnings.push(REPAIRED_JSON_WARNING);
+  const parsedJson: unknown = result.value;
 
   const envelope = rawResponseSchema.safeParse(parsedJson);
   if (!envelope.success) {
@@ -171,15 +249,9 @@ export function parseReclipBoundaries(
   rawText: string,
   segmentDurationSeconds: number,
 ): { startSeconds: number; endSeconds: number } | null {
-  const json = extractJsonObject(rawText);
-  if (!json) return null;
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(json);
-  } catch {
-    return null;
-  }
+  const result = parseModelJson(rawText);
+  if (!result.ok) return null;
+  const parsed: unknown = result.value;
   if (typeof parsed !== 'object' || parsed === null) return null;
 
   const start = Number((parsed as Record<string, unknown>).start_seconds);

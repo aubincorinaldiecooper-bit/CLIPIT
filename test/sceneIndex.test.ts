@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { extractJsonObject } from '../src/services/search/modelResponse.js';
 import { parseModelScenes } from '../src/services/search/sceneIndex.js';
 
 const CHUNK_SECONDS = 120;
@@ -81,5 +82,85 @@ describe('reading a video into notes', () => {
 
     expect(result.scenes).toEqual([]);
     expect(result.warnings).toContain(warning);
+  });
+});
+
+describe('the fullwidth colon that threw away real chunks', () => {
+  /**
+   * From production, 2026-09-01, video 05e8510c: MiniCPM wrote
+   * `"description："` — a fullwidth colon standing in for the `":` that
+   * should close the key — and minutes of a real basketball video were
+   * recorded as unreadable over that one character. Two chunks died with two
+   * different log messages ("failed to parse" and "no JSON object").
+   *
+   * The logged payloads are truncated, so the exact production responses
+   * cannot be replayed here. What these pin instead is the malformation
+   * CLASS through every route it can take out of the parser: the misplaced
+   * quote desyncs the extractor's string tracking, and depending on what the
+   * description happens to contain, the response then fails to parse whole,
+   * yields a bogus briefly-balanced slice, or extracts nothing at all. The
+   * repair runs on the whole response and re-reads it, so all three recover
+   * the same way.
+   */
+  const repairWarning = 'response JSON repaired: fullwidth colon after a key name';
+
+  it('recovers the bare-JSON shape that failed at parse (the chunk-0 log line)', () => {
+    const raw =
+      '{"scenes":[{"start_seconds":0,"end_seconds":14.5,"description："The segment shows a basketball game between the Miami Heat and the Boston Celtics, with players actively moving and shooting the ball."}]}';
+    // Control: this really is the parse-failure symptom.
+    expect(() => JSON.parse(raw)).toThrow();
+
+    const result = parseModelScenes(raw, 121);
+    expect(result.scenes).toHaveLength(1);
+    expect(result.scenes[0]!.description).toContain('Miami Heat');
+    // Recovered, not fine: the warning keeps the model misbehaviour visible
+    // in the same logs that used to record the chunk as unreadable.
+    expect(result.warnings).toContain(repairWarning);
+  });
+
+  it('recovers a description whose own escaped quotes join the desync (the "MIAMI" shape)', () => {
+    const raw =
+      'Here is the scene breakdown:\n' +
+      '{"scenes":[{"start_seconds":0,"end_seconds":14.5,"description："The video shows a player in a red \\"MIAMI\\" jersey shooting while others defend."}]}';
+    // Control: unrepaired, extraction hands back a slice that cannot parse.
+    const slice = extractJsonObject(raw);
+    expect(slice === null || (() => { try { JSON.parse(slice); return false; } catch { return true; } })()).toBe(true);
+
+    const result = parseModelScenes(raw, 121);
+    expect(result.scenes).toHaveLength(1);
+    expect(result.scenes[0]!.description).toContain('"MIAMI"');
+    expect(result.warnings).toContain(repairWarning);
+  });
+
+  it('recovers when the desync swallows the closing braces entirely', () => {
+    // A brace inside the description is ordinary string content once the
+    // value is a real string — and an extraction-breaking token while the
+    // desync has the scanner reading the description as bare text.
+    const raw =
+      'Scene notes follow.\n' +
+      '{"scenes":[{"start_seconds":0,"end_seconds":12,"description："The crowd rises, celebrating {wildly as the buzzer sounds."}]}';
+    // Control: unrepaired, the scanner never gets back to depth zero.
+    expect(extractJsonObject(raw)).toBeNull();
+
+    const result = parseModelScenes(raw, 60);
+    expect(result.scenes).toHaveLength(1);
+    expect(result.scenes[0]!.description).toContain('celebrating {wildly');
+    expect(result.warnings).toContain(repairWarning);
+  });
+
+  it('leaves a fullwidth colon in ordinary description text alone', () => {
+    const valid =
+      '{"scenes":[{"start_seconds":0,"end_seconds":10,"description":"The scoreboard reads 比分：3-2 as the quarter ends."}]}';
+    const result = parseModelScenes(valid, 60);
+    expect(result.scenes).toHaveLength(1);
+    expect(result.scenes[0]!.description).toContain('比分：3-2');
+    // Straight parse succeeded; no repair ran, so none is claimed.
+    expect(result.warnings).not.toContain(repairWarning);
+  });
+
+  it('still reports genuinely unreadable answers as unreadable', () => {
+    const result = parseModelScenes('the model answered in free prose with no JSON at all', 60);
+    expect(result.scenes).toHaveLength(0);
+    expect(result.warnings).toContain('response contained no JSON object');
   });
 });

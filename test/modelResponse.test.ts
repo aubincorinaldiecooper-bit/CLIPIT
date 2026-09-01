@@ -178,3 +178,22 @@ describe('parseReclipBoundaries', () => {
     expect(parseReclipBoundaries('{"start_seconds":50,"end_seconds":60}', 40)).toBeNull();
   });
 });
+
+describe('search matches survive the fullwidth-colon malformation too', () => {
+  /**
+   * Same parser seam, same production malformation (2026-09-01, indexing
+   * chunks) — pinned here because a search answer travels through the same
+   * shared parse, and a moment lost to punctuation at search time would be
+   * reported to a person as "nothing matched".
+   */
+  it('recovers matches from a repaired response, and says it repaired', () => {
+    const raw =
+      '{"matches":[{"start_seconds":12,"end_seconds":30,"description："A dunk over two defenders brings the bench to its feet.","confidence":0.9}]}';
+    expect(() => JSON.parse(raw)).toThrow();
+
+    const result = parseModelMatches(raw);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]!.description).toContain('dunk');
+    expect(result.warnings).toContain('response JSON repaired: fullwidth colon after a key name');
+  });
+});

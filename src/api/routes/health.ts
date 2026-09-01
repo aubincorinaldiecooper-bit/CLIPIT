@@ -34,6 +34,7 @@ export async function registerHealthRoutes(app: FastifyInstance): Promise<void> 
         maxSourceDurationSeconds: env.MAX_SOURCE_DURATION_SECONDS,
         analysisChunkSeconds: env.ANALYSIS_CHUNK_SECONDS,
         transcriptionEnabled: env.TRANSCRIPTION_ENABLED,
+        youtubeIngestionEnabled: env.YOUTUBE_INGESTION_ENABLED,
         // Which service reads video, and the model that answers for it.
         videoProvider: env.VIDEO_PROVIDER,
         model: env.VIDEO_PROVIDER === 'minicpm' ? 'openbmb/MiniCPM-V-4.6' : env.OPENROUTER_VIDEO_MODEL,

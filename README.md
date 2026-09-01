@@ -4,7 +4,7 @@ User-directed AI video clipping. Give it a long video, describe the moment you
 want in plain language, and get back playable MP4 clips.
 
 ```
-upload / YouTube URL
+upload (YouTube URLs are off by default — YOUTUBE_INGESTION_ENABLED)
   → ingest
   → preprocess (probe, proxy, configurable 2-minute analysis chunks)
   → transcribe (once, over the whole source)
@@ -110,8 +110,8 @@ welcome") are de-duplicated word-by-word before storage.
 
 ## Local development
 
-Requires Node 22, PostgreSQL, Redis, `ffmpeg`, `ffprobe`, and `yt-dlp` on PATH,
-plus an S3-compatible bucket (MinIO works).
+Requires Node 22, PostgreSQL, Redis, `ffmpeg` and `ffprobe` on PATH, plus an
+S3-compatible bucket (MinIO works).
 
 ```bash
 npm install
@@ -127,6 +127,39 @@ npm run typecheck
 
 Migrations run automatically when the API or worker starts, so a fresh deploy
 is usable without a manual step.
+
+### The smallest `.env` that boots
+
+Everything else in `.env.example` has a working default:
+
+```
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/clipit
+REDIS_URL=redis://127.0.0.1:6379
+AWS_ACCESS_KEY_ID=…
+AWS_SECRET_ACCESS_KEY=…
+BUCKET_NAME=clipit
+OPENROUTER_API_KEY=…
+```
+
+Against MinIO also set `AWS_ENDPOINT_URL=http://127.0.0.1:9000` and
+`S3_FORCE_PATH_STYLE=true`. MinIO rejects the CORS rule the API applies on
+boot; the log line is expected there and only affects browser uploads, which
+need the rule set with `mc` by hand.
+
+Ingestion and preprocessing work without a valid `OPENROUTER_API_KEY` — an
+upload still reaches `ready`. Transcription, indexing and search are the parts
+that fail with a `401` until a real one is set.
+
+### YouTube ingestion is off
+
+`YOUTUBE_INGESTION_ENABLED` defaults to `false`: `POST /api/videos` refuses a
+`sourceType: "youtube"` body with `400`, and the worker neither requires
+`yt-dlp` at startup nor calls it. Uploads are the only way a video enters the
+pipeline, and `/health` reports `youtubeIngestionEnabled` so a frontend can
+hide the option.
+
+Turning it back on means setting that variable to `true` and putting `yt-dlp`
+on PATH — from a server it also needs the pieces below.
 
 ---
 
@@ -165,7 +198,8 @@ curl -sX POST $API/api/sessions
 
 Send it on everything below as `-H "Authorization: Bearer $TOKEN"`.
 
-**2a. YouTube source.**
+**2a. YouTube source.** Refused with `400` unless
+`YOUTUBE_INGESTION_ENABLED=true`.
 
 ```bash
 curl -sX POST $API/api/videos -H "Authorization: Bearer $TOKEN" \
@@ -407,6 +441,9 @@ raising it.
 
 ## YouTube ingestion on a hosted platform
 
+Off by default (`YOUTUBE_INGESTION_ENABLED=false`); everything here applies
+only once it is turned on.
+
 Expect this ingestion failure on any cloud host, including Railway:
 
 ```
@@ -509,7 +546,8 @@ than YouTube specifically, upload a file and skip this section entirely.
   earliest contributor, so when it spans a boundary its *local* timestamps
   extend past that chunk's end. Clips are always cut from the global range.
 - Live streams are rejected; the VOD must have ended.
-- YouTube ingestion from a datacenter IP generally requires cookies — see
+- YouTube ingestion is disabled by default, and from a datacenter IP it
+  generally requires cookies once enabled — see
   [YouTube ingestion on a hosted platform](#youtube-ingestion-on-a-hosted-platform).
   Uploads are unaffected.
 - Clip generation re-downloads the original per clip, so generating many clips

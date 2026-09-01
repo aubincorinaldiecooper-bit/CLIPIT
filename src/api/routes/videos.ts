@@ -146,6 +146,9 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const sessionId = request.principal?.sessionId ?? null;
 
     if (body.sourceType === 'youtube') {
+      if (!env.YOUTUBE_INGESTION_ENABLED) {
+        throw HttpError.badRequest('YouTube links are not accepted right now — upload the video file instead');
+      }
       if (!isSupportedYoutubeUrl(body.url)) {
         throw HttpError.badRequest('url must be a public YouTube video URL');
       }
