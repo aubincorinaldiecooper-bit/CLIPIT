@@ -444,6 +444,26 @@ export async function getClip(clipId: string): Promise<Clip | null> {
   return row ? mapClip(row) : null;
 }
 
+export async function getLibraryClip(clipId: string): Promise<LibraryClip | null> {
+  const row = await queryOne<
+    ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }
+  >(
+    `SELECT c.*, COALESCE(c.title, m.description) AS description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
+       FROM clips c
+       JOIN clip_matches m ON m.id = c.clip_match_id
+       JOIN videos v ON v.id = c.video_id
+      WHERE c.id = $1`,
+    [clipId],
+  );
+  if (!row) return null;
+  return {
+    clip: mapClip(row),
+    description: row.description,
+    thumbnailKey: row.thumbnail_key ?? null,
+    videoTitle: row.video_title ?? row.video_filename ?? null,
+  };
+}
+
 export async function listClipsForRequest(requestId: string): Promise<Clip[]> {
   // Originals only. A match can now also have DERIVED clips (captioned
   // copies, possibly other people's); without this filter they collide with
