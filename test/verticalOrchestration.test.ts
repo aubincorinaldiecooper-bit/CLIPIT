@@ -543,8 +543,12 @@ describe('a claimless write must not overwrite a finished answer', () => {
       src.indexOf('export async function finishClipRequest'),
       src.indexOf('export async function getPreviousClipRequest'),
     );
-    // No token: only while the request has not already completed.
-    expect(finish).toContain("status <> 'completed'");
+    // No token: only while NOBODY owns the request. Allowing anything not
+    // yet 'completed' left the 'searching' row open, which is the case that
+    // actually happens — a live newer run failed out from under itself on
+    // any stalled redelivery.
+    expect(finish).toContain('deck_attempt_id IS NULL');
+    expect(finish).not.toContain("status <> 'completed'");
     // With a token: only the attempt that owns the deck.
     expect(finish).toContain('deck_attempt_id = $5::uuid');
   });

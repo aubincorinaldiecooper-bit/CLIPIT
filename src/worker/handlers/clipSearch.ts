@@ -109,7 +109,10 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
   const video = await getVideo(request.videoId);
   if (!video) {
-    await finishClipRequest(clipRequestId, 'failed', 'Video no longer exists');
+    const wrote = await finishClipRequest(clipRequestId, 'failed', 'Video no longer exists');
+    if (!wrote) {
+      log.warn('another attempt owns this request; leaving its outcome alone', { clipRequestId });
+    }
     return;
   }
 

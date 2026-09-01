@@ -324,15 +324,33 @@ export async function finishClipRequest(
    * a creator unable to Keep any of it.
    *
    * Null means the caller holds no claim — the paths that fail before any
-   * deck is planned. Those are NOT simply unfenced: an older delivery that
-   * dies early still carries a null token, and letting it write freely was
-   * the same overwrite by another door. It marked a newer, finished answer
-   * failed and hid its clips.
+   * deck is planned. Those are NOT unfenced: an older delivery that dies
+   * early also carries a null token, and letting it write freely was the same
+   * overwrite by another door.
    *
-   * So a claimless write may not land on a request that has already
-   * completed. It stays allowed on one still searching or already failed,
-   * because refusing there would strand a request in 'searching' forever when
-   * the only run that could speak for it died before planning.
+   * A claimless write lands only when NOBODY owns the request:
+   *
+   *   deck_attempt_id  status      land?  why
+   *   ──────────────────────────────────────────────────────────────────
+   *   NULL             any         yes    the only run that can speak for it
+   *   set              completed   no     would hide a finished deck
+   *   set              searching   no     a live newer run is mid-flight;
+   *                                       failing it out from under makes a
+   *                                       polling client abandon an answer
+   *                                       that is still coming
+   *   set              pending     no     same, before it started
+   *   set              failed      no     already terminal; adds nothing
+   *
+   * My first attempt at this allowed anything not yet 'completed', which left
+   * the searching row open — the case that actually happens, on any stalled
+   * redelivery.
+   *
+   * The cost, stated rather than hidden: a request whose owning run was hard
+   * killed before writing any terminal status, AND whose video then went
+   * missing, can sit in 'searching' with nothing able to speak for it. That
+   * needs both a kill that skips the catch and a deleted video; the case this
+   * refuses happens on an ordinary stalled redelivery. The caller is told, so
+   * it can log rather than assume it wrote.
    */
   attemptId: string | null = null,
 ): Promise<boolean> {
@@ -344,7 +362,7 @@ export async function finishClipRequest(
             updated_at = now()
       WHERE id = $1
         AND ($5::uuid IS NOT NULL
-             OR status <> 'completed')
+             OR deck_attempt_id IS NULL)
         AND ($5::uuid IS NULL OR deck_attempt_id = $5::uuid)
       RETURNING id`,
     [requestId, status, errorMessage, answeredFrom, attemptId],
