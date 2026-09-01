@@ -1,11 +1,12 @@
 import path from 'node:path';
-import { stat } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { env } from '../../config/env.js';
 import { logger, type Logger } from '../../lib/logger.js';
 import { errorMessage } from '../../lib/errors.js';
 import { getStorage } from '../storage/s3.js';
 import { clipKey } from '../storage/types.js';
-import { cutClip } from './ffmpeg.js';
+import { createAnalysisProxy, cutClip } from './ffmpeg.js';
 import { applyClipPadding } from '../timestamps.js';
 import { getClip, upsertClipForMatch, setClipStatus } from '../../db/repositories/clips.js';
 import { setVerticalMedia, markVerticalFailed } from '../../db/repositories/verticalMedia.js';
@@ -104,42 +105,64 @@ function compositionAsker(input: OrchestrateInput, canonicalKey: string, duratio
     // the text parts, so base64-encoding the clip for it produces a
     // multi-megabyte string that is built and thrown away. One clip is
     // nothing; a deck is that repeated for every candidate, inside a worker
-    // already running FFmpeg. The OpenRouter lane genuinely needs the bytes
-    // and still gets them.
+    // already running FFmpeg. The OpenRouter lane genuinely needs the bytes.
     const usesStorageKey = env.VIDEO_PROVIDER === 'minicpm';
     let videoBytes: number;
+    let proxyPath: string | null = null;
     if (usesStorageKey) {
       videoBytes = (await stat(canonicalPath)).size;
     } else {
-      const videoPart = await videoPartFromFile(canonicalPath);
+      // ...but it must never be handed the DELIVERY file. The canonical clip
+      // is full quality: thirty seconds of it is ~20MB, and base64 adds a
+      // third again, which the provider refuses with a 413 before looking at
+      // a single frame. Every candidate then falls back to the safe
+      // composition, so no crop is chosen by anything that actually watched
+      // the footage. That is what production did on 2026-09-01: three
+      // candidates, three 413s, three fallbacks, and a deck of TikToks framed
+      // by nobody.
+      //
+      // Framing is answered in NORMALISED coordinates (focal_x/focal_y in
+      // 0..1), so 360p settles it exactly as well as 1080p does. This is the
+      // same proxy, at the same settings, that the search lane already reads
+      // from — around fifty times smaller than what was being sent.
+      proxyPath = path.join(input.workDir, `composition-${randomUUID()}.mp4`);
+      await createAnalysisProxy(canonicalPath, proxyPath, Math.max(1, Math.ceil(durationSeconds)));
+      const videoPart = await videoPartFromFile(proxyPath);
       parts.push(videoPart.part);
       videoBytes = videoPart.bytes;
     }
 
-    const answer = await askVideoModel({
-      chunkIndex: 0,
-      chunkDurationSeconds: durationSeconds,
-      systemPrompt: COMPOSITION_SYSTEM_PROMPT,
-      parts,
-      videoBytes,
-      purpose: 'search',
-      videoStorageKey: canonicalKey,
-      onUsage: (usage) => {
-        // Counted in the request's total...
-        input.tally.add(usage);
-        // ...and stored under its own stage, for the same reason re-clip has
-        // one: what framing costs is a separate business number from what
-        // searching costs, and it only exists if the rows keep it apart.
-        void recordModelUsage({
-          ...usage,
-          stage: 'composition',
-          videoId: input.videoId,
-          clipRequestId: input.clipRequestId,
-        });
-      },
-    });
+    try {
+      const answer = await askVideoModel({
+        chunkIndex: 0,
+        chunkDurationSeconds: durationSeconds,
+        systemPrompt: COMPOSITION_SYSTEM_PROMPT,
+        parts,
+        videoBytes,
+        purpose: 'search',
+        videoStorageKey: canonicalKey,
+        onUsage: (usage) => {
+          // Counted in the request's total...
+          input.tally.add(usage);
+          // ...and stored under its own stage, for the same reason re-clip has
+          // one: what framing costs is a separate business number from what
+          // searching costs, and it only exists if the rows keep it apart.
+          void recordModelUsage({
+            ...usage,
+            stage: 'composition',
+            videoId: input.videoId,
+            clipRequestId: input.clipRequestId,
+          });
+        },
+      });
 
-    return { content: answer.content, provider: answer.provider, model: answer.model };
+      return { content: answer.content, provider: answer.provider, model: answer.model };
+    } finally {
+      // A deck renders every candidate through one work directory, so a proxy
+      // left behind is multiplied by the size of the deck. Failing to delete
+      // it must never fail a composition that already succeeded.
+      if (proxyPath) await rm(proxyPath, { force: true }).catch(() => {});
+    }
   };
 }
 
