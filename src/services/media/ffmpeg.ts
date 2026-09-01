@@ -286,6 +286,20 @@ export interface CutClipOptions {
   videoFilters?: string[];
 }
 
+/**
+ * Scale so the shorter side is at most CLIP_MAX_SHORT_SIDE, whichever way the
+ * frame is turned: 4096x2160 becomes 2048x1080, 2160x4096 becomes 1080x2048,
+ * and anything already inside the cap passes through untouched — `min()`
+ * against the input size is what stops it ever upscaling. `-2` keeps the
+ * aspect ratio and rounds to an even number, which H.264 requires.
+ *
+ * Exported for the tests only; the cut applies it itself.
+ */
+export function clipResolutionCap(maxShortSide: number = env.CLIP_MAX_SHORT_SIDE): string {
+  const cap = Math.round(maxShortSide);
+  return `scale='if(gt(iw,ih),-2,min(${cap},iw))':'if(gt(iw,ih),min(${cap},ih),-2)'`;
+}
+
 /** Cuts a clip from the ORIGINAL source and re-encodes to MP4 / H.264 / AAC. */
 export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: number; durationSeconds: number }> {
   const duration = Math.max(0.1, options.endSeconds - options.startSeconds);
@@ -317,9 +331,10 @@ export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: num
     '-level', '4.1',
   ];
 
-  if (options.videoFilters?.length) {
-    args.push('-vf', options.videoFilters.join(','));
-  }
+  // Caller filters first, the cap last. Burned captions are sized against
+  // the ORIGINAL frame, so they must be drawn before it is scaled down or a
+  // 4K caption lands on a 1080p canvas at four times the intended size.
+  args.push('-vf', [...(options.videoFilters ?? []), clipResolutionCap()].join(','));
 
   if (options.hasAudio) {
     args.push('-map', '0:a:0?', '-c:a', 'aac', '-b:a', env.CLIP_AUDIO_BITRATE, '-ac', '2');
