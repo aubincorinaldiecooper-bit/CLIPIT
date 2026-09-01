@@ -237,7 +237,20 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     const probe = await ffprobe(output);
     expect(probe.height).toBe(718);
     expect(probe.width! % 2).toBe(0);
-  }, 180_000);
+
+    // And never a pixel larger than the source when only the long side is
+    // odd — ffmpeg's -2 would have rounded 1279 up to 1280.
+    const oddLong = path.join(dir, 'odd-long-playback-source.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=size=1279x720:rate=10:duration=1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv444p', oddLong,
+    ], { timeoutMs: 120_000 });
+    const outputLong = path.join(dir, 'odd-long-playback.mp4');
+    await createPlaybackProxy(oddLong, outputLong);
+    const probeLong = await ffprobe(outputLong);
+    expect([probeLong.width, probeLong.height]).toEqual([1278, 720]);
+  }, 240_000);
 
   it('cuts a 9:16 thumbnail through the export window, at its native size', async () => {
     const proxy = await makeOversized('thumb-source.mp4', '1920x1080');

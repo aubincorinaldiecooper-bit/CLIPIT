@@ -317,6 +317,10 @@ export async function extractAudioSegments(
  */
 export async function createPlaybackProxy(inputPath: string, outputPath: string): Promise<void> {
   const side = Math.max(2, Math.floor(env.PLAYBACK_PROXY_SHORT_SIDE / 2) * 2);
+  const shortLandscape = `min(${side},trunc(ih/2)*2)`;
+  const shortPortrait = `min(${side},trunc(iw/2)*2)`;
+  const proxyWidth = `if(gt(iw,ih),trunc(iw*${shortLandscape}/ih/2)*2,${shortPortrait})`;
+  const proxyHeight = `if(gt(iw,ih),${shortLandscape},trunc(ih*${shortPortrait}/iw/2)*2)`;
   await run(
     env.FFMPEG_PATH,
     [
@@ -327,12 +331,14 @@ export async function createPlaybackProxy(inputPath: string, outputPath: string)
       '-map', '0:v:0',
       '-map', '0:a:0?',
       // Shorter side to `side`, never upscaling, whichever way the frame is
-      // turned — ffmpeg has already applied the file's rotation by here. The
-      // source side is rounded down to even too: a 1280x719 recording is
-      // under the cap and would otherwise reach the encoder at 719 lines,
-      // which 4:2:0 H.264 refuses — and a proxy that fails to build sends
-      // review back to the original.
-      '-vf', `scale='if(gt(iw,ih),-2,min(${side},trunc(iw/2)*2))':'if(gt(iw,ih),min(${side},trunc(ih/2)*2),-2)',fps=fps='min(30,source_fps)'`,
+      // turned — ffmpeg has already applied the file's rotation by here.
+      // Both sides come out even and neither exceeds its source side: the
+      // shorter side is min(side, source rounded DOWN to even), because a
+      // 1280x719 recording is under the cap and would otherwise reach the
+      // encoder at 719 lines, which 4:2:0 H.264 refuses; the longer side is
+      // derived from it and floored, because ffmpeg's `-2` rounds to the
+      // nearest even and would make a 1279-wide source 1280.
+      '-vf', `scale='${proxyWidth}':'${proxyHeight}',fps=fps='min(30,source_fps)'`,
       '-c:v', 'libx264',
       '-preset', env.PROXY_PRESET,
       '-crf', String(env.PLAYBACK_PROXY_CRF),
