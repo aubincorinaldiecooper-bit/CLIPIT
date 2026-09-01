@@ -52,20 +52,39 @@ export function planDeck(
 }
 
 export interface DeckOutcome {
-  /** The complete set, or empty. Never a partial deck. */
+  /** The released set, or empty. Never a partial deck. */
   deck: PreparedCandidate[];
-  /** True only when the full requested count was assembled. */
+  /** True only when the full effective target was assembled. */
   complete: boolean;
-  /** Prepared, finished, and not needed — the rendered-but-skipped cost. */
-  surplus: PreparedCandidate[];
-  /** Prepared and never finished. The suppression count. */
-  suppressed: PreparedCandidate[];
-  candidatesRendered: number;
+  /**
+   * Candidates that produced real media nobody will see — surplus beyond the
+   * target, plus everything rendered for a deck that then failed. This is the
+   * wasted-render cost, and it deliberately excludes failures: a candidate
+   * that never rendered wasted GPU time, not storage.
+   */
+  readyButUnused: PreparedCandidate[];
+  /** Unique candidates that never became creator-visible. */
+  failed: PreparedCandidate[];
+  /** Distinct candidates prepare() was invoked for. */
+  uniqueCandidatesAttempted: number;
+  /** Total preparation attempts, retries included. */
+  renderAttempts: number;
+  /**
+   * Unique candidates attempted beyond the first `target` rank positions —
+   * i.e. reached ONLY because an earlier candidate failed outright.
+   *
+   * Position, not attempt count. A candidate that needed two tries and then
+   * succeeded costs an extra attempt, not an extra candidate, and counting it
+   * as backfill would report the deck reaching deeper into the pool than it
+   * did.
+   */
   backfillCount: number;
+  /** The effective target this assembly worked to. */
+  target: number;
 }
 
 /**
- * Prepare candidates in rank order until the requested number are READY.
+ * Prepare candidates in rank order until the target number are READY.
  *
  * `prepare` does the expensive work for one candidate and reports what came
  * back. It is injected rather than imported so the ordering rules here can be
@@ -74,7 +93,7 @@ export interface DeckOutcome {
  *
  * Stops early on success. Stops at the candidate ceiling on failure, and
  * returns an INCOMPLETE outcome rather than a short deck: a deck of two when
- * three were asked for is the partial reveal this whole file exists to
+ * the target was three is the partial reveal this whole file exists to
  * prevent, and the caller decides what to tell the creator instead.
  */
 export async function assembleDeck(
@@ -84,21 +103,24 @@ export async function assembleDeck(
   maxAttempts: number,
 ): Promise<DeckOutcome> {
   const ready: PreparedCandidate[] = [];
-  const suppressed: PreparedCandidate[] = [];
-  let candidatesRendered = 0;
+  const failed: PreparedCandidate[] = [];
+  let uniqueCandidatesAttempted = 0;
+  let renderAttempts = 0;
   let backfillCount = 0;
 
-  for (const candidate of ranked.slice(0, plan.candidateTarget)) {
+  const pool = ranked.slice(0, plan.candidateTarget);
+  for (let position = 0; position < pool.length; position += 1) {
     if (ready.length >= plan.requested) break;
+    const candidate = pool[position]!;
 
-    // Anything past the first `requested` candidates is only being touched
-    // because an earlier one failed. That is the backfill, and counting it
-    // is how "how often does a failure cost us extra work" gets answered.
-    if (candidatesRendered >= plan.requested) backfillCount += 1;
+    uniqueCandidatesAttempted += 1;
+    // Reached only because an earlier candidate failed outright. Measured by
+    // rank position so retries on an earlier candidate never inflate it.
+    if (position >= plan.requested) backfillCount += 1;
 
     let prepared: PreparedCandidate | null = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      candidatesRendered += 1;
+      renderAttempts += 1;
       prepared = await prepare(candidate, attempt);
       if (isCreatorVisible(prepared)) break;
       // Bounded, automatic, and only where another go could genuinely differ.
@@ -107,7 +129,7 @@ export async function assembleDeck(
     }
 
     if (prepared && isCreatorVisible(prepared)) ready.push(prepared);
-    else if (prepared) suppressed.push(prepared);
+    else if (prepared) failed.push(prepared);
   }
 
   const complete = ready.length >= plan.requested;
@@ -116,53 +138,112 @@ export async function assembleDeck(
     // returned empty so no caller can accidentally reveal a partial one.
     deck: complete ? ready.slice(0, plan.requested) : [],
     complete,
-    surplus: complete ? ready.slice(plan.requested) : [],
-    // On an incomplete outcome the ready ones were still rendered and still
-    // went unseen — they belong in the skipped cost, not silently nowhere.
-    suppressed: complete ? suppressed : [...suppressed, ...ready],
-    candidatesRendered,
+    // On an incomplete outcome every ready candidate was still rendered and
+    // still goes unseen, so it belongs in the wasted cost rather than
+    // silently nowhere.
+    readyButUnused: complete ? ready.slice(plan.requested) : [...ready],
+    failed,
+    uniqueCandidatesAttempted,
+    renderAttempts,
     backfillCount,
+    target: plan.requested,
   };
 }
 
 /**
- * What the deck cost, for the metrics the owner asked for.
+ * What the deck cost, in numbers that mean exactly what they are called.
  *
- * renderedButSkipped is the number that says how much media generation is
- * spent on moments a creator never sees — surplus we prepared and did not
- * need, plus everything suppressed. Generating before Keep is what makes this
- * measurable and what makes it matter.
+ * The distinction this exists to keep straight is unique CANDIDATES versus
+ * render ATTEMPTS. Blurring them makes a retry look like the deck reaching
+ * deeper into the pool, which reads as "the search is running short of
+ * moments" when what actually happened is "one encode needed a second go".
+ * Those call for opposite responses, so they get separate names.
  */
 export function deckMetrics(
   outcome: DeckOutcome,
   startedAtMs: number,
   nowMs: number,
-  /** The ranked pool the deck could draw from, before any of it was touched. */
-  internalCandidateCount = outcome.candidatesRendered,
+  request: {
+    /** Exactly what the creator asked for, before any availability cap. */
+    requestedResultCount: number;
+    /** The whole ranked pool this deck could draw from. */
+    internalCandidateCount: number;
+  },
 ) {
-  const renderedButSkipped = outcome.surplus.length + outcome.suppressed.length;
+  // Only candidates that actually produced media can be "rendered but
+  // skipped". A failure wasted time; it did not leave a file behind.
+  const uniqueRendered = outcome.deck.length + outcome.readyButUnused.length;
+  const renderedButSkippedCount = outcome.readyButUnused.length;
+
   return {
-    requestedResultCount: outcome.deck.length + (outcome.complete ? 0 : outcome.suppressed.length),
+    // From the REQUEST, never inferred from how things turned out. Deriving
+    // it from outcomes meant a deck that failed reported having been asked
+    // for however many happened to fail.
+    requestedResultCount: request.requestedResultCount,
+    internalCandidateCount: request.internalCandidateCount,
+    /** How many moments were actually obtainable: min(requested, available). */
+    effectiveDeckTarget: outcome.target,
+    uniqueCandidatesAttempted: outcome.uniqueCandidatesAttempted,
+    renderAttempts: outcome.renderAttempts,
     readyResultCount: outcome.deck.length,
-    // How many candidates existed to choose from. Read next to
-    // candidatesRendered it answers "did we run out of moments, or did we run
-    // out of moments that would render?" — two very different problems.
-    internalCandidateCount,
-    candidatesRendered: outcome.candidatesRendered,
-    failedCandidateCount: outcome.suppressed.length,
-    // The same count named as what it MEANS: moments a creator wanted and did
-    // not get because we could not finish them. Kept alongside rather than
-    // instead of failedCandidateCount so neither name goes looking and finds
-    // nothing.
-    suppressedFailureCount: outcome.suppressed.length,
+    failedCandidateCount: outcome.failed.length,
+    // The same unique count named as what it MEANS: moments a creator wanted
+    // and did not get because we could not finish them.
+    suppressedFailureCount: outcome.failed.length,
     backfillCount: outcome.backfillCount,
-    renderedButSkippedCount: renderedButSkipped,
+    renderedButSkippedCount,
+    // Against candidates that actually rendered — the population the question
+    // is about. Null rather than zero when nothing rendered, because "no
+    // waste" and "nothing to measure" are different answers.
     renderedButSkippedRate:
-      outcome.candidatesRendered > 0
-        ? Number((renderedButSkipped / outcome.candidatesRendered).toFixed(4))
-        : null,
+      uniqueRendered > 0 ? Number((renderedButSkippedCount / uniqueRendered).toFixed(4)) : null,
     // The creator-facing milestone: not time-to-first-card, which nobody
     // sees, but time until the whole deck could be shown.
     timeToCompleteDeckMs: outcome.complete ? Math.max(0, Math.round(nowMs - startedAtMs)) : null,
   };
+}
+
+
+/**
+ * How a request that owed a deck should be finished.
+ *
+ * Pure, and separate from the worker, because this is a DECISION and the
+ * decisions in this codebase get tests that run without a queue, a database
+ * or a frame of video. It is also the decision most worth pinning: every
+ * branch here is a different sentence said to a creator about their own
+ * footage, and three of them are easy to confuse.
+ */
+export type DeckCompletion =
+  /** The footage was gone before anything could be judged. We never looked. */
+  | { kind: 'source_unavailable' }
+  /** Moments were found and we could not finish them. Our failure, not theirs. */
+  | { kind: 'render_failed' }
+  /** The effective deck stands — including, legitimately, an empty one. */
+  | { kind: 'complete' };
+
+export function deckCompletion(deck: {
+  complete: boolean;
+  effectiveDeckTarget: number;
+  sourceUnavailable: boolean;
+}): DeckCompletion {
+  // Consulted at all, which is what matters: without this branch a missing
+  // source falls through to 'complete' below, because it produces a zero
+  // target and the render-failure check requires a target above zero. The
+  // creator would then be told their video has no postable moments on the
+  // strength of an examination that never happened.
+  //
+  // Checked first is defensive rather than load-bearing — a missing source
+  // always yields a zero target today, so the branch below would not claim it
+  // either way. It sits here so that stays true if a future change ever gives
+  // an unavailable source a non-zero target.
+  if (deck.sourceUnavailable) return { kind: 'source_unavailable' };
+
+  // Candidates existed and could not be finished.
+  if (!deck.complete && deck.effectiveDeckTarget > 0) return { kind: 'render_failed' };
+
+  // Either a real deck, or an honest empty one: the search looked and this
+  // platform could take none of what it found. Both are finished answers, and
+  // both open the gate — leaving it shut would make a completed request look
+  // forever like one still assembling.
+  return { kind: 'complete' };
 }

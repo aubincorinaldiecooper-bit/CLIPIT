@@ -32,6 +32,11 @@ interface ClipRequestRow {
   chunk_degradations: ChunkDegradation[] | null;
   answered_from: AnsweredFrom | null;
   uncertain_matches: UncertainMatch[] | null;
+  presentation_target: 'original' | 'vertical' | null;
+  requested_result_count: number | null;
+  available_candidate_count: number | null;
+  effective_deck_target: number | null;
+  deck_completed_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -55,6 +60,11 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     chunkErrors: row.chunk_errors ?? [],
     answeredFrom: row.answered_from ?? null,
     uncertainMatches: row.uncertain_matches ?? [],
+    presentationTarget: row.presentation_target ?? null,
+    requestedResultCount: row.requested_result_count ?? null,
+    availableCandidateCount: row.available_candidate_count ?? null,
+    effectiveDeckTarget: row.effective_deck_target ?? null,
+    deckCompletedAt: row.deck_completed_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -211,21 +221,214 @@ export async function recordSearchApproach(
   );
 }
 
+/**
+ * Declare that this request owes a post-ready deck — before a single
+ * candidate is rendered.
+ *
+ * The ordering is the whole point. If the target were written after the first
+ * clip finished, a client polling in that gap would see a request that does
+ * not yet know it is a deck request, fall through to the legacy path, and be
+ * handed one finished card. That is the progressive reveal the rule forbids,
+ * and it would appear only under load, only sometimes.
+ *
+ * deck_completed_at is CLEARED here on purpose. A retrying job re-plans and
+ * re-renders, and serving the previous run's finished deck while the new one
+ * is mid-flight would show a set that no longer matches the clips underneath.
+ */
+/**
+ * Claim this request for THIS delivery, before anything can fail.
+ *
+ * The token used to be minted at deck-planning time, which left every check
+ * before it — video missing, video not ready, no chunks, a correction with
+ * nothing to correct — holding no claim. A redelivery failing in that window
+ * could not record its own failure if an earlier, dead run had left a token
+ * behind, and the request sat in 'searching' until retries ran out with
+ * nothing able to speak for it.
+ *
+ * Taken at the top instead, so every exit from a delivery is fenced by a
+ * claim that delivery actually holds. Last claimer wins: an older run that is
+ * still executing finds its token stale and is refused everywhere, which is
+ * what being superseded should mean.
+ */
+export async function claimClipRequestAttempt(requestId: string): Promise<string | null> {
+  // Never over a finished answer.
+  //
+  // handleClipSearch reads the request and returns early if it is already
+  // completed, but another delivery can finish it in the gap between that
+  // read and this claim. An unconditional claim would then hand this stale
+  // delivery ownership of a request that is already answered, and every
+  // fence downstream would dutifully let it overwrite that answer.
+  //
+  // 'failed' and 'searching' stay claimable: a retry may legitimately
+  // re-attempt a failed request, and superseding a running one is the whole
+  // point of last-claimer-wins.
+  const row = await queryOne<{ deck_attempt_id: string }>(
+    `UPDATE clip_requests
+        SET deck_attempt_id = gen_random_uuid(), updated_at = now()
+      WHERE id = $1
+        AND status <> 'completed'
+        -- And never over a deck already released to the creator. The release
+        -- and the status now move together, so this should be unreachable —
+        -- it stays because it was reachable for exactly as long as they were
+        -- two writes, and the next person to split them deserves a guard
+        -- rather than a bug.
+        AND deck_completed_at IS NULL
+      RETURNING deck_attempt_id`,
+    [requestId],
+  );
+  return row?.deck_attempt_id ?? null;
+}
+
+export async function recordDeckPlan(
+  requestId: string,
+  plan: { presentationTarget: 'original' | 'vertical'; requestedResultCount: number },
+  /** The claim this delivery already holds. The plan is fenced to it. */
+  attemptId: string,
+): Promise<boolean> {
+  // Does NOT mint a token — the delivery claimed the request on the way in.
+  // Minting here left every earlier check unclaimed; see
+  // claimClipRequestAttempt.
+  const row = await queryOne<{ id: string }>(
+    `UPDATE clip_requests
+        SET presentation_target      = $2,
+            requested_result_count   = $3,
+            available_candidate_count = NULL,
+            effective_deck_target    = NULL,
+            deck_completed_at        = NULL,
+            updated_at               = now()
+      WHERE id = $1 AND deck_attempt_id = $4
+      RETURNING id`,
+    [requestId, plan.presentationTarget, plan.requestedResultCount, attemptId],
+  );
+  return row !== null;
+}
+
+/**
+ * What the search actually turned up, and the deck size that follows from it.
+ *
+ * Recorded even when it is smaller than the ask: "you wanted three, your video
+ * had two" is a fact about their footage and has to stay legible as that,
+ * rather than being flattened into a failure or silently rounded away.
+ */
+/**
+ * Open the gate AND finish the request, in one statement.
+ *
+ * These used to be two writes, and I said the fence made that benign. It did
+ * not. Between them the deck was released to the creator while the request
+ * still said 'searching', and a claim guarded only on status could seize a
+ * request whose deck was already on screen — then clear it and rebuild it
+ * underneath them.
+ *
+ * One statement, so there is no instant in which a deck is released and the
+ * request does not say so. Fenced to the attempt that planned it, like every
+ * other write this delivery makes.
+ */
+export async function releaseDeckAndComplete(
+  requestId: string,
+  attemptId: string,
+  answeredFrom: AnsweredFrom,
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
+    `UPDATE clip_requests
+        SET deck_completed_at = now(),
+            status            = 'completed',
+            error_message     = NULL,
+            answered_from     = COALESCE($3, answered_from),
+            updated_at        = now()
+      WHERE id = $1 AND deck_attempt_id = $2
+      RETURNING id`,
+    [requestId, attemptId, answeredFrom],
+  );
+  return row !== null;
+}
+
+export async function recordDeckAvailability(
+  requestId: string,
+  counts: { availableCandidateCount: number; effectiveDeckTarget: number },
+  /** Fenced like the gate: a superseded attempt must not rewrite these. */
+  attemptId: string | null,
+): Promise<void> {
+  await queryOne(
+    `UPDATE clip_requests
+        SET available_candidate_count = $2,
+            effective_deck_target     = $3,
+            updated_at                = now()
+      WHERE id = $1
+        AND ($4::uuid IS NULL OR deck_attempt_id = $4::uuid)`,
+    [requestId, counts.availableCandidateCount, counts.effectiveDeckTarget, attemptId],
+  );
+}
+
+/**
+ * The gate opens. Called only once every moment in the effective deck is
+ * finished AND persisted, so there is no instant in which this says yes and
+ * the clips behind it are not there.
+ */
+
 export async function finishClipRequest(
   requestId: string,
   status: ClipRequestStatus,
   errorMessage: string | null = null,
   answeredFrom: AnsweredFrom | null = null,
-): Promise<void> {
-  await queryOne(
+  /**
+   * The attempt allowed to write this final answer.
+   *
+   * Overlapping deliveries mean two runs can both reach a terminal write. A
+   * superseded one finishing last would stamp its outcome over the run that
+   * replaced it — most damagingly a stale FAILURE landing on a newer success,
+   * which leaves a complete deck sitting behind a request marked failed and
+   * a creator unable to Keep any of it.
+   *
+   * Null means the caller holds no claim — the paths that fail before any
+   * deck is planned. Those are NOT unfenced: an older delivery that dies
+   * early also carries a null token, and letting it write freely was the same
+   * overwrite by another door.
+   *
+   * A claimless write lands only when NOBODY owns the request:
+   *
+   *   deck_attempt_id  status      land?  why
+   *   ──────────────────────────────────────────────────────────────────
+   *   NULL             any         yes    the only run that can speak for it
+   *   set              completed   no     would hide a finished deck
+   *   set              searching   no     a live newer run is mid-flight;
+   *                                       failing it out from under makes a
+   *                                       polling client abandon an answer
+   *                                       that is still coming
+   *   set              pending     no     same, before it started
+   *   set              failed      no     already terminal; adds nothing
+   *
+   * My first attempt at this allowed anything not yet 'completed', which left
+   * the searching row open — the case that actually happens, on any stalled
+   * redelivery.
+   *
+   * That rule used to strand requests, and the reason is worth keeping: the
+   * token was minted at deck-planning time, so every check before it —
+   * video missing, video not ready, no chunks, a correction with nothing to
+   * correct — ran claimless. A redelivery failing there could not record its
+   * failure if a dead run had left a token, and the request sat in
+   * 'searching' until retries ran out.
+   *
+   * The search now claims the request on the way in
+   * (claimClipRequestAttempt), so every one of its deliveries holds a token
+   * before anything can fail and none of them need this branch. It stays for
+   * callers outside the search, and stays strict.
+   */
+  attemptId: string | null = null,
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET status = $2,
             error_message = $3,
             answered_from = COALESCE($4, answered_from),
             updated_at = now()
-      WHERE id = $1`,
-    [requestId, status, errorMessage, answeredFrom],
+      WHERE id = $1
+        AND ($5::uuid IS NOT NULL
+             OR deck_attempt_id IS NULL)
+        AND ($5::uuid IS NULL OR deck_attempt_id = $5::uuid)
+      RETURNING id`,
+    [requestId, status, errorMessage, answeredFrom, attemptId],
   );
+  return row !== null;
 }
 
 /**
@@ -511,9 +714,6 @@ export async function listMatchesByIds(requestId: string, matchIds: string[]): P
   return rows.map(mapMatch);
 }
 
-export async function deleteMatches(requestId: string): Promise<void> {
-  await queryOne('DELETE FROM clip_matches WHERE clip_request_id = $1', [requestId]);
-}
 
 /**
  * What the last day of use taught us. See docs/learning-loop.md.

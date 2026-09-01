@@ -27,7 +27,7 @@ import { warmMiniCpm } from '../../services/search/minicpmVideo.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import {
-  creatorVisibleMatches,
+  creatorVisibleDeck,
   serializeClipRequest,
   serializeVideo,
   serializeVideoWithPlayback,
@@ -146,6 +146,9 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     const sessionId = request.principal?.sessionId ?? null;
 
     if (body.sourceType === 'youtube') {
+      if (!env.YOUTUBE_INGESTION_ENABLED) {
+        throw HttpError.badRequest('YouTube links are not accepted right now — upload the video file instead');
+      }
       if (!isSupportedYoutubeUrl(body.url)) {
         throw HttpError.badRequest('url must be a public YouTube video URL');
       }
@@ -511,7 +514,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
         // Same gate as the request route. History is still a creator-facing
         // view, and an unfinished moment must not reappear in it just
         // because it is being read from a different page.
-        const { matches } = creatorVisibleMatches(allMatches, clipsByMatchId);
+        const { matches } = creatorVisibleDeck(clipRequest, allMatches, clipsByMatchId);
         return serializeClipRequest(clipRequest, matches, clipsByMatchId);
       }),
     );

@@ -42,7 +42,10 @@ export const PLATFORM_OUTPUT_PROFILES: Record<OutputPlatform, PlatformOutputProf
 
 /** How each platform is actually written by the people asking for it. */
 const PLATFORM_PATTERNS: Array<[OutputPlatform, RegExp]> = [
-  ['tiktok', /\btik\s?tok\b/i],
+  // The trailing s matters: "give me 5 tiktoks" is how people actually ask,
+  // and without it the platform came back null, no deck was built at all, and
+  // the creator got a list of timestamps for an explicit TikTok request.
+  ['tiktok', /\btik\s?toks?\b/i],
   ['reels', /\b(instagram\s+)?reels?\b|\binstagram\b/i],
   ['shorts', /\b(youtube\s+)?shorts?\b/i],
 ];
@@ -66,7 +69,7 @@ const WORD_NUMBERS: Record<string, number> = {
  * the SOURCE, not something being asked for, and counting it would read an
  * ordinary question as a request for one clip.
  */
-const MOMENT_WORDS = 'moment|clip|cut|highlight|post|short|reel';
+const MOMENT_WORDS = 'moment|clip|cut|highlight|post|short|reel|bit|tiktok';
 
 /** "3 moments", "three funny clips", "a couple of highlights". */
 const COUNTED = new RegExp(
@@ -77,8 +80,8 @@ const COUNTED = new RegExp(
   'i',
 );
 
-/** Any mention of the noun at all, so singular can be told from plural. */
-const BARE_NOUN = new RegExp(String.raw`\b(?:${MOMENT_WORDS})(s?)\b`, 'i');
+/** Every mention of the noun, so singular can be told from plural. */
+const BARE_NOUN = new RegExp(String.raw`\b(?:${MOMENT_WORDS})(s?)\b`, 'gi');
 
 /** A number that is really a duration: "30 second clips" is ONE clip. */
 const DURATION_NUMBER = /\b\d+\s*(?:seconds?|secs?|minutes?|mins?)\b/i;
@@ -108,8 +111,19 @@ export function parseRequestedMomentCount(instruction: string): number | null {
   }
 
   // No number, but the noun itself can be singular or plural.
-  const bare = instruction.match(BARE_NOUN);
-  if (bare && !bare[1]) return 1;
+  //
+  // Skipped when the word OPENS the instruction, because there it is a verb,
+  // not a thing being counted. "post the 5 best bits to tiktok" was read as a
+  // request for one moment — the leading "post" taken as a singular noun —
+  // and the whole deck was built for a single card when five were asked for.
+  for (const bare of instruction.matchAll(BARE_NOUN)) {
+    // A word that OPENS the instruction is a verb, not a thing being counted:
+    // "post the best bits", "clip this for tiktok". Skipping to the next
+    // mention rather than giving up keeps the noun further along — "clip this
+    // for tiktok" is still one moment, read off "tiktok".
+    if (bare.index === 0) continue;
+    return bare[1] ? null : 1;
+  }
 
   return null;
 }
@@ -133,8 +147,10 @@ export interface PlatformIntent {
   hardMaxSeconds: number;
   /** The phrase that decided the framing, for the log line. */
   matchedPhrase: string | null;
-  /** How many moments the deck should hold. Never below one. */
+  /** How many moments the creator asked for. Never below one, never clamped. */
   requestedCount: number;
+  /** The most this pipeline will render for one request. */
+  renderCeiling: number;
 }
 
 /**
@@ -174,12 +190,15 @@ export function resolvePlatformIntent(
     explicitDurationSeconds,
     hardMaxSeconds,
     matchedPhrase: framing.matched,
-    // Bounded on both sides: at least one, and never more than the pipeline
-    // is willing to render for a single request.
-    requestedCount: Math.min(
-      Math.max(1, parseRequestedMomentCount(text) ?? options.defaultCount ?? 3),
-      Math.max(1, options.maxCount ?? 8),
-    ),
+    // What the creator ASKED FOR, and nothing else. Clamping it to the render
+    // ceiling here meant "give me 12 clips for TikTok" was recorded, reported
+    // and shown back as a request for 8 — the number we were willing to make
+    // standing in for the number they wanted, with nothing left saying
+    // otherwise. The ceiling still applies; it applies to the deck target,
+    // which is a different quantity and now has its own name.
+    requestedCount: Math.max(1, parseRequestedMomentCount(text) ?? options.defaultCount ?? 3),
+    /** The most this pipeline will render for one request. */
+    renderCeiling: Math.max(1, options.maxCount ?? 8),
   };
 }
 

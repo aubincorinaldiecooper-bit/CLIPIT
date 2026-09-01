@@ -8,6 +8,7 @@ import {
   extractAudioSegments,
   extractFrameAt,
   ffprobe,
+  renderVerticalDerivative,
   splitIntoChunks,
 } from '../src/services/media/ffmpeg.js';
 import { mapLocalRangeToGlobal } from '../src/services/timestamps.js';
@@ -273,5 +274,110 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(left.centreX!).toBeLessThan(320 * 0.35);
     expect(right.centreX!).toBeGreaterThan(320 * 0.65);
   }, 180_000);
+
+  /**
+   * Phones and drones sometimes ship with extra video or audio tracks (cover
+   * art, alternate angles, commentary). If FFmpeg is left on auto-selection,
+   * the proxy, clip, or vertical render can pick a different stream than the
+   * one ffprobe reports as primary. This test asserts every output carries
+   * only the first video and first audio streams, matching the dimensions the
+   * rest of the pipeline expects.
+   */
+  it('uses only the first video and audio streams when the source contains extras', async () => {
+    const multiSource = path.join(dir, 'multi-source.mp4');
+    const multiSeconds = 6;
+
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `testsrc=size=320x240:rate=15:duration=${multiSeconds}`,
+      '-f', 'lavfi', '-i', `testsrc=size=640x360:rate=15:duration=${multiSeconds}`,
+      '-f', 'lavfi', '-i', `sine=frequency=440:sample_rate=44100:duration=${multiSeconds}`,
+      '-f', 'lavfi', '-i', `sine=frequency=880:sample_rate=22050:duration=${multiSeconds}`,
+      '-map', '0:v', '-map', '1:v', '-map', '2:a', '-map', '3:a',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '64k', '-shortest', multiSource,
+    ]);
+
+    const sourceProbe = await ffprobe(multiSource);
+    expect(sourceProbe.width).toBe(320);
+    expect(sourceProbe.height).toBe(240);
+    expect(sourceProbe.hasAudio).toBe(true);
+
+    const { stdout: sourceStreams } = await run('ffprobe', [
+      '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'json', multiSource,
+    ]);
+    const parsed = JSON.parse(sourceStreams) as { streams: { codec_type: string }[] };
+    expect(parsed.streams.filter((s) => s.codec_type === 'video').length).toBe(2);
+    expect(parsed.streams.filter((s) => s.codec_type === 'audio').length).toBe(2);
+
+    // Proxy should downscale the first video (320x240) to the configured proxy
+    // height and drop all audio. PROXY_HEIGHT=360, so width becomes 480.
+    const proxy = path.join(dir, 'multi-proxy.mp4');
+    await createAnalysisProxy(multiSource, proxy, CHUNK_SECONDS);
+    const proxyProbe = await ffprobe(proxy);
+    expect(proxyProbe.width).toBe(480);
+    expect(proxyProbe.height).toBe(360);
+    expect(proxyProbe.hasAudio).toBe(false);
+
+    // cutClip should encode the first video and first audio.
+    const clip = path.join(dir, 'multi-clip.mp4');
+    await cutClip({
+      inputPath: multiSource,
+      outputPath: clip,
+      startSeconds: 1,
+      endSeconds: 3,
+      hasAudio: true,
+    });
+    const clipProbe = await ffprobe(clip);
+    expect(clipProbe.width).toBe(320);
+    expect(clipProbe.height).toBe(240);
+    expect(clipProbe.audioCodec).toBe('aac');
+
+    const { stdout: clipRate } = await run('ffprobe', [
+      '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=sample_rate',
+      '-of', 'csv=p=0', clip,
+    ]);
+    expect(clipRate.trim()).toBe('44100');
+
+    // renderVerticalDerivative smart crop should use the first stream too.
+    const { planReframe } = await import('../src/services/media/reframe.js');
+    const { VERTICAL_DELIVERY } = await import('../src/services/media/composition.js');
+    const plan = planReframe({ aspect: '9:16', focusPct: 50 }, { width: 320, height: 240 });
+    expect(plan.filter).not.toBeNull();
+
+    const smart = path.join(dir, 'multi-vertical-smart.mp4');
+    await renderVerticalDerivative({
+      inputPath: multiSource,
+      outputPath: smart,
+      hasAudio: true,
+      delivery: VERTICAL_DELIVERY,
+      cropFilter: plan.filter,
+    });
+    const smartProbe = await ffprobe(smart);
+    expect(smartProbe.width).toBe(1080);
+    expect(smartProbe.height).toBe(1920);
+    expect(smartProbe.audioCodec).toBe('aac');
+
+    const { stdout: smartRate } = await run('ffprobe', [
+      '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=sample_rate',
+      '-of', 'csv=p=0', smart,
+    ]);
+    expect(smartRate.trim()).toBe('44100');
+
+    // Blurred background path should also produce a single vertical video
+    // from the first source stream.
+    const blurred = path.join(dir, 'multi-vertical-blurred.mp4');
+    await renderVerticalDerivative({
+      inputPath: multiSource,
+      outputPath: blurred,
+      hasAudio: true,
+      delivery: VERTICAL_DELIVERY,
+      cropFilter: null,
+    });
+    const blurredProbe = await ffprobe(blurred);
+    expect(blurredProbe.width).toBe(1080);
+    expect(blurredProbe.height).toBe(1920);
+    expect(blurredProbe.audioCodec).toBe('aac');
+  }, 300_000);
 
 });

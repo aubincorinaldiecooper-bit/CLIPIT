@@ -207,6 +207,20 @@ export interface ClipRequest {
   chunkDegradations: ChunkDegradation[];
   answeredFrom: AnsweredFrom | null;
   uncertainMatches: UncertainMatch[];
+  /**
+   * Whether this request owes a finished 9:16 deck, and whether that deck
+   * stands. Read together they are the ONLY authority on what a creator may
+   * see: readiness is decided for the whole set, never per card.
+   */
+  presentationTarget: 'original' | 'vertical' | null;
+  /** What the creator asked for. */
+  requestedResultCount: number | null;
+  /** Eligible moments the search actually found for this platform. */
+  availableCandidateCount: number | null;
+  /** The deck being assembled: min(requested, available). */
+  effectiveDeckTarget: number | null;
+  /** Set only when the whole effective deck is finished and persisted. */
+  deckCompletedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
