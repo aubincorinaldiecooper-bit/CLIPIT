@@ -6,6 +6,7 @@ import type { FastifyRequest } from 'fastify';
 import {
   deleteClipRow,
   getClip,
+  getLibraryClip,
   listClipFamily,
   insertDerivedClip,
   listClipsForPrincipal,
@@ -215,7 +216,9 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
 
     const updated = await setClipTitle(clipId, body.title === '' ? null : body.title);
     if (!updated) throw HttpError.notFound('Clip not found');
-    return reply.send({ clip: await serializeClip(updated) });
+    const entry = await getLibraryClip(clipId);
+    if (!entry) throw HttpError.notFound('Clip not found');
+    return reply.send({ clip: await serializeLibraryClip(entry) });
   });
 
   /**
