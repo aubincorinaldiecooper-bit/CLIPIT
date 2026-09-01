@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { run } from '../src/lib/exec.js';
 import {
   createAnalysisProxy,
+  clipResolutionCap,
   cutClip,
   extractAudioSegments,
   extractFrameAt,
@@ -156,14 +157,51 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     return file;
   }
 
-  it('caps a landscape source at 1080 lines', async () => {
+  it('caps a landscape source at 1080 lines, and reports the size it delivered', async () => {
     const big = await makeOversized('big-landscape.mp4', '1920x1440');
     const output = path.join(dir, 'capped-landscape.mp4');
-    await cutClip({ inputPath: big, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
+    const result = await cutClip({ inputPath: big, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
 
     const probe = await ffprobe(output);
     expect(probe.height).toBe(1080);
     expect(probe.width).toBe(1440);
+    // What the caller is told matches the file, not the source.
+    expect(result.width).toBe(1440);
+    expect(result.height).toBe(1080);
+  }, 180_000);
+
+  it("reports the delivered size when the cap shrinks a caller's crop", async () => {
+    // A variant plans a crop and would otherwise record the crop's size.
+    // Here the crop's shorter side (1200) is over the cap, so the file is
+    // smaller than the plan — and the result must say so.
+    const big = await makeOversized('big-cropped.mp4', '1920x1440');
+    const output = path.join(dir, 'capped-crop.mp4');
+    const result = await cutClip({
+      inputPath: big, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false,
+      videoFilters: ['crop=1600:1200:0:0'],
+    });
+
+    const probe = await ffprobe(output);
+    expect([probe.width, probe.height]).toEqual([1440, 1080]);
+    expect([result.width, result.height]).toEqual([1440, 1080]);
+  }, 180_000);
+
+  it('rounds an odd cap down so the encoder still accepts the frame', async () => {
+    // An odd short side is not "a slightly smaller clip": H.264 4:2:0 refuses
+    // it outright, so every oversized cut would fail and deliver nothing.
+    expect(clipResolutionCap(1079)).toContain('1078');
+    expect(clipResolutionCap(1079)).not.toContain('1079');
+
+    const big = await makeOversized('big-odd.mp4', '1920x1440');
+    const output = path.join(dir, 'odd-cap.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y', '-i', big,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+      '-vf', clipResolutionCap(1079), output,
+    ], { timeoutMs: 120_000 });
+
+    const probe = await ffprobe(output);
+    expect(probe.height).toBe(1078);
   }, 180_000);
 
   it('caps a portrait source on its shorter side, not its height', async () => {
