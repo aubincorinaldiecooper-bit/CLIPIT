@@ -317,8 +317,11 @@ export async function extractAudioSegments(
  */
 export async function createPlaybackProxy(inputPath: string, outputPath: string): Promise<void> {
   const side = Math.max(2, Math.floor(env.PLAYBACK_PROXY_SHORT_SIDE / 2) * 2);
-  const shortLandscape = `min(${side},trunc(ih/2)*2)`;
-  const shortPortrait = `min(${side},trunc(iw/2)*2)`;
+  // A one-pixel side rounds to zero, which ffmpeg reads as "keep the
+  // input" — and 1 is odd. Such a video is not footage; it is scaled to the
+  // two pixels the encoder needs rather than left with no proxy at all.
+  const shortLandscape = `max(2,min(${side},trunc(ih/2)*2))`;
+  const shortPortrait = `max(2,min(${side},trunc(iw/2)*2))`;
   const proxyWidth = `if(gt(iw,ih),trunc(iw*${shortLandscape}/ih/2)*2,${shortPortrait})`;
   const proxyHeight = `if(gt(iw,ih),${shortLandscape},trunc(ih*${shortPortrait}/iw/2)*2)`;
   await run(
