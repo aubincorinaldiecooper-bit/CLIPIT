@@ -310,8 +310,14 @@ export function clipResolutionCap(maxShortSide: number = env.CLIP_MAX_SHORT_SIDE
   // is then computed from it and rounded down too — ffmpeg's `-2` rounds to
   // the NEAREST even, which turns a 1279-wide source into 1280 and breaks
   // the promise that nothing is ever upscaled, even by a pixel.
-  const shortLandscape = `min(${cap},trunc(ih/2)*2)`;
-  const shortPortrait = `min(${cap},trunc(iw/2)*2)`;
+  //
+  // The one exception to "never larger": a side of a single pixel rounds
+  // down to zero, which ffmpeg reads as "keep the input" — and 1 is odd, so
+  // the encoder refuses. A one-pixel video is not footage; it is scaled up
+  // to the two pixels the encoder needs, aspect kept, rather than failing
+  // three times and delivering nothing.
+  const shortLandscape = `max(2,min(${cap},trunc(ih/2)*2))`;
+  const shortPortrait = `max(2,min(${cap},trunc(iw/2)*2))`;
   const width = `if(gt(iw,ih),trunc(iw*${shortLandscape}/ih/2)*2,${shortPortrait})`;
   const height = `if(gt(iw,ih),${shortLandscape},trunc(ih*${shortPortrait}/iw/2)*2)`;
   return `scale='${width}':'${height}'`;

@@ -254,6 +254,31 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     }
   }, 240_000);
 
+  it('still produces an encodable file from a one-pixel-wide or one-pixel-tall source', async () => {
+    // Degenerate, and the only case anything is ever made larger: a side of
+    // one pixel rounds to zero, which ffmpeg reads as "keep the input", and
+    // the encoder refuses an odd side. Two pixels, aspect kept, beats three
+    // failed attempts and no clip.
+    // lavfi will not draw a one-pixel frame, and a subsampled format cannot
+    // hold one, so it is cut out of a normal frame as RGB and kept lossless
+    // — the point is the size, not the pixels.
+    for (const [canvas, crop, expected] of [
+      ['16x720', 'crop=1:720:0:0', [2, 1440]],
+      ['720x16', 'crop=720:1:0:0', [1440, 2]],
+    ] as const) {
+      const src = path.join(dir, `degenerate-${crop.replace(/[^0-9]+/g, '-')}.mkv`);
+      await run('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', `color=c=red:size=${canvas}:d=2:r=10`,
+        '-vf', `format=rgb24,${crop}`, '-c:v', 'ffv1', src,
+      ], { timeoutMs: 120_000 });
+      const output = path.join(dir, `degenerate-${size}-cut.mp4`);
+      await cutClip({ inputPath: src, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
+      const probe = await ffprobe(output);
+      expect([probe.width, probe.height]).toEqual([...expected]);
+    }
+  }, 240_000);
+
   it('never upscales a source already inside the cap', async () => {
     // The shared 320x240 source: the cut must come out exactly 320x240.
     const output = path.join(dir, 'untouched.mp4');
