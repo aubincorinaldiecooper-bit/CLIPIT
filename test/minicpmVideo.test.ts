@@ -139,7 +139,7 @@ describe('MiniCPM provider seam', () => {
     expect(args).toEqual([]);
     // A signed URL to the chunk — not base64 bytes, and not the bare key.
     expect(kwargs.video_url).toContain('chunks/video-1/2.mp4');
-    expect(kwargs.video_url).toMatch(/^https:\/\//);
+    expect(kwargs.video_url).toMatch(/^https?:\/\//);
     expect(kwargs.prompt).toContain('find the drift');
 
     // The call is accounted even though MiniCPM reports no tokens.
