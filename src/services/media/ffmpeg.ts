@@ -302,11 +302,19 @@ export interface CutClipOptions {
  */
 export function clipResolutionCap(maxShortSide: number = env.CLIP_MAX_SHORT_SIDE): string {
   const cap = Math.max(2, Math.floor(maxShortSide / 2) * 2);
-  // The SOURCE side is rounded down to even as well as the cap: a 1279x719
-  // original is under the cap and would otherwise pass through at 719
-  // lines, which the encoder refuses just as it refused an odd cap. `-2`
-  // keeps the other side even.
-  return `scale='if(gt(iw,ih),-2,min(${cap},trunc(iw/2)*2))':'if(gt(iw,ih),min(${cap},trunc(ih/2)*2),-2)'`;
+  // Both sides come out even, and neither ever exceeds its input side.
+  //
+  // The SHORTER side is min(cap, source rounded DOWN to even): a 1279x719
+  // original is under the cap and would otherwise reach the encoder at 719
+  // lines, which it refuses just as it refused an odd cap. The LONGER side
+  // is then computed from it and rounded down too — ffmpeg's `-2` rounds to
+  // the NEAREST even, which turns a 1279-wide source into 1280 and breaks
+  // the promise that nothing is ever upscaled, even by a pixel.
+  const shortLandscape = `min(${cap},trunc(ih/2)*2)`;
+  const shortPortrait = `min(${cap},trunc(iw/2)*2)`;
+  const width = `if(gt(iw,ih),trunc(iw*${shortLandscape}/ih/2)*2,${shortPortrait})`;
+  const height = `if(gt(iw,ih),${shortLandscape},trunc(ih*${shortPortrait}/iw/2)*2)`;
+  return `scale='${width}':'${height}'`;
 }
 
 /**

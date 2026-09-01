@@ -233,6 +233,27 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(probe.width).toBeLessThanOrEqual(1279);
   }, 180_000);
 
+  it('never adds a pixel when only the longer side is odd', async () => {
+    // ffmpeg's -2 rounds to the NEAREST even: 1279 would become 1280. Both
+    // sides are computed and rounded down instead, so the cut is never wider
+    // or taller than what it was cut from.
+    for (const [size, expected] of [
+      ['1279x720', [1278, 720]],
+      ['720x1279', [720, 1278]],
+    ] as const) {
+      const src = path.join(dir, `odd-long-${size}.mp4`);
+      await run('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', `testsrc=size=${size}:rate=10:duration=2`,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv444p', src,
+      ], { timeoutMs: 120_000 });
+      const output = path.join(dir, `odd-long-${size}-cut.mp4`);
+      await cutClip({ inputPath: src, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
+      const probe = await ffprobe(output);
+      expect([probe.width, probe.height]).toEqual([...expected]);
+    }
+  }, 240_000);
+
   it('never upscales a source already inside the cap', async () => {
     // The shared 320x240 source: the cut must come out exactly 320x240.
     const output = path.join(dir, 'untouched.mp4');
