@@ -327,8 +327,12 @@ export async function createPlaybackProxy(inputPath: string, outputPath: string)
       '-map', '0:v:0',
       '-map', '0:a:0?',
       // Shorter side to `side`, never upscaling, whichever way the frame is
-      // turned — ffmpeg has already applied the file's rotation by here.
-      '-vf', `scale='if(gt(iw,ih),-2,min(${side},iw))':'if(gt(iw,ih),min(${side},ih),-2)',fps=fps='min(30,source_fps)'`,
+      // turned — ffmpeg has already applied the file's rotation by here. The
+      // source side is rounded down to even too: a 1280x719 recording is
+      // under the cap and would otherwise reach the encoder at 719 lines,
+      // which 4:2:0 H.264 refuses — and a proxy that fails to build sends
+      // review back to the original.
+      '-vf', `scale='if(gt(iw,ih),-2,min(${side},trunc(iw/2)*2))':'if(gt(iw,ih),min(${side},trunc(ih/2)*2),-2)',fps=fps='min(30,source_fps)'`,
       '-c:v', 'libx264',
       '-preset', env.PROXY_PRESET,
       '-crf', String(env.PLAYBACK_PROXY_CRF),

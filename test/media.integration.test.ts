@@ -224,6 +224,21 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(probe.fps).toBeLessThanOrEqual(30);
   }, 180_000);
 
+  it('builds the playback proxy from an odd-sized recording', async () => {
+    const odd = path.join(dir, 'odd-playback-source.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=size=1280x719:rate=10:duration=1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv444p', odd,
+    ], { timeoutMs: 120_000 });
+
+    const output = path.join(dir, 'odd-playback.mp4');
+    await createPlaybackProxy(odd, output);
+    const probe = await ffprobe(output);
+    expect(probe.height).toBe(718);
+    expect(probe.width! % 2).toBe(0);
+  }, 180_000);
+
   it('cuts a 9:16 thumbnail through the export window, at its native size', async () => {
     const proxy = await makeOversized('thumb-source.mp4', '1920x1080');
     const frame = { width: 1920, height: 1080 };
