@@ -214,6 +214,25 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(probe.height).toBe(1440);
   }, 180_000);
 
+  it('evens out an odd source that is already inside the cap', async () => {
+    // Phone and screen recordings arrive at odd sizes. 4:4:4 lets the test
+    // encode one; the cut is 4:2:0, which cannot carry an odd side.
+    const odd = path.join(dir, 'odd-source.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=size=1279x719:rate=10:duration=2',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv444p', odd,
+    ], { timeoutMs: 120_000 });
+
+    const output = path.join(dir, 'odd-cut.mp4');
+    await cutClip({ inputPath: odd, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
+
+    const probe = await ffprobe(output);
+    expect(probe.height).toBe(718);
+    expect(probe.width! % 2).toBe(0);
+    expect(probe.width).toBeLessThanOrEqual(1279);
+  }, 180_000);
+
   it('never upscales a source already inside the cap', async () => {
     // The shared 320x240 source: the cut must come out exactly 320x240.
     const output = path.join(dir, 'untouched.mp4');

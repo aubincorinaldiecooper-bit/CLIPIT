@@ -302,7 +302,11 @@ export interface CutClipOptions {
  */
 export function clipResolutionCap(maxShortSide: number = env.CLIP_MAX_SHORT_SIDE): string {
   const cap = Math.max(2, Math.floor(maxShortSide / 2) * 2);
-  return `scale='if(gt(iw,ih),-2,min(${cap},iw))':'if(gt(iw,ih),min(${cap},ih),-2)'`;
+  // The SOURCE side is rounded down to even as well as the cap: a 1279x719
+  // original is under the cap and would otherwise pass through at 719
+  // lines, which the encoder refuses just as it refused an odd cap. `-2`
+  // keeps the other side even.
+  return `scale='if(gt(iw,ih),-2,min(${cap},trunc(iw/2)*2))':'if(gt(iw,ih),min(${cap},trunc(ih/2)*2),-2)'`;
 }
 
 /**
