@@ -71,6 +71,13 @@ export interface OrchestrateInput {
   candidates: OrchestratorCandidate[];
   log: Logger;
   /**
+   * When the creator's wait for this deck began.
+   *
+   * Started here, the clock missed the entire source download that precedes
+   * it — for a 2GB original, a minute of real waiting reported as zero.
+   */
+  startedAtMs: number;
+  /**
    * The search's own cost tally. Composition calls are made inside the search
    * job and are part of what that request cost; leaving them out would make
    * the "clip search cost" line understate a vertical request by every
@@ -461,7 +468,7 @@ export interface OrchestrationResult {
  * a partial one even by mistake.
  */
 export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<OrchestrationResult> {
-  const startedAt = performance.now();
+  const startedAt = input.startedAtMs;
   const plan = planDeck(input.effectiveDeckTarget, env.VERTICAL_CANDIDATE_OVERFETCH, env.VERTICAL_CANDIDATE_CEILING);
 
   const outcome = await assembleDeck(

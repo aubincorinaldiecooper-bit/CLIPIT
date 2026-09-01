@@ -129,6 +129,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     maxCount: env.VERTICAL_CANDIDATE_CEILING,
   });
   let deck: VerticalDeckResult | null = null;
+  // Identifies THIS planning of the deck, so a superseded stalled attempt
+  // cannot open the creator-facing gate over a newer run's half-built deck.
+  let deckAttemptId: string | null = null;
 
   try {
     if (video.status !== 'ready') {
@@ -205,7 +208,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     //
     // It also CLEARS any previous completion, so a retrying job cannot serve
     // last run's finished deck while it rebuilds this one.
-    await recordDeckPlan(clipRequestId, {
+    deckAttemptId = await recordDeckPlan(clipRequestId, {
       presentationTarget: needsVerticalDerivative(intent) ? 'vertical' : 'original',
       requestedResultCount: intent.requestedCount,
     });
@@ -259,6 +262,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           clipRequestId,
           request,
           intent,
+          deckAttemptId,
           video,
           chunks,
           instruction,
@@ -354,6 +358,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         clipRequestId,
         request,
         intent,
+        deckAttemptId,
         video,
         chunks,
         instruction,
@@ -505,7 +510,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // per candidate, inside the deck assembly where it costs one render
       // rather than a re-reading of the entire video.
       const finished = await completeRequestWithDeck({
-        clipRequestId, request, video, intent, workDir: dir, log, tally, answeredFrom: 'footage',
+        clipRequestId, request, video, intent, workDir: dir, log, tally,
+        answeredFrom: 'footage', deckAttemptId,
+        // The creator has been waiting since the search finished, not since
+        // the source finished downloading.
+        deckStartedAtMs: performance.now(),
       });
       deck = finished.deck;
       if (!finished.completed) {
@@ -761,6 +770,10 @@ export async function completeRequestWithDeck(input: {
   log: Logger;
   tally: UsageTally;
   answeredFrom: 'notes' | 'footage';
+  /** The token from recordDeckPlan — the gate is fenced to it. */
+  deckAttemptId: string | null;
+  /** When the creator's wait for this deck actually began. */
+  deckStartedAtMs: number;
 }): Promise<{ completed: boolean; deck: VerticalDeckResult | null }> {
   const { clipRequestId, intent, log } = input;
 
@@ -777,6 +790,11 @@ export async function completeRequestWithDeck(input: {
     workDir: input.workDir,
     log,
     tally: input.tally,
+    // Passed in rather than started inside: the whole original source is
+    // downloaded before a single candidate renders, and a clock started after
+    // it reported a wait that no creator ever had. A 2GB source is a minute
+    // of that wait on its own.
+    startedAtMs: input.deckStartedAtMs,
   });
 
   const completion = deckCompletion(deck);
@@ -824,7 +842,20 @@ export async function completeRequestWithDeck(input: {
   // It also opens on a legitimately EMPTY deck (nothing this platform could
   // take). That is a finished answer too, and leaving the gate shut would
   // leave a completed request looking forever like one still assembling.
-  await markDeckComplete(clipRequestId);
+  // A superseded run finds the token changed and opens nothing. It must not
+  // then report the request complete either — the run that replaced it owns
+  // that, and saying so here would finish a request over someone else's
+  // half-built deck.
+  const opened = input.deckAttemptId
+    ? await markDeckComplete(clipRequestId, input.deckAttemptId)
+    : false;
+  if (!opened) {
+    log.warn('deck attempt was superseded before it could be released', {
+      clipRequestId, answeredFrom: input.answeredFrom,
+    });
+    return { completed: false, deck };
+  }
+
   await finishClipRequest(clipRequestId, 'completed', null, input.answeredFrom);
   return { completed: true, deck };
 }
@@ -875,6 +906,8 @@ async function buildVerticalDeck(input: {
   workDir: string;
   log: Logger;
   tally: UsageTally;
+  /** When the creator's wait began — before the source download, not after. */
+  startedAtMs: number;
 }): Promise<VerticalDeckResult> {
   const { clipRequestId, request, video, intent, log } = input;
   const empty: VerticalDeckResult = {
@@ -980,6 +1013,7 @@ async function buildVerticalDeck(input: {
     candidates,
     log,
     tally: input.tally,
+    startedAtMs: input.startedAtMs,
   });
 
   return {
@@ -1066,6 +1100,8 @@ async function answerFromNotes(input: {
   clipRequestId: string;
   request: ClipRequest;
   intent: PlatformIntent;
+  /** The deck-planning token, so the gate stays fenced on this path too. */
+  deckAttemptId: string | null;
   video: Video;
   chunks: VideoChunk[];
   instruction: string;
@@ -1252,7 +1288,9 @@ async function answerFromNotes(input: {
     // they found, and the request is completed by the same helper the footage
     // path uses so the two can never drift apart on what a creator is owed.
     const completed = await completeRequestWithDeck({
-      clipRequestId, request, video, intent, workDir: dir, log, tally, answeredFrom: 'notes',
+      clipRequestId, request, video, intent, workDir: dir, log, tally,
+      answeredFrom: 'notes', deckAttemptId: input.deckAttemptId,
+      deckStartedAtMs: performance.now(),
     });
     deckCompleted = completed.completed;
   });

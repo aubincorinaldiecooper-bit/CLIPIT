@@ -453,3 +453,43 @@ describe('a retry must never reach into the library', () => {
     expect(clear).toContain('DELETE FROM clip_matches');
   });
 });
+
+describe('a superseded attempt must not open the gate', () => {
+  /**
+   * BullMQ redelivers a stalled search while the first run is still
+   * assembling. The second run re-plans, clears the first run's work and
+   * renders its own deck. The first run — still executing, unaware it was
+   * replaced — reaches the gate and, unfenced, opens it over the second run's
+   * half-built deck. That is the progressive reveal the whole set-level rule
+   * exists to forbid, arriving through the one door left unlocked.
+   *
+   * A guard over the SQL, because the fence lives there: dropping the
+   * deck_attempt_id predicate silently reopens it.
+   */
+  it('fences the gate to the attempt that planned the deck', () => {
+    const src = readFileSync(
+      path.join(__dirname, '..', 'src/db/repositories/clipRequests.ts'),
+      'utf8',
+    );
+    const mark = src.slice(src.indexOf('export async function markDeckComplete'));
+    expect(mark).toContain('deck_attempt_id = $2');
+    // And it must report whether it won, so a superseded run can stand down
+    // rather than assume it completed the request.
+    expect(mark).toContain('RETURNING id');
+
+    const plan = src.slice(src.indexOf('export async function recordDeckPlan'));
+    expect(plan).toContain('gen_random_uuid()');
+  });
+
+  /**
+   * The retry path must no longer be able to cascade every match away: the
+   * one function that did is gone, and its replacement spares kept moments.
+   */
+  it('no longer ships a function that deletes every match unconditionally', () => {
+    const src = readFileSync(
+      path.join(__dirname, '..', 'src/db/repositories/clipRequests.ts'),
+      'utf8',
+    );
+    expect(src).not.toContain('export async function deleteMatches');
+  });
+});

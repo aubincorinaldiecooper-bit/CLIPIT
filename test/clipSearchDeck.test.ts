@@ -12,12 +12,11 @@ const listMatches = vi.fn(async () => [{
   globalEndSeconds: 30,
 }]);
 const finishClipRequest = vi.fn(async () => undefined);
-const markDeckComplete = vi.fn(async () => undefined);
+const markDeckComplete = vi.fn(async () => true);
 const recordDeckAvailability = vi.fn(async () => undefined);
 const downloadToFile = vi.fn(async () => undefined);
 
 vi.mock('../src/db/repositories/clipRequests.js', () => ({
-  deleteMatches: vi.fn(),
   finishClipRequest,
   getClipRequest: vi.fn(),
   getPreviousClipRequest: vi.fn(),
@@ -109,11 +108,14 @@ describe('the deck gate every finished request passes through', () => {
       log,
       tally,
       answeredFrom: 'notes',
+      deckAttemptId: 'attempt-1',
+      deckStartedAtMs: 0,
     });
 
     expect(result.completed).toBe(true);
     expect(orchestrateVerticalDeck).toHaveBeenCalled();
-    expect(markDeckComplete).toHaveBeenCalledWith('request-1');
+    // Fenced: the gate opens only for the attempt that planned this deck.
+    expect(markDeckComplete).toHaveBeenCalledWith('request-1', 'attempt-1');
     expect(finishClipRequest).toHaveBeenCalledWith('request-1', 'completed', null, 'notes');
   });
 
@@ -127,6 +129,8 @@ describe('the deck gate every finished request passes through', () => {
       log,
       tally,
       answeredFrom: 'notes',
+      deckAttemptId: 'attempt-1',
+      deckStartedAtMs: 0,
     });
 
     expect(result.completed).toBe(false);
@@ -158,6 +162,8 @@ describe('the deck gate every finished request passes through', () => {
       log,
       tally,
       answeredFrom: 'notes',
+      deckAttemptId: 'attempt-1',
+      deckStartedAtMs: 0,
     });
 
     expect(result.completed).toBe(false);
@@ -167,5 +173,37 @@ describe('the deck gate every finished request passes through', () => {
       'We found the moments but could not finish making them ready to post. Please try again.',
     );
     expect(markDeckComplete).not.toHaveBeenCalled();
+  });
+});
+
+describe('a superseded attempt stands down', () => {
+  /**
+   * A stalled job redelivered mid-assembly means two runs exist. The second
+   * re-plans and takes a new token; the first, still executing, reaches the
+   * gate holding a token that is no longer current.
+   *
+   * It must open nothing AND complete nothing — finishing the request here
+   * would mark it done over the other run's half-built deck, which is the
+   * same partial reveal by a different route.
+   */
+  it('neither opens the gate nor completes the request', async () => {
+    markDeckComplete.mockResolvedValueOnce(false as never);
+    finishClipRequest.mockClear();
+
+    const result = await completeRequestWithDeck({
+      clipRequestId: 'request-1',
+      request: request as any,
+      video: video as any,
+      intent,
+      workDir: '/tmp',
+      log,
+      tally,
+      answeredFrom: 'footage',
+      deckAttemptId: 'stale-attempt',
+      deckStartedAtMs: 0,
+    });
+
+    expect(result.completed).toBe(false);
+    expect(finishClipRequest).not.toHaveBeenCalled();
   });
 });

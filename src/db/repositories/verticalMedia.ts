@@ -40,7 +40,14 @@ export interface VerticalMediaInput {
  * reason to create one and rely on being caught.
  */
 export async function setVerticalMedia(clipId: string, input: VerticalMediaInput): Promise<void> {
-  await query(
+  // The row count is checked, not discarded.
+  //
+  // The clip can be gone by the time this runs — the video deleted mid-render,
+  // or a concurrent retry having cleared the matches this clip hung from. The
+  // UPDATE then matches nothing and returns perfectly happily, and the deck
+  // records a candidate as READY whose media is referenced by no row at all:
+  // a card that cannot be served, and two orphaned objects.
+  const result = await query(
     `UPDATE clips
         SET derivative_storage_key   = $2,
             derivative_status        = 'ready',
@@ -84,6 +91,10 @@ export async function setVerticalMedia(clipId: string, input: VerticalMediaInput
       input.retentionClass,
     ],
   );
+
+  if (result.rowCount === 0) {
+    throw new Error(`Clip ${clipId} no longer exists — its finished media has nowhere to be recorded`);
+  }
 }
 
 /**

@@ -238,18 +238,24 @@ export async function recordSearchApproach(
 export async function recordDeckPlan(
   requestId: string,
   plan: { presentationTarget: 'original' | 'vertical'; requestedResultCount: number },
-): Promise<void> {
-  await queryOne(
+): Promise<string> {
+  // Returns a token identifying THIS planning. Only the run holding it may
+  // later open the gate — see markDeckComplete.
+  const row = await queryOne<{ deck_attempt_id: string }>(
     `UPDATE clip_requests
         SET presentation_target      = $2,
             requested_result_count   = $3,
             available_candidate_count = NULL,
             effective_deck_target    = NULL,
             deck_completed_at        = NULL,
+            deck_attempt_id          = gen_random_uuid(),
             updated_at               = now()
-      WHERE id = $1`,
+      WHERE id = $1
+      RETURNING deck_attempt_id`,
     [requestId, plan.presentationTarget, plan.requestedResultCount],
   );
+  if (!row) throw new Error(`Clip request ${requestId} disappeared while planning its deck`);
+  return row.deck_attempt_id;
 }
 
 /**
@@ -278,11 +284,26 @@ export async function recordDeckAvailability(
  * finished AND persisted, so there is no instant in which this says yes and
  * the clips behind it are not there.
  */
-export async function markDeckComplete(requestId: string): Promise<void> {
-  await queryOne(
-    'UPDATE clip_requests SET deck_completed_at = now(), updated_at = now() WHERE id = $1',
-    [requestId],
+export async function markDeckComplete(requestId: string, attemptId: string): Promise<boolean> {
+  // Fenced to the attempt that planned this deck.
+  //
+  // A stalled job is redelivered while the first run is still assembling. The
+  // second run re-plans — taking a new token — clears the first run's work and
+  // renders its own deck. The first run, still executing and unaware it was
+  // superseded, would otherwise reach this line and open the creator-facing
+  // gate over the second run's half-built deck: the progressive reveal the
+  // whole set-level rule exists to forbid.
+  //
+  // A superseded run matches no row and changes nothing, which is exactly
+  // right. The caller is told, so it can say so rather than assume it won.
+  const row = await queryOne<{ id: string }>(
+    `UPDATE clip_requests
+        SET deck_completed_at = now(), updated_at = now()
+      WHERE id = $1 AND deck_attempt_id = $2
+      RETURNING id`,
+    [requestId, attemptId],
   );
+  return row !== null;
 }
 
 export async function finishClipRequest(
@@ -585,9 +606,6 @@ export async function listMatchesByIds(requestId: string, matchIds: string[]): P
   return rows.map(mapMatch);
 }
 
-export async function deleteMatches(requestId: string): Promise<void> {
-  await queryOne('DELETE FROM clip_matches WHERE clip_request_id = $1', [requestId]);
-}
 
 /**
  * What the last day of use taught us. See docs/learning-loop.md.
