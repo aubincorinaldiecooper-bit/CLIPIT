@@ -3,9 +3,11 @@ import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import {
+  getClipRequest,
   listMatchesMissingThumbnails,
   listVideosMissingThumbnails,
 } from '../../db/repositories/clipRequests.js';
+import { getVideo } from '../../db/repositories/videos.js';
 import { attachThumbnails } from '../../services/media/thumbnails.js';
 import type { ThumbnailBackfillJob } from '../../queues/index.js';
 
@@ -51,14 +53,27 @@ export async function handleThumbnailBackfill(job: Job<ThumbnailBackfillJob>): P
     const matches = await listMatchesMissingThumbnails(video.videoId);
     if (matches.length === 0) continue;
 
+    const playbackStorageKey = (await getVideo(video.videoId))?.playbackStorageKey ?? null;
+    // A still is cut to the shape its request delivers, and one video's
+    // missing stills can belong to several requests — so one call per
+    // request, each with its own presentation.
+    const byRequest = new Map<string, typeof matches>();
+    for (const match of matches) {
+      byRequest.set(match.clipRequestId, [...(byRequest.get(match.clipRequestId) ?? []), match]);
+    }
     await withWorkDir(`thumbs-${video.videoId}`, async (dir) => {
-      attached += await attachThumbnails({
-        videoId: video.videoId,
-        proxyStorageKey: video.proxyStorageKey,
-        matches,
-        workDir: dir,
-        log,
-      });
+      for (const [clipRequestId, group] of byRequest) {
+        const request = await getClipRequest(clipRequestId);
+        attached += await attachThumbnails({
+          videoId: video.videoId,
+          proxyStorageKey: video.proxyStorageKey,
+          playbackStorageKey,
+          presentation: request?.presentationTarget === 'vertical' ? 'vertical' : 'original',
+          matches: group,
+          workDir: dir,
+          log,
+        });
+      }
     });
   }
 

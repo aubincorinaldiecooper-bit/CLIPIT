@@ -1090,10 +1090,16 @@ async function attachSearchThumbnails(input: {
   const { clipRequestId, video, workDir, log } = input;
   if (!video.proxyStorageKey) return;
 
+  // The request row already says how its moments will be delivered; the
+  // thumbnail is cut to the same shape so the card never shows a frame the
+  // export will not keep.
+  const request = await getClipRequest(clipRequestId);
   const matches = await listMatches(clipRequestId);
   await attachThumbnails({
     videoId: video.id,
     proxyStorageKey: video.proxyStorageKey,
+    playbackStorageKey: video.playbackStorageKey ?? null,
+    presentation: request?.presentationTarget === 'vertical' ? 'vertical' : 'original',
     matches,
     workDir,
     log,

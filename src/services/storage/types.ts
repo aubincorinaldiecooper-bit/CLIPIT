@@ -81,6 +81,11 @@ export function proxyKey(videoId: string): string {
   return `${StoragePrefix.proxies}/${videoId}/proxy.mp4`;
 }
 
+/** The watchable proxy: 720 lines, real frame rate, with audio. */
+export function playbackProxyKey(videoId: string): string {
+  return `${StoragePrefix.proxies}/${videoId}/playback.mp4`;
+}
+
 export function chunkKey(videoId: string, chunkIndex: number): string {
   return `${StoragePrefix.proxies}/${videoId}/chunks/${String(chunkIndex).padStart(4, '0')}.mp4`;
 }

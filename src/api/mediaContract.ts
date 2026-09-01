@@ -1,4 +1,5 @@
-import { aspectRatioLabel, type CompositionMode } from '../services/media/composition.js';
+import { aspectRatioLabel, focusPctForCrop, type CompositionMode } from '../services/media/composition.js';
+import { reframeWindow } from '../services/media/reframe.js';
 import { isCreatorVisible, type DerivativeStatus } from '../services/media/verticalVisibility.js';
 
 /**
@@ -16,7 +17,29 @@ import { isCreatorVisible, type DerivativeStatus } from '../services/media/verti
  */
 
 /** The exact shape a client receives. Field names per the agreed contract. */
+/**
+ * How a moment is framed — the one definition the thumbnail, the card, the
+ * Preview and the export all derive from.
+ *
+ * `focusPct` is the number a CSS `object-position` wants: 0..100 along the
+ * axis being cut (horizontal for a landscape source cropped to 9:16). `crop`
+ * is the exact window the export kept, normalised against the source frame
+ * so it means the same thing at any resolution. Both come from the same
+ * calculation the render used (reframeWindow), never recomputed on a client.
+ */
+export interface ClipComposition {
+  /** The delivered shape: '9:16' for a vertical moment, else the source's own. */
+  aspectRatio: string;
+  /** What was actually done to make that shape. */
+  mode: CompositionMode;
+  focalX: number | null;
+  focalY: number | null;
+  focusPct: number;
+  crop: { x: number; y: number; width: number; height: number } | null;
+}
+
 export interface ClipMediaContract {
+  composition: ClipComposition;
   /** What to play. The 9:16 derivative for a vertical moment; otherwise the canonical clip. */
   url: string | null;
   /** Always the original-framing excerpt. Never replaced by a derivative. */
@@ -42,6 +65,53 @@ export interface ClipMediaRow {
   outputWidth: number | null;
   outputHeight: number | null;
   compositionMode: CompositionMode | null;
+  /** The model's chosen focal point, 0..1 against the source frame; null unless smart-cropped. */
+  focalX: number | null;
+  focalY: number | null;
+}
+
+const VERTICAL_RATIO = 9 / 16;
+
+/**
+ * The composition block, from the stored decision. For a finished smart crop
+ * the window is recomputed from the same focal point and source size the
+ * render used, so what the card positions from IS what the export kept. Any
+ * other case is centred and uncut — including a vertical moment whose
+ * derivative is not ready yet, which the card previews from the source at
+ * the centre until the render decides otherwise.
+ */
+export function clipComposition(row: ClipMediaRow, wantsVertical: boolean, derivativeReady: boolean): ClipComposition {
+  const sourceAspect = aspectRatioLabel(row.sourceWidth, row.sourceHeight) ?? 'source';
+  const mode: CompositionMode = wantsVertical && derivativeReady ? (row.compositionMode ?? 'original') : 'original';
+  const base: ClipComposition = {
+    aspectRatio: wantsVertical ? '9:16' : sourceAspect,
+    mode,
+    focalX: null,
+    focalY: null,
+    focusPct: 50,
+    crop: null,
+  };
+
+  if (mode !== 'smart_crop') return base;
+  if (row.focalX === null || row.focalY === null || !row.sourceWidth || !row.sourceHeight) return base;
+
+  const source = { width: row.sourceWidth, height: row.sourceHeight };
+  const focusPct = focusPctForCrop(row.focalX, row.focalY, source, VERTICAL_RATIO);
+  const window = reframeWindow({ aspect: '9:16', focusPct }, source);
+  return {
+    ...base,
+    focalX: row.focalX,
+    focalY: row.focalY,
+    focusPct,
+    crop: window
+      ? {
+          x: Number((window.x / source.width).toFixed(4)),
+          y: Number((window.y / source.height).toFixed(4)),
+          width: Number((window.width / source.width).toFixed(4)),
+          height: Number((window.height / source.height).toFixed(4)),
+        }
+      : null,
+  };
 }
 
 /**
@@ -79,6 +149,7 @@ export function clipMediaContract(row: ClipMediaRow, wantsVertical: boolean): Cl
     : sourceAspectRatio;
 
   return {
+    composition: clipComposition(row, wantsVertical, derivativeReady),
     url,
     canonicalUrl: row.canonicalUrl,
     posterUrl: row.posterUrl,

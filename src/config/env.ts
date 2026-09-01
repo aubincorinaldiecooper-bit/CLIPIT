@@ -388,6 +388,21 @@ const envSchema = z.object({
   PROXY_FPS: num(2, 0.5, 30),
   PROXY_CRF: int(30, 0, 51),
   PROXY_PRESET: z.string().default('veryfast'),
+  /**
+   * The playback proxy: what the browser plays while a moment is being
+   * reviewed, and what candidate thumbnails are cut from. The analysis proxy
+   * is 360p at 2fps with no audio — right for a model, unwatchable for a
+   * person, and a 320px still from it is the blurry thumbnail creators saw.
+   *
+   * 1080 on the shorter side, the same cap delivered clips get, so what is
+   * reviewed is what is delivered. It is also the least that lets a 9:16
+   * thumbnail be cut from a landscape frame without upscaling: 1080 lines
+   * give a 606-wide window, 720 lines only 404.
+   */
+  PLAYBACK_PROXY_SHORT_SIDE: int(1080, 360, 2160),
+  PLAYBACK_PROXY_CRF: int(23, 0, 51),
+  /** Candidate thumbnails: shorter side in pixels. 720 → 720x1280 for a 9:16 moment. */
+  THUMBNAIL_SHORT_SIDE: int(720, 240, 1080),
   // The model is responsible for the moment's boundaries. Adding another
   // handle here made the rendered file longer than the timestamps shown in
   // the result, and compounded the prompt's former request for context.

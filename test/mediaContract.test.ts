@@ -22,6 +22,8 @@ const row = (over: Partial<ClipMediaRow> = {}): ClipMediaRow => ({
   outputWidth: 1080,
   outputHeight: 1920,
   compositionMode: 'smart_crop',
+  focalX: 0.75,
+  focalY: 0.5,
   ...over,
 });
 
@@ -109,5 +111,38 @@ describe('creatorVisibleVerticalRows — the backend is authoritative', () => {
     const rows = [withId('pending', { derivativeStatus: 'pending', derivativeStorageKey: null })];
     // Nothing leaves here to be leaked.
     expect(creatorVisibleVerticalRows(rows)).toEqual([]);
+  });
+});
+
+describe('clipMediaContract — composition, the one framing everything derives from', () => {
+  it('recomputes the export window from the stored focal point', () => {
+    const media = clipMediaContract(row(), true);
+    expect(media.composition.aspectRatio).toBe('9:16');
+    expect(media.composition.mode).toBe('smart_crop');
+    expect(media.composition.focusPct).toBe(75);
+    // 606 of 1920 wide, starting at 1137: the window reframeWindow gives a
+    // 1920x1080 source at focus 75, normalised.
+    expect(media.composition.crop).toEqual({ x: 0.5922, y: 0, width: 0.3156, height: 1 });
+  });
+
+  it('is centred and uncut for the safe composition', () => {
+    const media = clipMediaContract(row({ compositionMode: 'blurred_background' }), true);
+    expect(media.composition.mode).toBe('blurred_background');
+    expect(media.composition.focusPct).toBe(50);
+    expect(media.composition.crop).toBeNull();
+  });
+
+  it('is centred while the derivative is still pending, but already 9:16', () => {
+    const media = clipMediaContract(row({ derivativeStatus: 'pending', derivativeUrl: null }), true);
+    expect(media.composition.aspectRatio).toBe('9:16');
+    expect(media.composition.mode).toBe('original');
+    expect(media.composition.crop).toBeNull();
+  });
+
+  it('keeps the source shape for a moment that was never vertical', () => {
+    const media = clipMediaContract(row(), false);
+    expect(media.composition.aspectRatio).toBe('16:9');
+    expect(media.composition.mode).toBe('original');
+    expect(media.composition.crop).toBeNull();
   });
 });

@@ -62,22 +62,37 @@ export interface ReframePlan {
  * window is then slid along the axis being cut, to `focusPct`, and clamped so
  * it can never leave the frame.
  */
-export function planReframe(
+/** The window a reframe keeps, in source pixels. Null when nothing is cut. */
+export interface ReframeWindow {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * THE crop calculation. Everything that shows a moment framed — the export,
+ * the thumbnail, the API's composition block the card and Preview position
+ * themselves from — derives from this window, so there is exactly one answer
+ * to "which part of the frame did we keep".
+ *
+ * Null means the source already has the target shape (or the format asks for
+ * the source as it is), and nothing is cut.
+ */
+export function reframeWindow(
   format: ClipFormat | null | undefined,
   source: { width: number; height: number },
-): ReframePlan {
+): ReframeWindow | null {
   const aspect = format?.aspect ?? 'source';
   // Guard the RAW numbers: a probe that knew nothing reports 0, and rounding
   // that to an even 2 would produce a 2×2 crop of a real video.
   if (!Number.isFinite(source.width) || !Number.isFinite(source.height) || source.width < 2 || source.height < 2) {
-    return { filter: null, outputWidth: source.width, outputHeight: source.height };
+    return null;
   }
 
   const width = even(source.width);
   const height = even(source.height);
-  if (aspect === 'source') {
-    return { filter: null, outputWidth: width, outputHeight: height };
-  }
+  if (aspect === 'source') return null;
 
   const target = RATIOS[aspect];
   const sourceRatio = width / height;
@@ -91,9 +106,8 @@ export function planReframe(
     // Source is taller: keep the width, shorten the height.
     cropHeight = even(width / target);
   } else {
-    // Already the right shape — nothing to cut, and saying so keeps the
-    // encode from doing a pointless copy of every pixel.
-    return { filter: null, outputWidth: width, outputHeight: height };
+    // Already the right shape — nothing to cut.
+    return null;
   }
 
   const focus = Number.isFinite(format?.focusPct) ? (format?.focusPct ?? 50) : 50;
@@ -103,9 +117,25 @@ export function planReframe(
   const x = Math.round(Math.min(slack.x, Math.max(0, (focus / 100) * width - cropWidth / 2)));
   const y = Math.round(Math.min(slack.y, Math.max(0, (focus / 100) * height - cropHeight / 2)));
 
+  return { x: slack.x === 0 ? 0 : x, y: slack.y === 0 ? 0 : y, width: cropWidth, height: cropHeight };
+}
+
+export function planReframe(
+  format: ClipFormat | null | undefined,
+  source: { width: number; height: number },
+): ReframePlan {
+  const window = reframeWindow(format, source);
+  if (!window) {
+    const usable = Number.isFinite(source.width) && Number.isFinite(source.height) && source.width >= 2 && source.height >= 2;
+    return {
+      filter: null,
+      outputWidth: usable ? even(source.width) : source.width,
+      outputHeight: usable ? even(source.height) : source.height,
+    };
+  }
   return {
-    filter: `crop=${cropWidth}:${cropHeight}:${slack.x === 0 ? 0 : x}:${slack.y === 0 ? 0 : y}`,
-    outputWidth: cropWidth,
-    outputHeight: cropHeight,
+    filter: `crop=${window.width}:${window.height}:${window.x}:${window.y}`,
+    outputWidth: window.width,
+    outputHeight: window.height,
   };
 }

@@ -407,12 +407,18 @@ export async function serializeVideoWithPlayback(video: Video, chunks?: VideoChu
   const playable = video.originalStorageKey !== null && video.sizeBytes !== null;
   if (!playable) return { ...base, playback: null };
 
+  const expiresAt = new Date(Date.now() + env.SIGNED_URL_EXPIRY_SECONDS * 1000).toISOString();
   const url = await getStorage().createDownloadUrl(video.originalStorageKey!);
+  // The watchable proxy, when preprocessing built one. The review cards and
+  // the Preview play THIS; the original is what a cut is made from. Null is
+  // honest — the client falls back to the original, as it always did.
+  const proxyUrl = video.playbackStorageKey ? await getStorage().createDownloadUrl(video.playbackStorageKey) : null;
   return {
     ...base,
     playback: {
       url,
-      expiresAt: new Date(Date.now() + env.SIGNED_URL_EXPIRY_SECONDS * 1000).toISOString(),
+      expiresAt,
+      proxyUrl,
     },
   };
 }
@@ -632,6 +638,8 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
         outputWidth: clip.outputWidth,
         outputHeight: clip.outputHeight,
         compositionMode: clip.compositionMode as CompositionMode | null,
+        focalX: clip.focalX,
+        focalY: clip.focalY,
       },
       // A clip made by the post-ready pipeline was made FOR a vertical
       // request. The row itself says so; no caller has to remember to.
