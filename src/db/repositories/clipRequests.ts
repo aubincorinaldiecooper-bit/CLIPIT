@@ -323,8 +323,16 @@ export async function finishClipRequest(
    * which leaves a complete deck sitting behind a request marked failed and
    * a creator unable to Keep any of it.
    *
-   * Null means unfenced, for the paths that fail before any deck is planned
-   * and for callers outside the search.
+   * Null means the caller holds no claim — the paths that fail before any
+   * deck is planned. Those are NOT simply unfenced: an older delivery that
+   * dies early still carries a null token, and letting it write freely was
+   * the same overwrite by another door. It marked a newer, finished answer
+   * failed and hid its clips.
+   *
+   * So a claimless write may not land on a request that has already
+   * completed. It stays allowed on one still searching or already failed,
+   * because refusing there would strand a request in 'searching' forever when
+   * the only run that could speak for it died before planning.
    */
   attemptId: string | null = null,
 ): Promise<boolean> {
@@ -335,6 +343,8 @@ export async function finishClipRequest(
             answered_from = COALESCE($4, answered_from),
             updated_at = now()
       WHERE id = $1
+        AND ($5::uuid IS NOT NULL
+             OR status <> 'completed')
         AND ($5::uuid IS NULL OR deck_attempt_id = $5::uuid)
       RETURNING id`,
     [requestId, status, errorMessage, answeredFrom, attemptId],

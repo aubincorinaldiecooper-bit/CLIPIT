@@ -521,3 +521,31 @@ describe('a superseded run cannot stamp its outcome over the newer one', () => {
     expect(finish).toContain('RETURNING id');
   });
 });
+
+describe('a claimless write must not overwrite a finished answer', () => {
+  /**
+   * The fence had a door in it. An older delivery that dies BEFORE planning
+   * carries no token, and "no token means unfenced" let it mark a newer,
+   * already-completed request as failed — hiding a finished deck behind a
+   * failure, which is the same damage the fence was added to prevent.
+   *
+   * It is not simply refused either: a request whose only run died before
+   * planning would then sit in 'searching' forever, with nothing left able to
+   * speak for it. So a claimless write is allowed on anything that has not
+   * completed, and refused on anything that has.
+   */
+  it('is refused on a completed request and allowed otherwise', () => {
+    const src = readFileSync(
+      path.join(__dirname, '..', 'src/db/repositories/clipRequests.ts'),
+      'utf8',
+    );
+    const finish = src.slice(
+      src.indexOf('export async function finishClipRequest'),
+      src.indexOf('export async function getPreviousClipRequest'),
+    );
+    // No token: only while the request has not already completed.
+    expect(finish).toContain("status <> 'completed'");
+    // With a token: only the attempt that owns the deck.
+    expect(finish).toContain('deck_attempt_id = $5::uuid');
+  });
+});
