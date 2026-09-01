@@ -88,13 +88,20 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       // from. Best-effort: analysis does not depend on it, so a failure here
       // costs review quality, never the ingestion. Both fall back to the
       // analysis proxy when this key is null.
+      // Retention finds objects through the keys on rows. An object that was
+      // uploaded but whose key never reached the row is invisible to every
+      // sweep, so a failure between the upload and the write removes what
+      // was uploaded — best-effort, logged with the key either way.
+      let uploadedPlaybackKey: string | null = null;
       try {
         const playbackStartedAt = performance.now();
         const playbackPath = path.join(dir, 'playback.mp4');
         await createPlaybackProxy(sourcePath, playbackPath);
         const playbackStorageKey = playbackProxyKey(videoId);
         await storage.uploadFile(playbackStorageKey, playbackPath, 'video/mp4');
+        uploadedPlaybackKey = playbackStorageKey;
         await updateVideoMedia(videoId, { playbackStorageKey });
+        uploadedPlaybackKey = null;
         log.info('playback proxy created', {
           playbackStorageKey,
           elapsedMs: Math.round(performance.now() - playbackStartedAt),
@@ -103,6 +110,17 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
         log.warn('could not create a playback proxy; review will use the analysis proxy', {
           error: errorMessage(cause),
         });
+        if (uploadedPlaybackKey) {
+          try {
+            await storage.remove(uploadedPlaybackKey);
+          } catch (removeCause) {
+            log.error('playback proxy uploaded but its key was not saved, and it could not be removed; it is now an orphan', {
+              videoId,
+              key: uploadedPlaybackKey,
+              error: errorMessage(removeCause),
+            });
+          }
+        }
       }
 
       // A poster frame for the video itself, so the library shows the footage
