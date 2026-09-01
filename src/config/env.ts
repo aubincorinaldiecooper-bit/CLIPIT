@@ -396,6 +396,16 @@ const envSchema = z.object({
   MAX_CLIP_SECONDS: num(300, 1, 3_600),
   CLIP_VIDEO_CRF: int(20, 0, 51),
   CLIP_PRESET: z.string().default('veryfast'),
+  /**
+   * Longest the SHORTER side of a delivered clip may be. A clip is cut from
+   * the original at the original's resolution, and a 4K original made that
+   * a 4K encode: two of them at once took the worker to its 8GB ceiling and
+   * the kernel killed ffmpeg mid-cut (2026-09-01, two clips lost after three
+   * attempts each, a 240-second one delivered at 723MB). 1080 lines is what
+   * every short-form platform re-encodes to anyway. Never upscales; raise to
+   * 2160 to deliver 4K again.
+   */
+  CLIP_MAX_SHORT_SIDE: int(1080, 360, 4320),
   CLIP_AUDIO_BITRATE: z.string().default('160k'),
   MIN_MATCH_CONFIDENCE: num(0.3, 0, 1),
   /**

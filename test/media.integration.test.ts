@@ -141,6 +141,69 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(result.sizeBytes).toBeGreaterThan(0);
     expect(result.durationSeconds).toBeCloseTo(2, 0);
   }, 180_000);
+  /**
+   * A synthetic source taller than the cap, in both orientations. 1440 on the
+   * short side is enough to prove the rule without encoding anything near 4K
+   * in a unit test.
+   */
+  async function makeOversized(name: string, size: string): Promise<string> {
+    const file = path.join(dir, name);
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `testsrc=size=${size}:rate=10:duration=2`,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', file,
+    ], { timeoutMs: 120_000 });
+    return file;
+  }
+
+  it('caps a landscape source at 1080 lines', async () => {
+    const big = await makeOversized('big-landscape.mp4', '1920x1440');
+    const output = path.join(dir, 'capped-landscape.mp4');
+    await cutClip({ inputPath: big, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
+
+    const probe = await ffprobe(output);
+    expect(probe.height).toBe(1080);
+    expect(probe.width).toBe(1440);
+  }, 180_000);
+
+  it('caps a portrait source on its shorter side, not its height', async () => {
+    const big = await makeOversized('big-portrait.mp4', '1440x1920');
+    const output = path.join(dir, 'capped-portrait.mp4');
+    await cutClip({ inputPath: big, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
+
+    const probe = await ffprobe(output);
+    expect(probe.width).toBe(1080);
+    expect(probe.height).toBe(1440);
+  }, 180_000);
+
+  it('never upscales a source already inside the cap', async () => {
+    // The shared 320x240 source: the cut must come out exactly 320x240.
+    const output = path.join(dir, 'untouched.mp4');
+    await cutClip({ inputPath: source, outputPath: output, startSeconds: 1, endSeconds: 2, hasAudio: true });
+
+    const probe = await ffprobe(output);
+    expect(probe.width).toBe(320);
+    expect(probe.height).toBe(240);
+  }, 180_000);
+
+  it('draws captions before scaling, so they are sized to the original frame', async () => {
+    const big = await makeOversized('big-captioned.mp4', '1920x1440');
+    const filters = await prepareCaptionFilters(
+      [{ text: 'sized against 1440 lines', font: 'bold', sizePct: 8, color: '#ffffff', yPct: 85, xPct: 50, outline: true }],
+      dir,
+      { videoWidth: 1920, videoHeight: 1440 },
+    );
+    const output = path.join(dir, 'capped-captioned.mp4');
+    await cutClip({ inputPath: big, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false, videoFilters: filters });
+
+    // Still capped with the caption in the chain, and the encode survived
+    // drawtext followed by scale.
+    const probe = await ffprobe(output);
+    expect(probe.height).toBe(1080);
+    expect(probe.width).toBe(1440);
+    expect(probe.videoCodec).toBe('h264');
+  }, 180_000);
+
   it('burns captions into a cut without breaking the encode', async () => {
     const probe = await ffprobe(source);
     const filters = await prepareCaptionFilters(
