@@ -107,32 +107,37 @@ function compositionAsker(input: OrchestrateInput, canonicalKey: string, duratio
     // nothing; a deck is that repeated for every candidate, inside a worker
     // already running FFmpeg. The OpenRouter lane genuinely needs the bytes.
     const usesStorageKey = env.VIDEO_PROVIDER === 'minicpm';
-    let videoBytes: number;
+    // Named before anything can create it, and cleaned up in the `finally`
+    // below, so a proxy that ffmpeg only half-wrote is removed on the same
+    // path as one that was read successfully. A framing failure is caught by
+    // the caller and the deck keeps rendering, so anything left here would
+    // survive every remaining candidate in the request.
     let proxyPath: string | null = null;
-    if (usesStorageKey) {
-      videoBytes = (await stat(canonicalPath)).size;
-    } else {
-      // ...but it must never be handed the DELIVERY file. The canonical clip
-      // is full quality: thirty seconds of it is ~20MB, and base64 adds a
-      // third again, which the provider refuses with a 413 before looking at
-      // a single frame. Every candidate then falls back to the safe
-      // composition, so no crop is chosen by anything that actually watched
-      // the footage. That is what production did on 2026-09-01: three
-      // candidates, three 413s, three fallbacks, and a deck of TikToks framed
-      // by nobody.
-      //
-      // Framing is answered in NORMALISED coordinates (focal_x/focal_y in
-      // 0..1), so 360p settles it exactly as well as 1080p does. This is the
-      // same proxy, at the same settings, that the search lane already reads
-      // from — around fifty times smaller than what was being sent.
-      proxyPath = path.join(input.workDir, `composition-${randomUUID()}.mp4`);
-      await createAnalysisProxy(canonicalPath, proxyPath, Math.max(1, Math.ceil(durationSeconds)));
-      const videoPart = await videoPartFromFile(proxyPath);
-      parts.push(videoPart.part);
-      videoBytes = videoPart.bytes;
-    }
-
     try {
+      let videoBytes: number;
+      if (usesStorageKey) {
+        videoBytes = (await stat(canonicalPath)).size;
+      } else {
+        // ...but it must never be handed the DELIVERY file. The canonical
+        // clip is full quality: thirty seconds of it is ~20MB, and base64
+        // adds a third again, which the provider refuses with a 413 before
+        // looking at a single frame. Every candidate then falls back to the
+        // safe composition, so no crop is chosen by anything that actually
+        // watched the footage. That is what production did on 2026-09-01:
+        // three candidates, three 413s, three fallbacks, and a deck of
+        // TikToks framed by nobody.
+        //
+        // Framing is answered in NORMALISED coordinates (focal_x/focal_y in
+        // 0..1), so 360p settles it exactly as well as 1080p does. This is
+        // the same proxy, at the same settings, that the search lane already
+        // reads from — around fifty times smaller than what was being sent.
+        proxyPath = path.join(input.workDir, `composition-${randomUUID()}.mp4`);
+        await createAnalysisProxy(canonicalPath, proxyPath, Math.max(1, Math.ceil(durationSeconds)));
+        const videoPart = await videoPartFromFile(proxyPath);
+        parts.push(videoPart.part);
+        videoBytes = videoPart.bytes;
+      }
+
       const answer = await askVideoModel({
         chunkIndex: 0,
         chunkDurationSeconds: durationSeconds,
@@ -158,9 +163,9 @@ function compositionAsker(input: OrchestrateInput, canonicalKey: string, duratio
 
       return { content: answer.content, provider: answer.provider, model: answer.model };
     } finally {
-      // A deck renders every candidate through one work directory, so a proxy
-      // left behind is multiplied by the size of the deck. Failing to delete
-      // it must never fail a composition that already succeeded.
+      // A deck renders every candidate through one work directory, so a
+      // proxy left behind is multiplied by the size of the deck. Failing to
+      // delete it must never fail a composition that already succeeded.
       if (proxyPath) await rm(proxyPath, { force: true }).catch(() => {});
     }
   };

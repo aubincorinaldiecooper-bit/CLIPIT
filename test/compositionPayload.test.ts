@@ -12,6 +12,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * creator downloads.
  */
 
+const removedFiles: string[] = [];
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, rm: vi.fn(async (target: string) => { removedFiles.push(target); }) };
+});
+
 const uploadFile = vi.fn(async () => {});
 const remove = vi.fn(async () => {});
 vi.mock('../src/services/storage/s3.js', () => ({ getStorage: () => ({ uploadFile, remove }) }));
@@ -89,7 +95,7 @@ async function runOneCandidate() {
   });
 }
 
-beforeEach(() => { vi.clearAllMocks(); });
+beforeEach(() => { vi.clearAllMocks(); removedFiles.length = 0; });
 
 describe('what the framing call is allowed to send', () => {
   it('sends a downscaled proxy, never the delivery clip', async () => {
@@ -129,5 +135,36 @@ describe('what the framing call is allowed to send', () => {
     };
     expect(persisted.compositionMode).toBe('smart_crop');
     expect(persisted.focalX).toBe(0.5);
+  });
+});
+
+describe('the proxy never outlives the call that needed it', () => {
+  it('deletes it after a successful framing call', async () => {
+    await runOneCandidate();
+
+    const [, proxyPath] = createAnalysisProxy.mock.calls[0] as unknown as [string, string];
+    expect(removedFiles).toContain(proxyPath);
+  });
+
+  it('deletes it when the encode fails', async () => {
+    videoPartFromFile.mockRejectedValueOnce(new Error('could not read the proxy'));
+
+    // The framing failure is caught upstream and the deck carries on, so
+    // nothing else would ever come back for this file.
+    await runOneCandidate();
+
+    const [, proxyPath] = createAnalysisProxy.mock.calls[0] as unknown as [string, string];
+    expect(removedFiles).toContain(proxyPath);
+  });
+
+  it('deletes the half-written file when ffmpeg fails', async () => {
+    createAnalysisProxy.mockRejectedValueOnce(new Error('ffmpeg died mid-write'));
+
+    await runOneCandidate();
+
+    // Named before ffmpeg ran, so whatever it managed to write is still
+    // removed by name.
+    const [, proxyPath] = createAnalysisProxy.mock.calls[0] as unknown as [string, string];
+    expect(removedFiles).toContain(proxyPath);
   });
 });
