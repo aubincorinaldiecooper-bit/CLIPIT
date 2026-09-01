@@ -235,27 +235,54 @@ export async function recordSearchApproach(
  * re-renders, and serving the previous run's finished deck while the new one
  * is mid-flight would show a set that no longer matches the clips underneath.
  */
+/**
+ * Claim this request for THIS delivery, before anything can fail.
+ *
+ * The token used to be minted at deck-planning time, which left every check
+ * before it — video missing, video not ready, no chunks, a correction with
+ * nothing to correct — holding no claim. A redelivery failing in that window
+ * could not record its own failure if an earlier, dead run had left a token
+ * behind, and the request sat in 'searching' until retries ran out with
+ * nothing able to speak for it.
+ *
+ * Taken at the top instead, so every exit from a delivery is fenced by a
+ * claim that delivery actually holds. Last claimer wins: an older run that is
+ * still executing finds its token stale and is refused everywhere, which is
+ * what being superseded should mean.
+ */
+export async function claimClipRequestAttempt(requestId: string): Promise<string | null> {
+  const row = await queryOne<{ deck_attempt_id: string }>(
+    `UPDATE clip_requests
+        SET deck_attempt_id = gen_random_uuid(), updated_at = now()
+      WHERE id = $1
+      RETURNING deck_attempt_id`,
+    [requestId],
+  );
+  return row?.deck_attempt_id ?? null;
+}
+
 export async function recordDeckPlan(
   requestId: string,
   plan: { presentationTarget: 'original' | 'vertical'; requestedResultCount: number },
-): Promise<string> {
-  // Returns a token identifying THIS planning. Only the run holding it may
-  // later open the gate — see markDeckComplete.
-  const row = await queryOne<{ deck_attempt_id: string }>(
+  /** The claim this delivery already holds. The plan is fenced to it. */
+  attemptId: string,
+): Promise<boolean> {
+  // Does NOT mint a token — the delivery claimed the request on the way in.
+  // Minting here left every earlier check unclaimed; see
+  // claimClipRequestAttempt.
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET presentation_target      = $2,
             requested_result_count   = $3,
             available_candidate_count = NULL,
             effective_deck_target    = NULL,
             deck_completed_at        = NULL,
-            deck_attempt_id          = gen_random_uuid(),
             updated_at               = now()
-      WHERE id = $1
-      RETURNING deck_attempt_id`,
-    [requestId, plan.presentationTarget, plan.requestedResultCount],
+      WHERE id = $1 AND deck_attempt_id = $4
+      RETURNING id`,
+    [requestId, plan.presentationTarget, plan.requestedResultCount, attemptId],
   );
-  if (!row) throw new Error(`Clip request ${requestId} disappeared while planning its deck`);
-  return row.deck_attempt_id;
+  return row !== null;
 }
 
 /**
@@ -345,12 +372,17 @@ export async function finishClipRequest(
    * the searching row open — the case that actually happens, on any stalled
    * redelivery.
    *
-   * The cost, stated rather than hidden: a request whose owning run was hard
-   * killed before writing any terminal status, AND whose video then went
-   * missing, can sit in 'searching' with nothing able to speak for it. That
-   * needs both a kill that skips the catch and a deleted video; the case this
-   * refuses happens on an ordinary stalled redelivery. The caller is told, so
-   * it can log rather than assume it wrote.
+   * That rule used to strand requests, and the reason is worth keeping: the
+   * token was minted at deck-planning time, so every check before it —
+   * video missing, video not ready, no chunks, a correction with nothing to
+   * correct — ran claimless. A redelivery failing there could not record its
+   * failure if a dead run had left a token, and the request sat in
+   * 'searching' until retries ran out.
+   *
+   * The search now claims the request on the way in
+   * (claimClipRequestAttempt), so every one of its deliveries holds a token
+   * before anything can fail and none of them need this branch. It stays for
+   * callers outside the search, and stays strict.
    */
   attemptId: string | null = null,
 ): Promise<boolean> {

@@ -31,6 +31,7 @@ import { getVideo, listChunks } from '../../db/repositories/videos.js';
 import { listTranscriptSegments, listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
 import { listScenes, sceneProgress } from '../../db/repositories/scenes.js';
 import {
+  claimClipRequestAttempt,
   finishClipRequest,
   getClipRequest,
   getPreviousClipRequest,
@@ -107,9 +108,21 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     return;
   }
 
+  // Claimed before anything can fail, so every exit from this delivery is
+  // fenced by a claim it actually holds. Minting it at deck-planning time
+  // left the checks below unclaimed, and a redelivery failing there could not
+  // record its own failure if a dead run had left a token behind.
+  const deckAttemptId = await claimClipRequestAttempt(clipRequestId);
+  if (!deckAttemptId) {
+    log.warn('clip request disappeared before it could be claimed');
+    return;
+  }
+
   const video = await getVideo(request.videoId);
   if (!video) {
-    const wrote = await finishClipRequest(clipRequestId, 'failed', 'Video no longer exists');
+    const wrote = await finishClipRequest(
+      clipRequestId, 'failed', 'Video no longer exists', null, deckAttemptId,
+    );
     if (!wrote) {
       log.warn('another attempt owns this request; leaving its outcome alone', { clipRequestId });
     }
@@ -132,9 +145,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     maxCount: env.VERTICAL_CANDIDATE_CEILING,
   });
   let deck: VerticalDeckResult | null = null;
-  // Identifies THIS planning of the deck, so a superseded stalled attempt
-  // cannot open the creator-facing gate over a newer run's half-built deck.
-  let deckAttemptId: string | null = null;
 
   try {
     if (video.status !== 'ready') {
@@ -172,6 +182,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           clipRequestId,
           'failed',
           'There is nothing to look at again yet — ask about a moment first.',
+          null,
+          deckAttemptId,
         );
         outcome = 'completed';
         return;
@@ -211,10 +223,18 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     //
     // It also CLEARS any previous completion, so a retrying job cannot serve
     // last run's finished deck while it rebuilds this one.
-    deckAttemptId = await recordDeckPlan(clipRequestId, {
+    const planned = await recordDeckPlan(clipRequestId, {
       presentationTarget: needsVerticalDerivative(intent) ? 'vertical' : 'original',
       requestedResultCount: intent.requestedCount,
-    });
+    }, deckAttemptId);
+    if (!planned) {
+      // Another delivery claimed this request while we were getting here.
+      // It owns the answer now; carrying on would spend renders whose every
+      // write is refused.
+      log.warn('superseded before planning; standing down', { clipRequestId });
+      outcome = 'completed';
+      return;
+    }
 
     // Decide what to search. A transcript that is still being built is worth a
     // bounded wait, because falling back to visual-only silently would give the

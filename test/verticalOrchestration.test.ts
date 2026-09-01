@@ -477,8 +477,11 @@ describe('a superseded attempt must not open the gate', () => {
     // rather than assume it completed the request.
     expect(mark).toContain('RETURNING id');
 
-    const plan = src.slice(src.indexOf('export async function recordDeckPlan'));
-    expect(plan).toContain('gen_random_uuid()');
+    // The token is minted by the CLAIM taken on the way in, not by planning —
+    // planning happens after four checks that can fail, and minting there
+    // left them unclaimed.
+    const claim = src.slice(src.indexOf('export async function claimClipRequestAttempt'));
+    expect(claim).toContain('gen_random_uuid()');
   });
 
   /**
@@ -551,5 +554,44 @@ describe('a claimless write must not overwrite a finished answer', () => {
     expect(finish).not.toContain("status <> 'completed'");
     // With a token: only the attempt that owns the deck.
     expect(finish).toContain('deck_attempt_id = $5::uuid');
+  });
+});
+
+describe('a delivery holds its claim before anything can fail', () => {
+  /**
+   * The token used to be minted at deck-planning time, which left four checks
+   * ahead of it unclaimed: video missing, video not ready, no chunks, and a
+   * correction with nothing to correct. A redelivery failing in that window
+   * could not record its own failure if a dead run had left a token behind,
+   * and the request sat in 'searching' until retries ran out with nothing
+   * able to speak for it.
+   *
+   * Claiming on the way in removes the window rather than widening the rule
+   * that closed it.
+   */
+  it('claims on entry, and plans against that claim rather than minting a new one', () => {
+    const repo = readFileSync(
+      path.join(__dirname, '..', 'src/db/repositories/clipRequests.ts'),
+      'utf8',
+    );
+    const claim = repo.slice(repo.indexOf('export async function claimClipRequestAttempt'));
+    expect(claim).toContain('gen_random_uuid()');
+
+    // Planning no longer mints — it writes against the claim already held.
+    const plan = repo.slice(
+      repo.indexOf('export async function recordDeckPlan'),
+      repo.indexOf('export async function recordDeckAvailability'),
+    );
+    expect(plan).not.toContain('gen_random_uuid()');
+    expect(plan).toContain('deck_attempt_id = $4');
+
+    const handler = readFileSync(
+      path.join(__dirname, '..', 'src/worker/handlers/clipSearch.ts'),
+      'utf8',
+    );
+    // The claim is taken before the video lookup, which is the first thing
+    // that can fail.
+    expect(handler.indexOf('claimClipRequestAttempt(clipRequestId)'))
+      .toBeLessThan(handler.indexOf('const video = await getVideo(request.videoId)'));
   });
 });
