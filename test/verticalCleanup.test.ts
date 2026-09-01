@@ -36,10 +36,12 @@ const renderVerticalDerivative = vi.fn(async () => ({ width: 1080, height: 1920,
 const extractFrameAt = vi.fn(async () => true);
 const ffprobe = vi.fn(async () => ({ width: 1920, height: 1080, durationSeconds: 20 }));
 
+const createAnalysisProxy = vi.fn(async () => {});
 vi.mock('../src/services/media/ffmpeg.js', () => ({
   renderVerticalDerivative,
   extractFrameAt,
   ffprobe,
+  createAnalysisProxy,
 }));
 
 const errorLog = vi.fn();
