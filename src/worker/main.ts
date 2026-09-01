@@ -95,10 +95,10 @@ function checkVideoProviderConfig(): void {
 }
 
 async function checkBinaries(): Promise<void> {
-  const checks: Array<[string, () => Promise<unknown>]> = [
-    ['ffmpeg/ffprobe', assertFfmpegAvailable],
-    ['yt-dlp', assertYtdlpAvailable],
-  ];
+  const checks: Array<[string, () => Promise<unknown>]> = [['ffmpeg/ffprobe', assertFfmpegAvailable]];
+  if (env.YOUTUBE_INGESTION_ENABLED) {
+    checks.push(['yt-dlp', assertYtdlpAvailable]);
+  }
 
   for (const [label, check] of checks) {
     try {
@@ -121,6 +121,7 @@ async function main(): Promise<void> {
     // at upload and searching its footage both pass through the same gate.
     videoCallConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
     indexing: env.INDEXING_ENABLED,
+    youtubeIngestion: env.YOUTUBE_INGESTION_ENABLED,
   });
 
   checkVideoProviderConfig();

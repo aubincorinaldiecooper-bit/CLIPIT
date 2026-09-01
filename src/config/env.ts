@@ -411,6 +411,13 @@ const envSchema = z.object({
   TRANSCRIPT_WAIT_POLL_MS: int(10_000, 1_000, 120_000),
   FFMPEG_PATH: z.string().default('ffmpeg'),
   FFPROBE_PATH: z.string().default('ffprobe'),
+  /**
+   * Whether a video may be created from a YouTube URL. Off: the route refuses
+   * one, the worker neither requires nor calls yt-dlp, and uploads are the
+   * only way in. Everything yt-dlp needs to work from a server is still here
+   * and is turned back on with one variable.
+   */
+  YOUTUBE_INGESTION_ENABLED: bool(false),
   YTDLP_PATH: z.string().default('yt-dlp'),
   YTDLP_FORMAT: z.string().default('bv*[height<=1080]+ba/b[height<=1080]/b'),
   YTDLP_JS_RUNTIMES: z.string().trim().default('node'),
