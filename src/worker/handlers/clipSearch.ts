@@ -569,7 +569,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   } catch (error) {
     const message = errorMessage(error);
     log.error('clip search failed', { err: error });
-    await finishClipRequest(clipRequestId, 'failed', message);
+    // Fenced like every other terminal write: a stalled delivery failing
+    // late must not overwrite the outcome of the run that replaced it.
+    await finishClipRequest(clipRequestId, 'failed', message, null, deckAttemptId);
     throw error;
   } finally {
     // A failed attempt still paid for whatever it managed to call, and BullMQ
@@ -787,7 +789,13 @@ export async function completeRequestWithDeck(input: {
   const { clipRequestId, intent, log } = input;
 
   if (!needsVerticalDerivative(intent)) {
-    await finishClipRequest(clipRequestId, 'completed', null, input.answeredFrom);
+    const finished = await finishClipRequest(
+      clipRequestId, 'completed', null, input.answeredFrom, input.deckAttemptId,
+    );
+    if (!finished) {
+      log.warn('a superseded attempt tried to complete a request', { clipRequestId });
+      return { completed: false, deck: null };
+    }
     return { completed: true, deck: null };
   }
 
@@ -816,6 +824,8 @@ export async function completeRequestWithDeck(input: {
       clipRequestId,
       'failed',
       'The original video is no longer available, so these moments could not be made ready to post.',
+      null,
+      input.deckAttemptId,
     );
     log.error('vertical deck abandoned: the source footage is gone', {
       answeredFrom: input.answeredFrom,
@@ -833,6 +843,8 @@ export async function completeRequestWithDeck(input: {
       clipRequestId,
       'failed',
       'We found the moments but could not finish making them ready to post. Please try again.',
+      null,
+      input.deckAttemptId,
     );
     log.error('vertical deck incomplete', {
       answeredFrom: input.answeredFrom,
@@ -866,7 +878,7 @@ export async function completeRequestWithDeck(input: {
     return { completed: false, deck };
   }
 
-  await finishClipRequest(clipRequestId, 'completed', null, input.answeredFrom);
+  await finishClipRequest(clipRequestId, 'completed', null, input.answeredFrom, input.deckAttemptId);
   return { completed: true, deck };
 }
 

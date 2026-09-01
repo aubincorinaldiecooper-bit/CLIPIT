@@ -11,7 +11,7 @@ const listMatches = vi.fn(async () => [{
   globalStartSeconds: 10,
   globalEndSeconds: 30,
 }]);
-const finishClipRequest = vi.fn(async () => undefined);
+const finishClipRequest = vi.fn(async () => true);
 const markDeckComplete = vi.fn(async () => true);
 const recordDeckAvailability = vi.fn(async () => undefined);
 const downloadToFile = vi.fn(async () => undefined);
@@ -116,7 +116,11 @@ describe('the deck gate every finished request passes through', () => {
     expect(orchestrateVerticalDeck).toHaveBeenCalled();
     // Fenced: the gate opens only for the attempt that planned this deck.
     expect(markDeckComplete).toHaveBeenCalledWith('request-1', 'attempt-1');
-    expect(finishClipRequest).toHaveBeenCalledWith('request-1', 'completed', null, 'notes');
+    // Fenced: the terminal write names the attempt that owns this deck, so a
+    // superseded delivery cannot stamp its outcome over a newer run's.
+    expect(finishClipRequest).toHaveBeenCalledWith(
+      'request-1', 'completed', null, 'notes', 'attempt-1',
+    );
   });
 
   it('fails without opening the gate when the original source is missing', async () => {
@@ -138,6 +142,8 @@ describe('the deck gate every finished request passes through', () => {
       'request-1',
       'failed',
       'The original video is no longer available, so these moments could not be made ready to post.',
+      null,
+      'attempt-1',
     );
     expect(markDeckComplete).not.toHaveBeenCalled();
     expect(orchestrateVerticalDeck).not.toHaveBeenCalled();
@@ -171,6 +177,8 @@ describe('the deck gate every finished request passes through', () => {
       'request-1',
       'failed',
       'We found the moments but could not finish making them ready to post. Please try again.',
+      null,
+      'attempt-1',
     );
     expect(markDeckComplete).not.toHaveBeenCalled();
   });

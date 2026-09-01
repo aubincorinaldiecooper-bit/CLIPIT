@@ -493,3 +493,31 @@ describe('a superseded attempt must not open the gate', () => {
     expect(src).not.toContain('export async function deleteMatches');
   });
 });
+
+describe('a superseded run cannot stamp its outcome over the newer one', () => {
+  /**
+   * The last unfenced terminal write, and the most damaging way it failed:
+   * a stalled delivery finishing LAST would write its FAILURE over a newer
+   * run's success — leaving a complete, finished deck sitting behind a
+   * request marked failed, and the creator unable to Keep any of it.
+   *
+   * A guard over the SQL, because the fence is the predicate: removing it
+   * reopens the overwrite silently.
+   */
+  it('fences every terminal status write to the owning attempt', () => {
+    const src = readFileSync(
+      path.join(__dirname, '..', 'src/db/repositories/clipRequests.ts'),
+      'utf8',
+    );
+    const finish = src.slice(
+      src.indexOf('export async function finishClipRequest'),
+      src.indexOf('export async function getPreviousClipRequest'),
+    );
+    expect(finish).toContain('deck_attempt_id = $5::uuid');
+    // Null stays unfenced on purpose: the paths that fail before any deck is
+    // planned have no token to check against.
+    expect(finish).toContain('$5::uuid IS NULL');
+    // And it reports whether it won, so a superseded run can stand down.
+    expect(finish).toContain('RETURNING id');
+  });
+});

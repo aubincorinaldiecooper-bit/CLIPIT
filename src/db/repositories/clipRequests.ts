@@ -314,16 +314,32 @@ export async function finishClipRequest(
   status: ClipRequestStatus,
   errorMessage: string | null = null,
   answeredFrom: AnsweredFrom | null = null,
-): Promise<void> {
-  await queryOne(
+  /**
+   * The attempt allowed to write this final answer.
+   *
+   * Overlapping deliveries mean two runs can both reach a terminal write. A
+   * superseded one finishing last would stamp its outcome over the run that
+   * replaced it — most damagingly a stale FAILURE landing on a newer success,
+   * which leaves a complete deck sitting behind a request marked failed and
+   * a creator unable to Keep any of it.
+   *
+   * Null means unfenced, for the paths that fail before any deck is planned
+   * and for callers outside the search.
+   */
+  attemptId: string | null = null,
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET status = $2,
             error_message = $3,
             answered_from = COALESCE($4, answered_from),
             updated_at = now()
-      WHERE id = $1`,
-    [requestId, status, errorMessage, answeredFrom],
+      WHERE id = $1
+        AND ($5::uuid IS NULL OR deck_attempt_id = $5::uuid)
+      RETURNING id`,
+    [requestId, status, errorMessage, answeredFrom, attemptId],
   );
+  return row !== null;
 }
 
 /**
