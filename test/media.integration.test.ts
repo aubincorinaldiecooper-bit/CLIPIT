@@ -272,7 +272,7 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
         '-f', 'lavfi', '-i', `color=c=red:size=${canvas}:d=2:r=10`,
         '-vf', `format=rgb24,${crop}`, '-c:v', 'ffv1', src,
       ], { timeoutMs: 120_000 });
-      const output = path.join(dir, `degenerate-${size}-cut.mp4`);
+      const output = src.replace(/\.mkv$/, '-cut.mp4');
       await cutClip({ inputPath: src, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
       const probe = await ffprobe(output);
       expect([probe.width, probe.height]).toEqual([...expected]);
