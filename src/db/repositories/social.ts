@@ -291,6 +291,21 @@ export async function listPublishedPosts(userId: string, limit = 50): Promise<Pu
   );
 }
 
+/**
+ * A clip's recent posts, newest first — the truth behind the Publish
+ * button once it is pressed: every attempt, whatever it came to. Bounded:
+ * a clip published a hundred times is a clip whose history is the
+ * Publishing page's business, not the button's.
+ */
+export async function listRecentPostsForClip(clipId: string, limit = 20): Promise<PublishedPostRow[]> {
+  return queryRows<PublishedPostRow>(
+    `SELECT id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at
+       FROM published_posts WHERE clip_id = $1
+      ORDER BY created_at DESC LIMIT $2`,
+    [clipId, limit],
+  );
+}
+
 /** Posts still mid-publish for a clip — what blocks deleting it. */
 export async function listActivePostsForClip(clipId: string): Promise<PublishedPostRow[]> {
   return queryRows<PublishedPostRow>(
