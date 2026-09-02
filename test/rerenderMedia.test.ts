@@ -393,6 +393,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
     const [record] = recordUnknownRender.mock.calls[0]!;
     expect(record.clipId).toBe('clip-1');
     expect(record.storageKey).toMatch(FRESH_CANONICAL);
+    expect(record.previousStorageKey).toBe(OLD_CANONICAL);
     expect(record.job.reclip.matchId).toBe('match-1');
   });
 
