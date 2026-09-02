@@ -49,8 +49,10 @@ import type { Clip } from '../../domain/types.js';
 export class RenderOutcomeUnknownError extends Error {
   constructor(
     readonly original: unknown,
-    /** The file this render wrote; the row naming it proves the write landed. */
+    /** The file this render wrote; the row naming it proves the write landed — when the key is new to the row. */
     readonly storageKey: string,
+    /** The file the row named before this render, if any. */
+    readonly previousStorageKey: string | null,
   ) {
     super(`the render's outcome is unknown: ${errorMessage(original)}`);
     this.name = 'RenderOutcomeUnknownError';
@@ -330,7 +332,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
               });
             });
           }
-          throw new RenderOutcomeUnknownError(error, key);
+          throw new RenderOutcomeUnknownError(error, key, clip.storageKey);
         }
         // The row naming this render's key proves the write landed only when
         // the key is NEW to the row: a first render at the plain key, on a
@@ -392,7 +394,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         lastAttempt,
       });
       if (lastAttempt) {
-        await recordUnknownRender({ clipId, storageKey: error.storageKey, job: job.data }).catch((recordError: unknown) => {
+        await recordUnknownRender({ clipId, storageKey: error.storageKey, previousStorageKey: error.previousStorageKey, job: job.data }).catch((recordError: unknown) => {
           // The database is the thing that could not be reached; if it still
           // cannot, the log line is the only record, and says so.
           log.error('the unknown render could not be written down for the sweep; the row may stay generating until settled by hand', {

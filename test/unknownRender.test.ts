@@ -24,7 +24,8 @@ const reclipJob = {
     previous: { startSeconds: 130, endSeconds: 150, boundariesEditedAt: null, status: 'ready' as const },
   },
 };
-const render = (job: object, storageKey = NEW_KEY) => ({ id: 'ur-1', clipId: 'clip-1', storageKey, job } as never);
+const render = (job: object, storageKey = NEW_KEY, previousStorageKey: string | null = OLD_KEY) =>
+  ({ id: 'ur-1', clipId: 'clip-1', storageKey, previousStorageKey, job } as never);
 
 beforeEach(() => {
   for (const mock of [...Object.values(clips), markReclipFailed]) mock.mockReset();
@@ -57,8 +58,21 @@ describe('settleUnknownRender', () => {
 
   it('marks a first render that never landed as failed', async () => {
     clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: null });
-    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY), log)).resolves.toBe('rolled_back');
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, null), log)).resolves.toBe('rolled_back');
     expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'failed', { errorMessage: RENDER_FAILED_MESSAGE });
+  });
+
+  it('does not mistake a retried first render for landed because the row already named its plain key', async () => {
+    // Devin's finding on #81: the key proves nothing when the row had it
+    // before the attempt; the status is the evidence there.
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY), log)).resolves.toBe('rolled_back');
+    expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'ready', { errorMessage: RENDER_FAILED_MESSAGE });
+
+    clips.setClipStatus.mockClear();
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: OLD_KEY });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY), log)).resolves.toBe('moved_on');
+    expect(clips.setClipStatus).not.toHaveBeenCalled();
   });
 
   it('leaves a row alone that has moved on since, and one whose clip is gone', async () => {
