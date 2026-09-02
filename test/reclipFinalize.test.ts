@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * would post footage from the old cut.
  */
 
-const clips = { getClip: vi.fn(), setClipStatus: vi.fn(), restoreClipBoundaries: vi.fn() };
+const clips = { getClip: vi.fn(), markClipGenerating: vi.fn(), setClipStatus: vi.fn(), restoreClipBoundaries: vi.fn() };
 const reclips = { appendReclipVersion: vi.fn(), clearReclipPending: vi.fn(), markReclipFailed: vi.fn() };
 const discardVariants = vi.fn();
 const getVideo = vi.fn();
@@ -20,6 +20,7 @@ const media = { cutClip: vi.fn(), ffprobe: vi.fn() };
 
 vi.mock('../src/db/repositories/clips.js', () => ({
   getClip: clips.getClip,
+  markClipGenerating: clips.markClipGenerating,
   setClipStatus: clips.setClipStatus,
   restoreClipBoundaries: clips.restoreClipBoundaries,
 }));
@@ -91,6 +92,7 @@ beforeEach(() => {
     captions: null,
   });
   clips.setClipStatus.mockResolvedValue(undefined);
+  clips.markClipGenerating.mockResolvedValue(new Date('2026-09-02T16:58:00Z'));
   clips.restoreClipBoundaries.mockResolvedValue(undefined);
   reclips.appendReclipVersion.mockResolvedValue({ version: 2 });
   reclips.clearReclipPending.mockResolvedValue(undefined);

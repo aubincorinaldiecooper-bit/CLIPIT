@@ -1,0 +1,15 @@
+-- The clip row's updated_at as an unknown render's attempt wrote it when it
+-- set the row generating — the last write of its own before the one whose
+-- outcome was lost.
+--
+-- Settling an unknown render (see settleUnknownRender) must tell a row that
+-- has waited since that lost write from a row something later has taken.
+-- The record's own created_at cannot: it is written after the render's
+-- re-reads and their retries, so a Replace or Re-clip that a LANDED render's
+-- row took in between is older than the record and looked like a row that
+-- had waited. A row written after THIS mark was written by the render's
+-- commit or by something later that owns the row now — either way not the
+-- render's to roll back; a row not written since has waited for a write
+-- that never came. Records from before this column carry no mark and are
+-- settled against created_at as before.
+ALTER TABLE unknown_renders ADD COLUMN IF NOT EXISTS row_updated_at TIMESTAMPTZ;

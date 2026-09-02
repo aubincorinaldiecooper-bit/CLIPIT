@@ -14,7 +14,9 @@ vi.mock('../src/db/pool.js', () => ({
 
 const { drainUnknownRenders } = await import('../src/db/repositories/unknownRenders.js');
 
-const row = { id: 'ur-1', clip_id: 'clip-1', storage_key: 'clips/video-1/clip-1-0ddba11a.mp4', previous_storage_key: 'clips/video-1/clip-1.mp4', job: { clipId: 'clip-1' } };
+const markedAt = new Date('2026-09-02T16:58:00Z');
+const recordedAt = new Date('2026-09-02T17:00:00Z');
+const row = { id: 'ur-1', clip_id: 'clip-1', storage_key: 'clips/video-1/clip-1-0ddba11a.mp4', previous_storage_key: 'clips/video-1/clip-1.mp4', row_updated_at: markedAt, job: { clipId: 'clip-1' }, created_at: recordedAt };
 
 beforeEach(() => {
   client.query.mockReset();
@@ -26,7 +28,7 @@ describe('drainUnknownRenders', () => {
     const settle = vi.fn(async () => undefined);
     await expect(drainUnknownRenders(10, settle)).resolves.toBe(1);
     expect(settle).toHaveBeenCalledWith(
-      { id: 'ur-1', clipId: 'clip-1', storageKey: row.storage_key, previousStorageKey: row.previous_storage_key, job: row.job },
+      { id: 'ur-1', clipId: 'clip-1', storageKey: row.storage_key, previousStorageKey: row.previous_storage_key, job: row.job, recordedAt, rowUpdatedAt: markedAt },
       client,
     );
     const deletes = client.query.mock.calls.filter(([sql]) => String(sql).startsWith('DELETE'));
