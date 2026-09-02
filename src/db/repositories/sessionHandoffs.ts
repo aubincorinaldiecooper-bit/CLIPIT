@@ -1,4 +1,5 @@
-import { queryOne } from '../pool.js';
+import type { PoolClient } from 'pg';
+import { query, queryOne } from '../pool.js';
 import { generateToken, hashToken } from './sessions.js';
 
 /**
@@ -9,23 +10,55 @@ import { generateToken, hashToken } from './sessions.js';
  */
 export const HANDOFF_TTL_SECONDS = 60 * 60;
 
+/**
+ * How many live claims one guest session may hold. Re-sending a link — a
+ * mistyped address, a second try — must not kill the one just sent, so it
+ * is not one; and it is not unbounded, or a guest could grow the table
+ * without limit from behind changing addresses (Devin, #87). The newest
+ * survive.
+ */
+export const LIVE_HANDOFFS_PER_SESSION = 5;
+
 export interface Handoff {
   /** The raw token, returned exactly once; only its digest is stored. */
   token: string;
   expiresAt: Date;
 }
 
+/** Digest of an address, compared for equality only: case and edges do not count. */
+export function hashEmail(email: string): string {
+  return hashToken(email.trim().toLowerCase());
+}
+
 /**
  * Packs a guest session's claim on its work into a token that can travel in
- * a sign-in link. See migration 040 for why one is needed at all.
+ * a sign-in link — a link to ONE address, the only sign-in the claim will
+ * answer. See migration 040 for why one is needed at all.
  */
-export async function createHandoff(sessionId: string): Promise<Handoff> {
+export async function createHandoff(sessionId: string, email: string): Promise<Handoff> {
   const token = generateToken();
+
+  // Housekeeping first, so the table cannot grow without bound: claims past
+  // their hour go, and this guest keeps only its newest few live ones.
+  await query(`DELETE FROM session_handoffs WHERE expires_at <= now()`);
+  await query(
+    `DELETE FROM session_handoffs
+      WHERE session_id = $1
+        AND redeemed_at IS NULL
+        AND id NOT IN (
+          SELECT id FROM session_handoffs
+           WHERE session_id = $1 AND redeemed_at IS NULL
+           ORDER BY created_at DESC
+           LIMIT $2
+        )`,
+    [sessionId, LIVE_HANDOFFS_PER_SESSION - 1],
+  );
+
   const row = await queryOne<{ expires_at: Date }>(
-    `INSERT INTO session_handoffs (token_hash, session_id, expires_at)
-     VALUES ($1, $2, now() + ($3 || ' seconds')::interval)
+    `INSERT INTO session_handoffs (token_hash, email_hash, session_id, expires_at)
+     VALUES ($1, $2, $3, now() + ($4 || ' seconds')::interval)
      RETURNING expires_at`,
-    [hashToken(token), sessionId, String(HANDOFF_TTL_SECONDS)],
+    [hashToken(token), hashEmail(email), sessionId, String(HANDOFF_TTL_SECONDS)],
   );
   return { token, expiresAt: row!.expires_at };
 }
@@ -37,25 +70,34 @@ export interface RedeemedHandoff {
 }
 
 /**
- * Redeems a hand-over exactly once.
+ * Redeems a hand-over exactly once, for the address it was sent to.
  *
- * The row is marked in the same statement that finds it, so two tabs racing
- * on the same link get one winner and one null — never two adoptions, and
- * never a token that stays live after use. Unknown, expired and already-used
- * tokens all come back as null; the caller cannot tell them apart, and does
- * not need to.
+ * Runs on the caller's transaction: the mark is committed together with the
+ * adoption it pays for, so a failure between the two rolls it back and the
+ * claim stays usable for the retry (Devin, #87). The row is marked in the
+ * same statement that finds it, so two tabs racing on one link get one
+ * winner and one null. A link opened by a different address than the one
+ * it was sent to leaves the row untouched: the claim answers one sign-in.
+ * Unknown, expired and already-used tokens all come back as null; the
+ * caller cannot tell them apart, and does not need to.
  */
-export async function redeemHandoff(token: string): Promise<RedeemedHandoff | null> {
-  const row = await queryOne<{ session_id: string; user_id: string | null }>(
+export async function redeemHandoff(
+  token: string,
+  email: string,
+  client: Pick<PoolClient, 'query'>,
+): Promise<RedeemedHandoff | null> {
+  const result = await client.query<{ session_id: string; user_id: string | null }>(
     `UPDATE session_handoffs h
         SET redeemed_at = now()
        FROM sessions s
       WHERE h.token_hash = $1
+        AND h.email_hash = $2
         AND h.redeemed_at IS NULL
         AND h.expires_at > now()
         AND s.id = h.session_id
       RETURNING h.session_id, s.user_id`,
-    [hashToken(token)],
+    [hashToken(token), hashEmail(email)],
   );
+  const row = result.rows[0];
   return row ? { sessionId: row.session_id, userId: row.user_id } : null;
 }

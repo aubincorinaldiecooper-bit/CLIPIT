@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import type { PoolClient } from 'pg';
 import { queryOne, queryRows } from '../pool.js';
 import { env } from '../../config/env.js';
 import type { Session } from '../../domain/types.js';
@@ -98,19 +99,26 @@ export async function findSessionByToken(token: string): Promise<Session | null>
  * Only rows with NO owner are taken. A row that already belongs to somebody
  * is never reassigned, whatever the session says.
  */
-export async function adoptSessionWork(input: {
-  sessionId: string;
-  userId: string;
-  workspaceId: string;
-}): Promise<{ videos: number; clipRequests: number; clips: number }> {
+export async function adoptSessionWork(
+  input: {
+    sessionId: string;
+    userId: string;
+    workspaceId: string;
+  },
+  /**
+   * The transaction this runs in, when it must move as one with the claim
+   * that pays for it and the lock that orders it (adoptOnSignIn). Without
+   * one, each table is its own statement, as before.
+   */
+  client?: Pick<PoolClient, 'query'>,
+): Promise<{ videos: number; clipRequests: number; clips: number }> {
   const claim = async (table: 'videos' | 'clip_requests' | 'clips'): Promise<number> => {
-    const rows = await queryRows<{ id: string }>(
-      `UPDATE ${table}
+    const sql = `UPDATE ${table}
           SET user_id = $2, workspace_id = $3
         WHERE session_id = $1 AND user_id IS NULL
-        RETURNING id`,
-      [input.sessionId, input.userId, input.workspaceId],
-    );
+        RETURNING id`;
+    const params = [input.sessionId, input.userId, input.workspaceId];
+    const rows = client ? (await client.query<{ id: string }>(sql, params)).rows : await queryRows<{ id: string }>(sql, params);
     return rows.length;
   };
 
@@ -120,4 +128,30 @@ export async function adoptSessionWork(input: {
   const clipRequests = await claim('clip_requests');
   const clips = await claim('clips');
   return { videos, clipRequests, clips };
+}
+
+/**
+ * Takes the guest session's row for the rest of the caller's transaction.
+ *
+ * Two sign-ins can adopt the same guest at once — the tab that still holds
+ * the token and the phone that opened the link, or two links sent in a row.
+ * Each adoption is three tables' worth of updates, and run side by side they
+ * could split one guest's work between two accounts: the video to one, its
+ * questions and clips to the other (Devin and Codex, #87). Locking the row
+ * first queues the second behind the first; by the time it moves, the rows
+ * are owned and it takes nothing, which is the right answer.
+ *
+ * Null when the session is gone. The owner comes back so a session that
+ * already belongs to somebody is never adopted, however it was named.
+ */
+export async function lockSessionForAdoption(
+  sessionId: string,
+  client: Pick<PoolClient, 'query'>,
+): Promise<{ userId: string | null } | null> {
+  const result = await client.query<{ user_id: string | null }>(
+    `SELECT user_id FROM sessions WHERE id = $1 FOR UPDATE`,
+    [sessionId],
+  );
+  const row = result.rows[0];
+  return row ? { userId: row.user_id } : null;
 }
