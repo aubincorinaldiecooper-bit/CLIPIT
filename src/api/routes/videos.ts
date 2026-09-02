@@ -430,9 +430,14 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
       onlyIfUnowned: false,
     });
 
-    return reply.send({
+    // "Removed" only when it is. A second request while the first is still
+    // removing is told it is pending — the first may yet fail and give its
+    // claim back — and a video already gone is reported as gone (Devin, #88).
+    const pending = result.outcome === 'in-progress';
+    return reply.code(pending ? 202 : 200).send({
       videoId,
-      removed: true,
+      removed: result.outcome === 'removed' || result.outcome === 'already-removed',
+      pending,
       objectsDeleted: result.objectsDeleted,
       // Named rather than hidden: a file we could not delete is one the person
       // was told was gone.

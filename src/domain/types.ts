@@ -144,6 +144,8 @@ export interface Video {
    * Null while the video is still whole. See `services/retention.ts`.
    */
   footageExpiredAt: Date | null;
+  /** Set while a removal is running; see claimFootageForExpiry. */
+  footageClaimedAt: Date | null;
   indexStatus: IndexStatus;
   /**
    * How far into the video the notes reach, in seconds. Zero unless the video

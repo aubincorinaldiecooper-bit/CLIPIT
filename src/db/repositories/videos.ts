@@ -42,6 +42,7 @@ interface VideoRow {
   transcript_error: string | null;
   transcript_segment_count: number;
   footage_expired_at: Date | null;
+  footage_claimed_at?: Date | null;
   index_status: IndexStatus;
   index_error: string | null;
   scene_count: number;
@@ -82,6 +83,7 @@ function mapVideo(row: VideoRow): Video {
     transcriptError: row.transcript_error,
     transcriptSegmentCount: row.transcript_segment_count,
     footageExpiredAt: row.footage_expired_at ?? null,
+    footageClaimedAt: row.footage_claimed_at ?? null,
     indexStatus: row.index_status,
     // Filled by getVideoWithReadProgress; zero unless it was asked for.
     indexReadThroughSeconds: 0,

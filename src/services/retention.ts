@@ -33,7 +33,24 @@ import { getStorage } from './storage/s3.js';
  * checked against anything anyway.
  */
 
+/**
+ * What a removal request found. A null claim is three different things, and
+ * a caller that reports "removed" for all of them lies in two of them
+ * (Devin, #88): a removal that is still running elsewhere may yet fail and
+ * give its claim back.
+ */
+export type ExpiryOutcome =
+  /** Claimed here and carried through. */
+  | 'removed'
+  /** Finished before this request came. */
+  | 'already-removed'
+  /** Another removal holds the claim right now. */
+  | 'in-progress'
+  /** Nothing to claim: not a guest's under the sweep's rule, or no such video. */
+  | 'refused';
+
 export interface ExpiryResult {
+  outcome: ExpiryOutcome;
   objectsDeleted: number;
   objectsFailed: number;
 }
@@ -53,11 +70,19 @@ export async function expireVideoFootage(videoId: string, log: Logger, options: 
   // is deleted without this claim.
   const claimedAt = await claimFootageForExpiry(videoId, { onlyIfUnowned: options.onlyIfUnowned });
   if (!claimedAt) {
-    log.info('footage kept: expired already, or no longer a guest\'s', { videoId });
-    return { objectsDeleted: 0, objectsFailed: 0 };
+    const video = await getVideo(videoId);
+    const outcome: ExpiryOutcome = !video
+      ? 'refused'
+      : video.footageExpiredAt
+        ? 'already-removed'
+        : video.footageClaimedAt
+          ? 'in-progress'
+          : 'refused';
+    log.info('footage not removed by this request', { videoId, outcome });
+    return { outcome, objectsDeleted: 0, objectsFailed: 0 };
   }
   try {
-    return await removeClaimedFootage(videoId, log);
+    return { outcome: 'removed', ...(await removeClaimedFootage(videoId, log)) };
   } catch (error) {
     // The claim goes back — this exact claim, no other — or this video would
     // be hidden from every later sweep with its objects still stored. The
@@ -70,7 +95,10 @@ export async function expireVideoFootage(videoId: string, log: Logger, options: 
 }
 
 /** The removal itself, once the video is claimed. Throws to have the claim released. */
-async function removeClaimedFootage(videoId: string, log: Logger): Promise<ExpiryResult> {
+async function removeClaimedFootage(
+  videoId: string,
+  log: Logger,
+): Promise<{ objectsDeleted: number; objectsFailed: number }> {
   const video = await getVideo(videoId);
   if (!video) return { objectsDeleted: 0, objectsFailed: 0 };
 

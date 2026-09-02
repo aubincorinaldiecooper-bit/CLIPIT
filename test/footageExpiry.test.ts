@@ -91,7 +91,7 @@ describe('expireVideoFootage', () => {
     expect(videos.claimFootageForExpiry).toHaveBeenCalledWith('v1', { onlyIfUnowned: true });
     // The original, one clip, one still.
     expect(order.filter((step) => step === 'remove')).toHaveLength(3);
-    expect(result).toEqual({ objectsDeleted: 3, objectsFailed: 0 });
+    expect(result).toEqual({ outcome: 'removed', objectsDeleted: 3, objectsFailed: 0 });
     expect(videos.markFootageExpired).toHaveBeenCalledWith('v1');
   });
 
@@ -123,12 +123,33 @@ describe('expireVideoFootage', () => {
     expect(videos.releaseFootageClaim).not.toHaveBeenCalled();
   });
 
-  it('deletes and clears nothing when the claim finds no row — adopted since it was selected, or expired already', async () => {
+  it('says so when the video was removed before this request came, and deletes nothing', async () => {
     videos.claimFootageForExpiry.mockResolvedValueOnce(null);
+    videos.getVideo.mockResolvedValueOnce({ id: 'v1', footageExpiredAt: new Date(), footageClaimedAt: null });
+
+    const result = await expireVideoFootage('v1', log, { onlyIfUnowned: false });
+
+    expect(result).toEqual({ outcome: 'already-removed', objectsDeleted: 0, objectsFailed: 0 });
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('says so when another removal holds the claim right now — it may yet fail and give it back', async () => {
+    videos.claimFootageForExpiry.mockResolvedValueOnce(null);
+    videos.getVideo.mockResolvedValueOnce({ id: 'v1', footageExpiredAt: null, footageClaimedAt: new Date() });
+
+    const result = await expireVideoFootage('v1', log, { onlyIfUnowned: false });
+
+    expect(result).toEqual({ outcome: 'in-progress', objectsDeleted: 0, objectsFailed: 0 });
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('deletes and clears nothing when the claim finds no row — adopted since it was selected', async () => {
+    videos.claimFootageForExpiry.mockResolvedValueOnce(null);
+    videos.getVideo.mockResolvedValueOnce({ id: 'v1', footageExpiredAt: null, footageClaimedAt: null });
 
     const result = await expireVideoFootage('v1', log, { onlyIfUnowned: true });
 
-    expect(result).toEqual({ objectsDeleted: 0, objectsFailed: 0 });
+    expect(result).toEqual({ outcome: 'refused', objectsDeleted: 0, objectsFailed: 0 });
     expect(remove).not.toHaveBeenCalled();
     for (const clear of Object.values(clears)) expect(clear).not.toHaveBeenCalled();
     expect(videos.markFootageExpired).not.toHaveBeenCalled();
