@@ -127,10 +127,15 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       await job.updateProgress({ stage: 'uploading', percent: 80 });
 
       const key = clipKey(video.id, clipId, render);
-      // Everything this render made and nothing else: on a failure these go
-      // and the previous cut and media stay exactly as they were.
-      const fresh = [...(render ? [key] : []), ...(delivered?.freshKeys ?? [])];
+      // Everything this render uploaded: on a failure, whatever the row does
+      // not name goes, and the previous cut and media stay exactly as they
+      // were. A first render's plain key is in the list too — a cut whose
+      // row never came to name it would otherwise sit in storage for good.
+      const fresh = [key, ...(delivered?.freshKeys ?? [])];
       const context = { videoId: video.id, clipId };
+      // Platform shapes cut from the master this render replaces. Their rows
+      // go inside the transaction; their files, after it.
+      let staleVariantKeys: string[] = [];
       try {
         await getStorage().uploadFile(key, outputPath, 'video/mp4');
 
@@ -153,7 +158,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
             throw new Error(`Clip ${clipId} no longer exists — its render has nowhere to be recorded`);
           }
           if (job.data.captions !== undefined || job.data.reclip !== undefined) {
-            await discardVariants(clipId, client);
+            staleVariantKeys = (await discardVariants(clipId, client)) ?? [];
           }
           if (job.data.reclip) {
             const { matchId, startSeconds, endSeconds, provider, model, promptVersion } = job.data.reclip;
@@ -173,7 +178,13 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
           return null;
         });
         if (named === null) throw error;
-        if (named.has(key)) {
+        // The row naming this render's key proves the write landed only when
+        // the key is NEW to the row: a first render at the plain key, on a
+        // row that already named that key from an earlier attempt, proves
+        // nothing either way — so that is treated as the failure it reported,
+        // and the object the row still names is kept.
+        const landed = named.has(key) && clip.storageKey !== key;
+        if (landed) {
           // It landed; only the reply was lost. Carry on as committed.
           log.warn('the render\'s write landed although its reply did not; carrying on as committed', { ...context, err: error });
         } else {
@@ -186,7 +197,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       // could still fail has succeeded — so a failure anywhere above leaves
       // the old cut and its media where the row can still name them.
       await releaseObjects(
-        [render ? clip.storageKey : null, ...(delivered?.oldKeys ?? [])],
+        [render ? clip.storageKey : null, ...(delivered?.oldKeys ?? []), ...staleVariantKeys],
         [key, ...(delivered?.freshKeys ?? [])],
         context,
         log,

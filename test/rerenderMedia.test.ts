@@ -213,6 +213,24 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(storage.remove).toHaveBeenCalledWith(OLD_CANONICAL);
   });
 
+  it('removes the files of the platform shapes it discarded, after the write, never before', async () => {
+    discardVariants.mockResolvedValueOnce(['variants/video-1/clip-1-9x16.mp4'] as never);
+
+    await handleClipGeneration(job({ reclip: reclipPayload }));
+
+    expect(storage.remove).toHaveBeenCalledWith('variants/video-1/clip-1-9x16.mp4');
+    expect(orderOf(commitRender)).toBeLessThan(orderOf(storage.remove));
+  });
+
+  it('leaves the platform shapes\' files alone when the write fails', async () => {
+    discardVariants.mockResolvedValueOnce(['variants/video-1/clip-1-9x16.mp4'] as never);
+    reclips.appendReclipVersion.mockRejectedValueOnce(new Error('versions table locked'));
+
+    await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('versions table locked');
+
+    expect(storage.remove).not.toHaveBeenCalled();
+  });
+
   it('replaces nothing and rolls the Re-clip back when the new poster cannot be made', async () => {
     pipeline.runOriginalPipeline.mockRejectedValueOnce(new Error('poster frame extracted to nothing'));
 
@@ -392,15 +410,29 @@ describe('a first render', () => {
     expect(storage.remove).not.toHaveBeenCalled();
   });
 
-  it('has nothing of its own to take back out when the row write fails', async () => {
+  it('takes its own cut back out when the row write fails and the row never came to name it', async () => {
     clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
     commitRender.mockRejectedValueOnce(new Error('database refused'));
 
     await expect(handleClipGeneration(job({}))).rejects.toThrow('database refused');
 
-    // The plain key is not this render's to delete: a retry writes there again.
-    for (const [keys] of pipeline.discardUploadedObjects.mock.calls) expect(keys).toEqual([]);
+    // A cut no row names would sit in storage for good; a retry uploads again.
+    expect(pipeline.discardUploadedObjects).toHaveBeenCalledWith([OLD_CANONICAL], expect.objectContaining({ reason: 'render_commit_failed' }));
     expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'failed', expect.objectContaining({ errorMessage: 'database refused' }));
+  });
+
+  it('keeps a plain-key cut the row already named, and does not mistake that for a landed write', async () => {
+    // A failed clip being generated again: its row still names the plain key
+    // from the earlier attempt. The write fails. The row naming the key says
+    // nothing about this write, so it is a failure — and the object stays.
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: OLD_CANONICAL, status: 'failed' });
+    commitRender.mockRejectedValueOnce(new Error('database refused'));
+
+    await expect(handleClipGeneration(job({}))).rejects.toThrow('database refused');
+
+    for (const [keys] of pipeline.discardUploadedObjects.mock.calls) expect(keys).toEqual([]);
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('carrying on as committed'), expect.anything());
+    expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'ready', expect.objectContaining({ errorMessage: 'database refused' }));
   });
 });
 
