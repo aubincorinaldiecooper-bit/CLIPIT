@@ -1,6 +1,6 @@
 import { aspectRatioLabel, focusPctForCrop, type CompositionMode } from '../services/media/composition.js';
 import { reframeWindow } from '../services/media/reframe.js';
-import { isCreatorVisible, type DerivativeStatus } from '../services/media/verticalVisibility.js';
+import { isCreatorVisible, type DeckPresentation, type DerivativeStatus } from '../services/media/verticalVisibility.js';
 
 /**
  * ONE place that decides what a clip's media looks like to a client.
@@ -171,14 +171,16 @@ export function clipMediaContract(row: ClipMediaRow, wantsVertical: boolean): Cl
  */
 export function creatorVisibleVerticalRows<T extends ClipMediaRow & { matchId: string; confidence: number }>(
   rows: T[],
+  presentation: DeckPresentation = 'vertical',
 ): T[] {
   return rows.filter((row) =>
     isCreatorVisible({
       matchId: row.matchId,
-      derivativeStatus: row.derivativeStatus ?? 'pending',
+      derivativeStatus: row.derivativeStatus,
       derivativeStorageKey: row.derivativeStorageKey,
       posterStorageKey: row.posterStorageKey,
+      canonicalStorageKey: row.canonicalUrl ? 'present' : null,
       confidence: row.confidence,
-    }),
+    }, presentation),
   );
 }

@@ -281,7 +281,13 @@ export async function claimClipRequestAttempt(requestId: string): Promise<string
 
 export async function recordDeckPlan(
   requestId: string,
-  plan: { presentationTarget: 'original' | 'vertical'; requestedResultCount: number },
+  /**
+   * requestedResultCount is null when the question named no number and no
+   * platform: the answer is then "every moment the search finds", which is
+   * not known until it has. effective_deck_target carries the number once it
+   * is.
+   */
+  plan: { presentationTarget: 'original' | 'vertical'; requestedResultCount: number | null },
   /** The claim this delivery already holds. The plan is fenced to it. */
   attemptId: string,
 ): Promise<boolean> {

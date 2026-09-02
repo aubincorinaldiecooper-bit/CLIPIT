@@ -10,6 +10,8 @@ import { keepAction, retentionClassFor, type KeepTarget } from '../src/services/
 
 const target = (over: Partial<KeepTarget> = {}): KeepTarget => ({
   preRendered: true,
+  presentation: 'vertical' as const,
+  storageKey: 'clips/a.mp4',
   derivativeStatus: 'ready',
   derivativeStorageKey: 'clips/v/c-vertical.mp4',
   posterStorageKey: 'posters/v/c.jpg',
