@@ -39,6 +39,7 @@ interface ClipRow {
   retention_class: 'temporary' | 'owned' | null;
   created_at: Date;
   updated_at: Date;
+  row_version: number;
 }
 
 function mapClip(row: ClipRow): Clip {
@@ -86,6 +87,8 @@ function mapClip(row: ClipRow): Clip {
     retentionClass: row.retention_class ?? 'owned',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // A reader ahead of migration 038 sees no counter; zero, not undefined.
+    rowVersion: row.row_version ?? 0,
   };
 }
 
@@ -122,6 +125,7 @@ export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> 
            end_seconds = CASE WHEN clips.boundaries_edited_at IS NULL THEN EXCLUDED.end_seconds ELSE clips.end_seconds END,
            status = CASE WHEN clips.status = 'ready' THEN clips.status ELSE 'pending' END,
            error_message = CASE WHEN clips.status = 'ready' THEN clips.error_message ELSE NULL END,
+           row_version = clips.row_version + 1,
            updated_at = now()
      RETURNING *`,
     [input.videoId, input.clipMatchId, input.sessionId, input.userId ?? null, input.startSeconds, input.endSeconds],
@@ -156,6 +160,7 @@ export async function setClipBoundaries(
             boundaries_edited_at = now(),
             status = 'pending',
             error_message = NULL,
+            row_version = row_version + 1,
             updated_at = now()
       WHERE id = $1 AND derived_from_clip_id IS NULL AND status IN ('ready', 'failed')
       RETURNING *`,
@@ -192,6 +197,7 @@ export async function restoreClipBoundaries(
             end_seconds = $3,
             boundaries_edited_at = $4,
             status = $5,
+            row_version = row_version + 1,
             updated_at = now()
       WHERE id = $1 AND status IN ('pending', 'generating')`;
   const params = [clipId, previous.startSeconds, previous.endSeconds, previous.boundariesEditedAt, previous.status ?? 'ready'];
@@ -241,6 +247,7 @@ export async function clearClipKeysForVideo(videoId: string): Promise<void> {
             derivative_storage_key = NULL,
             derivative_status      = NULL,
             poster_storage_key     = NULL,
+            row_version            = row_version + 1,
             updated_at             = now()
       WHERE video_id = $1`,
     [videoId],
@@ -435,24 +442,25 @@ export async function insertDerivedClip(input: {
  */
 export async function setClipRenderPending(clipId: string): Promise<void> {
   await queryOne(
-    `UPDATE clips SET status = 'pending', error_message = NULL, updated_at = now() WHERE id = $1 RETURNING id`,
+    `UPDATE clips SET status = 'pending', error_message = NULL, row_version = row_version + 1, updated_at = now() WHERE id = $1 RETURNING id`,
     [clipId],
   );
 }
 
 /**
  * Marks a clip generating at the start of a render's attempt, and returns
- * the row's updated_at as written — the mark an unknown render is settled
- * against (see settleUnknownRender): a row written after it was written by
- * this render's commit or by something later, and one not written since
- * has waited for a write that never came. Null when the clip is gone.
+ * the row's version as this write set it — the mark an unknown render is
+ * settled against (see settleUnknownRender): a row whose version has moved
+ * past it was written by this render's commit or by something later, and
+ * one still at it has waited for a write that never came. Null when the
+ * clip is gone.
  */
-export async function markClipGenerating(clipId: string): Promise<Date | null> {
-  const row = await queryOne<{ updated_at: Date }>(
-    `UPDATE clips SET status = 'generating', error_message = NULL, updated_at = now() WHERE id = $1 RETURNING updated_at`,
+export async function markClipGenerating(clipId: string): Promise<number | null> {
+  const row = await queryOne<{ row_version: number }>(
+    `UPDATE clips SET status = 'generating', error_message = NULL, row_version = row_version + 1, updated_at = now() WHERE id = $1 RETURNING row_version`,
     [clipId],
   );
-  return row?.updated_at ?? null;
+  return row?.row_version ?? null;
 }
 
 /** The root clip cut from a moment, if one exists. Copies stay out of it. */
@@ -543,6 +551,7 @@ export async function setClipStatus(
             duration_seconds = COALESCE($5, duration_seconds),
             size_bytes = COALESCE($6, size_bytes),
             captions = COALESCE($7::jsonb, captions),
+            row_version = row_version + 1,
             updated_at = now()
       WHERE id = $1
       RETURNING id`;

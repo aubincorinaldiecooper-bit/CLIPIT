@@ -22,13 +22,16 @@ export const RENDER_FAILED_MESSAGE = 'The render could not be completed. Try aga
  *    back would cancel the newer render.
  * 2. A row no longer 'generating' or 'pending' has been settled by a
  *    render or moved on by something later: left alone.
- * 3. A row written since this render's attempt set it generating — its
+ * 3. A row written since this render's attempt marked it generating — its
  *    last write of its own before the one whose outcome was lost — was
  *    written by that write (landed, with a key that proves nothing: a
  *    first render at its plain key) or by something later that owns the
- *    row now: left alone either way. The record carries that mark; one
- *    from before it did (035, 036) is read against the time it was
- *    recorded, the best it has.
+ *    row now: left alone either way. "Written since" is the row's version,
+ *    a counter every render-state write bumps in place, having moved past
+ *    the value the attempt's mark set (see clips.row_version). A record
+ *    from before the counter is read against the mark by time 037 gave it,
+ *    or, with no mark at all (035, 036), the time it was recorded — the
+ *    best each has.
  * 4. Otherwise the write did not land, and the row has been waiting since:
  *    it is rolled back exactly as a failed render would have been:
  * a Re-clip back to its previous boundaries and status with the failure on
@@ -75,16 +78,23 @@ export async function settleUnknownRender(
     log.info('an unknown render\'s row is no longer generating; left as it is', { ...context, status: clip.status });
     return 'moved_on';
   }
-  // The mark is the row's updated_at as the attempt wrote it when it set the
-  // row generating, not when the record was written: the record comes after
-  // the render's re-reads and their retries, and a Replace or Re-clip that a
-  // landed render's row took in between is older than the record — it
-  // looked like a row that had waited, and was rolled back over the newer
-  // render (Devin's finding on #83).
-  const since = render.rowUpdatedAt ?? render.recordedAt;
-  if (clip.updatedAt.getTime() > since.getTime()) {
+  // The mark is the row's version as the attempt's own "generating" write
+  // set it, and "written since" is the version having moved past it — not
+  // a time. Devin's findings on #83: the record's own time comes after the
+  // render's re-reads and their retries, so a Replace or Re-clip that a
+  // landed render's row took in between looked like a row that had waited;
+  // and a time on the row cannot order the writes either, because now() is
+  // a transaction's start — a Replace whose write began a hair before the
+  // mark and reached the row after it lands with the older time. The
+  // counter is bumped in place, against the row as it stands when the
+  // write takes effect, so it rises in the order the writes land.
+  const writtenSince = render.rowVersion !== null
+    ? clip.rowVersion > render.rowVersion
+    : clip.updatedAt.getTime() > (render.rowUpdatedAt ?? render.recordedAt).getTime();
+  if (writtenSince) {
     log.info('an unknown render\'s row was written after its attempt began; the render landed or something later owns the row', {
-      ...context, status: clip.status, updatedAt: clip.updatedAt, since, marked: render.rowUpdatedAt !== null,
+      ...context, status: clip.status, rowVersion: clip.rowVersion, mark: render.rowVersion,
+      updatedAt: clip.updatedAt, rowUpdatedAt: render.rowUpdatedAt, recordedAt: render.recordedAt,
     });
     return 'moved_on';
   }

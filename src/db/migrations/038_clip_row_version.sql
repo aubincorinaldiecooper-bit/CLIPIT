@@ -1,0 +1,25 @@
+-- A counter of the writes that change what a clip's row says about its
+-- render: its status, its files, its boundaries, its captions, its error.
+-- Never an approval, never a title.
+--
+-- Settling an unknown render (see settleUnknownRender) must tell a row
+-- that has waited since the render's lost write from a row something later
+-- has taken. A timestamp cannot: now() is a transaction's START, so a
+-- Replace whose write began a hair before the attempt's own "generating"
+-- write and reached the row after it lands with the OLDER time, and reads
+-- as the untouched attempt. The counter is bumped in place —
+-- row_version = row_version + 1 — which PostgreSQL evaluates against the
+-- row as it stands when the write takes effect, so it rises in the order
+-- the writes land. The attempt's "generating" write returns the value it
+-- set; that is the mark on the record, and a row whose counter has moved
+-- past it has been written since — by the render's own commit, or by
+-- something later that owns the row now.
+--
+-- 037 gave the record a mark by time (row_updated_at) for the same
+-- purpose. Production applied it, so it stays exactly as it is — an
+-- applied migration is never edited — and its column stays on the table.
+-- A record that carries only that mark is read against it, and one that
+-- carries no mark at all (035, 036) against its created_at: the best each
+-- has.
+ALTER TABLE clips ADD COLUMN IF NOT EXISTS row_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE unknown_renders ADD COLUMN IF NOT EXISTS row_version INTEGER;
