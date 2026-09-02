@@ -377,15 +377,29 @@ export interface CutClipOptions {
  * against the input size is what stops it ever upscaling. `-2` keeps the
  * aspect ratio and rounds to an even number, which H.264 requires.
  *
+ * The cap itself is rounded DOWN to even first. H.264 with 4:2:0 chroma
+ * cannot encode an odd dimension, so an odd CLIP_MAX_SHORT_SIDE would not
+ * deliver slightly smaller clips — it would fail every oversized cut at the
+ * encoder ("height not divisible by 2") and deliver nothing.
+ *
  * Exported for the tests only; the cut applies it itself.
  */
 export function clipResolutionCap(maxShortSide: number = env.CLIP_MAX_SHORT_SIDE): string {
-  const cap = Math.round(maxShortSide);
+  const cap = Math.max(2, Math.floor(maxShortSide / 2) * 2);
   return `scale='if(gt(iw,ih),-2,min(${cap},iw))':'if(gt(iw,ih),min(${cap},ih),-2)'`;
 }
 
-/** Cuts a clip from the ORIGINAL source and re-encodes to MP4 / H.264 / AAC. */
-export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: number; durationSeconds: number }> {
+/**
+ * Cuts a clip from the ORIGINAL source and re-encodes to MP4 / H.264 / AAC.
+ *
+ * Reports the delivered file's own width and height, probed after the cut.
+ * The resolution cap can shrink what a caller's crop filter produced, so a
+ * caller that recorded its planned frame size would be describing a file
+ * that does not exist. renderVerticalDerivative already reports this way.
+ */
+export async function cutClip(
+  options: CutClipOptions,
+): Promise<{ sizeBytes: number; durationSeconds: number; width: number; height: number }> {
   const duration = Math.max(0.1, options.endSeconds - options.startSeconds);
 
   // Input-seek to a keyframe before the requested start, then output-seek to
@@ -431,7 +445,12 @@ export async function cutClip(options: CutClipOptions): Promise<{ sizeBytes: num
   await run(env.FFMPEG_PATH, args, { timeoutMs: 60 * 60 * 1000 });
 
   const [info, probe] = await Promise.all([stat(options.outputPath), ffprobe(options.outputPath)]);
-  return { sizeBytes: info.size, durationSeconds: probe.durationSeconds };
+  return {
+    sizeBytes: info.size,
+    durationSeconds: probe.durationSeconds,
+    width: probe.width ?? 0,
+    height: probe.height ?? 0,
+  };
 }
 
 /**

@@ -117,17 +117,23 @@ export async function handleClipVariant(job: Job<ClipVariantJob>): Promise<void>
       const key = `clips/${clip.videoId}/${clipId}/${aspect.replace(':', 'x')}-${Math.round(focusPct)}.mp4`;
       await getStorage().uploadFile(key, outputPath, 'video/mp4');
 
+      // The FILE's dimensions, not the plan's. The cut caps the shorter side
+      // at CLIP_MAX_SHORT_SIDE after the crop, so a 9:16 region of a 4K
+      // source is planned at 1215x2160 and delivered at 1080x1920; storing
+      // the plan would hand every consumer a size the object does not have.
       await setVariantStatus(variantId, 'ready', {
         storageKey: key,
-        width: plan.outputWidth,
-        height: plan.outputHeight,
+        width: result.width,
+        height: result.height,
         sizeBytes: result.sizeBytes,
       });
 
       log.info('clip variant rendered', {
         key,
-        width: plan.outputWidth,
-        height: plan.outputHeight,
+        width: result.width,
+        height: result.height,
+        plannedWidth: plan.outputWidth,
+        plannedHeight: plan.outputHeight,
         sizeBytes: result.sizeBytes,
       });
       await job.updateProgress({ stage: 'ready', percent: 100 });
