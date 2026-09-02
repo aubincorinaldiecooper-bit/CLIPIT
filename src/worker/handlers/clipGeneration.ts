@@ -49,8 +49,12 @@ import type { Clip } from '../../domain/types.js';
 export class RenderOutcomeUnknownError extends Error {
   constructor(
     readonly original: unknown,
-    /** The file this render wrote; the row naming it proves the write landed. */
+    /** The file this render wrote; the row naming it proves the write landed — when the key is new to the row. */
     readonly storageKey: string,
+    /** The file the row named before this render, if any. */
+    readonly previousStorageKey: string | null,
+    /** Objects neither the queue nor the database would take on record; only the job and this error know them. */
+    readonly unreleasedKeys: string[],
   ) {
     super(`the render's outcome is unknown: ${errorMessage(original)}`);
     this.name = 'RenderOutcomeUnknownError';
@@ -308,6 +312,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
           log.error('the render\'s outcome is unknown; its objects and the previous ones are queued for a release that will ask the row', {
             ...context, keys: unresolved, err: error,
           });
+          let unreleased: string[] = [];
           try {
             await enqueueObjectRelease(unresolved, { ...context, reason: 'render_outcome_unknown' });
           } catch (queueError) {
@@ -323,6 +328,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
             });
             await recordObjectRelease(unresolved, { ...context, reason: 'render_outcome_unknown' }).catch((recordError: unknown) => {
               log.error('the keys could not be recorded in the database either', { ...context, keys: unresolved, err: recordError });
+              unreleased = unresolved;
             });
             await job.updateData?.({ ...job.data, unresolvedKeys: unresolved }).catch((updateError: unknown) => {
               log.error('the keys could not be recorded on the job; they are orphaned unless the database record or the logs find them', {
@@ -330,7 +336,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
               });
             });
           }
-          throw new RenderOutcomeUnknownError(error, key);
+          throw new RenderOutcomeUnknownError(error, key, clip.storageKey, unreleased);
         }
         // The row naming this render's key proves the write landed only when
         // the key is NEW to the row: a first render at the plain key, on a
@@ -392,7 +398,11 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         lastAttempt,
       });
       if (lastAttempt) {
-        await recordUnknownRender({ clipId, storageKey: error.storageKey, job: job.data }).catch((recordError: unknown) => {
+        // With the objects nothing else would take on record, so the sweep
+        // that settles this render hands them to the queue first.
+        const unresolvedKeys = error.unreleasedKeys.length > 0 ? error.unreleasedKeys : job.data.unresolvedKeys;
+        const record = { ...job.data, ...(unresolvedKeys?.length ? { unresolvedKeys } : {}) };
+        await recordUnknownRender({ clipId, storageKey: error.storageKey, previousStorageKey: error.previousStorageKey, job: record }).catch((recordError: unknown) => {
           // The database is the thing that could not be reached; if it still
           // cannot, the log line is the only record, and says so.
           log.error('the unknown render could not be written down for the sweep; the row may stay generating until settled by hand', {

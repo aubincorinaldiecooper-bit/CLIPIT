@@ -1,3 +1,4 @@
+import type pg from 'pg';
 import { queryOne, queryRows } from '../pool.js';
 import type { Clip, ClipStatus } from '../../domain/types.js';
 
@@ -183,17 +184,19 @@ export async function restoreClipBoundaries(
     boundariesEditedAt: Date | null;
     status?: 'ready' | 'failed';
   },
+  /** Inside the caller's transaction when it has one, so the rollback lands with the failure it records or not at all. */
+  client?: pg.PoolClient,
 ): Promise<void> {
-  await queryOne(
-    `UPDATE clips
+  const sql = `UPDATE clips
         SET start_seconds = $2,
             end_seconds = $3,
             boundaries_edited_at = $4,
             status = $5,
             updated_at = now()
-      WHERE id = $1 AND status IN ('pending', 'generating')`,
-    [clipId, previous.startSeconds, previous.endSeconds, previous.boundariesEditedAt, previous.status ?? 'ready'],
-  );
+      WHERE id = $1 AND status IN ('pending', 'generating')`;
+  const params = [clipId, previous.startSeconds, previous.endSeconds, previous.boundariesEditedAt, previous.status ?? 'ready'];
+  if (client) await client.query(sql, params);
+  else await queryOne(sql, params);
 }
 
 /**
@@ -498,6 +501,8 @@ export async function setClipStatus(
     /** Written only when provided — on the success of the render that used it. */
     captions?: unknown;
   } = {},
+  /** Inside the caller's transaction when it has one. */
+  client?: pg.PoolClient,
 ): Promise<boolean> {
   // Reports whether a row was actually there.
   //
@@ -505,8 +510,7 @@ export async function setClipStatus(
   // render in flight. The UPDATE then matches nothing and returns perfectly
   // happily, and a caller that assumed success would leave its uploaded
   // objects referenced by no row at all.
-  const row = await queryOne<{ id: string }>(
-    `UPDATE clips
+  const sql = `UPDATE clips
         SET status = $2,
             error_message = $3,
             storage_key = COALESCE($4, storage_key),
@@ -515,17 +519,19 @@ export async function setClipStatus(
             captions = COALESCE($7::jsonb, captions),
             updated_at = now()
       WHERE id = $1
-      RETURNING id`,
-    [
-      clipId,
-      status,
-      options.errorMessage ?? null,
-      options.storageKey ?? null,
-      options.durationSeconds ?? null,
-      options.sizeBytes ?? null,
-      options.captions === undefined ? null : JSON.stringify(options.captions),
-    ],
-  );
+      RETURNING id`;
+  const params = [
+    clipId,
+    status,
+    options.errorMessage ?? null,
+    options.storageKey ?? null,
+    options.durationSeconds ?? null,
+    options.sizeBytes ?? null,
+    options.captions === undefined ? null : JSON.stringify(options.captions),
+  ];
+  const row = client
+    ? ((await client.query<{ id: string }>(sql, params)).rows[0] ?? null)
+    : await queryOne<{ id: string }>(sql, params);
   return row !== null;
 }
 
