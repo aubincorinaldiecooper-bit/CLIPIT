@@ -16,9 +16,11 @@ export interface UnknownRender {
   /** The file the row named before this render, if any; the same key as `storageKey` for a retried first render. */
   previousStorageKey: string | null;
   job: ClipGenerationJob;
+  /** When the render was written down. A row written after this was touched by something later. */
+  recordedAt: Date;
 }
 
-export async function recordUnknownRender(input: Omit<UnknownRender, 'id'>): Promise<void> {
+export async function recordUnknownRender(input: Omit<UnknownRender, 'id' | 'recordedAt'>): Promise<void> {
   await queryOne(
     `INSERT INTO unknown_renders (clip_id, storage_key, previous_storage_key, job)
      VALUES ($1, $2, $3, $4::jsonb)
@@ -40,8 +42,8 @@ export async function drainUnknownRenders(
   settle: (render: UnknownRender, client: pg.PoolClient) => Promise<void>,
 ): Promise<number> {
   return withTransaction(async (client) => {
-    const { rows } = await client.query<{ id: string; clip_id: string; storage_key: string; previous_storage_key: string | null; job: ClipGenerationJob }>(
-      `SELECT id, clip_id, storage_key, previous_storage_key, job
+    const { rows } = await client.query<{ id: string; clip_id: string; storage_key: string; previous_storage_key: string | null; job: ClipGenerationJob; created_at: Date }>(
+      `SELECT id, clip_id, storage_key, previous_storage_key, job, created_at
          FROM unknown_renders
         ORDER BY created_at
         LIMIT $1
@@ -50,7 +52,7 @@ export async function drainUnknownRenders(
     );
     let settled = 0;
     for (const row of rows) {
-      await settle({ id: row.id, clipId: row.clip_id, storageKey: row.storage_key, previousStorageKey: row.previous_storage_key, job: row.job }, client);
+      await settle({ id: row.id, clipId: row.clip_id, storageKey: row.storage_key, previousStorageKey: row.previous_storage_key, job: row.job, recordedAt: row.created_at }, client);
       await client.query('DELETE FROM unknown_renders WHERE id = $1', [row.id]);
       settled += 1;
     }

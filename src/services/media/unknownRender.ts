@@ -13,17 +13,21 @@ export const RENDER_FAILED_MESSAGE = 'The render could not be completed. Try aga
  * Settles a render whose outcome was unknown when its job's last attempt
  * ended, now that the database answers.
  *
- * The row is the evidence, and its STATUS is the evidence that always
- * holds: a write that landed made the row 'ready'; nothing else makes a
- * 'generating' row 'ready' while its render's outcome is unknown. The key
- * confirms it when it can — a row naming a file NEW to it was written by
- * the render — and says nothing when it cannot: a first render retried at
- * the plain key a failed earlier attempt already left on the row, or a
- * record from before the previous key was written down (rows made by the
- * 035 code carry no previous key). Still 'generating' or 'pending', the
- * write did not land, and nothing else can have started on the row since —
- * a Re-clip is refused while one is pending, a Replace while the clip is not
- * ready — so it is rolled back exactly as a failed render would have been:
+ * The row is the evidence, read in this order:
+ *
+ * 1. A row naming a file NEW to it was written by this render: landed,
+ *    whatever its status now — a landed render's row is 'ready' and can
+ *    take a Replace or a Re-clip before the sweep runs, which makes it
+ *    'generating' again with this render's file still on it; rolling that
+ *    back would cancel the newer render.
+ * 2. A row no longer 'generating' or 'pending' has been settled by a
+ *    render or moved on by something later: left alone.
+ * 3. A row written AFTER this render was recorded belongs to something
+ *    later too (the key said nothing: a first render retried at the plain
+ *    key, or a record from the 035 code, which wrote no previous key):
+ *    left alone.
+ * 4. Otherwise the write did not land, and the row has been waiting since:
+ *    it is rolled back exactly as a failed render would have been:
  * a Re-clip back to its previous boundaries and status with the failure on
  * record, a re-render back to 'ready' with the previous file, a first
  * render to 'failed'. Any other state means something later moved the row
@@ -56,18 +60,22 @@ export async function settleUnknownRender(
     log.info('an unknown render\'s clip no longer exists; nothing to settle', context);
     return 'gone';
   }
-  // The key confirms a landed write only when it is known to be new to the
-  // row; a record without a previous key (the 035 code wrote none) says
-  // nothing either way, and the status decides alone.
+  // The key proves a landed write only when it is known to be new to the
+  // row; a record without a previous key (the 035 code wrote none) proves
+  // nothing either way.
   const keyIsNew = render.previousStorageKey !== null && render.storageKey !== render.previousStorageKey;
-  if (clip.status === 'ready' && clip.storageKey === render.storageKey && keyIsNew) {
-    log.info('an unknown render had landed; the row names its file', context);
+  if (keyIsNew && clip.storageKey === render.storageKey) {
+    log.info('an unknown render had landed; the row names its file', { ...context, status: clip.status });
     return 'landed';
   }
   if (clip.status !== 'generating' && clip.status !== 'pending') {
-    // 'ready' at a key that proves nothing is still a landed render, or a
-    // row something later moved on. Either way, not ours to touch.
     log.info('an unknown render\'s row is no longer generating; left as it is', { ...context, status: clip.status });
+    return 'moved_on';
+  }
+  if (clip.updatedAt.getTime() > render.recordedAt.getTime()) {
+    log.info('an unknown render\'s row was written after the render was recorded; something later owns it', {
+      ...context, status: clip.status, updatedAt: clip.updatedAt, recordedAt: render.recordedAt,
+    });
     return 'moved_on';
   }
 
