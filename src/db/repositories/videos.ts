@@ -465,15 +465,22 @@ export async function getChunk(chunkId: string): Promise<VideoChunk | null> {
  * moves. If adoption got there first, this finds nothing and the sweep
  * deletes nothing. The keys stay in place here — they are nulled by
  * markFootageExpired once the objects are actually gone.
+ *
+ * `onlyIfUnowned` is the sweep's rule. An owner removing their own video
+ * has already been checked against it by the route, and their video is
+ * theirs whoever it belonged to before; that call passes false.
  */
-export async function claimFootageForExpiry(videoId: string): Promise<boolean> {
+export async function claimFootageForExpiry(
+  videoId: string,
+  options: { onlyIfUnowned: boolean },
+): Promise<boolean> {
   const row = await queryOne<{ id: string }>(
     `UPDATE videos
         SET footage_expired_at = now(),
             updated_at = now()
       WHERE id = $1
         AND footage_expired_at IS NULL
-        AND user_id IS NULL
+        ${options.onlyIfUnowned ? 'AND user_id IS NULL' : ''}
       RETURNING id`,
     [videoId],
   );

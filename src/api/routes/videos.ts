@@ -424,7 +424,11 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     if (!video) throw HttpError.notFound('Video not found');
     assertOwnership(request, video, 'Video');
 
-    const result = await expireVideoFootage(videoId, logger.child({ route: 'delete-video', videoId }));
+    // Theirs, as just asserted — signed in or not — so the sweep's guest-only
+    // rule does not apply to a removal they asked for.
+    const result = await expireVideoFootage(videoId, logger.child({ route: 'delete-video', videoId }), {
+      onlyIfUnowned: false,
+    });
 
     return reply.send({
       videoId,

@@ -73,21 +73,32 @@ beforeEach(() => {
 });
 
 describe('expireVideoFootage', () => {
-  it('claims the video as still a guest’s before any object is removed', async () => {
+  it('claims the video — still a guest’s, for the sweep — before any object is removed', async () => {
     videos.claimFootageForExpiry.mockResolvedValueOnce(true);
 
-    const result = await expireVideoFootage('v1', log);
+    const result = await expireVideoFootage('v1', log, { onlyIfUnowned: true });
 
     expect(order[0]).toBe('claim');
-    expect(order.filter((step) => step === 'remove')).toHaveLength(2);
-    expect(result).toEqual({ objectsDeleted: 2, objectsFailed: 0 });
+    expect(videos.claimFootageForExpiry).toHaveBeenCalledWith('v1', { onlyIfUnowned: true });
+    // The original, one clip, one still.
+    expect(order.filter((step) => step === 'remove')).toHaveLength(3);
+    expect(result).toEqual({ objectsDeleted: 3, objectsFailed: 0 });
     expect(videos.markFootageExpired).toHaveBeenCalledWith('v1');
+  });
+
+  it('lets an owner remove their own video whoever it belonged to before', async () => {
+    videos.claimFootageForExpiry.mockResolvedValueOnce(true);
+
+    await expireVideoFootage('v1', log, { onlyIfUnowned: false });
+
+    expect(videos.claimFootageForExpiry).toHaveBeenCalledWith('v1', { onlyIfUnowned: false });
+    expect(remove).toHaveBeenCalledTimes(3);
   });
 
   it('deletes and clears nothing when the claim finds no row — adopted since it was selected, or expired already', async () => {
     videos.claimFootageForExpiry.mockResolvedValueOnce(false);
 
-    const result = await expireVideoFootage('v1', log);
+    const result = await expireVideoFootage('v1', log, { onlyIfUnowned: true });
 
     expect(result).toEqual({ objectsDeleted: 0, objectsFailed: 0 });
     expect(remove).not.toHaveBeenCalled();

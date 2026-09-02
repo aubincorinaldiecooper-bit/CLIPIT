@@ -14,10 +14,10 @@ beforeEach(() => {
 });
 
 describe('claimFootageForExpiry', () => {
-  it('marks the video expired only while it is still unowned and not yet expired, in one statement', async () => {
+  it('for the sweep, marks the video expired only while it is still unowned and not yet expired, in one statement', async () => {
     queryOne.mockResolvedValueOnce({ id: 'v1' });
 
-    expect(await claimFootageForExpiry('v1')).toBe(true);
+    expect(await claimFootageForExpiry('v1', { onlyIfUnowned: true })).toBe(true);
     const [sql, params] = queryOne.mock.calls[0] as [string, unknown[]];
     expect(sql).toMatch(/UPDATE videos/);
     expect(sql).toMatch(/SET footage_expired_at = now\(\)/);
@@ -27,8 +27,17 @@ describe('claimFootageForExpiry', () => {
     expect(params).toEqual(['v1']);
   });
 
-  it('refuses when the row is no longer a guest’s', async () => {
+  it('for an owner’s own removal, does not ask whether the video is unowned', async () => {
+    queryOne.mockResolvedValueOnce({ id: 'v1' });
+
+    expect(await claimFootageForExpiry('v1', { onlyIfUnowned: false })).toBe(true);
+    const [sql] = queryOne.mock.calls[0] as [string, unknown[]];
+    expect(sql).toMatch(/footage_expired_at IS NULL/);
+    expect(sql).not.toMatch(/user_id IS NULL/);
+  });
+
+  it('refuses when the row is no longer a guest’s, or already expired', async () => {
     queryOne.mockResolvedValueOnce(null);
-    expect(await claimFootageForExpiry('v1')).toBe(false);
+    expect(await claimFootageForExpiry('v1', { onlyIfUnowned: true })).toBe(false);
   });
 });

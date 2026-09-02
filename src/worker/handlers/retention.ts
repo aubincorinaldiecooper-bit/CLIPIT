@@ -107,7 +107,9 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
   // a search or an upload someone is waiting on.
   for (const video of batch) {
     try {
-      const result = await expireVideoFootage(video.videoId, log);
+      // Only while it is still a guest's: a sign-in since the selection
+      // above makes the video an account's, and its footage stays.
+      const result = await expireVideoFootage(video.videoId, log, { onlyIfUnowned: true });
       objectsDeleted += result.objectsDeleted;
       objectsFailed += result.objectsFailed;
     } catch (error) {

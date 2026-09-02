@@ -32,13 +32,22 @@ export interface ExpiryResult {
   objectsFailed: number;
 }
 
-export async function expireVideoFootage(videoId: string, log: Logger): Promise<ExpiryResult> {
-  // Claim first, in one statement that also checks the video is still a
-  // guest's: the sweep selected it a moment ago, and a sign-in since then
-  // makes it somebody's. Nothing is deleted without this claim.
-  const claimed = await claimFootageForExpiry(videoId);
+export interface ExpiryOptions {
+  /**
+   * The sweep's rule: remove only while the video is still a guest's. It
+   * selected the video a moment ago, and a sign-in since then makes it
+   * somebody's (Devin, #88). An owner removing their own video passes false:
+   * the route has already checked it is theirs.
+   */
+  onlyIfUnowned: boolean;
+}
+
+export async function expireVideoFootage(videoId: string, log: Logger, options: ExpiryOptions): Promise<ExpiryResult> {
+  // Claim first, in one statement that also applies the rule above. Nothing
+  // is deleted without this claim.
+  const claimed = await claimFootageForExpiry(videoId, { onlyIfUnowned: options.onlyIfUnowned });
   if (!claimed) {
-    log.info('footage kept: expired already, or adopted since it was selected', { videoId });
+    log.info('footage kept: expired already, or no longer a guest\'s', { videoId });
     return { objectsDeleted: 0, objectsFailed: 0 };
   }
   const video = await getVideo(videoId);
