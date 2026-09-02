@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
@@ -11,7 +12,9 @@ import { appendReclipVersion, clearReclipPending, markReclipFailed } from '../..
 import { captionsSchema, prepareCaptionFilters } from '../../services/media/captions.js';
 import { applyClipPadding } from '../../services/timestamps.js';
 import { getClip, setClipStatus, restoreClipBoundaries } from '../../db/repositories/clips.js';
-import { renderDeliveredMedia } from '../../services/media/rerender.js';
+import { commitRender } from '../../db/repositories/verticalMedia.js';
+import { discardUploadedObjects } from '../../services/media/verticalPipeline.js';
+import { releaseObjects, renderDeliveredMedia } from '../../services/media/rerender.js';
 import { discardVariants } from '../../db/repositories/clipVariants.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import type { ClipGenerationJob } from '../../queues/index.js';
@@ -89,11 +92,17 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         ...(videoFilters ? { videoFilters } : {}),
       });
 
+      // A re-render puts a different file under the same clip id. Its bytes
+      // go to a FRESH key beside the old ones, so the working clip is never
+      // overwritten before the row accepts the new one; a first render keeps
+      // the plain key it always had.
+      const rerender = clip.storageKey !== null && (job.data.captions !== undefined || job.data.reclip !== undefined);
+      const render = rerender ? randomUUID().slice(0, 8) : undefined;
+
       // The card's picture — and for a vertical moment the 9:16 file — were
       // made from the cut, so they are made again from THIS one, first, at
-      // fresh keys beside the old. If any of it fails, the previous cut and
-      // its media are untouched and the failure below rolls this render back
-      // like any other; nothing has been replaced yet.
+      // fresh keys too. If any of it fails, nothing has been replaced yet and
+      // the failure below rolls this render back like any other.
       const delivered = await renderDeliveredMedia({
         clip,
         videoId: video.id,
@@ -101,39 +110,43 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         workDir: dir,
         hasAudio: video.hasAudio ?? true,
         cut: result,
+        render,
         log,
       });
 
       await job.updateProgress({ stage: 'uploading', percent: 80 });
 
-      const key = clipKey(video.id, clipId);
+      const key = clipKey(video.id, clipId, render);
+      // Everything this render made and nothing else: on a failure these go
+      // and the previous cut and media stay exactly as they were.
+      const fresh = [...(render ? [key] : []), ...(delivered?.freshKeys ?? [])];
       try {
         await getStorage().uploadFile(key, outputPath, 'video/mp4');
 
-        await setClipStatus(clipId, 'ready', {
+        // ONE row write: the cut and the media made from it become the row's
+        // truth together — a Replace's spec included — or not at all.
+        const wrote = await commitRender(clipId, {
           storageKey: key,
           durationSeconds: Number(result.durationSeconds.toFixed(3)),
           sizeBytes: result.sizeBytes,
-          // A Replace's spec becomes the row's truth only now, when the file
-          // that carries it exists.
-          ...(job.data.captions !== undefined ? { captions: job.data.captions } : {}),
+          captions: job.data.captions,
+          media: delivered?.media ?? { kind: 'none' },
         });
+        if (!wrote) {
+          throw new Error(`Clip ${clipId} no longer exists — its render has nowhere to be recorded`);
+        }
       } catch (error) {
-        // The new cut did not land, so the media made from it goes too.
-        await delivered?.discard('canonical_replace_failed');
+        await discardUploadedObjects(fresh, { videoId: video.id, clipId, reason: 'render_commit_failed' });
         throw error;
       }
 
-      // The new cut is the truth now, so the row takes the media made from
-      // it and the previous objects go. A failure here cannot fail the
-      // render — that would leave the row describing a file that no longer
-      // exists — so it is said out loud instead: the one way a card's
-      // picture can disagree with its file.
-      if (delivered) {
-        await delivered.commit().catch((commitError) => {
-          log.error('the re-cut clip kept its previous delivered media', { err: commitError });
-        });
-      }
+      // The row names the new cut and its media; the previous objects go.
+      await releaseObjects(
+        [render ? clip.storageKey : null, ...(delivered?.oldKeys ?? [])],
+        [key, ...(delivered?.freshKeys ?? [])],
+        { videoId: video.id, clipId },
+        log,
+      );
 
       // The master changed, so every platform shape cut from the OLD master
       // is stale — posting one would send footage the user just replaced.

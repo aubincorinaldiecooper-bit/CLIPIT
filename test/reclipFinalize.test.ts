@@ -14,7 +14,8 @@ const clips = { getClip: vi.fn(), setClipStatus: vi.fn(), restoreClipBoundaries:
 const reclips = { appendReclipVersion: vi.fn(), clearReclipPending: vi.fn(), markReclipFailed: vi.fn() };
 const discardVariants = vi.fn();
 const getVideo = vi.fn();
-const storage = { downloadToFile: vi.fn(), uploadFile: vi.fn() };
+const storage = { downloadToFile: vi.fn(), uploadFile: vi.fn(), remove: vi.fn() };
+const commitRender = vi.fn(async () => true);
 const media = { cutClip: vi.fn(), ffprobe: vi.fn() };
 
 vi.mock('../src/db/repositories/clips.js', () => ({
@@ -28,6 +29,7 @@ vi.mock('../src/db/repositories/reclips.js', () => ({
   markReclipFailed: reclips.markReclipFailed,
 }));
 vi.mock('../src/db/repositories/clipVariants.js', () => ({ discardVariants }));
+vi.mock('../src/db/repositories/verticalMedia.js', () => ({ commitRender }));
 vi.mock('../src/db/repositories/videos.js', () => ({ getVideo }));
 vi.mock('../src/services/storage/s3.js', () => ({ getStorage: () => storage }));
 vi.mock('../src/services/media/ffmpeg.js', () => ({

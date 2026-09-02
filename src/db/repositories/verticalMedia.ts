@@ -235,6 +235,93 @@ export async function setPosterFromCut(clipId: string, input: PosterFromCutInput
   }
 }
 
+export type RenderedMedia =
+  /** A moment cut on demand, or a first render: no media to record beside the cut. */
+  | { kind: 'none' }
+  | { kind: 'original'; poster: PosterFromCutInput }
+  | { kind: 'vertical'; media: VerticalMediaInput };
+
+export interface RenderCommit {
+  storageKey: string;
+  durationSeconds: number;
+  sizeBytes: number;
+  /** Written only when provided — a caption Replace's spec becomes the row's truth here. */
+  captions?: unknown;
+  media: RenderedMedia;
+}
+
+/**
+ * A render's ONE row write: the cut, and the media made from it, become the
+ * row's truth together or not at all.
+ *
+ * This deliberately crosses the line drawn at the top of this file — it
+ * writes the canonical columns clips.ts owns as well as the presentation
+ * ones — because a re-render is the one moment both must move together. As
+ * two statements there was an instant in which the row named a new cut and
+ * the previous poster, and a failure between them left it that way for
+ * good. Approval and retention are not touched: a re-render changes what a
+ * moment looks like, never whether anyone chose it.
+ *
+ * Returns whether a row was there to write, so the caller can take its
+ * fresh objects back out rather than leave them referenced by nothing.
+ */
+export async function commitRender(clipId: string, input: RenderCommit): Promise<boolean> {
+  const sets: string[] = [
+    "status = 'ready'",
+    'error_message = NULL',
+    'storage_key = $2',
+    'duration_seconds = $3',
+    'size_bytes = $4',
+    'captions = COALESCE($5::jsonb, captions)',
+    'updated_at = now()',
+  ];
+  const params: unknown[] = [
+    clipId,
+    input.storageKey,
+    input.durationSeconds,
+    input.sizeBytes,
+    input.captions === undefined ? null : JSON.stringify(input.captions),
+  ];
+  const set = (column: string, value: unknown) => {
+    params.push(value);
+    sets.push(`${column} = $${params.length}`);
+  };
+
+  if (input.media.kind === 'original') {
+    const poster = input.media.poster;
+    set('poster_storage_key', poster.posterStorageKey);
+    set('poster_timestamp_seconds', poster.posterTimestampSeconds);
+    set('source_width', poster.sourceWidth);
+    set('source_height', poster.sourceHeight);
+    // The deliverable IS the canonical file, so its size is the output.
+    set('output_width', poster.sourceWidth);
+    set('output_height', poster.sourceHeight);
+    set('poster_generation_ms', poster.posterGenerationMs);
+  } else if (input.media.kind === 'vertical') {
+    const media = input.media.media;
+    set('derivative_storage_key', media.derivativeStorageKey);
+    sets.push("derivative_status = 'ready'", 'derivative_error = NULL');
+    set('composition_mode', media.compositionMode);
+    set('focal_x', media.focalX);
+    set('focal_y', media.focalY);
+    set('poster_storage_key', media.posterStorageKey);
+    set('poster_timestamp_seconds', media.posterTimestampSeconds);
+    set('source_width', media.sourceWidth);
+    set('source_height', media.sourceHeight);
+    set('output_width', media.outputWidth);
+    set('output_height', media.outputHeight);
+    set('composition_decision_ms', media.compositionDecisionMs);
+    set('derivative_generation_ms', media.derivativeGenerationMs);
+    set('poster_generation_ms', media.posterGenerationMs);
+  }
+
+  const row = await queryOne<{ id: string }>(
+    `UPDATE clips SET ${sets.join(', ')} WHERE id = $1 RETURNING id`,
+    params,
+  );
+  return row !== null;
+}
+
 /**
  * Record that an original-framing pre-render failed.
  *
