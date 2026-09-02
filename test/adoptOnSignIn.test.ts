@@ -163,6 +163,13 @@ describe('adoptOnSignIn', () => {
     expect(sessions.adoptSessionWork).not.toHaveBeenCalled();
   });
 
+  it('reports a guest with nothing left to move as nothing adopted, not a success of zero', async () => {
+    redeemHandoff.mockResolvedValueOnce({ sessionId: 'guest-1', userId: null });
+    sessions.adoptSessionWork.mockResolvedValueOnce({ videos: 0, clipRequests: 0, clips: 0 });
+
+    expect(await adoptOnSignIn({ ...person, handoff: 'h' })).toBeNull();
+  });
+
   it('takes nothing on an unknown, spent, expired, or misaddressed hand-over', async () => {
     redeemHandoff.mockResolvedValueOnce(null);
     expect(await adoptOnSignIn({ ...person, handoff: 'stale' })).toBeNull();

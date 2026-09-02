@@ -450,3 +450,32 @@ export async function getChunk(chunkId: string): Promise<VideoChunk | null> {
   const row = await queryOne<ChunkRow>('SELECT * FROM video_chunks WHERE id = $1', [chunkId]);
   return row ? mapChunk(row) : null;
 }
+
+/**
+ * Claims a video's footage for removal — or refuses, because it is no
+ * longer a guest's.
+ *
+ * The sweep selects idle guest videos and then deletes their objects one by
+ * one. Between the selection and the deletes, the guest can sign in and the
+ * video becomes an account's: footage the person can now come back for
+ * would be removed out from under them (Devin, #88). So the removal starts
+ * by marking the video expired in ONE statement that also requires it to
+ * still be unowned. Adoption's own update and this one contend on the row;
+ * whichever commits first wins, and the other re-reads the row before it
+ * moves. If adoption got there first, this finds nothing and the sweep
+ * deletes nothing. The keys stay in place here — they are nulled by
+ * markFootageExpired once the objects are actually gone.
+ */
+export async function claimFootageForExpiry(videoId: string): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
+    `UPDATE videos
+        SET footage_expired_at = now(),
+            updated_at = now()
+      WHERE id = $1
+        AND footage_expired_at IS NULL
+        AND user_id IS NULL
+      RETURNING id`,
+    [videoId],
+  );
+  return row !== null;
+}

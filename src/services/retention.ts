@@ -7,7 +7,7 @@ import { clearClipKeysForVideo, listClipKeysForVideo } from '../db/repositories/
 import { clearVariantsForVideo, listVariantKeysForVideo } from '../db/repositories/clipVariants.js';
 import { deleteScenes } from '../db/repositories/scenes.js';
 import { deleteTranscript } from '../db/repositories/transcripts.js';
-import { getVideo, listChunks, markFootageExpired } from '../db/repositories/videos.js';
+import { claimFootageForExpiry, getVideo, listChunks, markFootageExpired } from '../db/repositories/videos.js';
 import { getStorage } from './storage/s3.js';
 
 /**
@@ -33,8 +33,16 @@ export interface ExpiryResult {
 }
 
 export async function expireVideoFootage(videoId: string, log: Logger): Promise<ExpiryResult> {
+  // Claim first, in one statement that also checks the video is still a
+  // guest's: the sweep selected it a moment ago, and a sign-in since then
+  // makes it somebody's. Nothing is deleted without this claim.
+  const claimed = await claimFootageForExpiry(videoId);
+  if (!claimed) {
+    log.info('footage kept: expired already, or adopted since it was selected', { videoId });
+    return { objectsDeleted: 0, objectsFailed: 0 };
+  }
   const video = await getVideo(videoId);
-  if (!video || video.footageExpiredAt) return { objectsDeleted: 0, objectsFailed: 0 };
+  if (!video) return { objectsDeleted: 0, objectsFailed: 0 };
 
   const chunks = await listChunks(videoId);
   const [clipKeys, thumbnailKeys, variantKeys] = await Promise.all([

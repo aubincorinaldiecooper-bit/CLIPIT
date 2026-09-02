@@ -1,0 +1,97 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * The sweep selects an idle guest's video, then deletes its objects one by
+ * one. If the guest signs in between the two, the video is an account's and
+ * its footage must stay. Removal therefore starts with a claim that also
+ * checks the video is still unowned, and deletes nothing without it.
+ */
+
+const videos = { claimFootageForExpiry: vi.fn(), getVideo: vi.fn(), listChunks: vi.fn(), markFootageExpired: vi.fn() };
+const remove = vi.fn();
+const clears = {
+  clearThumbnailsForVideo: vi.fn(),
+  clearClipKeysForVideo: vi.fn(),
+  clearVariantsForVideo: vi.fn(),
+  deleteScenes: vi.fn(),
+  deleteTranscript: vi.fn(),
+};
+const order: string[] = [];
+
+vi.mock('../src/db/repositories/videos.js', () => ({
+  claimFootageForExpiry: (...args: unknown[]) => {
+    order.push('claim');
+    return videos.claimFootageForExpiry(...args);
+  },
+  getVideo: (...args: unknown[]) => videos.getVideo(...args),
+  listChunks: (...args: unknown[]) => videos.listChunks(...args),
+  markFootageExpired: (...args: unknown[]) => videos.markFootageExpired(...args),
+}));
+vi.mock('../src/db/repositories/clipRequests.js', () => ({
+  clearThumbnailsForVideo: (...args: unknown[]) => clears.clearThumbnailsForVideo(...args),
+  listThumbnailKeysForVideo: vi.fn(async () => ['stills/1.jpg']),
+}));
+vi.mock('../src/db/repositories/clips.js', () => ({
+  clearClipKeysForVideo: (...args: unknown[]) => clears.clearClipKeysForVideo(...args),
+  listClipKeysForVideo: vi.fn(async () => ['clips/1.mp4']),
+}));
+vi.mock('../src/db/repositories/clipVariants.js', () => ({
+  clearVariantsForVideo: (...args: unknown[]) => clears.clearVariantsForVideo(...args),
+  listVariantKeysForVideo: vi.fn(async () => []),
+}));
+vi.mock('../src/db/repositories/scenes.js', () => ({ deleteScenes: (...args: unknown[]) => clears.deleteScenes(...args) }));
+vi.mock('../src/db/repositories/transcripts.js', () => ({
+  deleteTranscript: (...args: unknown[]) => clears.deleteTranscript(...args),
+}));
+vi.mock('../src/services/storage/s3.js', () => ({
+  getStorage: () => ({
+    remove: (...args: unknown[]) => {
+      order.push('remove');
+      return remove(...args);
+    },
+  }),
+}));
+
+const { expireVideoFootage } = await import('../src/services/retention.js');
+const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  order.length = 0;
+  videos.getVideo.mockResolvedValue({
+    id: 'v1',
+    footageExpiredAt: null,
+    originalStorageKey: 'videos/v1/original.mp4',
+    proxyStorageKey: null,
+    playbackStorageKey: null,
+    captionsStorageKey: null,
+  });
+  videos.listChunks.mockResolvedValue([]);
+  remove.mockResolvedValue(undefined);
+  for (const clear of Object.values(clears)) clear.mockResolvedValue(undefined);
+  videos.markFootageExpired.mockResolvedValue(undefined);
+});
+
+describe('expireVideoFootage', () => {
+  it('claims the video as still a guest’s before any object is removed', async () => {
+    videos.claimFootageForExpiry.mockResolvedValueOnce(true);
+
+    const result = await expireVideoFootage('v1', log);
+
+    expect(order[0]).toBe('claim');
+    expect(order.filter((step) => step === 'remove')).toHaveLength(2);
+    expect(result).toEqual({ objectsDeleted: 2, objectsFailed: 0 });
+    expect(videos.markFootageExpired).toHaveBeenCalledWith('v1');
+  });
+
+  it('deletes and clears nothing when the claim finds no row — adopted since it was selected, or expired already', async () => {
+    videos.claimFootageForExpiry.mockResolvedValueOnce(false);
+
+    const result = await expireVideoFootage('v1', log);
+
+    expect(result).toEqual({ objectsDeleted: 0, objectsFailed: 0 });
+    expect(remove).not.toHaveBeenCalled();
+    for (const clear of Object.values(clears)) expect(clear).not.toHaveBeenCalled();
+    expect(videos.markFootageExpired).not.toHaveBeenCalled();
+  });
+});

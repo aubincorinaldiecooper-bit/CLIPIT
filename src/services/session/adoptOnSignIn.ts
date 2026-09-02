@@ -87,7 +87,8 @@ export async function adoptOnSignIn(input: {
         total.videos += adopted.videos;
         total.clipRequests += adopted.clipRequests;
         total.clips += adopted.clips;
-        adoptedAny = true;
+        // A guest with nothing left to move is nothing adopted, not a success of zero.
+        adoptedAny ||= adopted.videos + adopted.clipRequests + adopted.clips > 0;
         logger.info('adopted guest work on sign-in', { ...adopted, via });
       }
       return adoptedAny ? total : null;
