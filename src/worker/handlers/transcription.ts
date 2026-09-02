@@ -33,6 +33,7 @@ const MIN_SEGMENT_SECONDS = 0.5;
 export async function handleTranscription(job: Job<TranscriptionJob>): Promise<void> {
   const { videoId } = job.data;
   const log = logger.child({ job: 'transcription', videoId });
+  const transcriptStartedAt = performance.now();
 
   const video = await getVideo(videoId);
   if (!video) {
@@ -59,7 +60,11 @@ export async function handleTranscription(job: Job<TranscriptionJob>): Promise<v
       const segments = await transcribeFromCaptions(captionsKey);
       if (segments.length > 0) {
         await store(videoId, segments, 'youtube_captions');
-        log.info('transcript built from captions', { segments: segments.length });
+        log.info('transcript built from captions', {
+          segments: segments.length,
+          uploadToTranscriptReadyMs: Math.max(0, Date.now() - video.createdAt.getTime()),
+          transcriptionMs: Math.round(performance.now() - transcriptStartedAt),
+        });
         await job.updateProgress({ stage: 'done', percent: 100, source: 'youtube_captions' });
         return;
       }
@@ -80,7 +85,11 @@ export async function handleTranscription(job: Job<TranscriptionJob>): Promise<v
     }
 
     await store(videoId, segments, 'openrouter_stt');
-    log.info('transcript built with speech-to-text', { segments: segments.length });
+    log.info('transcript built with speech-to-text', {
+      segments: segments.length,
+      uploadToTranscriptReadyMs: Math.max(0, Date.now() - video.createdAt.getTime()),
+      transcriptionMs: Math.round(performance.now() - transcriptStartedAt),
+    });
     await job.updateProgress({ stage: 'done', percent: 100, source: 'openrouter_stt' });
   } catch (error) {
     const message = errorMessage(error);

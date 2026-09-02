@@ -182,6 +182,8 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
     // asked of it afterwards.
     const gate = videoCallStats();
     log.info('video read into notes', {
+      path: 'background_visual_index',
+      fullVisualIndexCompletionMs: Math.round(performance.now() - startedAt),
       scenes: storedScenes,
       chunks: chunks.length,
       failedChunks,
