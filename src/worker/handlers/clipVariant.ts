@@ -114,7 +114,12 @@ export async function handleClipVariant(job: Job<ClipVariantJob>): Promise<void>
       });
 
       await job.updateProgress({ stage: 'uploading', percent: 80 });
-      const key = `clips/${clip.videoId}/${clipId}/${aspect.replace(':', 'x')}-${Math.round(focusPct)}.mp4`;
+      // The key carries this ROW's id. A shape discarded by a re-render and
+      // asked for again is a new row; when its key was only the shape and
+      // framing, the new file landed exactly where the discarded one had
+      // been — and the discarded one's queued release then took the new
+      // file with it. A retry of this same row keeps its own key.
+      const key = `clips/${clip.videoId}/${clipId}/${aspect.replace(':', 'x')}-${Math.round(focusPct)}-${variantId.slice(0, 8)}.mp4`;
       await getStorage().uploadFile(key, outputPath, 'video/mp4');
 
       // The FILE's dimensions, not the plan's. The cut caps the shorter side
