@@ -191,6 +191,50 @@ export async function setOriginalMedia(clipId: string, input: OriginalMediaInput
   }
 }
 
+export interface PosterFromCutInput {
+  posterStorageKey: string;
+  posterTimestampSeconds: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  posterGenerationMs: number | null;
+}
+
+/**
+ * A re-render put a different file under the same clip id — a Re-clip's new
+ * boundaries, or a caption Replace — so the card's picture is taken again
+ * from the new cut. Only the poster and the measured size move: approval,
+ * retention and the derivative columns are not this write's to touch, and
+ * a vertical moment is not either (its poster comes from its derivative).
+ */
+export async function setPosterFromCut(clipId: string, input: PosterFromCutInput): Promise<void> {
+  const result = await query(
+    `UPDATE clips
+        SET poster_storage_key       = $2,
+            poster_timestamp_seconds = $3,
+            source_width             = $4,
+            source_height            = $5,
+            output_width             = $4,
+            output_height            = $5,
+            poster_generation_ms     = $6,
+            updated_at               = now()
+      WHERE id = $1
+        AND pre_rendered = TRUE
+        AND presentation = 'original'`,
+    [
+      clipId,
+      input.posterStorageKey,
+      input.posterTimestampSeconds,
+      input.sourceWidth,
+      input.sourceHeight,
+      input.posterGenerationMs,
+    ],
+  );
+
+  if (result.rowCount === 0) {
+    throw new Error(`Clip ${clipId} is not a pre-rendered original moment — its new poster has nowhere to be recorded`);
+  }
+}
+
 /**
  * Record that an original-framing pre-render failed.
  *

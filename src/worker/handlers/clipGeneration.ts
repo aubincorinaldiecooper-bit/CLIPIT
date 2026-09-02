@@ -11,6 +11,8 @@ import { appendReclipVersion, clearReclipPending, markReclipFailed } from '../..
 import { captionsSchema, prepareCaptionFilters } from '../../services/media/captions.js';
 import { applyClipPadding } from '../../services/timestamps.js';
 import { getClip, setClipStatus, restoreClipBoundaries } from '../../db/repositories/clips.js';
+import { setPosterFromCut } from '../../db/repositories/verticalMedia.js';
+import { runOriginalPipeline } from '../../services/media/verticalPipeline.js';
 import { discardVariants } from '../../db/repositories/clipVariants.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import type { ClipGenerationJob } from '../../queues/index.js';
@@ -101,6 +103,41 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         // that carries it exists.
         ...(job.data.captions !== undefined ? { captions: job.data.captions } : {}),
       });
+
+      // The card's picture is a frame of the file it stands for. This render
+      // put a different file under the same id, so a moment that was cut on
+      // find takes its poster again from the new cut — the same step that made
+      // the first one, over the same key. Best-effort: the cut is already the
+      // truth, and failing it here would leave the row describing a file that
+      // no longer exists. What cannot be helped is said out loud instead.
+      if (clip.preRendered && clip.presentation === 'original') {
+        try {
+          const poster = await runOriginalPipeline({
+            videoId: video.id,
+            clipId,
+            canonicalPath: outputPath,
+            workDir: dir,
+            durationSeconds: result.durationSeconds,
+            width: result.width,
+            height: result.height,
+            currentPosterKey: async () => (await getClip(clipId))?.posterStorageKey ?? null,
+            snapshotPosterKey: clip.posterStorageKey,
+          });
+          await setPosterFromCut(clipId, {
+            posterStorageKey: poster.posterStorageKey,
+            posterTimestampSeconds: poster.posterTimestampSeconds,
+            sourceWidth: poster.sourceWidth,
+            sourceHeight: poster.sourceHeight,
+            posterGenerationMs: poster.posterGenerationMs,
+          });
+        } catch (posterError) {
+          // The previous poster still stands at the same key, so the card
+          // keeps showing a frame of the earlier cut of this moment rather
+          // than nothing. Logged at error level: this is the one way a
+          // card's picture can disagree with its file.
+          log.error('the re-cut clip kept its previous poster', { err: posterError });
+        }
+      }
 
       // The master changed, so every platform shape cut from the OLD master
       // is stale — posting one would send footage the user just replaced.
