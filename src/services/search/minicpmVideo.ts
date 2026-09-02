@@ -13,6 +13,7 @@ import { Semaphore, sleep } from '../../lib/concurrency.js';
 import { ExternalServiceError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { getStorage } from '../storage/s3.js';
+import { promptVersion } from './prompt.js';
 import type { VideoModelAnswer, VideoModelRequest } from './openrouterVideo.js';
 
 /**
@@ -28,7 +29,8 @@ import type { VideoModelAnswer, VideoModelRequest } from './openrouterVideo.js';
  * There is no HTTP endpoint and no URL to protect. The path is
  *
  *     ModalClient (MODAL_TOKEN_ID / MODAL_TOKEN_SECRET, Clipit's own token)
- *       → app clipit-minicpm-v46 → class MiniCPMModel → analyze(video_url, prompt)
+ *       → environment main → app clipit-minicpm-v46
+ *       → class MiniCPMVideoService → analyze(video_url, prompt)
  *
  * and the deployed method answers `{ model, result, metrics }`, where
  * `result` is free text the existing parsers consume.
@@ -78,12 +80,13 @@ let methodCache: Promise<Function_> | null = null;
 function modalClient(): ModalClient {
   // Explicit credentials rather than ambient env reading, so custody is
   // visible here: this token is Clipit's, revocable on its own.
-  // No environment param on purpose: the SDK itself honours the standard
-  // MODAL_ENVIRONMENT variable when one is set, and inventing a second name
-  // for the same thing would be configuration nobody needs.
+  // Pass the environment explicitly. Production's deployment lives in
+  // `main`; relying on ambient SDK behaviour made that deployed class look
+  // absent even though the app, class and workspace token were correct.
   clientCache ??= new ModalClient({
     tokenId: env.MODAL_TOKEN_ID!,
     tokenSecret: env.MODAL_TOKEN_SECRET!,
+    environment: env.MODAL_ENVIRONMENT,
   });
   return clientCache;
 }
@@ -95,6 +98,34 @@ function lookupMethod(): Promise<Function_> {
     return instance.method(ANALYZE_METHOD);
   })();
   return methodCache;
+}
+
+/**
+ * Resolve the class and method handles without invoking `analyze`.
+ * Modal does not start the L4 until `remote` is called, so this is safe to run
+ * before queue consumers start and turns a bad identity into one startup
+ * error rather than one failure for every chunk.
+ */
+export async function assertMiniCpmDeploymentAvailable(): Promise<void> {
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
+    throw new ExternalServiceError('minicpm-video', 'MiniCPM provider is not configured', { retryable: false });
+  }
+
+  try {
+    await lookupMethod();
+  } catch (error) {
+    methodCache = null;
+    const failure = classify(error);
+    if (!failure.retryable) {
+      throw new ExternalServiceError(
+        'minicpm-video',
+        `MiniCPM deployment unavailable: ${env.MODAL_APP_NAME} / ${env.MODAL_CLASS_NAME} could not be resolved ` +
+          `(Modal environment: ${env.MODAL_ENVIRONMENT}). Check the Modal app, environment, and workspace credentials.`,
+        { retryable: false, cause: failure },
+      );
+    }
+    throw failure;
+  }
 }
 
 /** Test seam: forget the cached client and handle. */
@@ -264,6 +295,9 @@ async function requestOnce(input: VideoModelRequest & { videoStorageKey: string 
 
   // Zero tokens with a null cost, not silence: the call happened, it held a
   // GPU for latencyMs, and the usage table is how anything is ever priced.
+  // The deployment's own measurements ride along verbatim — download_ms,
+  // inference_ms, total_ms — because cost-per-source-hour is computed from
+  // rows, and a number that only ever reached a log line prices nothing.
   input.onUsage?.({
     promptTokens: 0,
     completionTokens: 0,
@@ -272,6 +306,9 @@ async function requestOnce(input: VideoModelRequest & { videoStorageKey: string 
     latencyMs,
     provider: 'modal',
     model: payload?.model ?? 'openbmb/MiniCPM-V-4.6',
+    metrics: payload?.metrics ?? null,
+    startedAt: new Date(Date.now() - latencyMs),
+    promptVersion: promptVersion(input.systemPrompt),
   });
 
   // The same rule as the OpenRouter path: a blank answer must never parse as
@@ -280,7 +317,13 @@ async function requestOnce(input: VideoModelRequest & { videoStorageKey: string 
     throw new ExternalServiceError('minicpm-video', 'MiniCPM returned an empty result', { retryable: false });
   }
 
-  return { content, reasoningDisabled: false };
+  return {
+    content,
+    reasoningDisabled: false,
+    provider: 'modal',
+    model: payload?.model ?? 'openbmb/MiniCPM-V-4.6',
+    promptVersion: promptVersion(input.systemPrompt),
+  };
 }
 
 /**

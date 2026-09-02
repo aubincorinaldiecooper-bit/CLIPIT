@@ -13,6 +13,9 @@ interface ClipRow {
   focus_pct: number;
   start_seconds: number;
   end_seconds: number;
+  predicted_start_seconds: number | null;
+  predicted_end_seconds: number | null;
+  boundaries_edited_at: Date | null;
   storage_key: string | null;
   status: ClipStatus;
   error_message: string | null;
@@ -35,6 +38,9 @@ function mapClip(row: ClipRow): Clip {
     focusPct: Number(row.focus_pct ?? 50),
     startSeconds: row.start_seconds,
     endSeconds: row.end_seconds,
+    predictedStartSeconds: row.predicted_start_seconds ?? null,
+    predictedEndSeconds: row.predicted_end_seconds ?? null,
+    boundariesEditedAt: row.boundaries_edited_at ?? null,
     storageKey: row.storage_key,
     status: row.status,
     errorMessage: row.error_message,
@@ -57,14 +63,25 @@ export interface UpsertClipInput {
 /**
  * One clip per match. Re-generating an existing match resets it to `pending`
  * rather than creating a duplicate, which keeps `generate` idempotent.
+ *
+ * Two rules the ON CONFLICT branch holds:
+ *
+ * - `predicted_*` is written once, on first insert, and never again. It is
+ *   the model's answer frozen at the moment it was given — the ground truth
+ *   half of every boundary-accuracy number.
+ * - Boundaries someone has moved stay moved. Before `boundaries_edited_at`
+ *   existed, regenerating a match silently reset the clip to the prediction;
+ *   with editing in the product that would discard a person's correction —
+ *   and the measurement of it — on an idempotent retry.
  */
 export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> {
   const row = await queryOne<ClipRow>(
-    `INSERT INTO clips (video_id, clip_match_id, session_id, user_id, workspace_id, start_seconds, end_seconds, status)
-     VALUES ($1, $2, $3, $4, (SELECT workspace_id FROM videos WHERE id = $1), $5, $6, 'pending')
+    `INSERT INTO clips (video_id, clip_match_id, session_id, user_id, workspace_id,
+                        start_seconds, end_seconds, predicted_start_seconds, predicted_end_seconds, status)
+     VALUES ($1, $2, $3, $4, (SELECT workspace_id FROM videos WHERE id = $1), $5, $6, $5, $6, 'pending')
      ON CONFLICT (clip_match_id) WHERE derived_from_clip_id IS NULL DO UPDATE
-       SET start_seconds = EXCLUDED.start_seconds,
-           end_seconds = EXCLUDED.end_seconds,
+       SET start_seconds = CASE WHEN clips.boundaries_edited_at IS NULL THEN EXCLUDED.start_seconds ELSE clips.start_seconds END,
+           end_seconds = CASE WHEN clips.boundaries_edited_at IS NULL THEN EXCLUDED.end_seconds ELSE clips.end_seconds END,
            status = CASE WHEN clips.status = 'ready' THEN clips.status ELSE 'pending' END,
            error_message = CASE WHEN clips.status = 'ready' THEN clips.error_message ELSE NULL END,
            updated_at = now()
@@ -72,6 +89,74 @@ export async function upsertClipForMatch(input: UpsertClipInput): Promise<Clip> 
     [input.videoId, input.clipMatchId, input.sessionId, input.userId ?? null, input.startSeconds, input.endSeconds],
   );
   return mapClip(row!);
+}
+
+/**
+ * The person's answer to the model's prediction: new boundaries, recorded as
+ * an edit, and the row set back to pending for the re-render that makes the
+ * file match. `predicted_*` is deliberately not in the SET list — this
+ * function is the reason it exists, and the one write that must never reach
+ * it. Runs only on root clips: a captioned copy inherits its footage from
+ * its source, and its boundaries with it.
+ *
+ * The status condition in the WHERE is the claim, not a courtesy check: two
+ * re-evaluations racing past an in-memory status read would otherwise both
+ * write, share one queued render (stable job id), and leave the file cut
+ * from one set of boundaries while the row describes the other. A clip
+ * mid-render is refused; a FAILED clip is claimable on purpose — new
+ * boundaries are precisely how a failed render gets another chance.
+ */
+export async function setClipBoundaries(
+  clipId: string,
+  startSeconds: number,
+  endSeconds: number,
+): Promise<Clip | null> {
+  const row = await queryOne<ClipRow>(
+    `UPDATE clips
+        SET start_seconds = $2,
+            end_seconds = $3,
+            boundaries_edited_at = now(),
+            status = 'pending',
+            error_message = NULL,
+            updated_at = now()
+      WHERE id = $1 AND derived_from_clip_id IS NULL AND status IN ('ready', 'failed')
+      RETURNING *`,
+    [clipId, startSeconds, endSeconds],
+  );
+  return row ? mapClip(row) : null;
+}
+
+/**
+ * Undoes a boundary change whose re-render never happened — the job could
+ * not be queued, or the render itself terminally failed.
+ *
+ * Without this the row would keep describing the NEW boundaries while the
+ * stored file (if any) still shows the old cut, and every later attempt
+ * would be refused by the claim. Putting back the previous boundaries, the
+ * previous edit mark and the previous STATUS returns the clip to exactly
+ * the state the person could see — a re-evaluation that failed is one that
+ * did not happen. Matches rows in 'pending' (never started) or
+ * 'generating' (died mid-render).
+ */
+export async function restoreClipBoundaries(
+  clipId: string,
+  previous: {
+    startSeconds: number;
+    endSeconds: number;
+    boundariesEditedAt: Date | null;
+    status?: 'ready' | 'failed';
+  },
+): Promise<void> {
+  await queryOne(
+    `UPDATE clips
+        SET start_seconds = $2,
+            end_seconds = $3,
+            boundaries_edited_at = $4,
+            status = $5,
+            updated_at = now()
+      WHERE id = $1 AND status IN ('pending', 'generating')`,
+    [clipId, previous.startSeconds, previous.endSeconds, previous.boundariesEditedAt, previous.status ?? 'ready'],
+  );
 }
 
 /** Every clip file cut from this video, so they can be deleted with it. */
@@ -141,7 +226,7 @@ export async function listClipsForPrincipal(
   // clips must not shift under them, and "skip 60" does exactly that when
   // clip 61 arrives mid-scroll.
   const rows = await queryRows<ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }>(
-    `SELECT c.*, m.description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
+    `SELECT c.*, COALESCE(c.title, m.description) AS description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
        FROM clips c
        JOIN clip_matches m ON m.id = c.clip_match_id
        JOIN videos v ON v.id = c.video_id
@@ -173,7 +258,7 @@ export async function listWorkspaceClips(workspaceId: string, limit = 60): Promi
   const rows = await queryRows<
     ClipRow & { description: string; thumbnail_key: string | null; video_title: string | null; video_filename: string | null }
   >(
-    `SELECT c.*, m.description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
+    `SELECT c.*, COALESCE(c.title, m.description) AS description, m.thumbnail_key, v.title AS video_title, v.original_filename AS video_filename
        FROM workspace_clips s
        JOIN clips c ON c.id = s.clip_id
        JOIN clip_matches m ON m.id = c.clip_match_id
@@ -270,6 +355,15 @@ export async function setClipRenderPending(clipId: string): Promise<void> {
   );
 }
 
+/** The root clip cut from a moment, if one exists. Copies stay out of it. */
+export async function getRootClipByMatchId(matchId: string): Promise<Clip | null> {
+  const row = await queryOne<ClipRow>(
+    `SELECT * FROM clips WHERE clip_match_id = $1 AND derived_from_clip_id IS NULL`,
+    [matchId],
+  );
+  return row ? mapClip(row) : null;
+}
+
 export async function getClip(clipId: string): Promise<Clip | null> {
   const row = await queryOne<ClipRow>('SELECT * FROM clips WHERE id = $1', [clipId]);
   return row ? mapClip(row) : null;
@@ -323,4 +417,73 @@ export async function setClipStatus(
       options.captions === undefined ? null : JSON.stringify(options.captions),
     ],
   );
+}
+
+/** Give a clip a name of the person's own. Null takes the name back. */
+export async function setClipTitle(clipId: string, title: string | null): Promise<Clip | null> {
+  const rows = await queryRows<ClipRow>(`UPDATE clips SET title = $2 WHERE id = $1 RETURNING *`, [clipId, title]);
+  return rows[0] ? mapClip(rows[0]) : null;
+}
+
+/**
+ * Remove a clip and every copy made from it.
+ *
+ * Captioned copies are children of their original (`derived_from_clip_id`),
+ * and the FK there is ON DELETE SET NULL — so deleting an original promotes
+ * each copy to an original. With two or more copies that violates
+ * `clips_original_per_match_idx` (one root per match), and the delete dies
+ * on a duplicate key. Codex caught this on CLIPIT#56.
+ *
+ * Rather than leave orphans or fail, the whole family goes: a captioned
+ * version of a clip you deleted is a version of nothing. The count comes
+ * back so the caller can say how many actually went.
+ */
+export async function deleteClipRow(
+  clipId: string,
+): Promise<{ storageKeys: string[]; deletedCount: number } | null> {
+  // The subtree, in case a copy was ever made from a copy.
+  const family = await queryRows<{ id: string }>(
+    `WITH RECURSIVE tree AS (
+       SELECT id FROM clips WHERE id = $1
+       UNION ALL
+       SELECT c.id FROM clips c JOIN tree t ON c.derived_from_clip_id = t.id
+     )
+     SELECT id FROM tree`,
+    [clipId],
+  );
+  if (family.length === 0) return null;
+  const ids = family.map((row) => row.id);
+
+  // Every file the family owns: the clips themselves and their platform
+  // cuts. Gathered BEFORE the delete, which takes the rows with it.
+  const variants = await queryRows<{ storage_key: string | null }>(
+    `SELECT storage_key FROM clip_variants WHERE clip_id = ANY($1::uuid[]) AND storage_key IS NOT NULL`,
+    [ids],
+  );
+  const deleted = await queryRows<{ storage_key: string | null }>(
+    `DELETE FROM clips WHERE id = ANY($1::uuid[]) RETURNING storage_key`,
+    [ids],
+  );
+  if (deleted.length === 0) return null;
+
+  return {
+    storageKeys: [...deleted, ...variants]
+      .map((row) => row.storage_key)
+      .filter((key): key is string => Boolean(key)),
+    deletedCount: deleted.length,
+  };
+}
+
+/** A clip and every copy descended from it — what a delete would take. */
+export async function listClipFamily(clipId: string): Promise<string[]> {
+  const rows = await queryRows<{ id: string }>(
+    `WITH RECURSIVE tree AS (
+       SELECT id FROM clips WHERE id = $1
+       UNION ALL
+       SELECT c.id FROM clips c JOIN tree t ON c.derived_from_clip_id = t.id
+     )
+     SELECT id FROM tree`,
+    [clipId],
+  );
+  return rows.map((row) => row.id);
 }

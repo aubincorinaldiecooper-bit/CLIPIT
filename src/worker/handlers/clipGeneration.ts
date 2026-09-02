@@ -7,9 +7,10 @@ import { withWorkDir } from '../../lib/workdir.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { clipKey } from '../../services/storage/types.js';
 import { cutClip, ffprobe } from '../../services/media/ffmpeg.js';
+import { appendReclipVersion, clearReclipPending, markReclipFailed } from '../../db/repositories/reclips.js';
 import { captionsSchema, prepareCaptionFilters } from '../../services/media/captions.js';
 import { applyClipPadding } from '../../services/timestamps.js';
-import { getClip, setClipStatus } from '../../db/repositories/clips.js';
+import { getClip, setClipStatus, restoreClipBoundaries } from '../../db/repositories/clips.js';
 import { discardVariants } from '../../db/repositories/clipVariants.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import type { ClipGenerationJob } from '../../queues/index.js';
@@ -27,10 +28,11 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
     log.warn('clip no longer exists, dropping job');
     return;
   }
-  // Re-render jobs (a Replace) carry their spec and must run even against a
-  // finished clip; only a plain generation of an already-finished clip is a
-  // duplicate worth skipping.
-  if (clip.status === 'ready' && clip.storageKey && job.data.captions === undefined) {
+  // Re-render jobs (a Replace, or a Re-clip applying new boundaries) carry
+  // their intent in the job and must run even against a finished clip; only
+  // a plain generation of an already-finished clip is a duplicate worth
+  // skipping.
+  if (clip.status === 'ready' && clip.storageKey && job.data.captions === undefined && job.data.reclip === undefined) {
     log.info('clip already generated, skipping');
     return;
   }
@@ -102,9 +104,22 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
 
       // The master changed, so every platform shape cut from the OLD master
       // is stale — posting one would send footage the user just replaced.
-      // They re-render on the next publish that needs them.
-      if (job.data.captions !== undefined) {
+      // They re-render on the next publish that needs them. True for a
+      // caption Replace and for a Re-clip alike: both put a different
+      // master under the same clip id.
+      if (job.data.captions !== undefined || job.data.reclip !== undefined) {
         await discardVariants(clipId);
+      }
+
+      // A Re-clip becomes true only here, with the file that carries its
+      // boundaries stored: the moment's next version is recorded and the
+      // pending state clears. Doing this earlier would let a failed render
+      // leave the history claiming boundaries no file ever had.
+      if (job.data.reclip) {
+        const { matchId, startSeconds, endSeconds, provider, model, promptVersion } = job.data.reclip;
+        await appendReclipVersion({ matchId, startSeconds, endSeconds, provider, model, promptVersion });
+        await clearReclipPending(matchId);
+        log.info('reclip applied', { matchId, startSeconds, endSeconds });
       }
 
       log.info('clip generated', {
@@ -127,6 +142,30 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
   } catch (error) {
     const message = errorMessage(error);
     log.error('clip generation failed', { err: error });
+
+    // A Re-clip render that has spent its last attempt rolls the WHOLE
+    // re-evaluation back: the clip returns to exactly the boundaries, edit
+    // mark and status the person could see, no version is recorded, and the
+    // failure lands where they can read it. Intermediate attempts change
+    // nothing — the retry runs with the new boundaries still in place.
+    if (job.data.reclip) {
+      const finalAttempt = job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
+      if (finalAttempt) {
+        const previous = job.data.reclip.previous;
+        await restoreClipBoundaries(clipId, {
+          startSeconds: previous.startSeconds,
+          endSeconds: previous.endSeconds,
+          boundariesEditedAt: previous.boundariesEditedAt ? new Date(previous.boundariesEditedAt) : null,
+          status: previous.status,
+        });
+        await markReclipFailed(
+          job.data.reclip.matchId,
+          'The re-cut could not be rendered. The original clip is untouched — try again.',
+        );
+      }
+      throw error;
+    }
+
     if (clip.storageKey) {
       // A re-render failed, but the clip it was replacing still exists and
       // still plays. Marking it 'failed' would delete a working clip from

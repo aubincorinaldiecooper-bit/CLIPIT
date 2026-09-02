@@ -10,6 +10,7 @@ import { registerVideoRoutes } from './routes/videos.js';
 import { registerClipRequestRoutes } from './routes/clipRequests.js';
 import { registerClipRoutes } from './routes/clips.js';
 import { registerStatsRoutes } from './routes/stats.js';
+import { registerEvaluationRoutes } from './routes/evaluation.js';
 import { registerSocialRoutes } from './routes/social.js';
 import { registerZernioWebhookRoutes } from './routes/zernioWebhook.js';
 import { registerWorkspaceRoutes } from './routes/workspace.js';
@@ -90,6 +91,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await registerClipRequestRoutes(app);
   await registerClipRoutes(app);
   await registerStatsRoutes(app);
+  await registerEvaluationRoutes(app);
   await registerSocialRoutes(app);
   await registerZernioWebhookRoutes(app);
   await registerWorkspaceRoutes(app);

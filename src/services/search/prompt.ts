@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { ResolvedSearchMode } from '../../domain/types.js';
 
 /**
@@ -7,6 +9,19 @@ import type { ResolvedSearchMode } from '../../domain/types.js';
  * categories anywhere in this file. The prompt only tells the model *how* to
  * report what it finds, never *what* to look for.
  */
+
+/**
+ * A content hash standing in for a prompt version number.
+ *
+ * Attached to every match and usage row so that, months later, "the
+ * timestamps got better in September" can be pinned on a wording change, a
+ * model change, or a configuration change — three different fixes. A hash
+ * needs no one to remember to bump anything: edit the prompt and every row
+ * written afterwards carries a different version.
+ */
+export function promptVersion(promptText: string): string {
+  return createHash('sha256').update(promptText).digest('hex').slice(0, 12);
+}
 
 export interface TranscriptLine {
   /** Seconds from the start of the chunk. */
@@ -86,6 +101,56 @@ export function buildTranscriptBlock(lines: TranscriptLine[]): string {
  * things users ask about — text on a sign, a make of car, who is on screen —
  * are exactly the details a summary drops first.
  */
+
+/**
+ * The Re-clip voice: not "find moments" but "you already found this one —
+ * cut it better". The segment handed over is a WIDER window around the
+ * previously chosen moment, and the one rule that separates a Re-clip from
+ * a fresh search is that the answer must be the same moment reconsidered,
+ * never a different one.
+ */
+export const RECLIP_SYSTEM_PROMPT = [
+  'You are a video editing engine that refines the boundaries of a clip.',
+  'This clip was previously selected as a strong moment. You are given a WIDER MP4 segment containing that moment plus surrounding footage, the original clip boundaries within this segment, the instruction the moment was found for, and, when available, a timestamped transcript of the segment.',
+  '',
+  'Re-evaluate this SAME moment and determine the strongest standalone start and end boundaries for it.',
+  '',
+  'Optimize for:',
+  '- the strongest immediate hook at the start;',
+  '- enough context to understand the moment;',
+  '- complete sentences and complete thoughts — never cut a speaker off mid-word;',
+  '- the payoff included at the end;',
+  '- minimal dead air;',
+  '- a clean, natural beginning and a clean, natural ending;',
+  '- the clip making sense entirely on its own.',
+  '',
+  'Rules:',
+  '- Timestamps are in SECONDS FROM THE START OF THIS SEGMENT, not from the start of the video.',
+  '- end_seconds must be greater than start_seconds.',
+  '- Your boundaries MUST overlap the original clip boundaries you were given. Do not select a different or unrelated moment.',
+  '- If the original boundaries are already the best cut, return them unchanged.',
+  '- Return only the JSON. Do not explain your reasoning, before or after it.',
+  '',
+  'Respond with ONLY a JSON object in exactly this shape, and no other text:',
+  '{"start_seconds":6.5,"end_seconds":41.0}',
+].join('\n');
+
+/** The evidence block a Re-clip call carries under the system prompt above. */
+export function buildReclipInstruction(input: {
+  instruction: string;
+  originalLocalStartSeconds: number;
+  originalLocalEndSeconds: number;
+  segmentDurationSeconds: number;
+}): string {
+  return [
+    `This segment is ${input.segmentDurationSeconds.toFixed(1)} seconds long.`,
+    `The original clip runs from ${input.originalLocalStartSeconds.toFixed(1)}s to ${input.originalLocalEndSeconds.toFixed(1)}s within this segment.`,
+    '',
+    'The moment was originally found for this instruction:',
+    input.instruction,
+  ].join('\n');
+}
+
 export const INDEX_SYSTEM_PROMPT = [
   'You are a video indexer. You are given an actual MP4 segment of a longer video.',
   'Write down what happens in it, as a series of scenes, so that someone who cannot watch the video can later find moments in it from your notes alone.',
