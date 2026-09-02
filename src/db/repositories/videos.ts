@@ -301,22 +301,35 @@ export async function listVideosWithUnreachableFootage(
     `SELECT v.id, v.session_id
        FROM videos v
        LEFT JOIN sessions s ON s.id = v.session_id
-      WHERE v.footage_expired_at IS NULL
-        -- A signed-in person's footage is not tied to a browser tab. Their
-        -- session going quiet means they closed the laptop, not that the
-        -- video is unreachable: they can sign in again. Guest footage keeps
-        -- the old rule. What accounts eventually pay for storage is a product
-        -- decision for later; silently deleting their videos is not.
-        AND v.user_id IS NULL
-        AND (
-          v.session_id IS NULL
-          OR s.id IS NULL
-          OR s.expires_at <= now()
-          OR s.last_seen_at < now() - ($1 || ' seconds')::interval
+      WHERE (
+          v.footage_expired_at IS NULL
+          -- A signed-in person's footage is not tied to a browser tab. Their
+          -- session going quiet means they closed the laptop, not that the
+          -- video is unreachable: they can sign in again. Guest footage keeps
+          -- the old rule. What accounts eventually pay for storage is a product
+          -- decision for later; silently deleting their videos is not.
+          AND v.user_id IS NULL
+          AND (
+            v.session_id IS NULL
+            OR s.id IS NULL
+            OR s.expires_at <= now()
+            OR s.last_seen_at < now() - ($1 || ' seconds')::interval
+          )
+        )
+        -- Or a removal that was decided and never finished: claimed, its keys
+        -- never cleared, and the claim old enough that the attempt behind it
+        -- is dead (a process killed mid-removal has no catch block to give
+        -- the claim back). Whoever decided it — this sweep on a guest video,
+        -- the owner on theirs — the decision stands, so ownership is not
+        -- asked again here.
+        OR (
+          v.footage_expired_at IS NOT NULL
+          AND v.original_storage_key IS NOT NULL
+          AND v.footage_expired_at < now() - ($3 || ' seconds')::interval
         )
       ORDER BY v.created_at ASC
       LIMIT $2`,
-    [String(Math.floor(idleSeconds)), limit],
+    [String(Math.floor(idleSeconds)), limit, String(STALE_FOOTAGE_CLAIM_SECONDS)],
   );
   return rows.map((row) => ({ videoId: row.id, sessionId: row.session_id }));
 }
@@ -452,6 +465,13 @@ export async function getChunk(chunkId: string): Promise<VideoChunk | null> {
 }
 
 /**
+ * How old a footage claim must be, with its keys still in place, before it
+ * counts as abandoned and the next removal takes it over. A removal takes
+ * seconds; the sweep runs hourly.
+ */
+export const STALE_FOOTAGE_CLAIM_SECONDS = 60 * 60;
+
+/**
  * Claims a video's footage for removal — or refuses, because it is no
  * longer a guest's.
  *
@@ -472,6 +492,15 @@ export async function getChunk(chunkId: string): Promise<VideoChunk | null> {
  *
  * Returns the claim's own timestamp, which is its identity: a release names
  * it, so nothing but the attempt that made a claim can ever undo it.
+ *
+ * An ABANDONED claim is taken over: one whose keys were never cleared (so
+ * markFootageExpired never ran) and which is older than
+ * STALE_FOOTAGE_CLAIM_SECONDS, long past any removal's running time. The
+ * attempt behind it died without giving it back — a killed process has no
+ * catch block — and the removal it had decided still stands, whoever
+ * decided it; the guest-only rule is not asked again. The takeover stamps
+ * a new time, so the dead attempt's release, should it ever arrive,
+ * matches nothing.
  */
 export async function claimFootageForExpiry(
   videoId: string,
@@ -482,10 +511,16 @@ export async function claimFootageForExpiry(
         SET footage_expired_at = now(),
             updated_at = now()
       WHERE id = $1
-        AND footage_expired_at IS NULL
-        ${options.onlyIfUnowned ? 'AND user_id IS NULL' : ''}
+        AND (
+          (footage_expired_at IS NULL ${options.onlyIfUnowned ? 'AND user_id IS NULL' : ''})
+          OR (
+            footage_expired_at IS NOT NULL
+            AND original_storage_key IS NOT NULL
+            AND footage_expired_at < now() - ($2 || ' seconds')::interval
+          )
+        )
       RETURNING footage_expired_at`,
-    [videoId],
+    [videoId, String(STALE_FOOTAGE_CLAIM_SECONDS)],
   );
   return row ? row.footage_expired_at : null;
 }
