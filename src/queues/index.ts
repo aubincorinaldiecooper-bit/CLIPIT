@@ -318,6 +318,12 @@ export async function enqueueThumbnailBackfill(requestedAt: string): Promise<voi
  * under them. So the deletion is queued to run after that lifetime, with a
  * margin, on the retention queue — durable across a restart, retried on a
  * storage error, and logged with its keys if it still fails.
+ *
+ * Before removing anything the release asks the rows which of these keys
+ * they still name (see releaseObjectsNow): the decision is re-taken at the
+ * moment it acts. A database it cannot ask fails the job, and the retries
+ * stretch over hours rather than minutes so an outage at release time does
+ * not turn into an orphan.
  */
 export async function enqueueObjectRelease(
   keys: string[],
@@ -329,7 +335,7 @@ export async function enqueueObjectRelease(
     { kind: 'release', keys, context },
     {
       delay: (env.SIGNED_URL_EXPIRY_SECONDS + 60) * 1000,
-      attempts: 3,
+      attempts: 8,
       backoff: { type: 'exponential', delay: 60_000 },
     },
   );

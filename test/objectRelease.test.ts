@@ -8,7 +8,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 
 const remove = vi.fn();
+const storageKeysInUse = vi.fn();
 vi.mock('../src/services/storage/s3.js', () => ({ getStorage: () => ({ remove }) }));
+vi.mock('../src/db/repositories/objectOwnership.js', () => ({ storageKeysInUse }));
 const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 vi.mock('../src/lib/logger.js', () => ({ logger: { ...log, child: () => log } }));
 vi.mock('../src/db/repositories/verticalMedia.js', () => ({ claimUnkeptPreRenderedMedia: vi.fn() }));
@@ -21,8 +23,9 @@ const context = { videoId: 'video-1', clipId: 'clip-1', reason: 'superseded_by_r
 const job = (data: Record<string, unknown>) => ({ id: 'job-1', data } as never);
 
 beforeEach(() => {
-  for (const mock of [remove, ...Object.values(log)]) mock.mockReset();
+  for (const mock of [remove, storageKeysInUse, ...Object.values(log)]) mock.mockReset();
   remove.mockResolvedValue(undefined);
+  storageKeysInUse.mockResolvedValue(new Set());
 });
 
 describe('releasing objects a row no longer names', () => {
@@ -48,6 +51,31 @@ describe('releasing objects a row no longer names', () => {
       expect.stringContaining('could not be removed'),
       expect.objectContaining({ key: 'posters/video-1/clip-1.jpg', clipId: 'clip-1' }),
     );
+  });
+
+  it('asks the rows first, and keeps a key one of them names again', async () => {
+    // Devin's finding on #80: a platform shape discarded by a re-render and
+    // asked for again landed at the same key before the release ran. The
+    // release re-takes its decision at the moment it acts.
+    storageKeysInUse.mockResolvedValueOnce(new Set(['clips/video-1/clip-1/9x16-50.mp4']));
+
+    await handleRetention(job({ kind: 'release', keys: ['clips/video-1/clip-1/9x16-50.mp4', 'clips/video-1/clip-1.mp4'], context }));
+
+    expect(storageKeysInUse).toHaveBeenCalledWith(['clips/video-1/clip-1/9x16-50.mp4', 'clips/video-1/clip-1.mp4']);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith('clips/video-1/clip-1.mp4');
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('kept'), expect.objectContaining({ key: 'clips/video-1/clip-1/9x16-50.mp4' }));
+    expect(log.info).toHaveBeenCalledWith('released objects removed', expect.objectContaining({ removed: 1, kept: 1, failed: 0 }));
+  });
+
+  it('removes nothing when the rows cannot be asked, and fails so the queue tries again', async () => {
+    storageKeysInUse.mockRejectedValueOnce(new Error('database unreachable'));
+
+    await expect(
+      handleRetention(job({ kind: 'release', keys: ['clips/video-1/clip-1.mp4'], context })),
+    ).rejects.toThrow('database unreachable');
+
+    expect(remove).not.toHaveBeenCalled();
   });
 
   it('is not the footage sweep: a sweep job still sweeps', async () => {

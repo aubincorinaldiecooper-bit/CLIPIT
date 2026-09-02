@@ -62,11 +62,12 @@ export async function releaseObjects(
   keep: string[],
   context: { videoId: string; clipId: string },
   log: Logger,
+  reason = 'superseded_by_rerender',
 ): Promise<void> {
   const keys = oldKeys.filter((key): key is string => typeof key === 'string' && key.length > 0 && !keep.includes(key));
   if (keys.length === 0) return;
   try {
-    await enqueueObjectRelease(keys, { ...context, reason: 'superseded_by_rerender' });
+    await enqueueObjectRelease(keys, { ...context, reason });
   } catch (error) {
     log.error('a previous render\'s objects could not be queued for removal; they are orphaned', { ...context, keys, err: error });
   }
