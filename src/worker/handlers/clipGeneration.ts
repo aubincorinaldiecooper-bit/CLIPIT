@@ -56,13 +56,13 @@ export class RenderOutcomeUnknownError extends Error {
     /** Objects neither the queue nor the database would take on record; only the job and this error know them. */
     readonly unreleasedKeys: string[],
     /**
-     * The row's updated_at as this attempt wrote it when it set the row
+     * The row's version as this attempt set it when it marked the row
      * generating — its last write of its own before the one whose outcome
-     * was lost. The sweep settles against it: a row written since was
-     * written by that write or by something later (see settleUnknownRender).
-     * Null when the row was gone by then.
+     * was lost. The sweep settles against it: a row whose version has moved
+     * past it was written since, by that write or by something later (see
+     * settleUnknownRender). Null when the row was gone by then.
      */
-    readonly rowUpdatedAt: Date | null,
+    readonly rowVersion: number | null,
   ) {
     super(`the render's outcome is unknown: ${errorMessage(original)}`);
     this.name = 'RenderOutcomeUnknownError';
@@ -194,10 +194,9 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
     return;
   }
 
-  // The row's updated_at as written here is the mark an unknown outcome is
-  // settled against; nothing of this render's writes the row again before
-  // the commit.
-  const rowUpdatedAt = await markClipGenerating(clipId);
+  // The row's version as set here is the mark an unknown outcome is settled
+  // against; nothing of this render's writes the row again before the commit.
+  const rowVersion = await markClipGenerating(clipId);
   await job.updateProgress({ stage: 'generating', percent: 10 });
 
   try {
@@ -347,7 +346,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
               });
             });
           }
-          throw new RenderOutcomeUnknownError(error, key, clip.storageKey, unreleased, rowUpdatedAt);
+          throw new RenderOutcomeUnknownError(error, key, clip.storageKey, unreleased, rowVersion);
         }
         // The row naming this render's key proves the write landed only when
         // the key is NEW to the row: a first render at the plain key, on a
@@ -414,7 +413,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         const unresolvedKeys = error.unreleasedKeys.length > 0 ? error.unreleasedKeys : job.data.unresolvedKeys;
         const record = { ...job.data, ...(unresolvedKeys?.length ? { unresolvedKeys } : {}) };
         await recordUnknownRender({
-          clipId, storageKey: error.storageKey, previousStorageKey: error.previousStorageKey, rowUpdatedAt: error.rowUpdatedAt, job: record,
+          clipId, storageKey: error.storageKey, previousStorageKey: error.previousStorageKey, rowVersion: error.rowVersion, job: record,
         }).catch((recordError: unknown) => {
           // The database is the thing that could not be reached; if it still
           // cannot, the log line is the only record, and says so.
