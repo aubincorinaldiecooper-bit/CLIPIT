@@ -141,9 +141,9 @@ export async function clearReclipPending(matchId: string, client?: pg.PoolClient
  * toast that died with the tab. The message is chosen by the worker and must
  * already be safe to show.
  */
-export async function markReclipFailed(matchId: string, message: string): Promise<void> {
-  await queryOne(
-    `UPDATE clip_matches SET reclip_status = 'failed', reclip_error = $2 WHERE id = $1`,
-    [matchId, message.slice(0, 500)],
-  );
+export async function markReclipFailed(matchId: string, message: string, client?: pg.PoolClient): Promise<void> {
+  const sql = `UPDATE clip_matches SET reclip_status = 'failed', reclip_error = $2 WHERE id = $1`;
+  const params = [matchId, message.slice(0, 500)];
+  if (client) await client.query(sql, params);
+  else await queryOne(sql, params);
 }

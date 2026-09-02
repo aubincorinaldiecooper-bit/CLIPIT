@@ -11,12 +11,8 @@
 CREATE TABLE IF NOT EXISTS unknown_renders (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   clip_id UUID NOT NULL,
-  -- The file this render wrote. The row naming it is the proof the write
-  -- landed — when the key is NEW to the row. A first render retried at the
-  -- plain key a failed earlier attempt already left on the row proves
-  -- nothing by its key; there the row's status is the evidence.
+  -- The file this render wrote. The row naming it is the proof the write landed.
   storage_key TEXT NOT NULL,
-  previous_storage_key TEXT,
   -- The job as it ran, so the rollback can put back what a failure would have.
   job JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()

@@ -1,3 +1,4 @@
+import type pg from 'pg';
 import { queryOne, withTransaction } from '../pool.js';
 import type { ClipGenerationJob } from '../../queues/index.js';
 
@@ -27,13 +28,16 @@ export async function recordUnknownRender(input: Omit<UnknownRender, 'id'>): Pro
 }
 
 /**
- * Hands unknown renders over, oldest first, up to `limit`; each row is
- * deleted in the same transaction as its settling, so a settling that fails
- * leaves the row for the next sweep. Two sweeps at once take different rows.
+ * Hands unknown renders over, oldest first, up to `limit`. The settling
+ * runs INSIDE the drain's transaction, with its client, and the row is
+ * deleted in that same transaction: the rollback a settling writes, the
+ * failure it records and the row's removal land together or not at all, so
+ * a settling that fails half-way leaves the row — and the row's state — for
+ * the next sweep. Two sweeps at once take different rows.
  */
 export async function drainUnknownRenders(
   limit: number,
-  settle: (render: UnknownRender) => Promise<void>,
+  settle: (render: UnknownRender, client: pg.PoolClient) => Promise<void>,
 ): Promise<number> {
   return withTransaction(async (client) => {
     const { rows } = await client.query<{ id: string; clip_id: string; storage_key: string; previous_storage_key: string | null; job: ClipGenerationJob }>(
@@ -46,7 +50,7 @@ export async function drainUnknownRenders(
     );
     let settled = 0;
     for (const row of rows) {
-      await settle({ id: row.id, clipId: row.clip_id, storageKey: row.storage_key, previousStorageKey: row.previous_storage_key, job: row.job });
+      await settle({ id: row.id, clipId: row.clip_id, storageKey: row.storage_key, previousStorageKey: row.previous_storage_key, job: row.job }, client);
       await client.query('DELETE FROM unknown_renders WHERE id = $1', [row.id]);
       settled += 1;
     }

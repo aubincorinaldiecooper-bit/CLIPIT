@@ -397,6 +397,29 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(record.job.reclip.matchId).toBe('match-1');
   });
 
+  it('puts the objects nothing else would take on record onto the last attempt\'s render record, for the sweep to queue', async () => {
+    // Devin's finding on #81: queue and database both refused the release,
+    // the job record would never be read again, and the render record
+    // — written once the database recovered — did not carry the keys.
+    reclips.clearReclipPending.mockRejectedValueOnce(new Error('database refused'));
+    clips.getClip.mockResolvedValueOnce(original).mockRejectedValue(new Error('database unreachable'));
+    enqueueObjectRelease.mockRejectedValueOnce(new Error('redis refused'));
+    recordObjectRelease.mockRejectedValueOnce(new Error('database unreachable'));
+
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const outcome = expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('database refused');
+      await vi.runAllTimersAsync();
+      await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const [record] = recordUnknownRender.mock.calls[0]!;
+    expect(record.job.unresolvedKeys).toEqual(expect.arrayContaining([OLD_CANONICAL, OLD_POSTER]));
+    expect(record.job.unresolvedKeys.some((key: string) => FRESH_CANONICAL.test(key))).toBe(true);
+  });
+
   it('does not write an unknown render down while attempts remain: the retry will settle it', async () => {
     reclips.clearReclipPending.mockRejectedValueOnce(new Error('database refused'));
     clips.getClip.mockResolvedValueOnce(original).mockRejectedValue(new Error('database unreachable'));

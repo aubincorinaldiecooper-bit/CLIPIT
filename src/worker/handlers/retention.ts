@@ -136,8 +136,8 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
  */
 async function settleUnknownRenders(log: Logger): Promise<void> {
   try {
-    const settled = await drainUnknownRenders(env.RETENTION_VIDEO_LIMIT, async (render) => {
-      await settleUnknownRender(render, log);
+    const settled = await drainUnknownRenders(env.RETENTION_VIDEO_LIMIT, async (render, client) => {
+      await settleUnknownRender(render, log, client);
     });
     if (settled > 0) log.info('unknown renders settled', { renders: settled });
   } catch (error) {

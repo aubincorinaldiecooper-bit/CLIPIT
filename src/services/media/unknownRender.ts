@@ -1,7 +1,9 @@
+import type pg from 'pg';
 import type { Logger } from '../../lib/logger.js';
 import { getClip, restoreClipBoundaries, setClipStatus } from '../../db/repositories/clips.js';
 import { markReclipFailed } from '../../db/repositories/reclips.js';
 import type { UnknownRender } from '../../db/repositories/unknownRenders.js';
+import { enqueueObjectRelease } from '../../queues/index.js';
 
 /** What a Re-clip's failure says; the same words the render itself would have used. */
 export const RECLIP_FAILED_MESSAGE = 'The re-cut could not be rendered. The original clip is untouched — try again.';
@@ -25,10 +27,27 @@ export const RENDER_FAILED_MESSAGE = 'The render could not be completed. Try aga
  * record, a re-render back to 'ready' with the previous file, a first
  * render to 'failed'. Any other state means something later moved the row
  * on, and it is left alone.
+ *
+ * First, though, whatever objects the render could not put on record at
+ * the time (the queue and the database both refused, and the record on
+ * the job would never be read again) are handed to the queue now — before
+ * anything else, and a queue that refuses ends the settling here, so the
+ * row stays for the next sweep and the objects stay on record.
+ *
+ * The writes go through `client` when the caller has a transaction, so the
+ * rollback, the failure it records and the record's removal land together.
  */
-export async function settleUnknownRender(render: UnknownRender, log: Logger): Promise<'landed' | 'rolled_back' | 'moved_on' | 'gone'> {
+export async function settleUnknownRender(
+  render: UnknownRender,
+  log: Logger,
+  client?: pg.PoolClient,
+): Promise<'landed' | 'rolled_back' | 'moved_on' | 'gone'> {
   const clip = await getClip(render.clipId);
   const context = { clipId: render.clipId, storageKey: render.storageKey };
+  if (render.job.unresolvedKeys?.length) {
+    await enqueueObjectRelease(render.job.unresolvedKeys, { videoId: clip?.videoId ?? '', clipId: render.clipId, reason: 'render_outcome_unknown' });
+    log.warn('an unknown render\'s objects of unknown ownership are now queued for release', { ...context, keys: render.job.unresolvedKeys });
+  }
   if (!clip) {
     log.info('an unknown render\'s clip no longer exists; nothing to settle', context);
     return 'gone';
@@ -53,13 +72,13 @@ export async function settleUnknownRender(render: UnknownRender, log: Logger): P
       endSeconds: previous.endSeconds,
       boundariesEditedAt: previous.boundariesEditedAt ? new Date(previous.boundariesEditedAt) : null,
       status: previous.status,
-    });
-    await markReclipFailed(job.reclip.matchId, RECLIP_FAILED_MESSAGE);
+    }, client);
+    await markReclipFailed(job.reclip.matchId, RECLIP_FAILED_MESSAGE, client);
   } else if (clip.storageKey) {
     // A re-render that never landed: the previous file still plays.
-    await setClipStatus(render.clipId, 'ready', { errorMessage: RENDER_FAILED_MESSAGE });
+    await setClipStatus(render.clipId, 'ready', { errorMessage: RENDER_FAILED_MESSAGE }, client);
   } else {
-    await setClipStatus(render.clipId, 'failed', { errorMessage: RENDER_FAILED_MESSAGE });
+    await setClipStatus(render.clipId, 'failed', { errorMessage: RENDER_FAILED_MESSAGE }, client);
   }
   log.warn('an unknown render had not landed; rolled back as a failed render', { ...context, reclip: Boolean(job.reclip) });
   return 'rolled_back';
