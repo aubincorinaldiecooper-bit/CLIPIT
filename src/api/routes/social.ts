@@ -16,6 +16,7 @@ import {
   listSocialAccounts,
   setSocialAccountStatus,
   getSocialProfile,
+  listRecentPostsForClip,
   updatePublishedPost,
 } from '../../db/repositories/social.js';
 import {
@@ -28,6 +29,7 @@ import {
 } from '../../services/social/accounts.js';
 import { zernio, ZernioApiError, zernioConfigured } from '../../services/zernio/client.js';
 import { executeClipPublish } from '../../services/social/publishClip.js';
+import { serializeClipPost } from '../../services/social/postOutcome.js';
 import {
   cancelScheduledPost,
   getScheduledPost,
@@ -419,6 +421,28 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
     // `post` keeps the old single-post shape for existing clients; `posts`
     // is the whole story, one entry per shape.
     return reply.code(202).send({ post: posts[0], posts });
+  });
+
+  /**
+   * A clip's recent posts, newest first — the truth behind the Publish
+   * button once it is pressed: on its way, being cut to shape first, up, or
+   * refused. `outcome` is the status word read for a person (see
+   * postOutcome: "posted" only on the platform's own word); `status` is the
+   * word itself. Scoped like publishing is: the clip must be in the room
+   * the caller is working in. The posts are CLIPIT's own record and need
+   * no provider call, so there is no configured-check here: a deployment
+   * that has lost its provider must not read its history back as empty.
+   */
+  app.get('/api/clips/:clipId/posts', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+    const { clipId } = parse(z.object({ clipId: z.string().uuid() }), request.params, 'path parameters');
+    const workspaceId = requireWorkspaceId(request.principal);
+    const clip = await getClip(clipId);
+    if (!clip || clip.workspaceId !== workspaceId) throw HttpError.notFound('Clip not found');
+    const rows = await listRecentPostsForClip(clipId);
+    return reply.send({ posts: rows.map(serializeClipPost) });
   });
 
   /**
