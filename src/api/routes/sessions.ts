@@ -165,10 +165,12 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     if (!principal) {
       throw new HttpError(401, 'unauthenticated', 'A session token is required to hand its work over.');
     }
-    const body = parse(handoffSchema, request.body ?? {});
     if (principal.userId) {
       return reply.code(200).send({ handoff: null });
     }
+    // Only a guest's request has a body to judge: the address is for the
+    // claim, and a signed-in caller has none to make.
+    const body = parse(handoffSchema, request.body ?? {});
     const { token, expiresAt } = await createHandoff(principal.sessionId, body.email);
     return reply.code(201).send({ handoff: token, expiresAt: expiresAt.toISOString() });
   });

@@ -1,5 +1,5 @@
 import type { PoolClient } from 'pg';
-import { query, queryOne } from '../pool.js';
+import { query, withTransaction } from '../pool.js';
 import { generateToken, hashToken } from './sessions.js';
 
 /**
@@ -38,29 +38,39 @@ export function hashEmail(email: string): string {
 export async function createHandoff(sessionId: string, email: string): Promise<Handoff> {
   const token = generateToken();
 
-  // Housekeeping first, so the table cannot grow without bound: claims past
-  // their hour go, and this guest keeps only its newest few live ones.
+  // The sweep first, on an ordinary connection: claims past their hour go.
+  // Outside the transaction below on purpose — a transaction that waits on
+  // the pool for a side-query holds one connection while asking for another.
   await query(`DELETE FROM session_handoffs WHERE expires_at <= now()`);
-  await query(
-    `DELETE FROM session_handoffs
-      WHERE session_id = $1
-        AND redeemed_at IS NULL
-        AND id NOT IN (
-          SELECT id FROM session_handoffs
-           WHERE session_id = $1 AND redeemed_at IS NULL
-           ORDER BY created_at DESC
-           LIMIT $2
-        )`,
-    [sessionId, LIVE_HANDOFFS_PER_SESSION - 1],
-  );
 
-  const row = await queryOne<{ expires_at: Date }>(
-    `INSERT INTO session_handoffs (token_hash, email_hash, session_id, expires_at)
-     VALUES ($1, $2, $3, now() + ($4 || ' seconds')::interval)
-     RETURNING expires_at`,
-    [hashToken(token), hashEmail(email), sessionId, String(HANDOFF_TTL_SECONDS)],
-  );
-  return { token, expiresAt: row!.expires_at };
+  // Then, holding this guest's session row: keep only its newest few live
+  // claims and add this one. A burst of requests for one session queues on
+  // the lock, so each sees the rows the previous one left — not the same
+  // allowance all at once, which would let every one of them through the
+  // cap (Devin and Codex, #88).
+  const expiresAt = await withTransaction(async (client) => {
+    await client.query(`SELECT id FROM sessions WHERE id = $1 FOR UPDATE`, [sessionId]);
+    await client.query(
+      `DELETE FROM session_handoffs
+        WHERE session_id = $1
+          AND redeemed_at IS NULL
+          AND id NOT IN (
+            SELECT id FROM session_handoffs
+             WHERE session_id = $1 AND redeemed_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT $2
+          )`,
+      [sessionId, LIVE_HANDOFFS_PER_SESSION - 1],
+    );
+    const result = await client.query<{ expires_at: Date }>(
+      `INSERT INTO session_handoffs (token_hash, email_hash, session_id, expires_at)
+       VALUES ($1, $2, $3, now() + ($4 || ' seconds')::interval)
+       RETURNING expires_at`,
+      [hashToken(token), hashEmail(email), sessionId, String(HANDOFF_TTL_SECONDS)],
+    );
+    return result.rows[0]!.expires_at;
+  });
+  return { token, expiresAt };
 }
 
 export interface RedeemedHandoff {

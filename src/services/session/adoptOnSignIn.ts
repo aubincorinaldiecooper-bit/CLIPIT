@@ -26,16 +26,23 @@ export type Claim = 'token' | 'handoff';
  *   where no guest token exists. It answers only the address the link went
  *   to, so a sign-in that carries no address cannot spend it.
  *
- * Both name a session. Everything then happens in ONE transaction: the
- * hand-over is redeemed, the guest's session row is locked, and the work
- * moves. So a failure anywhere rolls the redemption back and the claim stays
- * good for a retry; two sign-ins adopting the same guest at once queue on
- * the lock and the second takes nothing, instead of each taking half; and
- * the same session named twice is adopted once. An owned session is never
- * taken whichever way it was named. Best-effort at the edge: a claim that
- * cannot be honoured is a smaller problem than a sign-in that fails, and
- * the person is signed in either way. Null means nothing was adopted, for
- * whichever reason — the caller has no use for the difference.
+ * Everything that can be settled on an ordinary connection is settled
+ * FIRST — the token looked up, the person's workspace in place — and only
+ * then is a connection taken for the transaction. A transaction that waited
+ * on the pool for its own side-queries would hold one connection while
+ * asking for another: a pool of one deadlocks outright, a bigger one under
+ * enough sign-ins at once (Devin and Codex, #88).
+ *
+ * Inside that transaction, on its one client: the hand-over redeemed, the
+ * guest's session row locked, the work moved. So a failure anywhere rolls
+ * the redemption back and the claim stays good for a retry; two sign-ins
+ * adopting the same guest at once queue on the lock and the second takes
+ * nothing, instead of each taking half; and the same session named twice
+ * is adopted once. An owned session is never taken whichever way it was
+ * named. Best-effort at the edge: a claim that cannot be honoured is a
+ * smaller problem than a sign-in that fails, and the person is signed in
+ * either way. Null means nothing was adopted, for whichever reason — the
+ * caller has no use for the difference.
  */
 export async function adoptOnSignIn(input: {
   userId: string;
@@ -44,27 +51,33 @@ export async function adoptOnSignIn(input: {
   handoff?: string | undefined;
 }): Promise<Adopted | null> {
   try {
+    const claims = new Map<string, Claim>();
+    if (input.guestToken) {
+      const guest = await findSessionByToken(input.guestToken);
+      if (guest && !guest.userId) claims.set(guest.id, 'token');
+    }
+    // A hand-over can only be judged inside the transaction that spends it,
+    // so its presence is enough to go on.
+    const handoff = input.handoff && input.email ? { token: input.handoff, email: input.email } : null;
+    if (claims.size === 0 && !handoff) return null;
+
+    const workspace = await ensureWorkspace(input.userId, input.email);
+
     return await withTransaction(async (client) => {
-      const guests = new Map<string, Claim>();
-      if (input.guestToken) {
-        const guest = await findSessionByToken(input.guestToken);
-        if (guest && !guest.userId) guests.set(guest.id, 'token');
-      }
-      if (input.handoff && input.email) {
+      if (handoff) {
         // Redeemed on this transaction, whether or not it is then needed:
         // spent by the sign-in it travelled with, never left live in an
         // inbox — and unspent again if that sign-in's adoption fails.
-        const named = await redeemHandoff(input.handoff, input.email, client);
-        if (named && !named.userId && !guests.has(named.sessionId)) {
-          guests.set(named.sessionId, 'handoff');
+        const named = await redeemHandoff(handoff.token, handoff.email, client);
+        if (named && !named.userId && !claims.has(named.sessionId)) {
+          claims.set(named.sessionId, 'handoff');
         }
       }
-      if (guests.size === 0) return null;
+      if (claims.size === 0) return null;
 
-      const workspace = await ensureWorkspace(input.userId, input.email);
       const total: Adopted = { videos: 0, clipRequests: 0, clips: 0 };
       let adoptedAny = false;
-      for (const [sessionId, via] of guests) {
+      for (const [sessionId, via] of claims) {
         // Only a real GUEST session, and only one at a time. One that already
         // belongs to somebody is never harvested, however the claim got
         // here — that would be one account taking another's work.

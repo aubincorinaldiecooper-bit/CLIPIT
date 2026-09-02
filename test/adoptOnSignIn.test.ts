@@ -59,10 +59,35 @@ describe('adoptOnSignIn', () => {
     expect(adopted).toEqual({ videos: 1, clipRequests: 2, clips: 3 });
   });
 
-  it('cannot spend a hand-over without the address the link went to', async () => {
+  it('cannot spend a hand-over without the address the link went to — and opens no transaction for it', async () => {
     await adoptOnSignIn({ userId: 'user-1', email: null, handoff: 'h' });
     expect(redeemHandoff).not.toHaveBeenCalled();
     expect(sessions.adoptSessionWork).not.toHaveBeenCalled();
+    expect(withTransaction).not.toHaveBeenCalled();
+  });
+
+  it('settles the token lookup and the workspace on ordinary connections BEFORE taking one for the transaction, so a pool of one cannot deadlock', async () => {
+    const order: string[] = [];
+    sessions.findSessionByToken.mockImplementationOnce(async () => {
+      order.push('lookup');
+      return { id: 'guest-1', userId: null };
+    });
+    ensureWorkspace.mockImplementationOnce(async () => {
+      order.push('workspace');
+      return { id: 'ws-1' };
+    });
+    withTransaction.mockImplementationOnce(async (fn: (c: unknown) => Promise<unknown>) => {
+      order.push('transaction');
+      return fn(client);
+    });
+    redeemHandoff.mockImplementationOnce(async () => {
+      order.push('redeem');
+      return { sessionId: 'guest-2', userId: null };
+    });
+
+    await adoptOnSignIn({ ...person, guestToken: 't', handoff: 'h' });
+
+    expect(order).toEqual(['lookup', 'workspace', 'transaction', 'redeem']);
   });
 
   it('adopts through the guest token alone — the same tab, as before', async () => {
@@ -121,7 +146,6 @@ describe('adoptOnSignIn', () => {
     const adopted = await adoptOnSignIn({ ...person, guestToken: 't', handoff: 'h' });
 
     expect(sessions.adoptSessionWork).not.toHaveBeenCalled();
-    expect(ensureWorkspace).not.toHaveBeenCalled();
     expect(adopted).toBeNull();
   });
 
@@ -145,10 +169,12 @@ describe('adoptOnSignIn', () => {
     expect(sessions.adoptSessionWork).not.toHaveBeenCalled();
   });
 
-  it('has nothing to do with no claim at all', async () => {
+  it('has nothing to do with no claim at all — no workspace touched, no transaction opened', async () => {
     expect(await adoptOnSignIn(person)).toBeNull();
     expect(sessions.findSessionByToken).not.toHaveBeenCalled();
     expect(redeemHandoff).not.toHaveBeenCalled();
+    expect(ensureWorkspace).not.toHaveBeenCalled();
+    expect(withTransaction).not.toHaveBeenCalled();
   });
 
   it('never fails the sign-in: an adoption error escapes the transaction — undoing the redemption with it — and is logged without its details', async () => {
