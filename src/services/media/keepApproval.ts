@@ -1,4 +1,4 @@
-import type { DerivativeStatus } from './verticalVisibility.js';
+import type { DeckPresentation, DerivativeStatus } from './verticalVisibility.js';
 
 /**
  * What Keep means once media is made before the deck, not after it.
@@ -20,8 +20,15 @@ import type { DerivativeStatus } from './verticalVisibility.js';
  */
 
 export interface KeepTarget {
-  /** Whether this moment came from the pre-rendered vertical path. */
+  /** Whether this moment was made before anyone chose it. */
   preRendered: boolean;
+  /**
+   * Which deliverable the pre-render made. Null on rows older than the
+   * column, every one of which came from the vertical pipeline.
+   */
+  presentation: DeckPresentation | null;
+  /** The canonical cut's key. */
+  storageKey: string | null;
   derivativeStatus: DerivativeStatus | null;
   derivativeStorageKey: string | null;
   posterStorageKey: string | null;
@@ -40,22 +47,24 @@ export type KeepAction =
 /**
  * Decide what a Keep press should do.
  *
- * The legacy path is preserved deliberately: a non-platform request still
- * shows candidates before anything is cut, and Keep there must keep cutting
- * or that whole flow stops working. Only the pre-rendered vertical path
- * changes meaning.
+ * Every moment is now cut when it is found, so on any request made after
+ * that rule Keep is an approval — the file exists, and Keep files it in the
+ * library. The legacy branch is kept for rows from before: a request answered
+ * as a list of moments with nothing cut behind them, where Keep must still
+ * cut or those old conversations stop working.
  */
 export function keepAction(target: KeepTarget): KeepAction {
   if (!target.preRendered) {
-    // Unchanged behaviour for every workflow that is not the post-ready
-    // vertical recommendation path.
+    // A moment from before cut-on-find: nothing was made yet.
     return { kind: 'generate', regenerate: true };
   }
 
-  if (target.clipStatus !== 'ready') {
+  if (target.clipStatus !== 'ready' || !target.storageKey) {
     return { kind: 'reject', regenerate: false, reason: 'The canonical clip is not ready' };
   }
-  if (target.derivativeStatus !== 'ready' || !target.derivativeStorageKey) {
+  // Rows older than the column all came from the vertical pipeline.
+  const presentation = target.presentation ?? 'vertical';
+  if (presentation === 'vertical' && (target.derivativeStatus !== 'ready' || !target.derivativeStorageKey)) {
     // A pre-rendered moment should never have reached the deck in this state.
     // Refusing beats regenerating: regenerating would quietly repair an
     // invariant violation instead of surfacing it.

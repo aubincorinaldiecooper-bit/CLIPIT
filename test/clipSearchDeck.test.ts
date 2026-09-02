@@ -183,6 +183,110 @@ describe('the deck gate every finished request passes through', () => {
   });
 });
 
+/**
+ * The owner's rule (2026-09-02): a moment is cut the moment it is found,
+ * whatever framing was asked for. A plain question used to complete through
+ * the status write with nothing cut behind it; now it owes a deck like any
+ * platform question, and only what the deck delivers differs.
+ */
+describe('an original-framing request is cut on find too', () => {
+  const plain = resolvePlatformIntent('find the funny moments', 90);
+  const counted = resolvePlatformIntent('give me 2 funny moments', 90);
+  const fourMatches = [0.9, 0.8, 0.7, 0.6].map((confidence, index) => ({
+    id: `match-${index + 1}`,
+    confidence,
+    globalStartSeconds: index * 20,
+    globalEndSeconds: index * 20 + 15,
+  }));
+
+  it('builds an original-framing deck and releases it through the gate', async () => {
+    const result = await completeRequestWithDeck({
+      clipRequestId: 'request-1',
+      request: request as any,
+      video: video as any,
+      intent: plain,
+      workDir: '/tmp',
+      log,
+      tally,
+      answeredFrom: 'footage',
+      deckAttemptId: 'attempt-1',
+      deckStartedAtMs: 0,
+    });
+
+    expect(result.completed).toBe(true);
+    expect(orchestrateVerticalDeck).toHaveBeenCalledWith(expect.objectContaining({ presentation: 'original' }));
+    // Same door as a vertical deck: released and completed in one statement,
+    // never the plain status write that used to answer these questions.
+    expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'footage');
+    expect(finishClipRequest).not.toHaveBeenCalled();
+  });
+
+  it('owes no derivative for its candidates', async () => {
+    await completeRequestWithDeck({
+      clipRequestId: 'request-1', request: request as any, video: video as any, intent: plain,
+      workDir: '/tmp', log, tally, answeredFrom: 'notes', deckAttemptId: 'attempt-1', deckStartedAtMs: 0,
+    });
+    const input = orchestrateVerticalDeck.mock.calls[0]![0] as { candidates: Array<{ derivativeStatus: unknown }> };
+    expect(input.candidates.map((c) => c.derivativeStatus)).toEqual([null]);
+  });
+
+  it('cuts every moment it found when the question named no number', async () => {
+    listMatches.mockResolvedValue(fourMatches as never);
+    await completeRequestWithDeck({
+      clipRequestId: 'request-1', request: request as any, video: video as any, intent: plain,
+      workDir: '/tmp', log, tally, answeredFrom: 'footage', deckAttemptId: 'attempt-1', deckStartedAtMs: 0,
+    });
+    // "Find the funny moments" used to show all four; cutting all four is
+    // what keeps that answer whole.
+    expect(recordDeckAvailability).toHaveBeenCalledWith(
+      'request-1',
+      { availableCandidateCount: 4, effectiveDeckTarget: 4 },
+      'attempt-1',
+    );
+    expect(orchestrateVerticalDeck).toHaveBeenCalledWith(expect.objectContaining({ effectiveDeckTarget: 4 }));
+  });
+
+  it('cuts the number asked for when the question named one', async () => {
+    listMatches.mockResolvedValue(fourMatches as never);
+    await completeRequestWithDeck({
+      clipRequestId: 'request-1', request: request as any, video: video as any, intent: counted,
+      workDir: '/tmp', log, tally, answeredFrom: 'footage', deckAttemptId: 'attempt-1', deckStartedAtMs: 0,
+    });
+    expect(recordDeckAvailability).toHaveBeenCalledWith(
+      'request-1',
+      { availableCandidateCount: 4, effectiveDeckTarget: 2 },
+      'attempt-1',
+    );
+  });
+
+  it('keeps a platform question at its default of three when no number was named', async () => {
+    listMatches.mockResolvedValue(fourMatches as never);
+    await completeRequestWithDeck({
+      clipRequestId: 'request-1', request: request as any, video: video as any,
+      intent: resolvePlatformIntent('find me moments to post on TikTok', 90),
+      workDir: '/tmp', log, tally, answeredFrom: 'footage', deckAttemptId: 'attempt-1', deckStartedAtMs: 0,
+    });
+    expect(recordDeckAvailability).toHaveBeenCalledWith(
+      'request-1',
+      { availableCandidateCount: 4, effectiveDeckTarget: 3 },
+      'attempt-1',
+    );
+  });
+
+  it('tells the creator when the footage is gone, exactly as a vertical deck does', async () => {
+    const result = await completeRequestWithDeck({
+      clipRequestId: 'request-1', request: request as any,
+      video: { ...video, originalStorageKey: null } as any, intent: plain,
+      workDir: '/tmp', log, tally, answeredFrom: 'footage', deckAttemptId: 'attempt-1', deckStartedAtMs: 0,
+    });
+    expect(result.completed).toBe(false);
+    expect(finishClipRequest).toHaveBeenCalledWith(
+      'request-1', 'failed', expect.stringContaining('no longer available'), null, 'attempt-1',
+    );
+    expect(releaseDeckAndComplete).not.toHaveBeenCalled();
+  });
+});
+
 describe('a superseded attempt stands down', () => {
   /**
    * A stalled job redelivered mid-assembly means two runs exist. The second

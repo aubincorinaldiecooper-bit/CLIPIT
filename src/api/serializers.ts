@@ -3,7 +3,7 @@ import { getStorage } from '../services/storage/s3.js';
 import { formatTimecode } from '../services/timestamps.js';
 import { latestVersionsForMatches } from '../db/repositories/reclips.js';
 import { clipMediaContract } from './mediaContract.js';
-import { isCreatorVisible } from '../services/media/verticalVisibility.js';
+import { isCreatorVisible, type DeckPresentation } from '../services/media/verticalVisibility.js';
 import type { CompositionMode } from '../services/media/composition.js';
 import type {
   ChunkDegradation,
@@ -332,7 +332,9 @@ export async function serializeClipRequest(
     /**
      * What was asked for, what the video had, and what came back.
      *
-     * Present only for requests that owe a finished deck. `available` below
+     * Present for every request that owes a finished deck — which, since
+     * moments are cut when they are found, is every request planned after
+     * that rule, whatever framing it asked for. `available` below
      * `requested` is a fact about the footage, not a failure — a creator who
      * asks for three and is offered two should be told their video had two,
      * and this is what lets the interface say that instead of implying we
@@ -342,7 +344,7 @@ export async function serializeClipRequest(
      * so a client can tell "still assembling" from "assembled, and this is
      * all of it" without inferring anything from the array length.
      */
-    ...(request.presentationTarget === 'vertical'
+    ...(request.presentationTarget !== null
       ? {
           deck: {
             requestedResultCount: request.requestedResultCount,
@@ -472,19 +474,21 @@ export async function serializeLibraryClip(entry: {
  * A request that owes no deck passes through untouched — every non-platform
  * flow behaves exactly as it did before any of this existed.
  */
-/** Does this moment have real, finished media behind it? */
-function clipIsShowable(match: ClipMatch, clip: Clip): boolean {
+/** Does this moment have real, finished media behind it, for what the deck delivers? */
+function clipIsShowable(match: ClipMatch, clip: Clip, presentation: DeckPresentation): boolean {
   return isCreatorVisible({
     matchId: match.id,
-    derivativeStatus: clip.derivativeStatus ?? 'pending',
+    derivativeStatus: clip.derivativeStatus,
     derivativeStorageKey: clip.derivativeStorageKey,
     posterStorageKey: clip.posterStorageKey,
+    // The canonical file counts only once its row says the cut finished.
+    canonicalStorageKey: clip.status === 'ready' ? clip.storageKey : null,
     confidence: match.confidence,
-  });
+  }, presentation);
 }
 
 export function creatorVisibleDeck(
-  request: Pick<ClipRequest, 'presentationTarget' | 'deckCompletedAt' | 'effectiveDeckTarget'>,
+  request: Pick<ClipRequest, 'presentationTarget' | 'deckCompletedAt' | 'effectiveDeckTarget' | 'status'>,
   matches: ClipMatch[],
   clipsByMatchId: Map<string, Clip>,
 ): { matches: ClipMatch[]; clips: Clip[]; withheld: number } {
@@ -506,7 +510,8 @@ export function creatorVisibleDeck(
     if (!preRendered) return { matches, clips: [...clipsByMatchId.values()], withheld: 0 };
     const legacyVisible = matches.filter((match) => {
       const clip = clipsByMatchId.get(match.id);
-      return clip ? clipIsShowable(match, clip) : false;
+      // Every pre-rendered row from before the column was a vertical one.
+      return clip ? clipIsShowable(match, clip, 'vertical') : false;
     });
     return {
       matches: legacyVisible,
@@ -515,12 +520,26 @@ export function creatorVisibleDeck(
     };
   }
 
-  if (request.presentationTarget !== 'vertical') {
+  // An original-framing request answered BEFORE every moment was cut on find.
+  //
+  // Those requests completed through the plain status write and never had a
+  // deck to release, so their gate never opened — and every one of their
+  // moments was shown at the time, with nothing cut behind it. Reading them
+  // through the gate would take finished answers off the screen; reading them
+  // as they were built keeps them exactly as the person last saw them. A
+  // request still searching, or failed, is not this case and falls through.
+  if (
+    request.presentationTarget === 'original'
+    && !request.deckCompletedAt
+    && request.status === 'completed'
+  ) {
     return { matches, clips: [...clipsByMatchId.values()], withheld: 0 };
   }
 
   // Assembling, or failed. Both are "there is no finished set", and a creator
-  // sees the same thing in both cases: nothing yet.
+  // sees the same thing in both cases: nothing yet. This now holds for every
+  // framing: a moment is cut when it is found, and the review shows finished
+  // clips or nothing.
   if (!request.deckCompletedAt) {
     return { matches: [], clips: [], withheld: matches.length };
   }
@@ -528,9 +547,12 @@ export function creatorVisibleDeck(
   // The deck stands. Release it whole — still checking each clip's FILES
   // rather than trusting the flag alone, because a released deck whose media
   // went missing underneath must not hand out a card that plays nothing.
+  // Narrowed to a local: the null case returned above, and a closure cannot
+  // carry that narrowing on a property.
+  const presentation: DeckPresentation = request.presentationTarget;
   const visible = matches.filter((match) => {
     const clip = clipsByMatchId.get(match.id);
-    return clip ? clipIsShowable(match, clip) : false;
+    return clip ? clipIsShowable(match, clip, presentation) : false;
   });
 
   // Deliberately NOT re-checked against effectiveDeckTarget.
@@ -555,6 +577,12 @@ export function creatorVisibleDeck(
     clips: visible.map((match) => clipsByMatchId.get(match.id)!),
     withheld: matches.length - visible.length,
   };
+}
+
+/** Does this clip's playback slot belong to a 9:16 derivative? */
+function wantsVertical(clip: Clip): boolean {
+  if (clip.presentation !== null) return clip.presentation === 'vertical';
+  return clip.preRendered;
 }
 
 export async function serializeClip(clip: Clip, includeUrl = true) {
@@ -641,10 +669,13 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
         focalX: clip.focalX,
         focalY: clip.focalY,
       },
-      // A clip made by the post-ready pipeline was made FOR a vertical
-      // request. The row itself says so; no caller has to remember to.
-      clip.preRendered,
+      // The row says which deliverable it was made for. A pre-rendered row
+      // from before the column was always a vertical one; a clip cut on
+      // demand delivers its canonical file.
+      wantsVertical(clip),
     ),
+    /** Which file this moment delivers: its own framing, or a 9:16 derivative. */
+    presentation: clip.presentation ?? (clip.preRendered ? 'vertical' : 'original'),
     /** Set when someone pressed Keep. Null means it is still on offer. */
     approvedAt: clip.approvedAt ? clip.approvedAt.toISOString() : null,
     createdAt: clip.createdAt.toISOString(),

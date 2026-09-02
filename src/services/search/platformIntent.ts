@@ -149,6 +149,11 @@ export interface PlatformIntent {
   matchedPhrase: string | null;
   /** How many moments the creator asked for. Never below one, never clamped. */
   requestedCount: number;
+  /**
+   * Whether that number was in the question. Without one, a platform
+   * question keeps its default; a plain question means every moment found.
+   */
+  countExplicit: boolean;
   /** The most this pipeline will render for one request. */
   renderCeiling: number;
 }
@@ -173,6 +178,7 @@ export function resolvePlatformIntent(
   const platform = found?.[0] ?? null;
   const profile = platform ? PLATFORM_OUTPUT_PROFILES[platform] : null;
   const explicitDurationSeconds = parseExplicitDurationSeconds(text);
+  const explicitCount = parseRequestedMomentCount(text);
 
   // The global product limit is never exceeded, explicit ask or not.
   const hardMaxSeconds = explicitDurationSeconds !== null
@@ -196,7 +202,8 @@ export function resolvePlatformIntent(
     // standing in for the number they wanted, with nothing left saying
     // otherwise. The ceiling still applies; it applies to the deck target,
     // which is a different quantity and now has its own name.
-    requestedCount: Math.max(1, parseRequestedMomentCount(text) ?? options.defaultCount ?? 3),
+    requestedCount: Math.max(1, explicitCount ?? options.defaultCount ?? 3),
+    countExplicit: explicitCount !== null,
     /** The most this pipeline will render for one request. */
     renderCeiling: Math.max(1, options.maxCount ?? 8),
   };

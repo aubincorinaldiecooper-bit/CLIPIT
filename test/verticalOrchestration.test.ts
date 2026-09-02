@@ -130,6 +130,8 @@ describe('what is filtered before anything is paid for', () => {
 describe('Keep, on a moment that was already made', () => {
   const finished = {
     preRendered: true,
+    presentation: 'vertical' as const,
+    storageKey: 'clips/a.mp4',
     derivativeStatus: 'ready' as const,
     derivativeStorageKey: 'vertical/a.mp4',
     posterStorageKey: 'poster/a.jpg',
@@ -154,6 +156,36 @@ describe('Keep, on a moment that was already made', () => {
   it('refuses rather than quietly repairing an unfinished card', () => {
     expect(keepAction({ ...finished, posterStorageKey: null }).kind).toBe('reject');
     expect(keepAction({ ...finished, derivativeStatus: 'failed' }).kind).toBe('reject');
+  });
+
+  /**
+   * The owner's rule (2026-09-02): every moment is cut when it is found,
+   * whatever framing was asked for. An original-framing moment's deliverable
+   * is the canonical cut itself, so Keep on it is an approval too — and it
+   * must not be refused for lacking a derivative it was never owed.
+   */
+  it('approves an original-framing moment that has its cut and its poster, and no derivative', () => {
+    const original = {
+      ...finished,
+      presentation: 'original' as const,
+      derivativeStatus: null,
+      derivativeStorageKey: null,
+    };
+    expect(keepAction(original)).toEqual({ kind: 'approve', regenerate: false });
+  });
+
+  it('still refuses an original-framing moment whose cut or poster is missing', () => {
+    const original = { ...finished, presentation: 'original' as const, derivativeStatus: null, derivativeStorageKey: null };
+    expect(keepAction({ ...original, posterStorageKey: null }).kind).toBe('reject');
+    expect(keepAction({ ...original, storageKey: null }).kind).toBe('reject');
+    expect(keepAction({ ...original, clipStatus: 'generating' }).kind).toBe('reject');
+  });
+
+  it('reads a pre-rendered row from before the column as a vertical one', () => {
+    // Every pre-rendered row before migration 033 came from the vertical
+    // pipeline, so a null presentation must still demand the derivative.
+    expect(keepAction({ ...finished, presentation: null }).kind).toBe('approve');
+    expect(keepAction({ ...finished, presentation: null, derivativeStorageKey: null }).kind).toBe('reject');
   });
 });
 
@@ -201,6 +233,75 @@ describe('what a client is told', () => {
   });
 });
 
+describe('what a client is told about an original-framing moment', () => {
+  it('plays the canonical cut itself, and claims no derivative', () => {
+    const media = clipMediaContract(
+      {
+        canonicalUrl: 'https://example/canonical.mp4',
+        derivativeUrl: null,
+        derivativeStorageKey: null,
+        derivativeStatus: null,
+        posterUrl: 'https://example/poster.jpg',
+        posterStorageKey: 'poster/a.jpg',
+        posterTimestampSeconds: 3.5,
+        sourceWidth: 1920,
+        sourceHeight: 1080,
+        outputWidth: 1920,
+        outputHeight: 1080,
+        compositionMode: 'original' as const,
+      },
+      false,
+    );
+    expect(media.url).toBe('https://example/canonical.mp4');
+    expect(media.posterUrl).toBe('https://example/poster.jpg');
+    expect(media.outputAspectRatio).toBe('16:9');
+    expect(media.compositionMode).toBe('original');
+    expect(media.derivativeStatus).toBeNull();
+  });
+});
+
+describe('an original-framing deck assembles by its own rule', () => {
+  const originalReady = (c: VerticalCandidate, attempt = 1): PreparedCandidate => ({
+    ...c,
+    derivativeStatus: null,
+    derivativeStorageKey: null,
+    canonicalStorageKey: `clips/${c.matchId}.mp4`,
+    posterStorageKey: `poster/${c.matchId}.jpg`,
+    attempts: attempt,
+    failureStage: null,
+  });
+  const pool = [candidate('a', 0.9), candidate('b', 0.8), candidate('c', 0.7)];
+
+  it('counts a moment as finished once its cut and poster exist — no derivative is owed', async () => {
+    const outcome = await assembleDeck(pool, planDeck(3, 1.7, 8, 'original'), async (c) => originalReady(c), 2);
+    expect(outcome.complete).toBe(true);
+    expect(outcome.deck.map((c) => c.matchId)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('would not accept those same moments as a vertical deck', async () => {
+    // The plan decides what "finished" means; the same files that complete
+    // an original deck are not a finished vertical one.
+    const outcome = await assembleDeck(pool, planDeck(3, 1.7, 8, 'vertical'), async (c) => originalReady(c), 1);
+    expect(outcome.complete).toBe(false);
+    expect(outcome.deck).toEqual([]);
+  });
+
+  it('withholds an original moment whose poster never landed', async () => {
+    const outcome = await assembleDeck(
+      pool,
+      planDeck(3, 1.7, 8, 'original'),
+      async (c) => (c.matchId === 'b'
+        ? { ...originalReady(c), posterStorageKey: null, failureStage: 'poster_generation' as const }
+        : originalReady(c)),
+      1,
+    );
+    // Three were asked for and the pool holds exactly three, so the deck
+    // cannot be completed — and it says so rather than releasing two.
+    expect(outcome.complete).toBe(false);
+    expect(outcome.failed.map((c) => c.matchId)).toEqual(['b']);
+  });
+});
+
 describe('atomic reveal at the API boundary — a polling client sees 0, then all', () => {
   const match = (id: string, confidence: number) => ({
     id, confidence,
@@ -228,7 +329,7 @@ describe('atomic reveal at the API boundary — a polling client sees 0, then al
     posterTimestampSeconds: 5,
     compositionMode: 'smart_crop',
     sourceWidth: 1920, sourceHeight: 1080, outputWidth: 1080, outputHeight: 1920,
-    preRendered: true, approvedAt: null, retentionClass: 'temporary' as const,
+    preRendered: true, presentation: 'vertical' as const, approvedAt: null, retentionClass: 'temporary' as const,
     createdAt: new Date(), updatedAt: new Date(),
     ...over,
   });
@@ -238,8 +339,9 @@ describe('atomic reveal at the API boundary — a polling client sees 0, then al
     presentationTarget: 'vertical' as const,
     deckCompletedAt: null,
     effectiveDeckTarget: 3,
+    status: 'searching' as const,
   };
-  const completed = { ...assembling, deckCompletedAt: new Date() };
+  const completed = { ...assembling, deckCompletedAt: new Date(), status: 'completed' as const };
 
   const matches = [match('a', 0.9), match('b', 0.8), match('c', 0.7)];
 
@@ -312,7 +414,7 @@ describe('atomic reveal at the API boundary — a polling client sees 0, then al
 
   /** A short pool is a complete deck at its own size. */
   it('releases a two-moment deck together when two was all the video had', () => {
-    const shortDeck = { presentationTarget: 'vertical' as const, deckCompletedAt: new Date(), effectiveDeckTarget: 2 };
+    const shortDeck = { presentationTarget: 'vertical' as const, deckCompletedAt: new Date(), effectiveDeckTarget: 2, status: 'completed' as const };
     const twoMatches = [match('a', 0.9), match('b', 0.8)];
     const clips = new Map<string, any>([['a', readyClip('a')], ['b', readyClip('b')]]);
     const visible = creatorVisibleDeck(shortDeck, twoMatches as any, clips);
@@ -335,7 +437,7 @@ describe('atomic reveal at the API boundary — a polling client sees 0, then al
    * exist the moment 030 ships.
    */
   it('still filters a pre-migration vertical request with a null target', () => {
-    const preMigration = { presentationTarget: null, deckCompletedAt: null, effectiveDeckTarget: null };
+    const preMigration = { presentationTarget: null, deckCompletedAt: null, effectiveDeckTarget: null, status: 'completed' as const };
     const clips = new Map<string, any>([
       ['a', readyClip('a')],
       // Rendered and failed — must not reappear just because the row is old.
@@ -348,7 +450,7 @@ describe('atomic reveal at the API boundary — a polling client sees 0, then al
   });
 
   it('leaves the legacy path completely untouched', () => {
-    const legacy = { presentationTarget: null, deckCompletedAt: null, effectiveDeckTarget: null };
+    const legacy = { presentationTarget: null, deckCompletedAt: null, effectiveDeckTarget: null, status: 'completed' as const };
     const clips = new Map<string, any>([
       ['a', readyClip('a', {
         preRendered: false, derivativeStatus: null, derivativeStorageKey: null,
@@ -358,6 +460,66 @@ describe('atomic reveal at the API boundary — a polling client sees 0, then al
     const visible = creatorVisibleDeck(legacy, [match('a', 0.9), match('b', 0.8)] as any, clips);
     expect(visible.matches.map((m) => m.id)).toEqual(['a', 'b']);
     expect(visible.withheld).toBe(0);
+  });
+
+  /**
+   * Since 2026-09-02 an original-framing request is cut on find as well, and
+   * goes through the same gate: nothing while the cuts are being made, then
+   * every finished moment together.
+   */
+  describe('an original-framing request', () => {
+    const originalClip = (id: string, over: Record<string, unknown> = {}) => readyClip(id, {
+      presentation: 'original', derivativeStatus: null, derivativeStorageKey: null,
+      derivativeUrl: null, compositionMode: 'original', outputWidth: 1920, outputHeight: 1080,
+      ...over,
+    });
+    const assemblingOriginal = {
+      presentationTarget: 'original' as const, deckCompletedAt: null, effectiveDeckTarget: 3, status: 'searching' as const,
+    };
+    const completedOriginal = { ...assemblingOriginal, deckCompletedAt: new Date(), status: 'completed' as const };
+
+    it('shows nothing while its moments are still being cut', () => {
+      const clips = new Map<string, any>([['a', originalClip('a')], ['b', originalClip('b')]]);
+      const visible = creatorVisibleDeck(assemblingOriginal, matches as any, clips);
+      expect(visible.matches).toEqual([]);
+      expect(visible.withheld).toBe(3);
+    });
+
+    it('releases every finished cut together once the gate opens, needing no derivative', () => {
+      const clips = new Map<string, any>([
+        ['a', originalClip('a')], ['b', originalClip('b')], ['c', originalClip('c')],
+      ]);
+      const visible = creatorVisibleDeck(completedOriginal, matches as any, clips);
+      expect(visible.matches.map((m) => m.id)).toEqual(['a', 'b', 'c']);
+      expect(visible.withheld).toBe(0);
+    });
+
+    it('withholds a moment whose cut or poster is missing even after release', () => {
+      const clips = new Map<string, any>([
+        ['a', originalClip('a')],
+        ['b', originalClip('b', { posterStorageKey: null })],
+        ['c', originalClip('c', { status: 'failed', storageKey: null })],
+      ]);
+      const visible = creatorVisibleDeck(completedOriginal, matches as any, clips);
+      expect(visible.matches.map((m) => m.id)).toEqual(['a']);
+      expect(visible.withheld).toBe(2);
+    });
+
+    it('shows a request answered before cut-on-find exactly as it was', () => {
+      // Completed through the plain status write, no deck ever released, and
+      // every moment shown at the time with nothing cut behind it.
+      const beforeTheRule = { ...assemblingOriginal, status: 'completed' as const };
+      const clips = new Map<string, any>();
+      const visible = creatorVisibleDeck(beforeTheRule, matches as any, clips);
+      expect(visible.matches.map((m) => m.id)).toEqual(['a', 'b', 'c']);
+      expect(visible.withheld).toBe(0);
+    });
+
+    it('shows nothing for a failed request whose deck never stood', () => {
+      const failed = { ...assemblingOriginal, status: 'failed' as const };
+      const clips = new Map<string, any>([['a', originalClip('a')]]);
+      expect(creatorVisibleDeck(failed, matches as any, clips).matches).toEqual([]);
+    });
   });
 });
 

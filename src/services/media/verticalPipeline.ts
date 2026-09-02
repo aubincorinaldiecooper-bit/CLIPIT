@@ -410,3 +410,103 @@ function focusPctFor(decision: CompositionDecision, source: { width: number; hei
   const clamped = Math.min(1, Math.max(0, along ?? 0.5));
   return Number((clamped * 100).toFixed(2));
 }
+
+export interface OriginalPipelineInput {
+  videoId: string;
+  clipId: string;
+  /** The canonical clip on disk — original framing, already cut. */
+  canonicalPath: string;
+  workDir: string;
+  /** The cut as ffmpeg reported it, so the poster is taken from inside it. */
+  durationSeconds: number;
+  width: number;
+  height: number;
+  /** See VerticalPipelineInput.currentDerivativeKey — the same rule, for the poster. */
+  currentPosterKey?: () => Promise<string | null>;
+  snapshotPosterKey?: string | null;
+}
+
+export interface OriginalPipelineResult {
+  posterStorageKey: string;
+  posterTimestampSeconds: number;
+  posterGenerationMs: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  sourceAspectRatio: string | null;
+}
+
+/**
+ * Finish a moment whose deliverable is the canonical cut itself.
+ *
+ * The owner's rule (2026-09-02): every moment is cut when it is found, and
+ * the review shows finished clips whatever framing was asked for. For an
+ * original-framing request there is no framing decision and no second
+ * encode — the cut IS the file the creator will receive — so all that stands
+ * between the cut and a card is the poster, taken from inside the cut at the
+ * same offset the vertical pipeline uses. No model is asked anything.
+ *
+ * Failures name their stage for the same reason the vertical pipeline's do:
+ * a candidate that fails is invisible to the creator by design, and the
+ * stage is what tells "we could not finish it" apart from "it was never there".
+ */
+export async function runOriginalPipeline(input: OriginalPipelineInput): Promise<OriginalPipelineResult> {
+  if (input.width < 2 || input.height < 2) {
+    throw new VerticalPipelineFailure('media_probe', 'no_dimensions', 'The canonical clip reported no usable dimensions');
+  }
+
+  const posterStartedAt = performance.now();
+  const posterTimestampSeconds = posterOffsetSeconds(input.durationSeconds);
+  const posterPath = path.join(input.workDir, `${input.clipId}-poster.jpg`);
+  const posterStorageKey = clipPosterKey(input.videoId, input.clipId);
+
+  let posterWritten = false;
+  try {
+    // The poster is the card's picture, so it is asked for at the cut's own
+    // width and at the quality the thumbnails use — not the preview default.
+    posterWritten = await extractFrameAt(input.canonicalPath, posterTimestampSeconds, posterPath, input.width, { quality: 2 });
+  } catch (error) {
+    throw new VerticalPipelineFailure('poster_generation', 'poster_failed', 'The poster frame could not be extracted', error);
+  }
+  if (!posterWritten) {
+    // extractFrameAt exits 0 without a file when the seek lands past the
+    // last decodable frame, so the result is confirmed rather than assumed.
+    throw new VerticalPipelineFailure('poster_generation', 'poster_empty', 'The poster frame extracted to nothing');
+  }
+
+  try {
+    await getStorage().uploadFile(posterStorageKey, posterPath, 'image/jpeg');
+  } catch (error) {
+    // The key is deterministic, so a retry writes where an earlier run wrote.
+    // Delete only what this attempt could itself have created — the same
+    // two-reading rule the derivative upload above uses.
+    let currentKey: string | null | undefined;
+    let readFailed = false;
+    try {
+      currentKey = input.currentPosterKey ? await input.currentPosterKey() : null;
+    } catch {
+      readFailed = true;
+    }
+    if (shouldDiscardOnUploadFailure({
+      key: posterStorageKey,
+      snapshotKey: input.snapshotPosterKey ?? null,
+      currentKey,
+      readFailed,
+    })) {
+      await discardUploadedObjects([posterStorageKey], {
+        videoId: input.videoId,
+        clipId: input.clipId,
+        reason: 'poster_upload_failed',
+      });
+    }
+    throw new VerticalPipelineFailure('storage_upload', 'poster_upload_failed', 'The poster could not be stored', error);
+  }
+
+  return {
+    posterStorageKey,
+    posterTimestampSeconds,
+    posterGenerationMs: Math.round(performance.now() - posterStartedAt),
+    sourceWidth: input.width,
+    sourceHeight: input.height,
+    sourceAspectRatio: aspectRatioLabel(input.width, input.height),
+  };
+}

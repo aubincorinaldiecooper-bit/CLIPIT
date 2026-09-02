@@ -35,13 +35,25 @@ export type FailureStage =
   | 'media_probe'
   | 'serialization';
 
+/**
+ * What a deck delivers for each moment: the canonical cut itself, or a 9:16
+ * derivative of it. Same values as clip_requests.presentation_target.
+ */
+export type DeckPresentation = 'original' | 'vertical';
+
 /** One candidate, as the selector sees it. */
 export interface VerticalCandidate {
   matchId: string;
-  derivativeStatus: DerivativeStatus;
+  /** Null when no derivative is owed — an original-framing deck. */
+  derivativeStatus: DerivativeStatus | null;
   /** The 9:16 file's key. Absent means there is no derivative, whatever the status says. */
   derivativeStorageKey: string | null;
   posterStorageKey: string | null;
+  /**
+   * The canonical cut's key, once its row says the cut finished. What an
+   * original-framing deck delivers; what a vertical one is derived from.
+   */
+  canonicalStorageKey?: string | null;
   /** Higher is better; the order candidates were ranked in. */
   confidence: number;
 }
@@ -56,11 +68,17 @@ export interface VerticalCandidate {
  *
  * The poster is required too: the spec calls for required media metadata, and
  * a post-ready card with no still is not post-ready.
+ *
+ * "Finished" depends on what the deck delivers. An original-framing moment is
+ * finished when its canonical cut and its poster exist; a vertical one needs
+ * the 9:16 derivative as well. Asked explicitly, never defaulted: reading an
+ * original moment against the vertical rule hides every one of them.
  */
-export function isCreatorVisible(candidate: VerticalCandidate): boolean {
+export function isCreatorVisible(candidate: VerticalCandidate, presentation: DeckPresentation): boolean {
+  if (!candidate.posterStorageKey) return false;
+  if (presentation === 'original') return Boolean(candidate.canonicalStorageKey);
   if (candidate.derivativeStatus !== 'ready') return false;
   if (!candidate.derivativeStorageKey) return false;
-  if (!candidate.posterStorageKey) return false;
   return true;
 }
 
@@ -81,13 +99,14 @@ export function isCreatorVisible(candidate: VerticalCandidate): boolean {
 export function selectCreatorVisible(
   candidates: VerticalCandidate[],
   requested: number,
+  presentation: DeckPresentation = 'vertical',
 ): { visible: VerticalCandidate[]; withheld: VerticalCandidate[] } {
   const ranked = [...candidates].sort((a, b) => b.confidence - a.confidence);
   const visible: VerticalCandidate[] = [];
   const withheld: VerticalCandidate[] = [];
 
   for (const candidate of ranked) {
-    if (isCreatorVisible(candidate) && visible.length < Math.max(0, requested)) {
+    if (isCreatorVisible(candidate, presentation) && visible.length < Math.max(0, requested)) {
       visible.push(candidate);
     } else {
       // Everything else, including ready candidates beyond the requested
@@ -108,8 +127,11 @@ export function selectCreatorVisible(
  * fail to finish them?" — and it is the reason the withheld list is returned
  * above rather than dropped.
  */
-export function suppressedByPipeline(withheld: VerticalCandidate[]): VerticalCandidate[] {
-  return withheld.filter((candidate) => !isCreatorVisible(candidate));
+export function suppressedByPipeline(
+  withheld: VerticalCandidate[],
+  presentation: DeckPresentation = 'vertical',
+): VerticalCandidate[] {
+  return withheld.filter((candidate) => !isCreatorVisible(candidate, presentation));
 }
 
 /**
