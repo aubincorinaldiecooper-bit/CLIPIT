@@ -1,4 +1,5 @@
 import { queryOne, queryRows } from '../pool.js';
+import { mergeOverlappingRanges } from '../../services/timestamps.js';
 import type { VideoScene } from '../../domain/types.js';
 
 interface SceneRow {
@@ -53,21 +54,34 @@ export async function clearScenes(videoId: string): Promise<void> {
 }
 
 /**
- * How far into the video the notes actually reach.
+ * How much of the video the notes describe: the seconds their scenes cover,
+ * overlaps merged. Real, measured, and it moves — a screen can say "read 8
+ * of 20 minutes" from this without anybody inventing a percentage.
  *
- * Real, measured, and it moves — it is the furthest second any note describes.
- * A screen can say "read 8 of 20 minutes" from this without anybody inventing
- * a percentage.
+ * NOT the furthest second any note reaches, which this once was. Parts are
+ * read several at a time and finish out of order, so the furthest reached
+ * said the whole video was read while a middle stretch was not: on
+ * 2026-09-02 a 685-second video read "through 685 s" with 361–601 s still
+ * unread, and the answer said "I'm only 11 minutes in" of an 11-minute
+ * video. Overlaps merged with a second's tolerance, as the coverage gaps
+ * are.
  */
-export async function sceneProgress(videoId: string): Promise<{ count: number; readThroughSeconds: number }> {
-  const row = await queryOne<{ count: number; read_through: number | null }>(
-    'SELECT COUNT(*)::int AS count, MAX(end_seconds) AS read_through FROM video_scenes WHERE video_id = $1',
+export async function coveredSeconds(videoId: string): Promise<number> {
+  const rows = await queryRows<{ start_seconds: number; end_seconds: number }>(
+    'SELECT start_seconds, end_seconds FROM video_scenes WHERE video_id = $1',
     [videoId],
   );
-  return {
-    count: row?.count ?? 0,
-    readThroughSeconds: row?.read_through === null || row?.read_through === undefined ? 0 : Number(row.read_through),
-  };
+  const merged = mergeOverlappingRanges(
+    rows.map((row) => ({ startSeconds: Number(row.start_seconds), endSeconds: Number(row.end_seconds) })),
+    1,
+  );
+  return Number(merged.reduce((sum, range) => sum + Math.max(0, range.endSeconds - range.startSeconds), 0).toFixed(3));
+}
+
+/** The notes so far: how many, and how much of the video they describe (see coveredSeconds). */
+export async function sceneProgress(videoId: string): Promise<{ count: number; readThroughSeconds: number }> {
+  const row = await queryOne<{ count: number }>('SELECT COUNT(*)::int AS count FROM video_scenes WHERE video_id = $1', [videoId]);
+  return { count: row?.count ?? 0, readThroughSeconds: await coveredSeconds(videoId) };
 }
 
 async function insertScenes(videoId: string, scenes: NewVideoScene[], sceneIndexOffset: number): Promise<number> {
