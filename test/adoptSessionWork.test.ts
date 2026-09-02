@@ -57,7 +57,7 @@ describe('adoptSessionWork', () => {
     await adoptSessionWork({ sessionId: 's1', userId: 'u1', workspaceId: 'w1' });
 
     for (const call of queryRows.mock.calls) {
-      expect(String(call[0])).toMatch(/footage_expired_at IS NULL/);
+      expect(String(call[0])).toMatch(/footage_expired_at IS NULL AND (v\.)?footage_claimed_at IS NULL/);
     }
   });
 
