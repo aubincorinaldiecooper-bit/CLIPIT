@@ -424,11 +424,20 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     if (!video) throw HttpError.notFound('Video not found');
     assertOwnership(request, video, 'Video');
 
-    const result = await expireVideoFootage(videoId, logger.child({ route: 'delete-video', videoId }));
+    // Theirs, as just asserted — signed in or not — so the sweep's guest-only
+    // rule does not apply to a removal they asked for.
+    const result = await expireVideoFootage(videoId, logger.child({ route: 'delete-video', videoId }), {
+      onlyIfUnowned: false,
+    });
 
-    return reply.send({
+    // "Removed" only when it is. A second request while the first is still
+    // removing is told it is pending — the first may yet fail and give its
+    // claim back — and a video already gone is reported as gone (Devin, #88).
+    const pending = result.outcome === 'in-progress';
+    return reply.code(pending ? 202 : 200).send({
       videoId,
-      removed: true,
+      removed: result.outcome === 'removed' || result.outcome === 'already-removed',
+      pending,
       objectsDeleted: result.objectsDeleted,
       // Named rather than hidden: a file we could not delete is one the person
       // was told was gone.

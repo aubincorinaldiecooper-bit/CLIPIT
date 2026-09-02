@@ -43,6 +43,15 @@ const exchangeSchema = z.object({
   handoff: z.string().trim().min(1).max(512).optional(),
 });
 
+const handoffSchema = z.object({
+  /**
+   * The address the sign-in link is about to go to — the one sign-in this
+   * claim will answer. A link forwarded to anybody else signs them in as
+   * themselves and carries nothing.
+   */
+  email: z.string().trim().email().max(320),
+});
+
 /**
  * Issues the anonymous session token the rest of the API expects. This is the
  * only unauthenticated /api route.
@@ -143,8 +152,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
    * BEFORE sending the link and puts it in the link's return address; the
    * exchange above redeems it, once, wherever the link lands.
    *
-   * A signed-in session has nothing to hand over — its work already belongs
-   * to the person — and is told so with a null, not an error.
+   * The claim is bound to the address the link goes to: only that sign-in
+   * can spend it. A signed-in session has nothing to hand over — its work
+   * already belongs to the person — and is told so with a null, not an
+   * error.
    */
   app.post('/api/sessions/handoff', { preHandler: requireSession }, async (request, reply) => {
     await enforceRateLimits(request, [
@@ -157,7 +168,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     if (principal.userId) {
       return reply.code(200).send({ handoff: null });
     }
-    const { token, expiresAt } = await createHandoff(principal.sessionId);
+    // Only a guest's request has a body to judge: the address is for the
+    // claim, and a signed-in caller has none to make.
+    const body = parse(handoffSchema, request.body ?? {});
+    const { token, expiresAt } = await createHandoff(principal.sessionId, body.email);
     return reply.code(201).send({ handoff: token, expiresAt: expiresAt.toISOString() });
   });
 

@@ -7,7 +7,13 @@ import { clearClipKeysForVideo, listClipKeysForVideo } from '../db/repositories/
 import { clearVariantsForVideo, listVariantKeysForVideo } from '../db/repositories/clipVariants.js';
 import { deleteScenes } from '../db/repositories/scenes.js';
 import { deleteTranscript } from '../db/repositories/transcripts.js';
-import { getVideo, listChunks, markFootageExpired } from '../db/repositories/videos.js';
+import {
+  claimFootageForExpiry,
+  getVideo,
+  listChunks,
+  markFootageExpired,
+  releaseFootageClaim,
+} from '../db/repositories/videos.js';
 import { getStorage } from './storage/s3.js';
 
 /**
@@ -27,14 +33,74 @@ import { getStorage } from './storage/s3.js';
  * checked against anything anyway.
  */
 
+/**
+ * What a removal request found. A null claim is three different things, and
+ * a caller that reports "removed" for all of them lies in two of them
+ * (Devin, #88): a removal that is still running elsewhere may yet fail and
+ * give its claim back.
+ */
+export type ExpiryOutcome =
+  /** Claimed here and carried through. */
+  | 'removed'
+  /** Finished before this request came. */
+  | 'already-removed'
+  /** Another removal holds the claim right now. */
+  | 'in-progress'
+  /** Nothing to claim: not a guest's under the sweep's rule, or no such video. */
+  | 'refused';
+
 export interface ExpiryResult {
+  outcome: ExpiryOutcome;
   objectsDeleted: number;
   objectsFailed: number;
 }
 
-export async function expireVideoFootage(videoId: string, log: Logger): Promise<ExpiryResult> {
+export interface ExpiryOptions {
+  /**
+   * The sweep's rule: remove only while the video is still a guest's. It
+   * selected the video a moment ago, and a sign-in since then makes it
+   * somebody's (Devin, #88). An owner removing their own video passes false:
+   * the route has already checked it is theirs.
+   */
+  onlyIfUnowned: boolean;
+}
+
+export async function expireVideoFootage(videoId: string, log: Logger, options: ExpiryOptions): Promise<ExpiryResult> {
+  // Claim first, in one statement that also applies the rule above. Nothing
+  // is deleted without this claim.
+  const claimedAt = await claimFootageForExpiry(videoId, { onlyIfUnowned: options.onlyIfUnowned });
+  if (!claimedAt) {
+    const video = await getVideo(videoId);
+    const outcome: ExpiryOutcome = !video
+      ? 'refused'
+      : video.footageExpiredAt
+        ? 'already-removed'
+        : video.footageClaimedAt
+          ? 'in-progress'
+          : 'refused';
+    log.info('footage not removed by this request', { videoId, outcome });
+    return { outcome, objectsDeleted: 0, objectsFailed: 0 };
+  }
+  try {
+    return { outcome: 'removed', ...(await removeClaimedFootage(videoId, log)) };
+  } catch (error) {
+    // The claim goes back — this exact claim, no other — or this video would
+    // be hidden from every later sweep with its objects still stored. The
+    // deletes are safe to repeat.
+    await releaseFootageClaim(videoId, claimedAt).catch((releaseError: unknown) => {
+      log.warn('could not release the footage claim after a failed removal', { videoId, err: releaseError });
+    });
+    throw error;
+  }
+}
+
+/** The removal itself, once the video is claimed. Throws to have the claim released. */
+async function removeClaimedFootage(
+  videoId: string,
+  log: Logger,
+): Promise<{ objectsDeleted: number; objectsFailed: number }> {
   const video = await getVideo(videoId);
-  if (!video || video.footageExpiredAt) return { objectsDeleted: 0, objectsFailed: 0 };
+  if (!video) return { objectsDeleted: 0, objectsFailed: 0 };
 
   const chunks = await listChunks(videoId);
   const [clipKeys, thumbnailKeys, variantKeys] = await Promise.all([
