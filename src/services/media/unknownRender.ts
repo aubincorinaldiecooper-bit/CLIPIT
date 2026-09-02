@@ -29,8 +29,9 @@ export const RENDER_FAILED_MESSAGE = 'The render could not be completed. Try aga
  *    row now: left alone either way. "Written since" is the row's version,
  *    a counter every render-state write bumps in place, having moved past
  *    the value the attempt's mark set (see clips.row_version). A record
- *    from before the counter (035, 036) is read against the time it was
- *    recorded, the best it has.
+ *    from before the counter is read against the mark by time 037 gave it,
+ *    or, with no mark at all (035, 036), the time it was recorded — the
+ *    best each has.
  * 4. Otherwise the write did not land, and the row has been waiting since:
  *    it is rolled back exactly as a failed render would have been:
  * a Re-clip back to its previous boundaries and status with the failure on
@@ -89,10 +90,11 @@ export async function settleUnknownRender(
   // write takes effect, so it rises in the order the writes land.
   const writtenSince = render.rowVersion !== null
     ? clip.rowVersion > render.rowVersion
-    : clip.updatedAt.getTime() > render.recordedAt.getTime();
+    : clip.updatedAt.getTime() > (render.rowUpdatedAt ?? render.recordedAt).getTime();
   if (writtenSince) {
     log.info('an unknown render\'s row was written after its attempt began; the render landed or something later owns the row', {
-      ...context, status: clip.status, rowVersion: clip.rowVersion, mark: render.rowVersion, updatedAt: clip.updatedAt, recordedAt: render.recordedAt,
+      ...context, status: clip.status, rowVersion: clip.rowVersion, mark: render.rowVersion,
+      updatedAt: clip.updatedAt, rowUpdatedAt: render.rowUpdatedAt, recordedAt: render.recordedAt,
     });
     return 'moved_on';
   }

@@ -33,12 +33,13 @@ const MARK = 7;
 const WAITING = { rowVersion: MARK };
 /** A row written since the mark — by the render's own commit, or by something later that owns it now. */
 const SINCE = { rowVersion: MARK + 1 };
-/** For records from before the counter (035, 036): when the render was written down, and rows before and after that. */
+/** For records from before the counter: the mark by time 037 gave them, when the render was written down, and rows before and after that. */
+const MARKED_AT = new Date('2026-09-02T16:58:00Z');
 const RECORDED_AT = new Date('2026-09-02T17:00:00Z');
 const BEFORE = new Date('2026-09-02T16:59:00Z');
 const AFTER = new Date('2026-09-02T17:30:00Z');
-const render = (job: object, storageKey = NEW_KEY, previousStorageKey: string | null = OLD_KEY, rowVersion: number | null = MARK) =>
-  ({ id: 'ur-1', clipId: 'clip-1', storageKey, previousStorageKey, job, recordedAt: RECORDED_AT, rowVersion } as never);
+const render = (job: object, storageKey = NEW_KEY, previousStorageKey: string | null = OLD_KEY, rowVersion: number | null = MARK, rowUpdatedAt: Date | null = null) =>
+  ({ id: 'ur-1', clipId: 'clip-1', storageKey, previousStorageKey, job, recordedAt: RECORDED_AT, rowUpdatedAt, rowVersion } as never);
 
 beforeEach(() => {
   for (const mock of [...Object.values(clips), markReclipFailed, enqueueObjectRelease]) mock.mockReset();
@@ -172,7 +173,18 @@ describe('settleUnknownRender', () => {
     expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'ready', { errorMessage: RENDER_FAILED_MESSAGE }, undefined);
   });
 
-  it('reads a record from before the counter against the time it was recorded — the best it has', async () => {
+  it('reads a record from the 037 code — a mark by time, no counter — against that mark', async () => {
+    // Production ran the 037 code between #83 and this; its records carry
+    // the row's updated_at as the attempt set it, and no counter.
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, rowVersion: 3, updatedAt: MARKED_AT });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY, null, MARKED_AT), log)).resolves.toBe('rolled_back');
+    clips.setClipStatus.mockClear();
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'pending', storageKey: OLD_KEY, rowVersion: 3, updatedAt: BEFORE });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY, null, MARKED_AT), log)).resolves.toBe('moved_on');
+    expect(clips.setClipStatus).not.toHaveBeenCalled();
+  });
+
+  it('reads a record with no mark at all against the time it was recorded — the best it has', async () => {
     // Records the 035 and 036 code wrote carry no mark.
     clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, rowVersion: 3, updatedAt: BEFORE });
     await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY, null), log)).resolves.toBe('rolled_back');

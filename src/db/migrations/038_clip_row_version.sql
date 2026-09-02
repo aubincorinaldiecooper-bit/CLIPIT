@@ -13,7 +13,13 @@
 -- the writes land. The attempt's "generating" write returns the value it
 -- set; that is the mark on the record, and a row whose counter has moved
 -- past it has been written since — by the render's own commit, or by
--- something later that owns the row now. Records from before this column
--- carry no mark and are settled against their created_at as before.
+-- something later that owns the row now.
+--
+-- 037 gave the record a mark by time (row_updated_at) for the same
+-- purpose. Production applied it, so it stays exactly as it is — an
+-- applied migration is never edited — and its column stays on the table.
+-- A record that carries only that mark is read against it, and one that
+-- carries no mark at all (035, 036) against its created_at: the best each
+-- has.
 ALTER TABLE clips ADD COLUMN IF NOT EXISTS row_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE unknown_renders ADD COLUMN IF NOT EXISTS row_version INTEGER;

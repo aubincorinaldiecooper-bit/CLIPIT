@@ -16,19 +16,26 @@ export interface UnknownRender {
   /** The file the row named before this render, if any; the same key as `storageKey` for a retried first render. */
   previousStorageKey: string | null;
   job: ClipGenerationJob;
-  /** When the render was written down — after its re-reads and their retries. What a record with no `rowVersion` is read against. */
+  /** When the render was written down — after its re-reads and their retries. What a record with no other mark is read against. */
   recordedAt: Date;
+  /**
+   * The mark migration 037 gave the record: the clip row's updated_at as
+   * the attempt's "generating" write set it. Read only for a record with
+   * no `rowVersion` — one the 037 code wrote; a time cannot order two
+   * writes that began a hair apart (see 038). Never written by this code.
+   */
+  rowUpdatedAt: Date | null;
   /**
    * The clip row's version as the render's attempt set it when it marked
    * the row generating — its last write of its own before the one whose
    * outcome was lost. A row whose version has moved past this was written
    * since, by that write or by something later. Null on records from
-   * before migration 037.
+   * before migration 038.
    */
   rowVersion: number | null;
 }
 
-export async function recordUnknownRender(input: Omit<UnknownRender, 'id' | 'recordedAt'>): Promise<void> {
+export async function recordUnknownRender(input: Omit<UnknownRender, 'id' | 'recordedAt' | 'rowUpdatedAt'>): Promise<void> {
   await queryOne(
     `INSERT INTO unknown_renders (clip_id, storage_key, previous_storage_key, row_version, job)
      VALUES ($1, $2, $3, $4, $5::jsonb)
@@ -50,8 +57,8 @@ export async function drainUnknownRenders(
   settle: (render: UnknownRender, client: pg.PoolClient) => Promise<void>,
 ): Promise<number> {
   return withTransaction(async (client) => {
-    const { rows } = await client.query<{ id: string; clip_id: string; storage_key: string; previous_storage_key: string | null; row_version: number | null; job: ClipGenerationJob; created_at: Date }>(
-      `SELECT id, clip_id, storage_key, previous_storage_key, row_version, job, created_at
+    const { rows } = await client.query<{ id: string; clip_id: string; storage_key: string; previous_storage_key: string | null; row_updated_at: Date | null; row_version: number | null; job: ClipGenerationJob; created_at: Date }>(
+      `SELECT id, clip_id, storage_key, previous_storage_key, row_updated_at, row_version, job, created_at
          FROM unknown_renders
         ORDER BY created_at
         LIMIT $1
@@ -62,7 +69,7 @@ export async function drainUnknownRenders(
     for (const row of rows) {
       await settle({
         id: row.id, clipId: row.clip_id, storageKey: row.storage_key, previousStorageKey: row.previous_storage_key,
-        job: row.job, recordedAt: row.created_at, rowVersion: row.row_version,
+        job: row.job, recordedAt: row.created_at, rowUpdatedAt: row.row_updated_at, rowVersion: row.row_version,
       }, client);
       await client.query('DELETE FROM unknown_renders WHERE id = $1', [row.id]);
       settled += 1;

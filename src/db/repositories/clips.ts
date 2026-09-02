@@ -87,7 +87,7 @@ function mapClip(row: ClipRow): Clip {
     retentionClass: row.retention_class ?? 'owned',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    // A reader ahead of migration 037 sees no counter; zero, not undefined.
+    // A reader ahead of migration 038 sees no counter; zero, not undefined.
     rowVersion: row.row_version ?? 0,
   };
 }
