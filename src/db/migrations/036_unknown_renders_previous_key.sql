@@ -5,7 +5,5 @@
 -- that file is NEW to the row. A first render retried at the plain key a
 -- failed earlier attempt already left on the row proves nothing by its key;
 -- there the row's status is the evidence. 035 shipped without this column,
--- so it arrives on its own — and rows written by the 035 code keep a NULL,
--- which settling reads as "provenance unknown": for those, and for a
--- genuine first render with no prior file, the status alone decides.
+-- so it arrives on its own.
 ALTER TABLE unknown_renders ADD COLUMN IF NOT EXISTS previous_storage_key TEXT;
