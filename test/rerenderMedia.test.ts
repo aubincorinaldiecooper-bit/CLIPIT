@@ -22,6 +22,7 @@ const getVideo = vi.fn();
 const storage = { downloadToFile: vi.fn(), uploadFile: vi.fn(), remove: vi.fn() };
 const media = { cutClip: vi.fn(), ffprobe: vi.fn() };
 const commitRender = vi.fn();
+const enqueueObjectRelease = vi.fn();
 const pipeline = { runOriginalPipeline: vi.fn(), runVerticalPipeline: vi.fn(), discardUploadedObjects: vi.fn() };
 const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 
@@ -38,6 +39,7 @@ vi.mock('../src/db/repositories/reclips.js', () => ({
 vi.mock('../src/db/repositories/clipVariants.js', () => ({ discardVariants }));
 vi.mock('../src/db/repositories/videos.js', () => ({ getVideo }));
 vi.mock('../src/db/repositories/verticalMedia.js', () => ({ commitRender }));
+vi.mock('../src/queues/index.js', () => ({ enqueueObjectRelease }));
 const txClient = { query: vi.fn() };
 vi.mock('../src/db/pool.js', () => ({ withTransaction: (fn: (client: unknown) => Promise<unknown>) => fn(txClient) }));
 vi.mock('../src/services/media/verticalPipeline.js', () => ({
@@ -121,10 +123,11 @@ const committed = () => commitRender.mock.calls[0]?.[1] as Record<string, unknow
 beforeEach(() => {
   for (const mock of [
     ...Object.values(clips), ...Object.values(reclips), ...Object.values(storage), ...Object.values(media),
-    ...Object.values(pipeline), ...Object.values(log), discardVariants, getVideo, commitRender,
+    ...Object.values(pipeline), ...Object.values(log), discardVariants, getVideo, commitRender, enqueueObjectRelease,
   ]) {
     mock.mockReset();
   }
+  enqueueObjectRelease.mockResolvedValue(undefined);
   clips.getClip.mockResolvedValue(original);
   clips.setClipStatus.mockResolvedValue(true);
   reclips.appendReclipVersion.mockResolvedValue({ version: 2 });
@@ -196,10 +199,12 @@ describe('a re-render of a moment cut on find, original framing', () => {
     });
     expect(committed()!.captions).toBeUndefined();
 
-    // Only after the row names the new: the old cut and poster go, and the Re-clip is finalized.
-    expect(storage.remove).toHaveBeenCalledWith(OLD_CANONICAL);
-    expect(storage.remove).toHaveBeenCalledWith(OLD_POSTER);
-    expect(orderOf(commitRender)).toBeLessThan(orderOf(storage.remove));
+    // Only after the row names the new: the old cut and poster are queued
+    // to go once no signed URL to them can still be live, and the Re-clip
+    // is finalized.
+    const released = enqueueObjectRelease.mock.calls[0]![0] as string[];
+    expect(released).toEqual(expect.arrayContaining([OLD_CANONICAL, OLD_POSTER]));
+    expect(orderOf(commitRender)).toBeLessThan(orderOf(enqueueObjectRelease));
     expect(orderOf(commitRender)).toBeLessThan(orderOf(reclips.appendReclipVersion));
     expect(reclips.clearReclipPending).toHaveBeenCalledWith('match-1', txClient);
     expect(pipeline.discardUploadedObjects).not.toHaveBeenCalled();
@@ -210,16 +215,18 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(canonicalUpload()![0]).toMatch(FRESH_CANONICAL);
     expect(pipeline.runOriginalPipeline).toHaveBeenCalledTimes(1);
     expect(committed()).toMatchObject({ captions: [], media: { kind: 'original' } });
-    expect(storage.remove).toHaveBeenCalledWith(OLD_CANONICAL);
+    expect(enqueueObjectRelease.mock.calls[0]![0]).toEqual(expect.arrayContaining([OLD_CANONICAL]));
   });
 
-  it('removes the files of the platform shapes it discarded, after the write, never before', async () => {
+  it('queues the files of the platform shapes it discarded for release, after the write, never before', async () => {
     discardVariants.mockResolvedValueOnce(['variants/video-1/clip-1-9x16.mp4'] as never);
 
     await handleClipGeneration(job({ reclip: reclipPayload }));
 
-    expect(storage.remove).toHaveBeenCalledWith('variants/video-1/clip-1-9x16.mp4');
-    expect(orderOf(commitRender)).toBeLessThan(orderOf(storage.remove));
+    expect(enqueueObjectRelease.mock.calls[0]![0]).toEqual(expect.arrayContaining(['variants/video-1/clip-1-9x16.mp4']));
+    expect(orderOf(commitRender)).toBeLessThan(orderOf(enqueueObjectRelease));
+    // Never removed on the spot: a publisher may still hold a signed URL to one.
+    expect(storage.remove).not.toHaveBeenCalled();
   });
 
   it('leaves the platform shapes\' files alone when the write fails', async () => {
@@ -228,7 +235,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
 
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('versions table locked');
 
-    expect(storage.remove).not.toHaveBeenCalled();
+    expect(enqueueObjectRelease).not.toHaveBeenCalled();
   });
 
   it('replaces nothing and rolls the Re-clip back when the new poster cannot be made', async () => {
@@ -257,7 +264,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(keys[1]).toMatch(/^posters\/video-1\/clip-1-[0-9a-f]{8}\.jpg$/);
     expect(context).toMatchObject({ clipId: 'clip-1', reason: 'render_commit_failed' });
     expect(commitRender).not.toHaveBeenCalled();
-    expect(storage.remove).not.toHaveBeenCalled();
+    expect(enqueueObjectRelease).not.toHaveBeenCalled();
     expect(reclips.appendReclipVersion).not.toHaveBeenCalled();
   });
 
@@ -269,7 +276,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
     const [keys] = pipeline.discardUploadedObjects.mock.calls[0]!;
     expect(keys).toHaveLength(2);
     // The previous cut and poster are still what the row names, so they stay.
-    expect(storage.remove).not.toHaveBeenCalled();
+    expect(enqueueObjectRelease).not.toHaveBeenCalled();
     // A failed render like any other: rolled back, no version, the failure on record.
     expect(clips.restoreClipBoundaries).toHaveBeenCalled();
     expect(reclips.markReclipFailed).toHaveBeenCalled();
@@ -285,7 +292,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
 
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('versions table locked');
 
-    expect(storage.remove).not.toHaveBeenCalled();
+    expect(enqueueObjectRelease).not.toHaveBeenCalled();
     expect(pipeline.discardUploadedObjects).toHaveBeenCalledTimes(1);
     expect(clips.restoreClipBoundaries).toHaveBeenCalled();
     expect(reclips.markReclipFailed).toHaveBeenCalled();
@@ -304,7 +311,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).resolves.toBeUndefined();
 
     expect(pipeline.discardUploadedObjects).not.toHaveBeenCalled();
-    expect(storage.remove).toHaveBeenCalledWith(OLD_CANONICAL);
+    expect(enqueueObjectRelease.mock.calls[0]![0]).toEqual(expect.arrayContaining([OLD_CANONICAL]));
     expect(clips.restoreClipBoundaries).not.toHaveBeenCalled();
     expect(reclips.markReclipFailed).not.toHaveBeenCalled();
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('carrying on as committed'), expect.anything());
@@ -320,7 +327,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
     // An orphan is a bill we can find in the logs; a ready clip pointing at
     // deleted media is not recoverable. The keys are on record.
     expect(pipeline.discardUploadedObjects).not.toHaveBeenCalled();
-    expect(storage.remove).not.toHaveBeenCalled();
+    expect(enqueueObjectRelease).not.toHaveBeenCalled();
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('could not be read'), expect.objectContaining({ keys: expect.any(Array) }));
   });
 
@@ -330,7 +337,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('no longer exists');
 
     expect(pipeline.discardUploadedObjects).toHaveBeenCalledTimes(1);
-    expect(storage.remove).not.toHaveBeenCalled();
+    expect(enqueueObjectRelease).not.toHaveBeenCalled();
     expect(reclips.appendReclipVersion).not.toHaveBeenCalled();
   });
 });
@@ -365,9 +372,7 @@ describe('a re-render of a moment cut on find, vertical', () => {
         },
       },
     });
-    expect(storage.remove).toHaveBeenCalledWith(OLD_CANONICAL);
-    expect(storage.remove).toHaveBeenCalledWith(OLD_DERIVATIVE);
-    expect(storage.remove).toHaveBeenCalledWith(OLD_POSTER);
+    expect(enqueueObjectRelease.mock.calls[0]![0]).toEqual(expect.arrayContaining([OLD_CANONICAL, OLD_DERIVATIVE, OLD_POSTER]));
     expect(pipeline.runOriginalPipeline).not.toHaveBeenCalled();
   });
 
@@ -381,7 +386,7 @@ describe('a re-render of a moment cut on find, vertical', () => {
     const [keys] = pipeline.discardUploadedObjects.mock.calls[0]!;
     expect(keys).toHaveLength(3);
     expect(commitRender).not.toHaveBeenCalled();
-    expect(storage.remove).not.toHaveBeenCalled();
+    expect(enqueueObjectRelease).not.toHaveBeenCalled();
   });
 });
 
@@ -395,7 +400,7 @@ describe('a re-render of a moment cut on demand', () => {
     expect(pipeline.runVerticalPipeline).not.toHaveBeenCalled();
     expect(canonicalUpload()![0]).toMatch(FRESH_CANONICAL);
     expect(committed()).toMatchObject({ media: { kind: 'none' } });
-    expect(storage.remove).toHaveBeenCalledWith(OLD_CANONICAL);
+    expect(enqueueObjectRelease.mock.calls[0]![0]).toEqual([OLD_CANONICAL]);
   });
 });
 
@@ -407,7 +412,7 @@ describe('a first render', () => {
 
     expect(canonicalUpload()![0]).toBe(OLD_CANONICAL);
     expect(committed()).toMatchObject({ storageKey: OLD_CANONICAL, media: { kind: 'none' } });
-    expect(storage.remove).not.toHaveBeenCalled();
+    expect(enqueueObjectRelease).not.toHaveBeenCalled();
   });
 
   it('takes its own cut back out when the row write fails and the row never came to name it', async () => {

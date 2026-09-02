@@ -1,6 +1,6 @@
 import type { Logger } from '../../lib/logger.js';
-import { getStorage } from '../storage/s3.js';
 import { getClip } from '../../db/repositories/clips.js';
+import { enqueueObjectRelease } from '../../queues/index.js';
 import type { RenderedMedia } from '../../db/repositories/verticalMedia.js';
 import { discardUploadedObjects, runOriginalPipeline, runVerticalPipeline } from './verticalPipeline.js';
 import type { Clip } from '../../domain/types.js';
@@ -50,9 +50,12 @@ export function storedCompositionAnswer(clip: Pick<Clip, 'compositionMode' | 'fo
 }
 
 /**
- * Objects the row no longer names go, best-effort and never silently: an
- * object no row names is invisible to every sweep, so a failed removal is
- * logged with its key. Keys the row still names (the same key reused) stay.
+ * Objects the row no longer names are queued for removal — not removed here.
+ * A signed URL to any of them handed out before the row changed may still be
+ * in someone's hands (a publisher downloading a shaped copy), so they go only
+ * once that lifetime has passed; see enqueueObjectRelease. Keys the row still
+ * names (the same key reused) stay. Never silent: an object no row names is
+ * invisible to every sweep, so if even queuing fails the keys are logged.
  */
 export async function releaseObjects(
   oldKeys: Array<string | null | undefined>,
@@ -60,13 +63,12 @@ export async function releaseObjects(
   context: { videoId: string; clipId: string },
   log: Logger,
 ): Promise<void> {
-  for (const key of oldKeys) {
-    if (!key || keep.includes(key)) continue;
-    try {
-      await getStorage().remove(key);
-    } catch (error) {
-      log.error('a previous render\'s object could not be removed; it is orphaned', { ...context, key, err: error });
-    }
+  const keys = oldKeys.filter((key): key is string => typeof key === 'string' && key.length > 0 && !keep.includes(key));
+  if (keys.length === 0) return;
+  try {
+    await enqueueObjectRelease(keys, { ...context, reason: 'superseded_by_rerender' });
+  } catch (error) {
+    log.error('a previous render\'s objects could not be queued for removal; they are orphaned', { ...context, keys, err: error });
   }
 }
 

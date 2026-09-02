@@ -8,6 +8,34 @@ import { expireVideoFootage } from '../../services/retention.js';
 import type { RetentionJob } from '../../queues/index.js';
 
 /**
+ * Objects a render's row stopped naming, removed now that no signed URL to
+ * them can still be live (see enqueueObjectRelease for why the wait). One key
+ * that will not go must not keep the others; it is named at error level and
+ * the job fails so the queue tries again — and if it never goes, the log is
+ * the map to the orphan.
+ */
+async function releaseObjectsNow(
+  keys: string[],
+  context: { videoId: string; clipId: string; reason: string },
+  log: Logger,
+): Promise<void> {
+  const storage = getStorage();
+  const failed: string[] = [];
+  for (const key of keys) {
+    try {
+      await storage.remove(key);
+    } catch (error) {
+      failed.push(key);
+      log.error('a released object could not be removed; it is orphaned unless a retry succeeds', { ...context, key, err: error });
+    }
+  }
+  log.info('released objects removed', { ...context, removed: keys.length - failed.length, failed: failed.length });
+  if (failed.length > 0) {
+    throw new Error(`${failed.length} of ${keys.length} released objects could not be removed`);
+  }
+}
+
+/**
  * Removes footage nobody can reach any more.
  *
  * A guest session lives in the browser tab, so a closed browser means that
@@ -19,6 +47,11 @@ import type { RetentionJob } from '../../queues/index.js';
  * short reads as "everything is tidy" while the bill keeps growing.
  */
 export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
+  if (job.data.kind === 'release') {
+    await releaseObjectsNow(job.data.keys, job.data.context, logger.child({ job: 'release-objects', jobId: job.id }));
+    return;
+  }
+
   const log = logger.child({ job: 'retention', jobId: job.id });
   const limit = env.RETENTION_VIDEO_LIMIT;
 
