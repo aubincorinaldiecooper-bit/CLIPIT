@@ -26,13 +26,18 @@ const reclipJob = {
     previous: { startSeconds: 130, endSeconds: 150, boundariesEditedAt: null, status: 'ready' as const },
   },
 };
+/** When the attempt set the row generating — its last write of its own before the one whose outcome was lost. */
+const MARKED_AT = new Date('2026-09-02T16:58:00Z');
+/** When the render was written down: after the re-reads and their retries. */
 const RECORDED_AT = new Date('2026-09-02T17:00:00Z');
-/** A row written before the record — the shape of a row that has waited since the unknown attempt. */
-const BEFORE = new Date('2026-09-02T16:59:00Z');
+/** A row not written since the attempt marked it: it has waited for a write that never came. */
+const WAITING = MARKED_AT;
+/** A row written between the mark and the record — the window Devin found on #83. */
+const BETWEEN = new Date('2026-09-02T16:59:30Z');
 /** A row written after the record — something later touched it. */
 const AFTER = new Date('2026-09-02T17:30:00Z');
-const render = (job: object, storageKey = NEW_KEY, previousStorageKey: string | null = OLD_KEY) =>
-  ({ id: 'ur-1', clipId: 'clip-1', storageKey, previousStorageKey, job, recordedAt: RECORDED_AT } as never);
+const render = (job: object, storageKey = NEW_KEY, previousStorageKey: string | null = OLD_KEY, rowUpdatedAt: Date | null = MARKED_AT) =>
+  ({ id: 'ur-1', clipId: 'clip-1', storageKey, previousStorageKey, job, recordedAt: RECORDED_AT, rowUpdatedAt } as never);
 
 beforeEach(() => {
   for (const mock of [...Object.values(clips), markReclipFailed, enqueueObjectRelease]) mock.mockReset();
@@ -48,7 +53,7 @@ describe('settleUnknownRender', () => {
     // drain's transaction waits for the pool's one connection when there is
     // only one.
     const client = { query: vi.fn() } as never;
-    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: NEW_KEY, updatedAt: BEFORE });
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: NEW_KEY, updatedAt: WAITING });
     await expect(settleUnknownRender(render(reclipJob), log, client)).resolves.toBe('landed');
     expect(clips.getClip).toHaveBeenCalledWith('clip-1', client);
     expect(clips.restoreClipBoundaries).not.toHaveBeenCalled();
@@ -61,7 +66,7 @@ describe('settleUnknownRender', () => {
     // so a failure between them left the boundaries restored, the Re-clip
     // pending forever, and the next sweep reading the row as moved on.
     const client = { query: vi.fn() } as never;
-    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: BEFORE });
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: WAITING });
     await expect(settleUnknownRender(render(reclipJob), log, client)).resolves.toBe('rolled_back');
     expect(clips.restoreClipBoundaries).toHaveBeenCalledWith('clip-1', { startSeconds: 130, endSeconds: 150, boundariesEditedAt: null, status: 'ready' }, client);
     expect(markReclipFailed).toHaveBeenCalledWith('match-1', RECLIP_FAILED_MESSAGE, client);
@@ -70,25 +75,25 @@ describe('settleUnknownRender', () => {
   it('hands objects nothing else took on record to the queue before anything else, and stops if the queue refuses', async () => {
     // Devin's finding on #81: the last attempt's unreleased objects rode on
     // the record, and settling deleted the record without queuing them.
-    clips.getClip.mockResolvedValue({ id: 'clip-1', videoId: 'video-1', status: 'ready', storageKey: NEW_KEY, updatedAt: BEFORE });
+    clips.getClip.mockResolvedValue({ id: 'clip-1', videoId: 'video-1', status: 'ready', storageKey: NEW_KEY, updatedAt: WAITING });
     await expect(settleUnknownRender(render({ ...reclipJob, unresolvedKeys: [OLD_KEY, 'posters/video-1/clip-1.jpg'] }), log)).resolves.toBe('landed');
     expect(enqueueObjectRelease).toHaveBeenCalledWith([OLD_KEY, 'posters/video-1/clip-1.jpg'], { videoId: 'video-1', clipId: 'clip-1', reason: 'render_outcome_unknown' });
 
     enqueueObjectRelease.mockRejectedValueOnce(new Error('redis refused'));
-    clips.getClip.mockResolvedValue({ id: 'clip-1', videoId: 'video-1', status: 'generating', storageKey: OLD_KEY, updatedAt: BEFORE });
+    clips.getClip.mockResolvedValue({ id: 'clip-1', videoId: 'video-1', status: 'generating', storageKey: OLD_KEY, updatedAt: WAITING });
     await expect(settleUnknownRender(render({ ...reclipJob, unresolvedKeys: [OLD_KEY] }), log)).rejects.toThrow('redis refused');
     expect(clips.restoreClipBoundaries).not.toHaveBeenCalled();
     expect(markReclipFailed).not.toHaveBeenCalled();
   });
 
   it('hands a Replace that never landed its previous file back, with the failure to report', async () => {
-    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: BEFORE });
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: WAITING });
     await expect(settleUnknownRender(render({ clipId: 'clip-1', captions: [] }), log)).resolves.toBe('rolled_back');
     expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'ready', { errorMessage: RENDER_FAILED_MESSAGE }, undefined);
   });
 
   it('marks a first render that never landed as failed', async () => {
-    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: null, updatedAt: BEFORE });
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: null, updatedAt: WAITING });
     await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, null), log)).resolves.toBe('rolled_back');
     expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'failed', { errorMessage: RENDER_FAILED_MESSAGE }, undefined);
   });
@@ -96,12 +101,12 @@ describe('settleUnknownRender', () => {
   it('does not mistake a retried first render for landed because the row already named its plain key', async () => {
     // Devin's finding on #81: the key proves nothing when the row had it
     // before the attempt; the status is the evidence there.
-    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: BEFORE });
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: WAITING });
     await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY), log)).resolves.toBe('rolled_back');
     expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'ready', { errorMessage: RENDER_FAILED_MESSAGE }, undefined);
 
     clips.setClipStatus.mockClear();
-    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: OLD_KEY, updatedAt: BEFORE });
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: OLD_KEY, updatedAt: WAITING });
     await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY), log)).resolves.toBe('moved_on');
     expect(clips.setClipStatus).not.toHaveBeenCalled();
   });
@@ -110,13 +115,13 @@ describe('settleUnknownRender', () => {
     // Devin's finding on #82: a null previous key made an unchanged plain
     // key look new, and a retried first render that never landed would
     // have been read as landed.
-    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: BEFORE });
-    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, null), log)).resolves.toBe('rolled_back');
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: WAITING });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, null, null), log)).resolves.toBe('rolled_back');
     expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'ready', { errorMessage: RENDER_FAILED_MESSAGE }, undefined);
 
     clips.setClipStatus.mockClear();
-    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: NEW_KEY, updatedAt: BEFORE });
-    await expect(settleUnknownRender(render(reclipJob, NEW_KEY, null), log)).resolves.toBe('moved_on');
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: NEW_KEY, updatedAt: WAITING });
+    await expect(settleUnknownRender(render(reclipJob, NEW_KEY, null, null), log)).resolves.toBe('moved_on');
     expect(clips.setClipStatus).not.toHaveBeenCalled();
   });
 
@@ -132,9 +137,41 @@ describe('settleUnknownRender', () => {
     expect(clips.setClipStatus).not.toHaveBeenCalled();
   });
 
-  it('when the key proves nothing, a row written after the record belongs to something later and is left alone', async () => {
+  it('when the key proves nothing, a row written since the attempt began belongs to something later and is left alone', async () => {
     clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: AFTER });
     await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, null), log)).resolves.toBe('moved_on');
+    expect(clips.setClipStatus).not.toHaveBeenCalled();
+  });
+
+  it('leaves a row alone that something took between the attempt and the record: a first render that landed and took a Replace before it was written down', async () => {
+    // Devin's finding on #83: the record is written after the re-reads and
+    // their retries, so a Replace or Re-clip that a LANDED render's row took
+    // in between was older than the record and looked like a row that had
+    // waited; with a key that proves nothing (a first render at its plain
+    // key), the newer render was rolled back. The mark is now the row's
+    // updated_at as the attempt wrote it when it set the row generating.
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'pending', storageKey: OLD_KEY, updatedAt: BETWEEN });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, null), log)).resolves.toBe('moved_on');
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: BETWEEN });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY), log)).resolves.toBe('moved_on');
+    expect(clips.setClipStatus).not.toHaveBeenCalled();
+    expect(clips.restoreClipBoundaries).not.toHaveBeenCalled();
+    expect(markReclipFailed).not.toHaveBeenCalled();
+  });
+
+  it('rolls back only a row not written since the attempt marked it, whatever the record\'s own time says', async () => {
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: WAITING });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY), log)).resolves.toBe('rolled_back');
+    expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'ready', { errorMessage: RENDER_FAILED_MESSAGE }, undefined);
+  });
+
+  it('reads a record from before the mark against the time it was recorded — the best it has', async () => {
+    // Records the 035 and 036 code wrote carry no mark.
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: BETWEEN });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY, null), log)).resolves.toBe('rolled_back');
+    clips.setClipStatus.mockClear();
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY, updatedAt: AFTER });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY, null), log)).resolves.toBe('moved_on');
     expect(clips.setClipStatus).not.toHaveBeenCalled();
   });
 

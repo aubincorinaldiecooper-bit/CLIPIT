@@ -22,10 +22,13 @@ export const RENDER_FAILED_MESSAGE = 'The render could not be completed. Try aga
  *    back would cancel the newer render.
  * 2. A row no longer 'generating' or 'pending' has been settled by a
  *    render or moved on by something later: left alone.
- * 3. A row written AFTER this render was recorded belongs to something
- *    later too (the key said nothing: a first render retried at the plain
- *    key, or a record from the 035 code, which wrote no previous key):
- *    left alone.
+ * 3. A row written since this render's attempt set it generating — its
+ *    last write of its own before the one whose outcome was lost — was
+ *    written by that write (landed, with a key that proves nothing: a
+ *    first render at its plain key) or by something later that owns the
+ *    row now: left alone either way. The record carries that mark; one
+ *    from before it did (035, 036) is read against the time it was
+ *    recorded, the best it has.
  * 4. Otherwise the write did not land, and the row has been waiting since:
  *    it is rolled back exactly as a failed render would have been:
  * a Re-clip back to its previous boundaries and status with the failure on
@@ -72,9 +75,16 @@ export async function settleUnknownRender(
     log.info('an unknown render\'s row is no longer generating; left as it is', { ...context, status: clip.status });
     return 'moved_on';
   }
-  if (clip.updatedAt.getTime() > render.recordedAt.getTime()) {
-    log.info('an unknown render\'s row was written after the render was recorded; something later owns it', {
-      ...context, status: clip.status, updatedAt: clip.updatedAt, recordedAt: render.recordedAt,
+  // The mark is the row's updated_at as the attempt wrote it when it set the
+  // row generating, not when the record was written: the record comes after
+  // the render's re-reads and their retries, and a Replace or Re-clip that a
+  // landed render's row took in between is older than the record — it
+  // looked like a row that had waited, and was rolled back over the newer
+  // render (Devin's finding on #83).
+  const since = render.rowUpdatedAt ?? render.recordedAt;
+  if (clip.updatedAt.getTime() > since.getTime()) {
+    log.info('an unknown render\'s row was written after its attempt began; the render landed or something later owns the row', {
+      ...context, status: clip.status, updatedAt: clip.updatedAt, since, marked: render.rowUpdatedAt !== null,
     });
     return 'moved_on';
   }

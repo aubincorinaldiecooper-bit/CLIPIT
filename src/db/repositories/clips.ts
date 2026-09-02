@@ -440,6 +440,21 @@ export async function setClipRenderPending(clipId: string): Promise<void> {
   );
 }
 
+/**
+ * Marks a clip generating at the start of a render's attempt, and returns
+ * the row's updated_at as written — the mark an unknown render is settled
+ * against (see settleUnknownRender): a row written after it was written by
+ * this render's commit or by something later, and one not written since
+ * has waited for a write that never came. Null when the clip is gone.
+ */
+export async function markClipGenerating(clipId: string): Promise<Date | null> {
+  const row = await queryOne<{ updated_at: Date }>(
+    `UPDATE clips SET status = 'generating', error_message = NULL, updated_at = now() WHERE id = $1 RETURNING updated_at`,
+    [clipId],
+  );
+  return row?.updated_at ?? null;
+}
+
 /** The root clip cut from a moment, if one exists. Copies stay out of it. */
 export async function getRootClipByMatchId(matchId: string): Promise<Clip | null> {
   const row = await queryOne<ClipRow>(

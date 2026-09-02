@@ -15,7 +15,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * reframed with the decision its first render stored.
  */
 
-const clips = { getClip: vi.fn(), setClipStatus: vi.fn(), restoreClipBoundaries: vi.fn() };
+const clips = { getClip: vi.fn(), markClipGenerating: vi.fn(), setClipStatus: vi.fn(), restoreClipBoundaries: vi.fn() };
+/** The row's updated_at as the attempt writes it when it sets the row generating. */
+const MARKED_AT = new Date('2026-09-02T16:58:00Z');
 const reclips = { appendReclipVersion: vi.fn(), clearReclipPending: vi.fn(), markReclipFailed: vi.fn() };
 const discardVariants = vi.fn();
 const getVideo = vi.fn();
@@ -28,6 +30,7 @@ const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 
 vi.mock('../src/db/repositories/clips.js', () => ({
   getClip: clips.getClip,
+  markClipGenerating: clips.markClipGenerating,
   setClipStatus: clips.setClipStatus,
   restoreClipBoundaries: clips.restoreClipBoundaries,
 }));
@@ -137,6 +140,7 @@ beforeEach(() => {
   recordUnknownRender.mockResolvedValue(undefined);
   clips.getClip.mockResolvedValue(original);
   clips.setClipStatus.mockResolvedValue(true);
+  clips.markClipGenerating.mockResolvedValue(MARKED_AT);
   reclips.appendReclipVersion.mockResolvedValue({ version: 2 });
   reclips.clearReclipPending.mockResolvedValue(undefined);
   discardVariants.mockResolvedValue(undefined);
@@ -394,6 +398,9 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(record.clipId).toBe('clip-1');
     expect(record.storageKey).toMatch(FRESH_CANONICAL);
     expect(record.previousStorageKey).toBe(OLD_CANONICAL);
+    // The mark the sweep settles against: the row's updated_at as this
+    // attempt wrote it when it set the row generating (Devin's finding on #83).
+    expect(record.rowUpdatedAt).toEqual(MARKED_AT);
     expect(record.job.reclip.matchId).toBe('match-1');
   });
 
