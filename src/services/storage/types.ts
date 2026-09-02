@@ -98,8 +98,15 @@ export function reclipWindowKey(videoId: string, matchId: string): string {
   return `videos/${videoId}/reclip/${matchId}.mp4`;
 }
 
-export function clipKey(videoId: string, clipId: string): string {
-  return `${StoragePrefix.clips}/${videoId}/${clipId}.mp4`;
+/**
+ * `render` names one re-render's file. A moment's first cut sits at the plain
+ * key; a re-render (a Re-clip, a caption Replace) writes a NEW file beside it,
+ * so the working clip is never overwritten before the row accepts the new
+ * one, and the old file goes only once the row names the new. See
+ * clipPosterKey for the same rule on the media made from the cut.
+ */
+export function clipKey(videoId: string, clipId: string, render?: string): string {
+  return `${StoragePrefix.clips}/${videoId}/${clipId}${render ? `-${render}` : ''}.mp4`;
 }
 
 /**

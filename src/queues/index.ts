@@ -105,9 +105,14 @@ export interface ClipVariantJob {
  * work it does is defined entirely by what the database is still missing.
  */
 /** Remove footage whose session has ended. Carries no payload. */
-export interface RetentionJob {
-  requestedAt: string;
-}
+export type RetentionJob =
+  /** The footage sweep. */
+  | { kind?: 'sweep'; requestedAt: string }
+  /**
+   * Objects a row no longer names, to be removed once no signed URL to them
+   * can still be live. See enqueueObjectRelease.
+   */
+  | { kind: 'release'; keys: string[]; context: { videoId: string; clipId: string; reason: string } };
 
 /** Summarise what the last day of use taught us. Carries no payload. */
 export interface LearningReportJob {
@@ -304,6 +309,32 @@ export async function enqueueThumbnailBackfill(requestedAt: string): Promise<voi
  * every few minutes by a restarting worker collapses into one per hour rather
  * than stacking, while still running again next hour.
  */
+/**
+ * Release objects a row no longer names — LATER, not now.
+ *
+ * A signed URL handed out before the row changed stays valid for
+ * SIGNED_URL_EXPIRY_SECONDS, and a publisher given one may still be
+ * downloading the file; deleting at the moment of commit would pull it from
+ * under them. So the deletion is queued to run after that lifetime, with a
+ * margin, on the retention queue — durable across a restart, retried on a
+ * storage error, and logged with its keys if it still fails.
+ */
+export async function enqueueObjectRelease(
+  keys: string[],
+  context: { videoId: string; clipId: string; reason: string },
+): Promise<void> {
+  if (keys.length === 0) return;
+  await getQueues().retention.add(
+    'release-objects',
+    { kind: 'release', keys, context },
+    {
+      delay: (env.SIGNED_URL_EXPIRY_SECONDS + 60) * 1000,
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 60_000 },
+    },
+  );
+}
+
 export async function enqueueRetentionSweep(requestedAt: string): Promise<void> {
   const hour = requestedAt.slice(0, 13);
   await addWithStableId(

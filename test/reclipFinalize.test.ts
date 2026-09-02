@@ -14,7 +14,8 @@ const clips = { getClip: vi.fn(), setClipStatus: vi.fn(), restoreClipBoundaries:
 const reclips = { appendReclipVersion: vi.fn(), clearReclipPending: vi.fn(), markReclipFailed: vi.fn() };
 const discardVariants = vi.fn();
 const getVideo = vi.fn();
-const storage = { downloadToFile: vi.fn(), uploadFile: vi.fn() };
+const storage = { downloadToFile: vi.fn(), uploadFile: vi.fn(), remove: vi.fn() };
+const commitRender = vi.fn(async () => true);
 const media = { cutClip: vi.fn(), ffprobe: vi.fn() };
 
 vi.mock('../src/db/repositories/clips.js', () => ({
@@ -28,6 +29,9 @@ vi.mock('../src/db/repositories/reclips.js', () => ({
   markReclipFailed: reclips.markReclipFailed,
 }));
 vi.mock('../src/db/repositories/clipVariants.js', () => ({ discardVariants }));
+vi.mock('../src/db/repositories/verticalMedia.js', () => ({ commitRender }));
+vi.mock('../src/db/pool.js', () => ({ withTransaction: (fn: (client: unknown) => Promise<unknown>) => fn({ query: vi.fn() }) }));
+vi.mock('../src/queues/index.js', () => ({ enqueueObjectRelease: vi.fn(async () => undefined) }));
 vi.mock('../src/db/repositories/videos.js', () => ({ getVideo }));
 vi.mock('../src/services/storage/s3.js', () => ({ getStorage: () => storage }));
 vi.mock('../src/services/media/ffmpeg.js', () => ({
@@ -106,7 +110,8 @@ describe('a Re-clip render succeeding', () => {
   it('finalizes the version, clears pending, and discards stale variants — in that render, not before', async () => {
     await handleClipGeneration(job());
 
-    expect(discardVariants).toHaveBeenCalledWith('clip-1');
+    // Inside the render's transaction: the client rides along.
+    expect(discardVariants).toHaveBeenCalledWith('clip-1', expect.anything());
     expect(reclips.appendReclipVersion).toHaveBeenCalledWith({
       matchId: 'match-1',
       startSeconds: 128,
@@ -114,8 +119,8 @@ describe('a Re-clip render succeeding', () => {
       provider: 'modal',
       model: 'openbmb/MiniCPM-V-4.6',
       promptVersion: 'reclip-v1',
-    });
-    expect(reclips.clearReclipPending).toHaveBeenCalledWith('match-1');
+    }, expect.anything());
+    expect(reclips.clearReclipPending).toHaveBeenCalledWith('match-1', expect.anything());
     expect(clips.restoreClipBoundaries).not.toHaveBeenCalled();
   });
 });

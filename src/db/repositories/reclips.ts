@@ -1,3 +1,4 @@
+import type pg from 'pg';
 import { queryOne, queryRows } from '../pool.js';
 import type { ClipMatch, MomentVersion } from '../../domain/types.js';
 
@@ -59,15 +60,18 @@ export async function appendReclipVersion(input: {
   provider: string | null;
   model: string | null;
   promptVersion: string | null;
-}): Promise<MomentVersion> {
-  const row = await queryOne<MomentVersionRow>(
-    `INSERT INTO moment_versions
+}, client?: pg.PoolClient): Promise<MomentVersion> {
+  const sql = `INSERT INTO moment_versions
         (match_id, version, trigger, start_seconds, end_seconds, provider, model, prompt_version)
      SELECT $1, COALESCE(MAX(version), 0) + 1, 'reclip', $2, $3, $4, $5, $6
        FROM moment_versions WHERE match_id = $1
-     RETURNING *`,
-    [input.matchId, input.startSeconds, input.endSeconds, input.provider, input.model, input.promptVersion],
-  );
+     RETURNING *`;
+  const params = [input.matchId, input.startSeconds, input.endSeconds, input.provider, input.model, input.promptVersion];
+  // Inside the render's transaction when the caller has one, so the version
+  // lands with the file that carries it or not at all.
+  const row = client
+    ? ((await client.query<MomentVersionRow>(sql, params)).rows[0] ?? null)
+    : await queryOne<MomentVersionRow>(sql, params);
   if (!row) throw new Error('appendReclipVersion inserted no row');
   return mapVersion(row);
 }
@@ -126,8 +130,10 @@ export async function claimReclip(matchId: string, maxAttempts: number): Promise
 }
 
 /** Success clears the lifecycle — the new version row is the record. */
-export async function clearReclipPending(matchId: string): Promise<void> {
-  await queryOne(`UPDATE clip_matches SET reclip_status = NULL, reclip_error = NULL WHERE id = $1`, [matchId]);
+export async function clearReclipPending(matchId: string, client?: pg.PoolClient): Promise<void> {
+  const sql = `UPDATE clip_matches SET reclip_status = NULL, reclip_error = NULL WHERE id = $1`;
+  if (client) await client.query(sql, [matchId]);
+  else await queryOne(sql, [matchId]);
 }
 
 /**

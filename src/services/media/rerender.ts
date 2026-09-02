@@ -1,8 +1,7 @@
-import { randomUUID } from 'node:crypto';
 import type { Logger } from '../../lib/logger.js';
-import { getStorage } from '../storage/s3.js';
 import { getClip } from '../../db/repositories/clips.js';
-import { setPosterFromCut, setVerticalMedia } from '../../db/repositories/verticalMedia.js';
+import { enqueueObjectRelease } from '../../queues/index.js';
+import type { RenderedMedia } from '../../db/repositories/verticalMedia.js';
 import { discardUploadedObjects, runOriginalPipeline, runVerticalPipeline } from './verticalPipeline.js';
 import type { Clip } from '../../domain/types.js';
 
@@ -15,19 +14,25 @@ import type { Clip } from '../../domain/types.js';
  * the card shows, and the viewer plays, a moment its file no longer contains.
  *
  * Ordering is the whole point. The new media is made and stored FIRST, at
- * fresh keys beside the old, and only once the new cut is stored and its row
- * written does the row take the new keys and the old objects go. A failure
- * anywhere before that leaves the previous cut and its previous media
- * exactly as they were, and the render's own rollback applies.
+ * fresh keys beside the old, before the cut itself is stored — also at a
+ * fresh key — and the row takes every new key in ONE write (commitRender).
+ * A failure anywhere before that write leaves the previous cut and its
+ * previous media exactly as they were, the fresh objects are taken back out,
+ * and the render's own rollback applies. The old objects go only once the
+ * row names the new ones.
  *
  * Nothing here asks the model anything: a vertical moment is reframed with
  * the decision its first render stored. The boundaries moved by seconds; the
  * subject did not.
  */
-export interface DeliveredMediaRefresh {
-  /** The new cut is stored and its row written: point the row at the new media, then let the old objects go. */
-  commit(): Promise<void>;
-  /** The new cut was not stored: take the new objects back out. */
+export interface DeliveredMedia {
+  /** What commitRender writes beside the new cut. */
+  media: RenderedMedia;
+  /** The objects this render made — the only ones a failure may remove. */
+  freshKeys: string[];
+  /** The objects the row named before — released once it names the new ones. */
+  oldKeys: string[];
+  /** The new cut was not committed: take this render's objects back out. */
   discard(reason: string): Promise<void>;
 }
 
@@ -44,6 +49,29 @@ export function storedCompositionAnswer(clip: Pick<Clip, 'compositionMode' | 'fo
   return JSON.stringify({ composition_mode: 'blurred_background', crop_safe: false });
 }
 
+/**
+ * Objects the row no longer names are queued for removal — not removed here.
+ * A signed URL to any of them handed out before the row changed may still be
+ * in someone's hands (a publisher downloading a shaped copy), so they go only
+ * once that lifetime has passed; see enqueueObjectRelease. Keys the row still
+ * names (the same key reused) stay. Never silent: an object no row names is
+ * invisible to every sweep, so if even queuing fails the keys are logged.
+ */
+export async function releaseObjects(
+  oldKeys: Array<string | null | undefined>,
+  keep: string[],
+  context: { videoId: string; clipId: string },
+  log: Logger,
+): Promise<void> {
+  const keys = oldKeys.filter((key): key is string => typeof key === 'string' && key.length > 0 && !keep.includes(key));
+  if (keys.length === 0) return;
+  try {
+    await enqueueObjectRelease(keys, { ...context, reason: 'superseded_by_rerender' });
+  } catch (error) {
+    log.error('a previous render\'s objects could not be queued for removal; they are orphaned', { ...context, keys, err: error });
+  }
+}
+
 export async function renderDeliveredMedia(input: {
   clip: Clip;
   videoId: string;
@@ -52,28 +80,15 @@ export async function renderDeliveredMedia(input: {
   workDir: string;
   hasAudio: boolean;
   cut: { durationSeconds: number; width: number; height: number };
+  /** This render's name, shared with the cut's own key. Absent for a first render. */
+  render: string | undefined;
   log: Logger;
-}): Promise<DeliveredMediaRefresh | null> {
-  const { clip, videoId, log } = input;
+}): Promise<DeliveredMedia | null> {
+  const { clip, videoId, render } = input;
   // A moment cut on demand never had delivered media; there is nothing to remake.
   if (!clip.preRendered) return null;
 
-  const render = randomUUID().slice(0, 8);
   const context = { videoId, clipId: clip.id };
-
-  // Old objects go only after the row names the new ones. Best-effort, and
-  // never silent: an object the row no longer names is invisible to every
-  // sweep, so a failed removal is logged with its key.
-  const releaseOld = async (oldKeys: Array<string | null>, newKeys: string[]) => {
-    for (const key of oldKeys) {
-      if (!key || newKeys.includes(key)) continue;
-      try {
-        await getStorage().remove(key);
-      } catch (error) {
-        log.error('previous delivered media could not be removed; the object is orphaned', { key, err: error });
-      }
-    }
-  };
 
   // Rows older than the column all came from the vertical pipeline.
   if ((clip.presentation ?? 'vertical') === 'original') {
@@ -90,16 +105,18 @@ export async function renderDeliveredMedia(input: {
       currentPosterKey: async () => (await getClip(clip.id))?.posterStorageKey ?? null,
     });
     return {
-      commit: async () => {
-        await setPosterFromCut(clip.id, {
+      media: {
+        kind: 'original',
+        poster: {
           posterStorageKey: poster.posterStorageKey,
           posterTimestampSeconds: poster.posterTimestampSeconds,
           sourceWidth: poster.sourceWidth,
           sourceHeight: poster.sourceHeight,
           posterGenerationMs: poster.posterGenerationMs,
-        });
-        await releaseOld([clip.posterStorageKey], [poster.posterStorageKey]);
+        },
       },
+      freshKeys: [poster.posterStorageKey],
+      oldKeys: [clip.posterStorageKey].filter((key): key is string => typeof key === 'string'),
       discard: (reason) => discardUploadedObjects([poster.posterStorageKey], { ...context, reason }),
     };
   }
@@ -117,8 +134,9 @@ export async function renderDeliveredMedia(input: {
     currentDerivativeKey: async () => (await getClip(clip.id))?.derivativeStorageKey ?? null,
   });
   return {
-    commit: async () => {
-      await setVerticalMedia(clip.id, {
+    media: {
+      kind: 'vertical',
+      media: {
         compositionMode: media.compositionMode,
         focalX: media.focalX,
         focalY: media.focalY,
@@ -133,14 +151,12 @@ export async function renderDeliveredMedia(input: {
         compositionDecisionMs: media.compositionDecisionMs,
         derivativeGenerationMs: media.derivativeGenerationMs,
         posterGenerationMs: media.posterGenerationMs,
-        // Whatever it was: a kept moment stays kept, an offered one stays offered.
+        // Not written by commitRender; a re-render never changes ownership.
         retentionClass: clip.retentionClass,
-      });
-      await releaseOld(
-        [clip.derivativeStorageKey, clip.posterStorageKey],
-        [media.derivativeStorageKey, media.posterStorageKey],
-      );
+      },
     },
+    freshKeys: [media.derivativeStorageKey, media.posterStorageKey],
+    oldKeys: [clip.derivativeStorageKey, clip.posterStorageKey].filter((key): key is string => typeof key === 'string'),
     discard: (reason) =>
       discardUploadedObjects([media.derivativeStorageKey, media.posterStorageKey], { ...context, reason }),
   };

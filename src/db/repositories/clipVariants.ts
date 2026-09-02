@@ -1,3 +1,4 @@
+import type pg from 'pg';
 import { queryOne, queryRows } from '../pool.js';
 import type { ClipFormat } from '../../services/media/reframe.js';
 
@@ -151,8 +152,19 @@ export async function listVariantsForClip(clipId: string): Promise<ClipVariant[]
  * the OLD master is now a lie, and posting one would send footage the user
  * has already replaced.
  */
-export async function discardVariants(clipId: string): Promise<void> {
-  await queryOne('DELETE FROM clip_variants WHERE clip_id = $1', [clipId]);
+export async function discardVariants(clipId: string, client?: pg.PoolClient): Promise<string[]> {
+  // The rows go, and their objects' keys come back so the caller can remove
+  // the files once its own write has committed — a row deleted without its
+  // key read first takes the only map to the object with it.
+  const sql = 'DELETE FROM clip_variants WHERE clip_id = $1 RETURNING storage_key';
+  // Inside a render's transaction when the caller has one: the variants go
+  // with the master they were cut from, or not at all.
+  const rows = client
+    ? (await client.query<{ storage_key: string | null }>(sql, [clipId])).rows
+    : await queryRows<{ storage_key: string | null }>(sql, [clipId]);
+  return rows
+    .map((row) => row.storage_key)
+    .filter((key): key is string => typeof key === 'string' && key.length > 0);
 }
 
 /**
