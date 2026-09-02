@@ -71,6 +71,15 @@ export interface ClipGenerationJob {
       status: 'ready' | 'failed';
     };
   };
+  /**
+   * Objects an earlier attempt of THIS job left with unknown ownership —
+   * its write's reply was lost, the row could not be read, and the release
+   * that would have settled it could not be queued either. Written onto
+   * the job by that attempt; the next attempt queues their release before
+   * it does anything else, and refuses to go on until that is done. See
+   * RenderOutcomeUnknownError.
+   */
+  unresolvedKeys?: string[];
 }
 
 /**

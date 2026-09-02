@@ -77,12 +77,13 @@ const reclipPayload = {
   previous: { startSeconds: 130, endSeconds: 150, boundariesEditedAt: null, status: 'ready' as const },
 };
 
-function job(data: Record<string, unknown>) {
+function job(data: Record<string, unknown>, overrides: { attemptsMade?: number; attempts?: number } = {}) {
   return {
     data: { clipId: 'clip-1', ...data },
-    attemptsMade: 0,
-    opts: { attempts: 1 },
+    attemptsMade: overrides.attemptsMade ?? 0,
+    opts: { attempts: overrides.attempts ?? 1 },
     updateProgress: vi.fn().mockResolvedValue(undefined),
+    updateData: vi.fn().mockResolvedValue(undefined),
   } as never;
 }
 
@@ -382,6 +383,58 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(clips.setClipStatus).not.toHaveBeenCalledWith('clip-1', 'failed', expect.anything());
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('outcome is unknown'), expect.objectContaining({ keys: expect.any(Array) }));
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('nothing marked failed'), expect.objectContaining({ lastAttempt: true }));
+  });
+
+  it('records the keys on the job when the release cannot be queued either, so the retry can', async () => {
+    // Devin's finding on #81: the release was the only record of those
+    // objects, and a queue that refused was being swallowed.
+    reclips.clearReclipPending.mockRejectedValueOnce(new Error('database refused'));
+    clips.getClip.mockResolvedValueOnce(original).mockRejectedValue(new Error('database unreachable'));
+    enqueueObjectRelease.mockRejectedValueOnce(new Error('redis refused'));
+    const attempt = job({ reclip: reclipPayload });
+
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const outcome = expect(handleClipGeneration(attempt)).rejects.toThrow('database refused');
+      await vi.runAllTimersAsync();
+      await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const recorded = (attempt as { updateData: ReturnType<typeof vi.fn> }).updateData.mock.calls[0]![0] as { unresolvedKeys: string[] };
+    expect(recorded.unresolvedKeys).toEqual(expect.arrayContaining([OLD_CANONICAL, OLD_POSTER]));
+    expect(recorded.unresolvedKeys.some((key) => FRESH_CANONICAL.test(key))).toBe(true);
+    expect(storage.remove).not.toHaveBeenCalled();
+    expect(reclips.markReclipFailed).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('recorded on the job'), expect.objectContaining({ keys: expect.any(Array) }));
+  });
+
+  it('on a retry, queues an earlier attempt\'s unresolved objects for release before anything else, then clears the record', async () => {
+    const attempt = job({ reclip: reclipPayload, unresolvedKeys: ['clips/video-1/clip-1-deadbeef.mp4', OLD_CANONICAL] }, { attemptsMade: 1, attempts: 3 });
+    clips.getClip.mockResolvedValue({ ...original, status: 'generating' });
+
+    await expect(handleClipGeneration(attempt)).resolves.toBeUndefined();
+
+    const [keys, context] = enqueueObjectRelease.mock.calls[0]!;
+    expect(keys).toEqual(['clips/video-1/clip-1-deadbeef.mp4', OLD_CANONICAL]);
+    expect(context).toMatchObject({ clipId: 'clip-1', reason: 'render_outcome_unknown' });
+    expect(orderOf(enqueueObjectRelease)).toBeLessThan(orderOf(media.cutClip));
+    const cleared = (attempt as { updateData: ReturnType<typeof vi.fn> }).updateData.mock.calls[0]![0] as { unresolvedKeys?: string[] };
+    expect(cleared.unresolvedKeys).toBeUndefined();
+    // And the render itself went on as normal.
+    expect(commitRender).toHaveBeenCalledTimes(1);
+  });
+
+  it('on a retry, stops before cutting when those objects still cannot be queued', async () => {
+    const attempt = job({ reclip: reclipPayload, unresolvedKeys: [OLD_CANONICAL] }, { attemptsMade: 1, attempts: 3 });
+    clips.getClip.mockResolvedValue({ ...original, status: 'generating' });
+    enqueueObjectRelease.mockRejectedValueOnce(new Error('redis refused'));
+
+    await expect(handleClipGeneration(attempt)).rejects.toThrow('redis refused');
+
+    expect(media.cutClip).not.toHaveBeenCalled();
+    expect(commitRender).not.toHaveBeenCalled();
   });
 
   it('on a retry, sees that the earlier attempt landed and neither cuts again nor records the version twice', async () => {
