@@ -67,21 +67,32 @@ export async function clearScenes(videoId: string): Promise<void> {
  * are.
  */
 export async function coveredSeconds(videoId: string): Promise<number> {
+  return coverageOf(await sceneRanges(videoId));
+}
+
+/**
+ * The notes so far: how many, and how much of the video they describe (see
+ * coveredSeconds). Both from ONE read of the rows: while a read is still
+ * appending notes, two reads can see two moments — a count of none beside
+ * coverage of something — and the search branches on the count (Codex's
+ * finding on #86).
+ */
+export async function sceneProgress(videoId: string): Promise<{ count: number; readThroughSeconds: number }> {
+  const ranges = await sceneRanges(videoId);
+  return { count: ranges.length, readThroughSeconds: coverageOf(ranges) };
+}
+
+async function sceneRanges(videoId: string): Promise<Array<{ startSeconds: number; endSeconds: number }>> {
   const rows = await queryRows<{ start_seconds: number; end_seconds: number }>(
     'SELECT start_seconds, end_seconds FROM video_scenes WHERE video_id = $1',
     [videoId],
   );
-  const merged = mergeOverlappingRanges(
-    rows.map((row) => ({ startSeconds: Number(row.start_seconds), endSeconds: Number(row.end_seconds) })),
-    1,
-  );
-  return Number(merged.reduce((sum, range) => sum + Math.max(0, range.endSeconds - range.startSeconds), 0).toFixed(3));
+  return rows.map((row) => ({ startSeconds: Number(row.start_seconds), endSeconds: Number(row.end_seconds) }));
 }
 
-/** The notes so far: how many, and how much of the video they describe (see coveredSeconds). */
-export async function sceneProgress(videoId: string): Promise<{ count: number; readThroughSeconds: number }> {
-  const row = await queryOne<{ count: number }>('SELECT COUNT(*)::int AS count FROM video_scenes WHERE video_id = $1', [videoId]);
-  return { count: row?.count ?? 0, readThroughSeconds: await coveredSeconds(videoId) };
+function coverageOf(ranges: Array<{ startSeconds: number; endSeconds: number }>): number {
+  const merged = mergeOverlappingRanges(ranges, 1);
+  return Number(merged.reduce((sum, range) => sum + Math.max(0, range.endSeconds - range.startSeconds), 0).toFixed(3));
 }
 
 async function insertScenes(videoId: string, scenes: NewVideoScene[], sceneIndexOffset: number): Promise<number> {

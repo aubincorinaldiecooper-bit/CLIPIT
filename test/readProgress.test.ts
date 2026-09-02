@@ -46,9 +46,12 @@ describe('coveredSeconds', () => {
 });
 
 describe('sceneProgress', () => {
-  it('reports the count and the coverage, never the furthest second', async () => {
-    queryOne.mockResolvedValue({ count: 5 });
+  it('reports the count and the coverage from one read of the rows, never the furthest second', async () => {
+    // Codex's finding on #86: a count from one query and coverage from
+    // another could describe two moments of a read still appending notes.
     queryRows.mockResolvedValue([{ start_seconds: 0, end_seconds: 121 }, { start_seconds: 601, end_seconds: 685 }]);
-    await expect(sceneProgress('video-1')).resolves.toEqual({ count: 5, readThroughSeconds: 205 });
+    await expect(sceneProgress('video-1')).resolves.toEqual({ count: 2, readThroughSeconds: 205 });
+    expect(queryRows).toHaveBeenCalledTimes(1);
+    expect(queryOne).not.toHaveBeenCalled();
   });
 });
