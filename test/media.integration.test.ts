@@ -214,6 +214,71 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(probe.height).toBe(1440);
   }, 180_000);
 
+  it('evens out an odd source that is already inside the cap', async () => {
+    // Phone and screen recordings arrive at odd sizes. 4:4:4 lets the test
+    // encode one; the cut is 4:2:0, which cannot carry an odd side.
+    const odd = path.join(dir, 'odd-source.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=size=1279x719:rate=10:duration=2',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv444p', odd,
+    ], { timeoutMs: 120_000 });
+
+    const output = path.join(dir, 'odd-cut.mp4');
+    await cutClip({ inputPath: odd, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
+
+    const probe = await ffprobe(output);
+    expect(probe.height).toBe(718);
+    expect(probe.width! % 2).toBe(0);
+    expect(probe.width).toBeLessThanOrEqual(1279);
+  }, 180_000);
+
+  it('never adds a pixel when only the longer side is odd', async () => {
+    // ffmpeg's -2 rounds to the NEAREST even: 1279 would become 1280. Both
+    // sides are computed and rounded down instead, so the cut is never wider
+    // or taller than what it was cut from.
+    for (const [size, expected] of [
+      ['1279x720', [1278, 720]],
+      ['720x1279', [720, 1278]],
+    ] as const) {
+      const src = path.join(dir, `odd-long-${size}.mp4`);
+      await run('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', `testsrc=size=${size}:rate=10:duration=2`,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv444p', src,
+      ], { timeoutMs: 120_000 });
+      const output = path.join(dir, `odd-long-${size}-cut.mp4`);
+      await cutClip({ inputPath: src, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
+      const probe = await ffprobe(output);
+      expect([probe.width, probe.height]).toEqual([...expected]);
+    }
+  }, 240_000);
+
+  it('still produces an encodable file from a one-pixel-wide or one-pixel-tall source', async () => {
+    // Degenerate, and the only case anything is ever made larger: a side of
+    // one pixel rounds to zero, which ffmpeg reads as "keep the input", and
+    // the encoder refuses an odd side. Two pixels, aspect kept, beats three
+    // failed attempts and no clip.
+    // lavfi will not draw a one-pixel frame, and a subsampled format cannot
+    // hold one, so it is cut out of a normal frame as RGB and kept lossless
+    // — the point is the size, not the pixels.
+    for (const [canvas, crop, expected] of [
+      ['16x720', 'crop=1:720:0:0', [2, 1440]],
+      ['720x16', 'crop=720:1:0:0', [1440, 2]],
+    ] as const) {
+      const src = path.join(dir, `degenerate-${crop.replace(/[^0-9]+/g, '-')}.mkv`);
+      await run('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', `color=c=red:size=${canvas}:d=2:r=10`,
+        '-vf', `format=rgb24,${crop}`, '-c:v', 'ffv1', src,
+      ], { timeoutMs: 120_000 });
+      const output = src.replace(/\.mkv$/, '-cut.mp4');
+      await cutClip({ inputPath: src, outputPath: output, startSeconds: 0, endSeconds: 1, hasAudio: false });
+      const probe = await ffprobe(output);
+      expect([probe.width, probe.height]).toEqual([...expected]);
+    }
+  }, 240_000);
+
   it('never upscales a source already inside the cap', async () => {
     // The shared 320x240 source: the cut must come out exactly 320x240.
     const output = path.join(dir, 'untouched.mp4');
