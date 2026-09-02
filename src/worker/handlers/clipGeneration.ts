@@ -17,6 +17,7 @@ import { commitRender } from '../../db/repositories/verticalMedia.js';
 import { discardUploadedObjects } from '../../services/media/verticalPipeline.js';
 import { releaseObjects, renderDeliveredMedia } from '../../services/media/rerender.js';
 import { discardVariants } from '../../db/repositories/clipVariants.js';
+import { recordObjectRelease } from '../../db/repositories/objectReleases.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import { enqueueObjectRelease, type ClipGenerationJob } from '../../queues/index.js';
 import type { Clip } from '../../domain/types.js';
@@ -123,6 +124,25 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
   const log = logger.child({ job: 'clip-generation', clipId });
 
   const clip = await getClip(clipId);
+
+  // An earlier attempt left objects of unknown ownership and could not queue
+  // their release (see RenderOutcomeUnknownError). That comes before every
+  // shortcut below — a clip already generated, a clip that is gone — because
+  // those are exactly the cases where the earlier attempt's write landed and
+  // this one would otherwise return without a word. A queue that refuses
+  // again ends this attempt here: the job retries later rather than
+  // finishing with those objects on record nowhere.
+  if (job.data.unresolvedKeys?.length) {
+    const keys = job.data.unresolvedKeys;
+    await enqueueObjectRelease(keys, { videoId: clip?.videoId ?? '', clipId, reason: 'render_outcome_unknown' });
+    log.warn('an earlier attempt\'s objects of unknown ownership are now queued for release', { keys });
+    // The record has served; a job that cannot clear it queues them again
+    // next time, which the release's ownership check makes harmless.
+    await job.updateData?.({ ...job.data, unresolvedKeys: undefined }).catch((updateError: unknown) => {
+      log.warn('the unresolved keys stay on the job; the next attempt will queue them again', { err: updateError });
+    });
+  }
+
   if (!clip) {
     log.warn('clip no longer exists, dropping job');
     return;
@@ -134,20 +154,6 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
   if (clip.status === 'ready' && clip.storageKey && job.data.captions === undefined && job.data.reclip === undefined) {
     log.info('clip already generated, skipping');
     return;
-  }
-  // An earlier attempt left objects of unknown ownership and could not queue
-  // their release (see RenderOutcomeUnknownError). That comes first, and a
-  // queue that refuses again ends this attempt here: the job retries later
-  // rather than finishing with those objects on record nowhere.
-  if (job.data.unresolvedKeys?.length) {
-    const keys = job.data.unresolvedKeys;
-    await enqueueObjectRelease(keys, { videoId: clip.videoId, clipId, reason: 'render_outcome_unknown' });
-    log.warn('an earlier attempt\'s objects of unknown ownership are now queued for release', { keys });
-    // The record has served; a job that cannot clear it queues them again
-    // next time, which the release's ownership check makes harmless.
-    await job.updateData?.({ ...job.data, unresolvedKeys: undefined }).catch((updateError: unknown) => {
-      log.warn('the unresolved keys stay on the job; the next attempt will queue them again', { err: updateError });
-    });
   }
   // A retry of a re-render whose earlier attempt landed without saying so:
   // the row already carries this render. Cutting again would put a second
@@ -295,15 +301,21 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
           try {
             await enqueueObjectRelease(unresolved, { ...context, reason: 'render_outcome_unknown' });
           } catch (queueError) {
-            // The release was the record. Without it the keys go onto the
-            // job, for the next attempt to queue before anything else; and
-            // if even that cannot be written, the log line above is the map
-            // to them — said so, rather than silently.
-            log.error('the release could not be queued either; the keys are recorded on the job for the next attempt', {
+            // The release was the record. Without it the keys are written
+            // down where the queue is not needed: in the database, for the
+            // footage sweep to hand to the queue when it next runs — a
+            // record that holds even on the job's last attempt — and on the
+            // job, for the next attempt to queue before anything else. If
+            // neither can be written, the log line above is the map to
+            // them — said so, rather than silently.
+            log.error('the release could not be queued either; recording the keys for the sweep and the next attempt', {
               ...context, keys: unresolved, err: queueError,
             });
+            await recordObjectRelease(unresolved, { ...context, reason: 'render_outcome_unknown' }).catch((recordError: unknown) => {
+              log.error('the keys could not be recorded in the database either', { ...context, keys: unresolved, err: recordError });
+            });
             await job.updateData?.({ ...job.data, unresolvedKeys: unresolved }).catch((updateError: unknown) => {
-              log.error('the keys could not be recorded on the job; they are orphaned unless found in the logs', {
+              log.error('the keys could not be recorded on the job; they are orphaned unless the database record or the logs find them', {
                 ...context, keys: unresolved, err: updateError,
               });
             });

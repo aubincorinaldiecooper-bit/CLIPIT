@@ -6,7 +6,8 @@ import { claimUnkeptPreRenderedMedia } from '../../db/repositories/verticalMedia
 import { storageKeysInUse } from '../../db/repositories/objectOwnership.js';
 import { listVideosWithUnreachableFootage } from '../../db/repositories/videos.js';
 import { expireVideoFootage } from '../../services/retention.js';
-import type { RetentionJob } from '../../queues/index.js';
+import { enqueueObjectRelease, type RetentionJob } from '../../queues/index.js';
+import { drainObjectReleases } from '../../db/repositories/objectReleases.js';
 
 /**
  * Objects a render's row stopped naming, removed now that no signed URL to
@@ -75,6 +76,10 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
   const log = logger.child({ job: 'retention', jobId: job.id });
   const limit = env.RETENTION_VIDEO_LIMIT;
 
+  // First, whatever a render wrote down because the queue could not be
+  // reached: it must not wait on there being footage to sweep.
+  await handOverRecordedReleases(log);
+
   const videos = await listVideosWithUnreachableFootage(env.FOOTAGE_IDLE_SECONDS, limit + 1);
   if (videos.length === 0) {
     log.info('no footage to remove');
@@ -116,6 +121,21 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
   });
 
   await sweepUnkeptPreRenderedMedia(log);
+}
+
+/**
+ * Releases a render wrote down because the queue could not be reached at
+ * the time (see recordObjectRelease). This sweep runs from the queue, so
+ * the queue is back; each row goes onto it and is deleted only then.
+ */
+async function handOverRecordedReleases(log: Logger): Promise<void> {
+  try {
+    const handed = await drainObjectReleases(env.RETENTION_VIDEO_LIMIT, (release) => enqueueObjectRelease(release.keys, release.context));
+    if (handed > 0) log.info('recorded releases handed to the queue', { releases: handed });
+  } catch (error) {
+    // The rows stay; the next sweep tries again.
+    log.warn('recorded releases could not be handed to the queue', { err: error });
+  }
 }
 
 /**

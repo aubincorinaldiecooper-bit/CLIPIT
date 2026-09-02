@@ -40,6 +40,8 @@ vi.mock('../src/db/repositories/clipVariants.js', () => ({ discardVariants }));
 vi.mock('../src/db/repositories/videos.js', () => ({ getVideo }));
 vi.mock('../src/db/repositories/verticalMedia.js', () => ({ commitRender }));
 vi.mock('../src/queues/index.js', () => ({ enqueueObjectRelease }));
+const recordObjectRelease = vi.fn();
+vi.mock('../src/db/repositories/objectReleases.js', () => ({ recordObjectRelease }));
 const txClient = { query: vi.fn() };
 vi.mock('../src/db/pool.js', () => ({ withTransaction: (fn: (client: unknown) => Promise<unknown>) => fn(txClient) }));
 vi.mock('../src/services/media/verticalPipeline.js', () => ({
@@ -124,11 +126,12 @@ const committed = () => commitRender.mock.calls[0]?.[1] as Record<string, unknow
 beforeEach(() => {
   for (const mock of [
     ...Object.values(clips), ...Object.values(reclips), ...Object.values(storage), ...Object.values(media),
-    ...Object.values(pipeline), ...Object.values(log), discardVariants, getVideo, commitRender, enqueueObjectRelease,
+    ...Object.values(pipeline), ...Object.values(log), discardVariants, getVideo, commitRender, enqueueObjectRelease, recordObjectRelease,
   ]) {
     mock.mockReset();
   }
   enqueueObjectRelease.mockResolvedValue(undefined);
+  recordObjectRelease.mockResolvedValue(undefined);
   clips.getClip.mockResolvedValue(original);
   clips.setClipStatus.mockResolvedValue(true);
   reclips.appendReclipVersion.mockResolvedValue({ version: 2 });
@@ -405,9 +408,13 @@ describe('a re-render of a moment cut on find, original framing', () => {
     const recorded = (attempt as { updateData: ReturnType<typeof vi.fn> }).updateData.mock.calls[0]![0] as { unresolvedKeys: string[] };
     expect(recorded.unresolvedKeys).toEqual(expect.arrayContaining([OLD_CANONICAL, OLD_POSTER]));
     expect(recorded.unresolvedKeys.some((key) => FRESH_CANONICAL.test(key))).toBe(true);
+    // And in the database, where the sweep finds it even after the job's last attempt.
+    const [dbKeys, dbContext] = recordObjectRelease.mock.calls[0]!;
+    expect(dbKeys).toEqual(recorded.unresolvedKeys);
+    expect(dbContext).toMatchObject({ clipId: 'clip-1', reason: 'render_outcome_unknown' });
     expect(storage.remove).not.toHaveBeenCalled();
     expect(reclips.markReclipFailed).not.toHaveBeenCalled();
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('recorded on the job'), expect.objectContaining({ keys: expect.any(Array) }));
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('recording the keys'), expect.objectContaining({ keys: expect.any(Array) }));
   });
 
   it('on a retry, queues an earlier attempt\'s unresolved objects for release before anything else, then clears the record', async () => {
@@ -424,6 +431,19 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(cleared.unresolvedKeys).toBeUndefined();
     // And the render itself went on as normal.
     expect(commitRender).toHaveBeenCalledTimes(1);
+  });
+
+  it('on a retry, queues them even when the clip is already generated — the earlier attempt landed, and this one would otherwise say nothing', async () => {
+    // Devin's finding on #81: the "already generated" shortcut came first
+    // and returned with the record unread.
+    const attempt = job({ unresolvedKeys: ['clips/video-1/clip-1.mp4', OLD_POSTER] }, { attemptsMade: 1, attempts: 3 });
+    clips.getClip.mockResolvedValue({ ...original, status: 'ready', storageKey: 'clips/video-1/clip-1.mp4' });
+
+    await expect(handleClipGeneration(attempt)).resolves.toBeUndefined();
+
+    expect(enqueueObjectRelease).toHaveBeenCalledWith(['clips/video-1/clip-1.mp4', OLD_POSTER], expect.objectContaining({ reason: 'render_outcome_unknown' }));
+    expect(media.cutClip).not.toHaveBeenCalled();
+    expect(log.info).toHaveBeenCalledWith('clip already generated, skipping');
   });
 
   it('on a retry, stops before cutting when those objects still cannot be queued', async () => {
