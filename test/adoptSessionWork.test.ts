@@ -81,3 +81,19 @@ describe('adoptSessionWork', () => {
     expect(order[0]).toBe('videos');
   });
 });
+
+describe('adoptSessionWork on a transaction', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('runs every update through the given client, so it commits as one with the lock and the claim', async () => {
+    const client = { query: vi.fn(async () => ({ rows: [{ id: 'x' }] })) };
+
+    const adopted = await adoptSessionWork({ sessionId: 's1', userId: 'u1', workspaceId: 'w1' }, client as never);
+
+    expect(queryRows).not.toHaveBeenCalled();
+    expect(client.query).toHaveBeenCalledTimes(3);
+    expect(adopted).toEqual({ videos: 1, clipRequests: 1, clips: 1 });
+  });
+});
