@@ -13,14 +13,15 @@ export const RENDER_FAILED_MESSAGE = 'The render could not be completed. Try aga
  * Settles a render whose outcome was unknown when its job's last attempt
  * ended, now that the database answers.
  *
- * The row is the evidence. Naming the render's file — a file NEW to the
- * row — it was written by the render: nothing to do (the release of the
- * previous objects was queued or recorded at the time). A first render
- * retried at the plain key a failed earlier attempt already left on the row
- * proves nothing by its key, so there the status decides: 'ready' was
- * written by a render, and is left alone. Still 'generating' or 'pending'
- * otherwise, the write did not land, and nothing else can have started on
- * the row since —
+ * The row is the evidence, and its STATUS is the evidence that always
+ * holds: a write that landed made the row 'ready'; nothing else makes a
+ * 'generating' row 'ready' while its render's outcome is unknown. The key
+ * confirms it when it can — a row naming a file NEW to it was written by
+ * the render — and says nothing when it cannot: a first render retried at
+ * the plain key a failed earlier attempt already left on the row, or a
+ * record from before the previous key was written down (rows made by the
+ * 035 code carry no previous key). Still 'generating' or 'pending', the
+ * write did not land, and nothing else can have started on the row since —
  * a Re-clip is refused while one is pending, a Replace while the clip is not
  * ready — so it is rolled back exactly as a failed render would have been:
  * a Re-clip back to its previous boundaries and status with the failure on
@@ -34,15 +35,18 @@ export const RENDER_FAILED_MESSAGE = 'The render could not be completed. Try aga
  * anything else, and a queue that refuses ends the settling here, so the
  * row stays for the next sweep and the objects stay on record.
  *
- * The writes go through `client` when the caller has a transaction, so the
- * rollback, the failure it records and the record's removal land together.
+ * The read and the writes go through `client` when the caller has a
+ * transaction — the read locking the row — so the decision, the rollback,
+ * the failure it records and the record's removal share one snapshot and
+ * land together. (And a read through the pool from inside a transaction
+ * would wait for the pool's one connection when there is only one.)
  */
 export async function settleUnknownRender(
   render: UnknownRender,
   log: Logger,
   client?: pg.PoolClient,
 ): Promise<'landed' | 'rolled_back' | 'moved_on' | 'gone'> {
-  const clip = await getClip(render.clipId);
+  const clip = await getClip(render.clipId, client);
   const context = { clipId: render.clipId, storageKey: render.storageKey };
   if (render.job.unresolvedKeys?.length) {
     await enqueueObjectRelease(render.job.unresolvedKeys, { videoId: clip?.videoId ?? '', clipId: render.clipId, reason: 'render_outcome_unknown' });
@@ -52,14 +56,17 @@ export async function settleUnknownRender(
     log.info('an unknown render\'s clip no longer exists; nothing to settle', context);
     return 'gone';
   }
-  const keyIsNew = render.storageKey !== render.previousStorageKey;
-  if (clip.storageKey === render.storageKey && keyIsNew) {
+  // The key confirms a landed write only when it is known to be new to the
+  // row; a record without a previous key (the 035 code wrote none) says
+  // nothing either way, and the status decides alone.
+  const keyIsNew = render.previousStorageKey !== null && render.storageKey !== render.previousStorageKey;
+  if (clip.status === 'ready' && clip.storageKey === render.storageKey && keyIsNew) {
     log.info('an unknown render had landed; the row names its file', context);
     return 'landed';
   }
   if (clip.status !== 'generating' && clip.status !== 'pending') {
-    // 'ready' at the plain key is a landed first render; anything else was
-    // moved on by something later. Either way, not ours to touch.
+    // 'ready' at a key that proves nothing is still a landed render, or a
+    // row something later moved on. Either way, not ours to touch.
     log.info('an unknown render\'s row is no longer generating; left as it is', { ...context, status: clip.status });
     return 'moved_on';
   }
