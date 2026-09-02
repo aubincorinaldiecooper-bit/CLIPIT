@@ -1,3 +1,4 @@
+import type pg from 'pg';
 import { queryOne, queryRows } from '../pool.js';
 import type { ClipFormat } from '../../services/media/reframe.js';
 
@@ -151,8 +152,12 @@ export async function listVariantsForClip(clipId: string): Promise<ClipVariant[]
  * the OLD master is now a lie, and posting one would send footage the user
  * has already replaced.
  */
-export async function discardVariants(clipId: string): Promise<void> {
-  await queryOne('DELETE FROM clip_variants WHERE clip_id = $1', [clipId]);
+export async function discardVariants(clipId: string, client?: pg.PoolClient): Promise<void> {
+  const sql = 'DELETE FROM clip_variants WHERE clip_id = $1';
+  // Inside a render's transaction when the caller has one: the variants go
+  // with the master they were cut from, or not at all.
+  if (client) await client.query(sql, [clipId]);
+  else await queryOne(sql, [clipId]);
 }
 
 /**

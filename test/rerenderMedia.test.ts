@@ -38,6 +38,8 @@ vi.mock('../src/db/repositories/reclips.js', () => ({
 vi.mock('../src/db/repositories/clipVariants.js', () => ({ discardVariants }));
 vi.mock('../src/db/repositories/videos.js', () => ({ getVideo }));
 vi.mock('../src/db/repositories/verticalMedia.js', () => ({ commitRender }));
+const txClient = { query: vi.fn() };
+vi.mock('../src/db/pool.js', () => ({ withTransaction: (fn: (client: unknown) => Promise<unknown>) => fn(txClient) }));
 vi.mock('../src/services/media/verticalPipeline.js', () => ({
   runOriginalPipeline: pipeline.runOriginalPipeline,
   runVerticalPipeline: pipeline.runVerticalPipeline,
@@ -179,8 +181,13 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(posterCall).toMatchObject({ canonicalPath: '/tmp/clipit-test/clip-1.mp4', render, snapshotPosterKey: OLD_POSTER });
     expect(orderOf(pipeline.runOriginalPipeline)).toBeLessThan(storage.uploadFile.mock.invocationCallOrder[storage.uploadFile.mock.calls.indexOf(upload)]!);
 
-    // One write, both keys.
+    // One write, both keys — inside the same transaction as the Re-clip's
+    // version and cleared pending state, and the stale variants.
     expect(commitRender).toHaveBeenCalledTimes(1);
+    expect(commitRender.mock.calls[0]![2]).toBe(txClient);
+    expect(reclips.appendReclipVersion.mock.calls[0]![1]).toBe(txClient);
+    expect(reclips.clearReclipPending.mock.calls[0]![1]).toBe(txClient);
+    expect(discardVariants.mock.calls[0]![1]).toBe(txClient);
     expect(committed()).toMatchObject({
       storageKey: freshCanonical,
       durationSeconds: 23,
@@ -194,7 +201,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(storage.remove).toHaveBeenCalledWith(OLD_POSTER);
     expect(orderOf(commitRender)).toBeLessThan(orderOf(storage.remove));
     expect(orderOf(commitRender)).toBeLessThan(orderOf(reclips.appendReclipVersion));
-    expect(reclips.clearReclipPending).toHaveBeenCalledWith('match-1');
+    expect(reclips.clearReclipPending).toHaveBeenCalledWith('match-1', txClient);
     expect(pipeline.discardUploadedObjects).not.toHaveBeenCalled();
   });
 
@@ -250,6 +257,53 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(reclips.markReclipFailed).toHaveBeenCalled();
     expect(reclips.appendReclipVersion).not.toHaveBeenCalled();
     expect(reclips.clearReclipPending).not.toHaveBeenCalled();
+  });
+
+  it('keeps the old objects when the finalization fails, because it is the same write', async () => {
+    // A version that cannot be recorded fails the whole transaction: the
+    // row still names the previous cut, so nothing old is removed and the
+    // Re-clip rolls back like any failed render.
+    reclips.appendReclipVersion.mockRejectedValueOnce(new Error('versions table locked'));
+
+    await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('versions table locked');
+
+    expect(storage.remove).not.toHaveBeenCalled();
+    expect(pipeline.discardUploadedObjects).toHaveBeenCalledTimes(1);
+    expect(clips.restoreClipBoundaries).toHaveBeenCalled();
+    expect(reclips.markReclipFailed).toHaveBeenCalled();
+  });
+
+  it('carries on as committed when the write landed but its reply was lost', async () => {
+    // The transaction committed; the connection dropped before the reply.
+    // Asked afterwards, the row names the fresh cut — so nothing fresh is
+    // deleted, the old objects go, and the Re-clip is not marked failed.
+    commitRender.mockRejectedValueOnce(new Error('connection reset'));
+    clips.getClip.mockImplementation(async () => {
+      const upload = canonicalUpload();
+      return upload ? { ...original, storageKey: upload[0], posterStorageKey: `posters/video-1/clip-1-${(upload[0] as string).slice(-12, -4)}.jpg` } : original;
+    });
+
+    await expect(handleClipGeneration(job({ reclip: reclipPayload }))).resolves.toBeUndefined();
+
+    expect(pipeline.discardUploadedObjects).not.toHaveBeenCalled();
+    expect(storage.remove).toHaveBeenCalledWith(OLD_CANONICAL);
+    expect(clips.restoreClipBoundaries).not.toHaveBeenCalled();
+    expect(reclips.markReclipFailed).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('carrying on as committed'), expect.anything());
+  });
+
+  it('deletes nothing when the write failed and the row cannot be read either', async () => {
+    commitRender.mockRejectedValueOnce(new Error('database refused'));
+    // The handler's first read succeeds; the re-read after the failed write does not.
+    clips.getClip.mockResolvedValueOnce(original).mockRejectedValueOnce(new Error('database unreachable'));
+
+    await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('database refused');
+
+    // An orphan is a bill we can find in the logs; a ready clip pointing at
+    // deleted media is not recoverable. The keys are on record.
+    expect(pipeline.discardUploadedObjects).not.toHaveBeenCalled();
+    expect(storage.remove).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('could not be read'), expect.objectContaining({ keys: expect.any(Array) }));
   });
 
   it('treats a row that vanished the same way: nothing to record, so the fresh objects go', async () => {

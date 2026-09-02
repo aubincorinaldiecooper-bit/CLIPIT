@@ -1,3 +1,4 @@
+import type pg from 'pg';
 import { query, queryOne, queryRows } from '../pool.js';
 import type { CompositionMode } from '../../services/media/composition.js';
 
@@ -264,8 +265,11 @@ export interface RenderCommit {
  *
  * Returns whether a row was there to write, so the caller can take its
  * fresh objects back out rather than leave them referenced by nothing.
+ *
+ * Runs on the caller's client when given one, so a Re-clip's version and
+ * cleared pending state can share this write's transaction.
  */
-export async function commitRender(clipId: string, input: RenderCommit): Promise<boolean> {
+export async function commitRender(clipId: string, input: RenderCommit, client?: pg.PoolClient): Promise<boolean> {
   const sets: string[] = [
     "status = 'ready'",
     'error_message = NULL',
@@ -315,10 +319,10 @@ export async function commitRender(clipId: string, input: RenderCommit): Promise
     set('poster_generation_ms', media.posterGenerationMs);
   }
 
-  const row = await queryOne<{ id: string }>(
-    `UPDATE clips SET ${sets.join(', ')} WHERE id = $1 RETURNING id`,
-    params,
-  );
+  const sql = `UPDATE clips SET ${sets.join(', ')} WHERE id = $1 RETURNING id`;
+  const row = client
+    ? ((await client.query<{ id: string }>(sql, params)).rows[0] ?? null)
+    : await queryOne<{ id: string }>(sql, params);
   return row !== null;
 }
 

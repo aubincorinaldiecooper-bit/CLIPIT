@@ -11,6 +11,7 @@ import { cutClip, ffprobe } from '../../services/media/ffmpeg.js';
 import { appendReclipVersion, clearReclipPending, markReclipFailed } from '../../db/repositories/reclips.js';
 import { captionsSchema, prepareCaptionFilters } from '../../services/media/captions.js';
 import { applyClipPadding } from '../../services/timestamps.js';
+import { withTransaction } from '../../db/pool.js';
 import { getClip, setClipStatus, restoreClipBoundaries } from '../../db/repositories/clips.js';
 import { commitRender } from '../../db/repositories/verticalMedia.js';
 import { discardUploadedObjects } from '../../services/media/verticalPipeline.js';
@@ -18,6 +19,15 @@ import { releaseObjects, renderDeliveredMedia } from '../../services/media/reren
 import { discardVariants } from '../../db/repositories/clipVariants.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import type { ClipGenerationJob } from '../../queues/index.js';
+
+/** Every storage key the clip's row names right now. */
+async function keysNamedByRow(clipId: string): Promise<Set<string>> {
+  const current = await getClip(clipId);
+  return new Set(
+    [current?.storageKey, current?.posterStorageKey, current?.derivativeStorageKey]
+      .filter((key): key is string => typeof key === 'string' && key.length > 0),
+  );
+}
 
 /**
  * Cuts a match out of the ORIGINAL source (never the analysis proxy) and stores
@@ -120,51 +130,69 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       // Everything this render made and nothing else: on a failure these go
       // and the previous cut and media stay exactly as they were.
       const fresh = [...(render ? [key] : []), ...(delivered?.freshKeys ?? [])];
+      const context = { videoId: video.id, clipId };
       try {
         await getStorage().uploadFile(key, outputPath, 'video/mp4');
 
-        // ONE row write: the cut and the media made from it become the row's
-        // truth together — a Replace's spec included — or not at all.
-        const wrote = await commitRender(clipId, {
-          storageKey: key,
-          durationSeconds: Number(result.durationSeconds.toFixed(3)),
-          sizeBytes: result.sizeBytes,
-          captions: job.data.captions,
-          media: delivered?.media ?? { kind: 'none' },
+        // ONE transaction. The row takes the new cut and the media made
+        // from it — a Replace's spec included — the platform shapes cut from
+        // the OLD master go (posting one would send footage the person just
+        // replaced), and a Re-clip's next version is recorded with its
+        // pending state cleared: together, or not at all. As separate writes
+        // a failure after the first left a row naming a new cut whose
+        // history still said the re-cut had failed.
+        await withTransaction(async (client) => {
+          const wrote = await commitRender(clipId, {
+            storageKey: key,
+            durationSeconds: Number(result.durationSeconds.toFixed(3)),
+            sizeBytes: result.sizeBytes,
+            captions: job.data.captions,
+            media: delivered?.media ?? { kind: 'none' },
+          }, client);
+          if (!wrote) {
+            throw new Error(`Clip ${clipId} no longer exists — its render has nowhere to be recorded`);
+          }
+          if (job.data.captions !== undefined || job.data.reclip !== undefined) {
+            await discardVariants(clipId, client);
+          }
+          if (job.data.reclip) {
+            const { matchId, startSeconds, endSeconds, provider, model, promptVersion } = job.data.reclip;
+            await appendReclipVersion({ matchId, startSeconds, endSeconds, provider, model, promptVersion }, client);
+            await clearReclipPending(matchId, client);
+          }
         });
-        if (!wrote) {
-          throw new Error(`Clip ${clipId} no longer exists — its render has nowhere to be recorded`);
-        }
       } catch (error) {
-        await discardUploadedObjects(fresh, { videoId: video.id, clipId, reason: 'render_commit_failed' });
-        throw error;
+        // The write's outcome may be unknown: a connection can drop after
+        // COMMIT, and then the row names every fresh key while this promise
+        // rejected. So the row is asked before anything is deleted, and what
+        // it names, this render keeps.
+        const named = await keysNamedByRow(clipId).catch((readError: unknown) => {
+          log.error('the render\'s write failed and the row could not be read; keeping this render\'s objects', {
+            ...context, keys: fresh, err: readError,
+          });
+          return null;
+        });
+        if (named === null) throw error;
+        if (named.has(key)) {
+          // It landed; only the reply was lost. Carry on as committed.
+          log.warn('the render\'s write landed although its reply did not; carrying on as committed', { ...context, err: error });
+        } else {
+          await discardUploadedObjects(fresh.filter((freshKey) => !named.has(freshKey)), { ...context, reason: 'render_commit_failed' });
+          throw error;
+        }
       }
 
-      // The row names the new cut and its media; the previous objects go.
+      // Committed. The previous objects go only now — after everything that
+      // could still fail has succeeded — so a failure anywhere above leaves
+      // the old cut and its media where the row can still name them.
       await releaseObjects(
         [render ? clip.storageKey : null, ...(delivered?.oldKeys ?? [])],
         [key, ...(delivered?.freshKeys ?? [])],
-        { videoId: video.id, clipId },
+        context,
         log,
       );
-
-      // The master changed, so every platform shape cut from the OLD master
-      // is stale — posting one would send footage the user just replaced.
-      // They re-render on the next publish that needs them. True for a
-      // caption Replace and for a Re-clip alike: both put a different
-      // master under the same clip id.
-      if (job.data.captions !== undefined || job.data.reclip !== undefined) {
-        await discardVariants(clipId);
-      }
-
-      // A Re-clip becomes true only here, with the file that carries its
-      // boundaries stored: the moment's next version is recorded and the
-      // pending state clears. Doing this earlier would let a failed render
-      // leave the history claiming boundaries no file ever had.
       if (job.data.reclip) {
-        const { matchId, startSeconds, endSeconds, provider, model, promptVersion } = job.data.reclip;
-        await appendReclipVersion({ matchId, startSeconds, endSeconds, provider, model, promptVersion });
-        await clearReclipPending(matchId);
+        const { matchId, startSeconds, endSeconds } = job.data.reclip;
         log.info('reclip applied', { matchId, startSeconds, endSeconds });
       }
 
