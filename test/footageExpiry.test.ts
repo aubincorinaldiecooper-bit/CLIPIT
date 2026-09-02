@@ -23,6 +23,7 @@ const clears = {
   deleteTranscript: vi.fn(),
 };
 const order: string[] = [];
+const claimedAt = new Date('2026-09-02T20:30:00Z');
 
 vi.mock('../src/db/repositories/videos.js', () => ({
   claimFootageForExpiry: (...args: unknown[]) => {
@@ -82,7 +83,7 @@ beforeEach(() => {
 
 describe('expireVideoFootage', () => {
   it('claims the video — still a guest’s, for the sweep — before any object is removed', async () => {
-    videos.claimFootageForExpiry.mockResolvedValueOnce(true);
+    videos.claimFootageForExpiry.mockResolvedValueOnce(claimedAt);
 
     const result = await expireVideoFootage('v1', log, { onlyIfUnowned: true });
 
@@ -95,7 +96,7 @@ describe('expireVideoFootage', () => {
   });
 
   it('lets an owner remove their own video whoever it belonged to before', async () => {
-    videos.claimFootageForExpiry.mockResolvedValueOnce(true);
+    videos.claimFootageForExpiry.mockResolvedValueOnce(claimedAt);
 
     await expireVideoFootage('v1', log, { onlyIfUnowned: false });
 
@@ -104,17 +105,18 @@ describe('expireVideoFootage', () => {
   });
 
   it('gives the claim back and rethrows when the removal fails after it, so the next sweep tries again', async () => {
-    videos.claimFootageForExpiry.mockResolvedValueOnce(true);
+    videos.claimFootageForExpiry.mockResolvedValueOnce(claimedAt);
     videos.listChunks.mockRejectedValueOnce(new Error('db down'));
 
     await expect(expireVideoFootage('v1', log, { onlyIfUnowned: true })).rejects.toThrow('db down');
 
-    expect(videos.releaseFootageClaim).toHaveBeenCalledWith('v1');
+    // This exact claim, no other.
+    expect(videos.releaseFootageClaim).toHaveBeenCalledWith('v1', claimedAt);
     expect(videos.markFootageExpired).not.toHaveBeenCalled();
   });
 
   it('keeps the claim once the removal has finished', async () => {
-    videos.claimFootageForExpiry.mockResolvedValueOnce(true);
+    videos.claimFootageForExpiry.mockResolvedValueOnce(claimedAt);
 
     await expireVideoFootage('v1', log, { onlyIfUnowned: true });
 
@@ -122,7 +124,7 @@ describe('expireVideoFootage', () => {
   });
 
   it('deletes and clears nothing when the claim finds no row — adopted since it was selected, or expired already', async () => {
-    videos.claimFootageForExpiry.mockResolvedValueOnce(false);
+    videos.claimFootageForExpiry.mockResolvedValueOnce(null);
 
     const result = await expireVideoFootage('v1', log, { onlyIfUnowned: true });
 

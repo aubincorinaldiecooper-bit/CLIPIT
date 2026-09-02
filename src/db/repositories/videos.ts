@@ -469,22 +469,25 @@ export async function getChunk(chunkId: string): Promise<VideoChunk | null> {
  * `onlyIfUnowned` is the sweep's rule. An owner removing their own video
  * has already been checked against it by the route, and their video is
  * theirs whoever it belonged to before; that call passes false.
+ *
+ * Returns the claim's own timestamp, which is its identity: a release names
+ * it, so nothing but the attempt that made a claim can ever undo it.
  */
 export async function claimFootageForExpiry(
   videoId: string,
   options: { onlyIfUnowned: boolean },
-): Promise<boolean> {
-  const row = await queryOne<{ id: string }>(
+): Promise<Date | null> {
+  const row = await queryOne<{ footage_expired_at: Date }>(
     `UPDATE videos
         SET footage_expired_at = now(),
             updated_at = now()
       WHERE id = $1
         AND footage_expired_at IS NULL
         ${options.onlyIfUnowned ? 'AND user_id IS NULL' : ''}
-      RETURNING id`,
+      RETURNING footage_expired_at`,
     [videoId],
   );
-  return row !== null;
+  return row ? row.footage_expired_at : null;
 }
 
 /**
@@ -495,13 +498,19 @@ export async function claimFootageForExpiry(
  * stored and the video reachable by nobody (Devin, #88). Released, the next
  * sweep selects it again; the deletes are safe to repeat. Only ever called
  * before markFootageExpired has run, so the keys are still in place.
+ *
+ * Releases exactly the claim named and nothing else. A finished removal
+ * stamps its own, later time (markFootageExpired), so a release that comes
+ * late, or from another attempt, matches nothing and revives nothing
+ * (Devin, #88).
  */
-export async function releaseFootageClaim(videoId: string): Promise<void> {
+export async function releaseFootageClaim(videoId: string, claimedAt: Date): Promise<void> {
   await queryOne(
     `UPDATE videos
         SET footage_expired_at = NULL,
             updated_at = now()
-      WHERE id = $1`,
-    [videoId],
+      WHERE id = $1
+        AND footage_expired_at = $2`,
+    [videoId, claimedAt],
   );
 }

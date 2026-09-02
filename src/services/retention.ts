@@ -51,17 +51,18 @@ export interface ExpiryOptions {
 export async function expireVideoFootage(videoId: string, log: Logger, options: ExpiryOptions): Promise<ExpiryResult> {
   // Claim first, in one statement that also applies the rule above. Nothing
   // is deleted without this claim.
-  const claimed = await claimFootageForExpiry(videoId, { onlyIfUnowned: options.onlyIfUnowned });
-  if (!claimed) {
+  const claimedAt = await claimFootageForExpiry(videoId, { onlyIfUnowned: options.onlyIfUnowned });
+  if (!claimedAt) {
     log.info('footage kept: expired already, or no longer a guest\'s', { videoId });
     return { objectsDeleted: 0, objectsFailed: 0 };
   }
   try {
     return await removeClaimedFootage(videoId, log);
   } catch (error) {
-    // The claim goes back, or this video would be hidden from every later
-    // sweep with its objects still stored. The deletes are safe to repeat.
-    await releaseFootageClaim(videoId).catch((releaseError: unknown) => {
+    // The claim goes back — this exact claim, no other — or this video would
+    // be hidden from every later sweep with its objects still stored. The
+    // deletes are safe to repeat.
+    await releaseFootageClaim(videoId, claimedAt).catch((releaseError: unknown) => {
       log.warn('could not release the footage claim after a failed removal', { videoId, err: releaseError });
     });
     throw error;
