@@ -92,7 +92,7 @@ beforeEach(() => {
     captions: null,
   });
   clips.setClipStatus.mockResolvedValue(undefined);
-  clips.markClipGenerating.mockResolvedValue(new Date('2026-09-02T16:58:00Z'));
+  clips.markClipGenerating.mockResolvedValue(7);
   clips.restoreClipBoundaries.mockResolvedValue(undefined);
   reclips.appendReclipVersion.mockResolvedValue({ version: 2 });
   reclips.clearReclipPending.mockResolvedValue(undefined);

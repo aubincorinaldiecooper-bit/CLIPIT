@@ -421,4 +421,11 @@ export interface Clip {
   sizeBytes: number | null;
   createdAt: Date;
   updatedAt: Date;
+  /**
+   * A counter of the writes that changed what this row says about its
+   * render — status, files, boundaries, captions, error; never an approval
+   * or a title. Bumped in place, so it rises in the order the writes land:
+   * the mark an unknown render is settled against (see settleUnknownRender).
+   */
+  rowVersion: number;
 }

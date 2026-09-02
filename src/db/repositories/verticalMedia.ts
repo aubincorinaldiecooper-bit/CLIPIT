@@ -72,6 +72,7 @@ export async function setVerticalMedia(clipId: string, input: VerticalMediaInput
             -- media is re-derived, because the person's choice outlives the
             -- file it was made about.
             retention_class          = CASE WHEN clips.approved_at IS NOT NULL THEN 'owned' ELSE $16 END,
+            row_version              = row_version + 1,
             updated_at               = now()
       WHERE id = $1`,
     [
@@ -122,6 +123,7 @@ export async function markVerticalFailed(clipId: string, message: string): Promi
             pre_rendered      = TRUE,
             presentation      = 'vertical',
             retention_class   = CASE WHEN clips.approved_at IS NOT NULL THEN 'owned' ELSE 'temporary' END,
+            row_version       = row_version + 1,
             updated_at        = now()
       WHERE id = $1`,
     [clipId, message.slice(0, 500)],
@@ -173,6 +175,7 @@ export async function setOriginalMedia(clipId: string, input: OriginalMediaInput
             pre_rendered             = TRUE,
             presentation             = 'original',
             retention_class          = CASE WHEN clips.approved_at IS NOT NULL THEN 'owned' ELSE $8 END,
+            row_version              = row_version + 1,
             updated_at               = now()
       WHERE id = $1`,
     [
@@ -217,6 +220,7 @@ export async function setPosterFromCut(clipId: string, input: PosterFromCutInput
             output_width             = $4,
             output_height            = $5,
             poster_generation_ms     = $6,
+            row_version              = row_version + 1,
             updated_at               = now()
       WHERE id = $1
         AND pre_rendered = TRUE
@@ -277,6 +281,7 @@ export async function commitRender(clipId: string, input: RenderCommit, client?:
     'duration_seconds = $3',
     'size_bytes = $4',
     'captions = COALESCE($5::jsonb, captions)',
+    'row_version = row_version + 1',
     'updated_at = now()',
   ];
   const params: unknown[] = [
@@ -344,6 +349,7 @@ export async function markOriginalFailed(clipId: string, message: string): Promi
             pre_rendered    = TRUE,
             presentation    = 'original',
             retention_class = CASE WHEN clips.approved_at IS NOT NULL THEN 'owned' ELSE 'temporary' END,
+            row_version     = row_version + 1,
             updated_at      = now()
       WHERE id = $1`,
     [clipId, message.slice(0, 500)],
@@ -448,6 +454,7 @@ export async function claimUnkeptPreRenderedMedia(
               derivative_status      = NULL,
               poster_storage_key     = NULL,
               storage_key            = NULL,
+              row_version            = row_version + 1,
               updated_at             = now()
          FROM claimed
         WHERE clips.id = claimed.id
