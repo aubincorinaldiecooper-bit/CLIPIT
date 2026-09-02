@@ -449,7 +449,18 @@ export async function getRootClipByMatchId(matchId: string): Promise<Clip | null
   return row ? mapClip(row) : null;
 }
 
-export async function getClip(clipId: string): Promise<Clip | null> {
+/**
+ * One clip. Inside the caller's transaction when it has one — and then
+ * locked, so the decision the caller takes from this row and the writes it
+ * makes share one snapshot. A caller holding a transaction must read this
+ * way: with a pool of one connection, a read through the pool would wait
+ * for the very connection the transaction holds.
+ */
+export async function getClip(clipId: string, client?: pg.PoolClient): Promise<Clip | null> {
+  if (client) {
+    const { rows } = await client.query<ClipRow>('SELECT * FROM clips WHERE id = $1 FOR UPDATE', [clipId]);
+    return rows[0] ? mapClip(rows[0]) : null;
+  }
   const row = await queryOne<ClipRow>('SELECT * FROM clips WHERE id = $1', [clipId]);
   return row ? mapClip(row) : null;
 }

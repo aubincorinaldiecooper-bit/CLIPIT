@@ -38,9 +38,14 @@ beforeEach(() => {
 });
 
 describe('settleUnknownRender', () => {
-  it('leaves a render alone whose write landed: the row names its file', async () => {
+  it('leaves a render alone whose write landed: the row names its file — read and locked through the caller\'s transaction', async () => {
+    // Devin's finding on #82: a read through the pool from inside the
+    // drain's transaction waits for the pool's one connection when there is
+    // only one.
+    const client = { query: vi.fn() } as never;
     clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: NEW_KEY });
-    await expect(settleUnknownRender(render(reclipJob), log)).resolves.toBe('landed');
+    await expect(settleUnknownRender(render(reclipJob), log, client)).resolves.toBe('landed');
+    expect(clips.getClip).toHaveBeenCalledWith('clip-1', client);
     expect(clips.restoreClipBoundaries).not.toHaveBeenCalled();
     expect(markReclipFailed).not.toHaveBeenCalled();
     expect(clips.setClipStatus).not.toHaveBeenCalled();
@@ -93,6 +98,20 @@ describe('settleUnknownRender', () => {
     clips.setClipStatus.mockClear();
     clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: OLD_KEY });
     await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, OLD_KEY), log)).resolves.toBe('moved_on');
+    expect(clips.setClipStatus).not.toHaveBeenCalled();
+  });
+
+  it('trusts the status alone for a record with no previous key — one the 035 code wrote before the column existed', async () => {
+    // Devin's finding on #82: a null previous key made an unchanged plain
+    // key look new, and a retried first render that never landed would
+    // have been read as landed.
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'generating', storageKey: OLD_KEY });
+    await expect(settleUnknownRender(render({ clipId: 'clip-1' }, OLD_KEY, null), log)).resolves.toBe('rolled_back');
+    expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'ready', { errorMessage: RENDER_FAILED_MESSAGE }, undefined);
+
+    clips.setClipStatus.mockClear();
+    clips.getClip.mockResolvedValue({ id: 'clip-1', status: 'ready', storageKey: NEW_KEY });
+    await expect(settleUnknownRender(render(reclipJob, NEW_KEY, null), log)).resolves.toBe('moved_on');
     expect(clips.setClipStatus).not.toHaveBeenCalled();
   });
 
