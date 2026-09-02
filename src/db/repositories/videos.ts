@@ -486,3 +486,22 @@ export async function claimFootageForExpiry(
   );
   return row !== null;
 }
+
+/**
+ * Gives a claim back when the removal it paid for failed part-way.
+ *
+ * A claim left standing after a failure would hide the video from every
+ * later sweep — the selection skips expired videos — with its objects still
+ * stored and the video reachable by nobody (Devin, #88). Released, the next
+ * sweep selects it again; the deletes are safe to repeat. Only ever called
+ * before markFootageExpired has run, so the keys are still in place.
+ */
+export async function releaseFootageClaim(videoId: string): Promise<void> {
+  await queryOne(
+    `UPDATE videos
+        SET footage_expired_at = NULL,
+            updated_at = now()
+      WHERE id = $1`,
+    [videoId],
+  );
+}

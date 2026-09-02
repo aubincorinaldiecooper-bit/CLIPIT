@@ -53,6 +53,14 @@ describe('adoptSessionWork', () => {
     }
   });
 
+  it('leaves a video whose footage is gone, or being removed, with the learning record — and its questions and clips with it', async () => {
+    await adoptSessionWork({ sessionId: 's1', userId: 'u1', workspaceId: 'w1' });
+
+    for (const call of queryRows.mock.calls) {
+      expect(String(call[0])).toMatch(/footage_expired_at IS NULL/);
+    }
+  });
+
   it('scopes strictly to the session presented', async () => {
     await adoptSessionWork({ sessionId: 's1', userId: 'u1', workspaceId: 'w1' });
 

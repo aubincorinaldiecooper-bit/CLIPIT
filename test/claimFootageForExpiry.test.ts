@@ -7,7 +7,7 @@ vi.mock('../src/db/pool.js', () => ({
   query: vi.fn(),
 }));
 
-const { claimFootageForExpiry } = await import('../src/db/repositories/videos.js');
+const { claimFootageForExpiry, releaseFootageClaim } = await import('../src/db/repositories/videos.js');
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -39,5 +39,18 @@ describe('claimFootageForExpiry', () => {
   it('refuses when the row is no longer a guest’s, or already expired', async () => {
     queryOne.mockResolvedValueOnce(null);
     expect(await claimFootageForExpiry('v1', { onlyIfUnowned: true })).toBe(false);
+  });
+});
+
+describe('releaseFootageClaim', () => {
+  it('clears the expiry mark so a later sweep selects the video again', async () => {
+    queryOne.mockResolvedValueOnce(null);
+
+    await releaseFootageClaim('v1');
+
+    const [sql, params] = queryOne.mock.calls[0] as [string, unknown[]];
+    expect(sql).toMatch(/UPDATE videos/);
+    expect(sql).toMatch(/SET footage_expired_at = NULL/);
+    expect(params).toEqual(['v1']);
   });
 });

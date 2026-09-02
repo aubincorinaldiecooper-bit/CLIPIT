@@ -7,7 +7,13 @@ import { clearClipKeysForVideo, listClipKeysForVideo } from '../db/repositories/
 import { clearVariantsForVideo, listVariantKeysForVideo } from '../db/repositories/clipVariants.js';
 import { deleteScenes } from '../db/repositories/scenes.js';
 import { deleteTranscript } from '../db/repositories/transcripts.js';
-import { claimFootageForExpiry, getVideo, listChunks, markFootageExpired } from '../db/repositories/videos.js';
+import {
+  claimFootageForExpiry,
+  getVideo,
+  listChunks,
+  markFootageExpired,
+  releaseFootageClaim,
+} from '../db/repositories/videos.js';
 import { getStorage } from './storage/s3.js';
 
 /**
@@ -50,6 +56,20 @@ export async function expireVideoFootage(videoId: string, log: Logger, options: 
     log.info('footage kept: expired already, or no longer a guest\'s', { videoId });
     return { objectsDeleted: 0, objectsFailed: 0 };
   }
+  try {
+    return await removeClaimedFootage(videoId, log);
+  } catch (error) {
+    // The claim goes back, or this video would be hidden from every later
+    // sweep with its objects still stored. The deletes are safe to repeat.
+    await releaseFootageClaim(videoId).catch((releaseError: unknown) => {
+      log.warn('could not release the footage claim after a failed removal', { videoId, err: releaseError });
+    });
+    throw error;
+  }
+}
+
+/** The removal itself, once the video is claimed. Throws to have the claim released. */
+async function removeClaimedFootage(videoId: string, log: Logger): Promise<ExpiryResult> {
   const video = await getVideo(videoId);
   if (!video) return { objectsDeleted: 0, objectsFailed: 0 };
 

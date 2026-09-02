@@ -112,11 +112,33 @@ export async function adoptSessionWork(
    */
   client?: Pick<PoolClient, 'query'>,
 ): Promise<{ videos: number; clipRequests: number; clips: number }> {
-  const claim = async (table: 'videos' | 'clip_requests' | 'clips'): Promise<number> => {
-    const sql = `UPDATE ${table}
+  // A video whose footage is gone — or being removed right now by the sweep,
+  // which claims it in one statement before deleting anything — is left with
+  // the learning record rather than carried into the account: there is
+  // nothing in it a person can come back for, and its questions and clips
+  // go the same way. This is also what settles the race between adoption
+  // and removal: the sweep's claim and this update contend on the video row,
+  // and whichever commits second re-reads the row before it moves.
+  const statements: Record<'videos' | 'clip_requests' | 'clips', string> = {
+    videos: `UPDATE videos
           SET user_id = $2, workspace_id = $3
-        WHERE session_id = $1 AND user_id IS NULL
-        RETURNING id`;
+        WHERE session_id = $1 AND user_id IS NULL AND footage_expired_at IS NULL
+        RETURNING id`,
+    clip_requests: `UPDATE clip_requests r
+          SET user_id = $2, workspace_id = $3
+         FROM videos v
+        WHERE r.session_id = $1 AND r.user_id IS NULL
+          AND v.id = r.video_id AND v.footage_expired_at IS NULL
+        RETURNING r.id`,
+    clips: `UPDATE clips c
+          SET user_id = $2, workspace_id = $3
+         FROM videos v
+        WHERE c.session_id = $1 AND c.user_id IS NULL
+          AND v.id = c.video_id AND v.footage_expired_at IS NULL
+        RETURNING c.id`,
+  };
+  const claim = async (table: 'videos' | 'clip_requests' | 'clips'): Promise<number> => {
+    const sql = statements[table];
     const params = [input.sessionId, input.userId, input.workspaceId];
     const rows = client ? (await client.query<{ id: string }>(sql, params)).rows : await queryRows<{ id: string }>(sql, params);
     return rows.length;
