@@ -1,4 +1,5 @@
 import { queryOne, queryRows } from '../pool.js';
+import { coveredSeconds } from './scenes.js';
 import type {
   IndexStatus,
   SourceType,
@@ -125,26 +126,17 @@ export async function createVideo(input: CreateVideoInput): Promise<Video> {
 }
 
 /**
- * A video with how far its notes reach.
+ * A video with how much of it its notes describe.
  *
- * Kept as a separate read rather than a column: the furthest second the notes
- * describe is derivable from the notes themselves, and a duplicate of it in
- * `videos` is one more thing that can disagree with the truth.
+ * Kept as a separate read rather than a column: the seconds the notes cover
+ * are derivable from the notes themselves, and a duplicate of it in `videos`
+ * is one more thing that can disagree with the truth. Coverage, not the
+ * furthest second reached — see coveredSeconds for why.
  */
 export async function getVideoWithReadProgress(videoId: string): Promise<Video | null> {
   const video = await getVideo(videoId);
   if (!video) return null;
-
-  const row = await queryOne<{ read_through: number | null }>(
-    'SELECT MAX(end_seconds) AS read_through FROM video_scenes WHERE video_id = $1',
-    [videoId],
-  );
-  return {
-    ...video,
-    indexReadThroughSeconds: row?.read_through === null || row?.read_through === undefined
-      ? 0
-      : Number(row.read_through),
-  };
+  return { ...video, indexReadThroughSeconds: await coveredSeconds(videoId) };
 }
 
 /**
