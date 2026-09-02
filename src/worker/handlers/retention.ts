@@ -8,6 +8,8 @@ import { listVideosWithUnreachableFootage } from '../../db/repositories/videos.j
 import { expireVideoFootage } from '../../services/retention.js';
 import { enqueueObjectRelease, type RetentionJob } from '../../queues/index.js';
 import { drainObjectReleases } from '../../db/repositories/objectReleases.js';
+import { drainUnknownRenders } from '../../db/repositories/unknownRenders.js';
+import { settleUnknownRender } from '../../services/media/unknownRender.js';
 
 /**
  * Objects a render's row stopped naming, removed now that no signed URL to
@@ -77,8 +79,10 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
   const limit = env.RETENTION_VIDEO_LIMIT;
 
   // First, whatever a render wrote down because the queue could not be
-  // reached: it must not wait on there being footage to sweep.
+  // reached, and whatever render could not learn its own outcome: neither
+  // must wait on there being footage to sweep.
   await handOverRecordedReleases(log);
+  await settleUnknownRenders(log);
 
   const videos = await listVideosWithUnreachableFootage(env.FOOTAGE_IDLE_SECONDS, limit + 1);
   if (videos.length === 0) {
@@ -121,6 +125,24 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
   });
 
   await sweepUnkeptPreRenderedMedia(log);
+}
+
+/**
+ * Renders whose outcome was unknown when their job's last attempt ended
+ * (see RenderOutcomeUnknownError): settled by the row's evidence now that
+ * the database answers — left alone if the write landed, rolled back as a
+ * failed render if it did not. A row that cannot be settled stays for the
+ * next sweep.
+ */
+async function settleUnknownRenders(log: Logger): Promise<void> {
+  try {
+    const settled = await drainUnknownRenders(env.RETENTION_VIDEO_LIMIT, async (render) => {
+      await settleUnknownRender(render, log);
+    });
+    if (settled > 0) log.info('unknown renders settled', { renders: settled });
+  } catch (error) {
+    log.warn('unknown renders could not be settled; they stay for the next sweep', { err: error });
+  }
 }
 
 /**

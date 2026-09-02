@@ -42,6 +42,8 @@ vi.mock('../src/db/repositories/verticalMedia.js', () => ({ commitRender }));
 vi.mock('../src/queues/index.js', () => ({ enqueueObjectRelease }));
 const recordObjectRelease = vi.fn();
 vi.mock('../src/db/repositories/objectReleases.js', () => ({ recordObjectRelease }));
+const recordUnknownRender = vi.fn();
+vi.mock('../src/db/repositories/unknownRenders.js', () => ({ recordUnknownRender }));
 const txClient = { query: vi.fn() };
 vi.mock('../src/db/pool.js', () => ({ withTransaction: (fn: (client: unknown) => Promise<unknown>) => fn(txClient) }));
 vi.mock('../src/services/media/verticalPipeline.js', () => ({
@@ -126,12 +128,13 @@ const committed = () => commitRender.mock.calls[0]?.[1] as Record<string, unknow
 beforeEach(() => {
   for (const mock of [
     ...Object.values(clips), ...Object.values(reclips), ...Object.values(storage), ...Object.values(media),
-    ...Object.values(pipeline), ...Object.values(log), discardVariants, getVideo, commitRender, enqueueObjectRelease, recordObjectRelease,
+    ...Object.values(pipeline), ...Object.values(log), discardVariants, getVideo, commitRender, enqueueObjectRelease, recordObjectRelease, recordUnknownRender,
   ]) {
     mock.mockReset();
   }
   enqueueObjectRelease.mockResolvedValue(undefined);
   recordObjectRelease.mockResolvedValue(undefined);
+  recordUnknownRender.mockResolvedValue(undefined);
   clips.getClip.mockResolvedValue(original);
   clips.setClipStatus.mockResolvedValue(true);
   reclips.appendReclipVersion.mockResolvedValue({ version: 2 });
@@ -386,6 +389,27 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(clips.setClipStatus).not.toHaveBeenCalledWith('clip-1', 'failed', expect.anything());
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('outcome is unknown'), expect.objectContaining({ keys: expect.any(Array) }));
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('nothing marked failed'), expect.objectContaining({ lastAttempt: true }));
+    // The last attempt writes the render down for the sweep to settle.
+    const [record] = recordUnknownRender.mock.calls[0]!;
+    expect(record.clipId).toBe('clip-1');
+    expect(record.storageKey).toMatch(FRESH_CANONICAL);
+    expect(record.job.reclip.matchId).toBe('match-1');
+  });
+
+  it('does not write an unknown render down while attempts remain: the retry will settle it', async () => {
+    reclips.clearReclipPending.mockRejectedValueOnce(new Error('database refused'));
+    clips.getClip.mockResolvedValueOnce(original).mockRejectedValue(new Error('database unreachable'));
+
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const outcome = expect(handleClipGeneration(job({ reclip: reclipPayload }, { attemptsMade: 0, attempts: 3 }))).rejects.toThrow('database refused');
+      await vi.runAllTimersAsync();
+      await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(recordUnknownRender).not.toHaveBeenCalled();
   });
 
   it('records the keys on the job when the release cannot be queued either, so the retry can', async () => {

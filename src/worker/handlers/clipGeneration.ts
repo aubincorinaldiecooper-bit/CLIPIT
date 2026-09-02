@@ -16,8 +16,10 @@ import { getClip, setClipStatus, restoreClipBoundaries } from '../../db/reposito
 import { commitRender } from '../../db/repositories/verticalMedia.js';
 import { discardUploadedObjects } from '../../services/media/verticalPipeline.js';
 import { releaseObjects, renderDeliveredMedia } from '../../services/media/rerender.js';
+import { RECLIP_FAILED_MESSAGE } from '../../services/media/unknownRender.js';
 import { discardVariants } from '../../db/repositories/clipVariants.js';
 import { recordObjectRelease } from '../../db/repositories/objectReleases.js';
+import { recordUnknownRender } from '../../db/repositories/unknownRenders.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import { enqueueObjectRelease, type ClipGenerationJob } from '../../queues/index.js';
 import type { Clip } from '../../domain/types.js';
@@ -39,9 +41,17 @@ import type { Clip } from '../../domain/types.js';
  * job itself, and the next attempt queues their release before it does
  * anything else — refusing to go on until that is done, so a retry can
  * never finish while an earlier attempt's objects have no record at all.
+ *
+ * The job's LAST attempt has no retry to settle it, so it writes the render
+ * down (unknown_renders) for the footage sweep to settle once the database
+ * answers — see settleUnknownRender. Nothing stays "generating" forever.
  */
 export class RenderOutcomeUnknownError extends Error {
-  constructor(readonly original: unknown) {
+  constructor(
+    readonly original: unknown,
+    /** The file this render wrote; the row naming it proves the write landed. */
+    readonly storageKey: string,
+  ) {
     super(`the render's outcome is unknown: ${errorMessage(original)}`);
     this.name = 'RenderOutcomeUnknownError';
   }
@@ -320,7 +330,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
               });
             });
           }
-          throw new RenderOutcomeUnknownError(error);
+          throw new RenderOutcomeUnknownError(error, key);
         }
         // The row naming this render's key proves the write landed only when
         // the key is NEW to the row: a first render at the plain key, on a
@@ -371,15 +381,25 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
   } catch (error) {
     // Not a failure: the write may have landed. Marking anything failed here
     // could be untrue, and would be about a render that is playing. The
-    // queue retries; the retry asks the row (earlierAttemptLanded). Should
-    // this have been the last attempt, the row stays as the write left it,
-    // and the log carries the clip id to reconcile by hand.
+    // queue retries; the retry asks the row (earlierAttemptLanded). The
+    // last attempt has no retry, so it writes the render down for the
+    // footage sweep to settle once the database answers.
     if (error instanceof RenderOutcomeUnknownError) {
+      const lastAttempt = job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
       log.error('the render\'s outcome is unknown; nothing marked failed', {
         err: error.original,
         attemptsMade: job.attemptsMade,
-        lastAttempt: job.attemptsMade + 1 >= (job.opts.attempts ?? 1),
+        lastAttempt,
       });
+      if (lastAttempt) {
+        await recordUnknownRender({ clipId, storageKey: error.storageKey, job: job.data }).catch((recordError: unknown) => {
+          // The database is the thing that could not be reached; if it still
+          // cannot, the log line is the only record, and says so.
+          log.error('the unknown render could not be written down for the sweep; the row may stay generating until settled by hand', {
+            clipId, storageKey: error.storageKey, err: recordError,
+          });
+        });
+      }
       throw error;
     }
 
@@ -401,10 +421,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
           boundariesEditedAt: previous.boundariesEditedAt ? new Date(previous.boundariesEditedAt) : null,
           status: previous.status,
         });
-        await markReclipFailed(
-          job.data.reclip.matchId,
-          'The re-cut could not be rendered. The original clip is untouched — try again.',
-        );
+        await markReclipFailed(job.data.reclip.matchId, RECLIP_FAILED_MESSAGE);
       }
       throw error;
     }

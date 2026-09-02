@@ -33,6 +33,7 @@ vi.mock('../src/db/repositories/verticalMedia.js', () => ({ commitRender }));
 vi.mock('../src/db/pool.js', () => ({ withTransaction: (fn: (client: unknown) => Promise<unknown>) => fn({ query: vi.fn() }) }));
 vi.mock('../src/queues/index.js', () => ({ enqueueObjectRelease: vi.fn(async () => undefined) }));
 vi.mock('../src/db/repositories/objectReleases.js', () => ({ recordObjectRelease: vi.fn(async () => undefined) }));
+vi.mock('../src/db/repositories/unknownRenders.js', () => ({ recordUnknownRender: vi.fn(async () => undefined) }));
 vi.mock('../src/db/repositories/videos.js', () => ({ getVideo }));
 vi.mock('../src/services/storage/s3.js', () => ({ getStorage: () => storage }));
 vi.mock('../src/services/media/ffmpeg.js', () => ({

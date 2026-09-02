@@ -20,6 +20,9 @@ const enqueueObjectRelease = vi.fn();
 vi.mock('../src/queues/index.js', () => ({ enqueueObjectRelease }));
 const drainObjectReleases = vi.fn();
 vi.mock('../src/db/repositories/objectReleases.js', () => ({ drainObjectReleases }));
+const drainUnknownRenders = vi.fn();
+vi.mock('../src/db/repositories/unknownRenders.js', () => ({ drainUnknownRenders }));
+vi.mock('../src/services/media/unknownRender.js', () => ({ settleUnknownRender: vi.fn(async () => 'landed') }));
 
 const { handleRetention } = await import('../src/worker/handlers/retention.js');
 
@@ -32,6 +35,8 @@ beforeEach(() => {
   storageKeysInUse.mockResolvedValue(new Set());
   enqueueObjectRelease.mockResolvedValue(undefined);
   drainObjectReleases.mockResolvedValue(0);
+  drainUnknownRenders.mockReset();
+  drainUnknownRenders.mockResolvedValue(0);
 });
 
 describe('releasing objects a row no longer names', () => {
