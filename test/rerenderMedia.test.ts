@@ -40,6 +40,10 @@ vi.mock('../src/db/repositories/clipVariants.js', () => ({ discardVariants }));
 vi.mock('../src/db/repositories/videos.js', () => ({ getVideo }));
 vi.mock('../src/db/repositories/verticalMedia.js', () => ({ commitRender }));
 vi.mock('../src/queues/index.js', () => ({ enqueueObjectRelease }));
+const recordObjectRelease = vi.fn();
+vi.mock('../src/db/repositories/objectReleases.js', () => ({ recordObjectRelease }));
+const recordUnknownRender = vi.fn();
+vi.mock('../src/db/repositories/unknownRenders.js', () => ({ recordUnknownRender }));
 const txClient = { query: vi.fn() };
 vi.mock('../src/db/pool.js', () => ({ withTransaction: (fn: (client: unknown) => Promise<unknown>) => fn(txClient) }));
 vi.mock('../src/services/media/verticalPipeline.js', () => ({
@@ -77,12 +81,13 @@ const reclipPayload = {
   previous: { startSeconds: 130, endSeconds: 150, boundariesEditedAt: null, status: 'ready' as const },
 };
 
-function job(data: Record<string, unknown>) {
+function job(data: Record<string, unknown>, overrides: { attemptsMade?: number; attempts?: number } = {}) {
   return {
     data: { clipId: 'clip-1', ...data },
-    attemptsMade: 0,
-    opts: { attempts: 1 },
+    attemptsMade: overrides.attemptsMade ?? 0,
+    opts: { attempts: overrides.attempts ?? 1 },
     updateProgress: vi.fn().mockResolvedValue(undefined),
+    updateData: vi.fn().mockResolvedValue(undefined),
   } as never;
 }
 
@@ -123,11 +128,13 @@ const committed = () => commitRender.mock.calls[0]?.[1] as Record<string, unknow
 beforeEach(() => {
   for (const mock of [
     ...Object.values(clips), ...Object.values(reclips), ...Object.values(storage), ...Object.values(media),
-    ...Object.values(pipeline), ...Object.values(log), discardVariants, getVideo, commitRender, enqueueObjectRelease,
+    ...Object.values(pipeline), ...Object.values(log), discardVariants, getVideo, commitRender, enqueueObjectRelease, recordObjectRelease, recordUnknownRender,
   ]) {
     mock.mockReset();
   }
   enqueueObjectRelease.mockResolvedValue(undefined);
+  recordObjectRelease.mockResolvedValue(undefined);
+  recordUnknownRender.mockResolvedValue(undefined);
   clips.getClip.mockResolvedValue(original);
   clips.setClipStatus.mockResolvedValue(true);
   reclips.appendReclipVersion.mockResolvedValue({ version: 2 });
@@ -317,18 +324,200 @@ describe('a re-render of a moment cut on find, original framing', () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('carrying on as committed'), expect.anything());
   });
 
-  it('deletes nothing when the write failed and the row cannot be read either', async () => {
-    commitRender.mockRejectedValueOnce(new Error('database refused'));
-    // The handler's first read succeeds; the re-read after the failed write does not.
-    clips.getClip.mockResolvedValueOnce(original).mockRejectedValueOnce(new Error('database unreachable'));
+  it('asks the row again before giving up: one dropped read does not make the outcome unknown', async () => {
+    commitRender.mockRejectedValueOnce(new Error('connection reset'));
+    // First read: the handler's own. Second: the re-read, dropped. Third: answered — the write landed.
+    clips.getClip
+      .mockResolvedValueOnce(original)
+      .mockRejectedValueOnce(new Error('connection reset'))
+      .mockImplementation(async () => {
+        const upload = canonicalUpload();
+        return { ...original, storageKey: upload![0], posterStorageKey: `posters/video-1/clip-1-${(upload![0] as string).slice(-12, -4)}.jpg` };
+      });
 
-    await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('database refused');
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const outcome = expect(handleClipGeneration(job({ reclip: reclipPayload }))).resolves.toBeUndefined();
+      await vi.runAllTimersAsync();
+      await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
 
-    // An orphan is a bill we can find in the logs; a ready clip pointing at
-    // deleted media is not recoverable. The keys are on record.
+    expect(clips.getClip).toHaveBeenCalledTimes(3);
     expect(pipeline.discardUploadedObjects).not.toHaveBeenCalled();
-    expect(enqueueObjectRelease).not.toHaveBeenCalled();
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('could not be read'), expect.objectContaining({ keys: expect.any(Array) }));
+    expect(enqueueObjectRelease.mock.calls[0]![0]).toEqual(expect.arrayContaining([OLD_CANONICAL]));
+    expect(reclips.markReclipFailed).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('asking again'), expect.anything());
+  });
+
+  it('marks nothing failed and deletes nothing when the write failed and the row cannot be read either; both renders\' objects go to the release that will ask', async () => {
+    // Devin's finding on #80: with the write's reply lost AND the row
+    // unreadable, the outcome is unknown, and "unknown" was being treated
+    // as "failed" — on the last attempt, a landed re-cut was labelled failed.
+    // The reply is lost at the END of the transaction — after the shapes'
+    // rows went — so their keys are in hand and must be queued too.
+    discardVariants.mockResolvedValueOnce(['clips/video-1/clip-1/9x16-50-aaaaaaaa.mp4'] as never);
+    reclips.clearReclipPending.mockRejectedValueOnce(new Error('database refused'));
+    clips.getClip.mockResolvedValueOnce(original).mockRejectedValue(new Error('database unreachable'));
+
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      // The job's LAST attempt — the case where a definite failure would roll the Re-clip back.
+      const outcome = expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('database refused');
+      await vi.runAllTimersAsync();
+      await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // Five reads: the handler's own, then the re-read and its four retries.
+    expect(clips.getClip).toHaveBeenCalledTimes(6);
+    expect(pipeline.discardUploadedObjects).not.toHaveBeenCalled();
+    expect(storage.remove).not.toHaveBeenCalled();
+    // Old cut, old poster, the discarded shape and this render's fresh pair —
+    // all queued; the release keeps whichever the row names when it acts.
+    const [keys, context] = enqueueObjectRelease.mock.calls[0]!;
+    expect(keys).toEqual(expect.arrayContaining([OLD_CANONICAL, OLD_POSTER, 'clips/video-1/clip-1/9x16-50-aaaaaaaa.mp4']));
+    expect(keys.some((key: string) => FRESH_CANONICAL.test(key))).toBe(true);
+    expect(keys.some((key: string) => /^posters\/video-1\/clip-1-[0-9a-f]{8}\.jpg$/.test(key))).toBe(true);
+    expect(context).toMatchObject({ clipId: 'clip-1', reason: 'render_outcome_unknown' });
+    // Not a failure: nothing put back, nothing marked, no error written on the clip.
+    expect(clips.restoreClipBoundaries).not.toHaveBeenCalled();
+    expect(reclips.markReclipFailed).not.toHaveBeenCalled();
+    expect(clips.setClipStatus).not.toHaveBeenCalledWith('clip-1', 'ready', expect.anything());
+    expect(clips.setClipStatus).not.toHaveBeenCalledWith('clip-1', 'failed', expect.anything());
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('outcome is unknown'), expect.objectContaining({ keys: expect.any(Array) }));
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('nothing marked failed'), expect.objectContaining({ lastAttempt: true }));
+    // The last attempt writes the render down for the sweep to settle.
+    const [record] = recordUnknownRender.mock.calls[0]!;
+    expect(record.clipId).toBe('clip-1');
+    expect(record.storageKey).toMatch(FRESH_CANONICAL);
+    expect(record.job.reclip.matchId).toBe('match-1');
+  });
+
+  it('does not write an unknown render down while attempts remain: the retry will settle it', async () => {
+    reclips.clearReclipPending.mockRejectedValueOnce(new Error('database refused'));
+    clips.getClip.mockResolvedValueOnce(original).mockRejectedValue(new Error('database unreachable'));
+
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const outcome = expect(handleClipGeneration(job({ reclip: reclipPayload }, { attemptsMade: 0, attempts: 3 }))).rejects.toThrow('database refused');
+      await vi.runAllTimersAsync();
+      await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(recordUnknownRender).not.toHaveBeenCalled();
+  });
+
+  it('records the keys on the job when the release cannot be queued either, so the retry can', async () => {
+    // Devin's finding on #81: the release was the only record of those
+    // objects, and a queue that refused was being swallowed.
+    reclips.clearReclipPending.mockRejectedValueOnce(new Error('database refused'));
+    clips.getClip.mockResolvedValueOnce(original).mockRejectedValue(new Error('database unreachable'));
+    enqueueObjectRelease.mockRejectedValueOnce(new Error('redis refused'));
+    const attempt = job({ reclip: reclipPayload });
+
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const outcome = expect(handleClipGeneration(attempt)).rejects.toThrow('database refused');
+      await vi.runAllTimersAsync();
+      await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const recorded = (attempt as { updateData: ReturnType<typeof vi.fn> }).updateData.mock.calls[0]![0] as { unresolvedKeys: string[] };
+    expect(recorded.unresolvedKeys).toEqual(expect.arrayContaining([OLD_CANONICAL, OLD_POSTER]));
+    expect(recorded.unresolvedKeys.some((key) => FRESH_CANONICAL.test(key))).toBe(true);
+    // And in the database, where the sweep finds it even after the job's last attempt.
+    const [dbKeys, dbContext] = recordObjectRelease.mock.calls[0]!;
+    expect(dbKeys).toEqual(recorded.unresolvedKeys);
+    expect(dbContext).toMatchObject({ clipId: 'clip-1', reason: 'render_outcome_unknown' });
+    expect(storage.remove).not.toHaveBeenCalled();
+    expect(reclips.markReclipFailed).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('recording the keys'), expect.objectContaining({ keys: expect.any(Array) }));
+  });
+
+  it('on a retry, queues an earlier attempt\'s unresolved objects for release before anything else, then clears the record', async () => {
+    const attempt = job({ reclip: reclipPayload, unresolvedKeys: ['clips/video-1/clip-1-deadbeef.mp4', OLD_CANONICAL] }, { attemptsMade: 1, attempts: 3 });
+    clips.getClip.mockResolvedValue({ ...original, status: 'generating' });
+
+    await expect(handleClipGeneration(attempt)).resolves.toBeUndefined();
+
+    const [keys, context] = enqueueObjectRelease.mock.calls[0]!;
+    expect(keys).toEqual(['clips/video-1/clip-1-deadbeef.mp4', OLD_CANONICAL]);
+    expect(context).toMatchObject({ clipId: 'clip-1', reason: 'render_outcome_unknown' });
+    expect(orderOf(enqueueObjectRelease)).toBeLessThan(orderOf(media.cutClip));
+    const cleared = (attempt as { updateData: ReturnType<typeof vi.fn> }).updateData.mock.calls[0]![0] as { unresolvedKeys?: string[] };
+    expect(cleared.unresolvedKeys).toBeUndefined();
+    // And the render itself went on as normal.
+    expect(commitRender).toHaveBeenCalledTimes(1);
+  });
+
+  it('on a retry, queues them even when the clip is already generated — the earlier attempt landed, and this one would otherwise say nothing', async () => {
+    // Devin's finding on #81: the "already generated" shortcut came first
+    // and returned with the record unread.
+    const attempt = job({ unresolvedKeys: ['clips/video-1/clip-1.mp4', OLD_POSTER] }, { attemptsMade: 1, attempts: 3 });
+    clips.getClip.mockResolvedValue({ ...original, status: 'ready', storageKey: 'clips/video-1/clip-1.mp4' });
+
+    await expect(handleClipGeneration(attempt)).resolves.toBeUndefined();
+
+    expect(enqueueObjectRelease).toHaveBeenCalledWith(['clips/video-1/clip-1.mp4', OLD_POSTER], expect.objectContaining({ reason: 'render_outcome_unknown' }));
+    expect(media.cutClip).not.toHaveBeenCalled();
+    expect(log.info).toHaveBeenCalledWith('clip already generated, skipping');
+  });
+
+  it('on a retry, stops before cutting when those objects still cannot be queued', async () => {
+    const attempt = job({ reclip: reclipPayload, unresolvedKeys: [OLD_CANONICAL] }, { attemptsMade: 1, attempts: 3 });
+    clips.getClip.mockResolvedValue({ ...original, status: 'generating' });
+    enqueueObjectRelease.mockRejectedValueOnce(new Error('redis refused'));
+
+    await expect(handleClipGeneration(attempt)).rejects.toThrow('redis refused');
+
+    expect(media.cutClip).not.toHaveBeenCalled();
+    expect(commitRender).not.toHaveBeenCalled();
+  });
+
+  it('on a retry, sees that the earlier attempt landed and neither cuts again nor records the version twice', async () => {
+    clips.getClip.mockResolvedValue({ ...original, status: 'ready', storageKey: 'clips/video-1/clip-1-0ddba11a.mp4', startSeconds: 128, endSeconds: 151 });
+
+    await expect(handleClipGeneration({ ...(job({ reclip: reclipPayload }) as object), attemptsMade: 1, opts: { attempts: 3 } } as never)).resolves.toBeUndefined();
+
+    expect(media.cutClip).not.toHaveBeenCalled();
+    expect(commitRender).not.toHaveBeenCalled();
+    expect(reclips.appendReclipVersion).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('earlier attempt of this render landed'), expect.objectContaining({ attemptsMade: 1 }));
+  });
+
+  it('on a retry, still renders a Re-clip whose earlier attempt failed for real: the row is not ready', async () => {
+    clips.getClip.mockResolvedValue({ ...original, status: 'generating', startSeconds: 128, endSeconds: 151 });
+
+    await expect(handleClipGeneration({ ...(job({ reclip: reclipPayload }) as object), attemptsMade: 1, opts: { attempts: 3 } } as never)).resolves.toBeUndefined();
+
+    expect(media.cutClip).toHaveBeenCalledTimes(1);
+    expect(commitRender).toHaveBeenCalledTimes(1);
+  });
+
+  it('on a retry of a Replace, reads the landed spec through its stored spelling', async () => {
+    const captions = [{ text: 'hello', start: 1, end: 2, position: 85 }];
+    // JSONB gives the keys back in its own order; the same spec all the same.
+    clips.getClip.mockResolvedValue({ ...original, status: 'ready', captions: [{ end: 2, position: 85, start: 1, text: 'hello' }] });
+
+    await expect(handleClipGeneration({ ...(job({ captions }) as object), attemptsMade: 1, opts: { attempts: 3 } } as never)).resolves.toBeUndefined();
+
+    expect(media.cutClip).not.toHaveBeenCalled();
+  });
+
+  it('on a retry of a Replace whose earlier attempt failed for real, renders: the row is ready with the OLD spec', async () => {
+    const captions = [{ text: 'hello', start: 1, end: 2, position: 85 }];
+    clips.getClip.mockResolvedValue({ ...original, status: 'ready', captions: null });
+
+    await expect(handleClipGeneration({ ...(job({ captions }) as object), attemptsMade: 1, opts: { attempts: 3 } } as never)).resolves.toBeUndefined();
+
+    expect(media.cutClip).toHaveBeenCalledTimes(1);
   });
 
   it('treats a row that vanished the same way: nothing to record, so the fresh objects go', async () => {

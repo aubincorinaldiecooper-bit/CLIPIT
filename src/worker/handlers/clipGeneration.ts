@@ -2,7 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
-import { logger } from '../../lib/logger.js';
+import { logger, type Logger } from '../../lib/logger.js';
 import { errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { getStorage } from '../../services/storage/s3.js';
@@ -16,17 +16,113 @@ import { getClip, setClipStatus, restoreClipBoundaries } from '../../db/reposito
 import { commitRender } from '../../db/repositories/verticalMedia.js';
 import { discardUploadedObjects } from '../../services/media/verticalPipeline.js';
 import { releaseObjects, renderDeliveredMedia } from '../../services/media/rerender.js';
+import { RECLIP_FAILED_MESSAGE } from '../../services/media/unknownRender.js';
 import { discardVariants } from '../../db/repositories/clipVariants.js';
+import { recordObjectRelease } from '../../db/repositories/objectReleases.js';
+import { recordUnknownRender } from '../../db/repositories/unknownRenders.js';
 import { getVideo } from '../../db/repositories/videos.js';
-import type { ClipGenerationJob } from '../../queues/index.js';
+import { enqueueObjectRelease, type ClipGenerationJob } from '../../queues/index.js';
+import type { Clip } from '../../domain/types.js';
 
-/** Every storage key the clip's row names right now. */
-async function keysNamedByRow(clipId: string): Promise<Set<string>> {
-  const current = await getClip(clipId);
-  return new Set(
-    [current?.storageKey, current?.posterStorageKey, current?.derivativeStorageKey]
-      .filter((key): key is string => typeof key === 'string' && key.length > 0),
+/**
+ * A write whose reply was lost, and a row that could not be read afterwards.
+ *
+ * The render may or may not have landed; nothing about it is known to have
+ * failed. So it is NOT a failure: no boundaries are put back, no Re-clip is
+ * marked failed, no error is written on the clip — any of those, done on a
+ * render that did land, would tell the person their re-cut failed over a
+ * file that is playing. The queue retries the job, and the retry starts by
+ * asking the row whether the earlier attempt landed (see
+ * earlierAttemptLanded). The objects of both the old render and this one
+ * are queued for release, and the release keeps whichever the row names.
+ *
+ * That release is the only record of those objects, so it is not allowed
+ * to quietly fail: if it cannot be queued, the keys are written onto the
+ * job itself, and the next attempt queues their release before it does
+ * anything else — refusing to go on until that is done, so a retry can
+ * never finish while an earlier attempt's objects have no record at all.
+ *
+ * The job's LAST attempt has no retry to settle it, so it writes the render
+ * down (unknown_renders) for the footage sweep to settle once the database
+ * answers — see settleUnknownRender. Nothing stays "generating" forever.
+ */
+export class RenderOutcomeUnknownError extends Error {
+  constructor(
+    readonly original: unknown,
+    /** The file this render wrote; the row naming it proves the write landed. */
+    readonly storageKey: string,
+  ) {
+    super(`the render's outcome is unknown: ${errorMessage(original)}`);
+    this.name = 'RenderOutcomeUnknownError';
+  }
+}
+
+/**
+ * How long to wait between the reads that ask the row what it names after a
+ * write's reply was lost. The database answered a moment ago; one dropped
+ * connection is the usual case, and a few seconds of patience separate that
+ * from an outage.
+ */
+const REREAD_DELAYS_MS = [500, 1_000, 2_000, 4_000];
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Every storage key the clip's row names right now — asked again, with a
+ * short wait between, if the first read fails. Null once the reads are
+ * spent: the caller then knows nothing, and must act as if it knows nothing.
+ */
+async function keysNamedByRow(clipId: string, log: Logger): Promise<Set<string> | null> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const current = await getClip(clipId);
+      return new Set(
+        [current?.storageKey, current?.posterStorageKey, current?.derivativeStorageKey]
+          .filter((key): key is string => typeof key === 'string' && key.length > 0),
+      );
+    } catch (error) {
+      const delay = REREAD_DELAYS_MS[attempt];
+      if (delay === undefined) {
+        log.error('the render\'s write failed and the row could not be read, even after waiting', { err: error, reads: attempt + 1 });
+        return null;
+      }
+      log.warn('the row could not be read after the write; asking again', { err: error, inMs: delay });
+      await sleep(delay);
+    }
+  }
+}
+
+/** JSON with every object's keys in one order, so two spellings of the same spec compare equal. */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, inner: unknown) =>
+    inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? Object.fromEntries(Object.entries(inner as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : inner,
   );
+}
+
+/**
+ * Whether an earlier attempt of THIS re-render landed although its reply was
+ * lost — asked at the start of a retry, so the retry records nothing twice
+ * and cuts nothing again.
+ *
+ * The evidence is the row. Every attempt marks the clip 'generating' before
+ * it cuts, and only a landed write marks it 'ready' again before the job's
+ * attempts are spent: a Re-clip's definite failure leaves the row alone
+ * until the last attempt, after which no retry runs; a Replace's puts the
+ * row back to 'ready' but with the captions it had, not the job's. So a row
+ * that is 'ready' AND carries what this job was to write — the Re-clip's
+ * boundaries, the Replace's spec — was written by this render.
+ */
+function earlierAttemptLanded(clip: Clip, data: ClipGenerationJob): boolean {
+  if (clip.status !== 'ready' || !clip.storageKey) return false;
+  if (data.reclip) {
+    return clip.startSeconds === data.reclip.startSeconds && clip.endSeconds === data.reclip.endSeconds;
+  }
+  if (data.captions !== undefined) {
+    return canonicalJson(clip.captions ?? []) === canonicalJson(data.captions);
+  }
+  return false;
 }
 
 /**
@@ -38,6 +134,25 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
   const log = logger.child({ job: 'clip-generation', clipId });
 
   const clip = await getClip(clipId);
+
+  // An earlier attempt left objects of unknown ownership and could not queue
+  // their release (see RenderOutcomeUnknownError). That comes before every
+  // shortcut below — a clip already generated, a clip that is gone — because
+  // those are exactly the cases where the earlier attempt's write landed and
+  // this one would otherwise return without a word. A queue that refuses
+  // again ends this attempt here: the job retries later rather than
+  // finishing with those objects on record nowhere.
+  if (job.data.unresolvedKeys?.length) {
+    const keys = job.data.unresolvedKeys;
+    await enqueueObjectRelease(keys, { videoId: clip?.videoId ?? '', clipId, reason: 'render_outcome_unknown' });
+    log.warn('an earlier attempt\'s objects of unknown ownership are now queued for release', { keys });
+    // The record has served; a job that cannot clear it queues them again
+    // next time, which the release's ownership check makes harmless.
+    await job.updateData?.({ ...job.data, unresolvedKeys: undefined }).catch((updateError: unknown) => {
+      log.warn('the unresolved keys stay on the job; the next attempt will queue them again', { err: updateError });
+    });
+  }
+
   if (!clip) {
     log.warn('clip no longer exists, dropping job');
     return;
@@ -48,6 +163,16 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
   // skipping.
   if (clip.status === 'ready' && clip.storageKey && job.data.captions === undefined && job.data.reclip === undefined) {
     log.info('clip already generated, skipping');
+    return;
+  }
+  // A retry of a re-render whose earlier attempt landed without saying so:
+  // the row already carries this render. Cutting again would put a second
+  // file under the same id and, for a Re-clip, record its version twice.
+  if (job.attemptsMade > 0 && earlierAttemptLanded(clip, job.data)) {
+    log.warn('an earlier attempt of this render landed although its reply was lost; nothing left to do', {
+      attemptsMade: job.attemptsMade,
+      key: clip.storageKey,
+    });
     return;
   }
 
@@ -171,13 +296,42 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         // COMMIT, and then the row names every fresh key while this promise
         // rejected. So the row is asked before anything is deleted, and what
         // it names, this render keeps.
-        const named = await keysNamedByRow(clipId).catch((readError: unknown) => {
-          log.error('the render\'s write failed and the row could not be read; keeping this render\'s objects', {
-            ...context, keys: fresh, err: readError,
+        const named = await keysNamedByRow(clipId, log);
+        if (named === null) {
+          // Nothing is known. Nothing is deleted now, and nothing is marked
+          // failed (see RenderOutcomeUnknownError). Both renders' objects go
+          // to the release, which asks the rows again when it acts and keeps
+          // whichever they name — the previous cut and media if the write
+          // did not land, this render's if it did.
+          const unresolved = [render ? clip.storageKey : null, ...(delivered?.oldKeys ?? []), ...staleVariantKeys, ...fresh]
+            .filter((unresolvedKey): unresolvedKey is string => typeof unresolvedKey === 'string' && unresolvedKey.length > 0);
+          log.error('the render\'s outcome is unknown; its objects and the previous ones are queued for a release that will ask the row', {
+            ...context, keys: unresolved, err: error,
           });
-          return null;
-        });
-        if (named === null) throw error;
+          try {
+            await enqueueObjectRelease(unresolved, { ...context, reason: 'render_outcome_unknown' });
+          } catch (queueError) {
+            // The release was the record. Without it the keys are written
+            // down where the queue is not needed: in the database, for the
+            // footage sweep to hand to the queue when it next runs — a
+            // record that holds even on the job's last attempt — and on the
+            // job, for the next attempt to queue before anything else. If
+            // neither can be written, the log line above is the map to
+            // them — said so, rather than silently.
+            log.error('the release could not be queued either; recording the keys for the sweep and the next attempt', {
+              ...context, keys: unresolved, err: queueError,
+            });
+            await recordObjectRelease(unresolved, { ...context, reason: 'render_outcome_unknown' }).catch((recordError: unknown) => {
+              log.error('the keys could not be recorded in the database either', { ...context, keys: unresolved, err: recordError });
+            });
+            await job.updateData?.({ ...job.data, unresolvedKeys: unresolved }).catch((updateError: unknown) => {
+              log.error('the keys could not be recorded on the job; they are orphaned unless the database record or the logs find them', {
+                ...context, keys: unresolved, err: updateError,
+              });
+            });
+          }
+          throw new RenderOutcomeUnknownError(error, key);
+        }
         // The row naming this render's key proves the write landed only when
         // the key is NEW to the row: a first render at the plain key, on a
         // row that already named that key from an earlier attempt, proves
@@ -225,6 +379,30 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       await job.updateProgress({ stage: 'ready', percent: 100 });
     });
   } catch (error) {
+    // Not a failure: the write may have landed. Marking anything failed here
+    // could be untrue, and would be about a render that is playing. The
+    // queue retries; the retry asks the row (earlierAttemptLanded). The
+    // last attempt has no retry, so it writes the render down for the
+    // footage sweep to settle once the database answers.
+    if (error instanceof RenderOutcomeUnknownError) {
+      const lastAttempt = job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
+      log.error('the render\'s outcome is unknown; nothing marked failed', {
+        err: error.original,
+        attemptsMade: job.attemptsMade,
+        lastAttempt,
+      });
+      if (lastAttempt) {
+        await recordUnknownRender({ clipId, storageKey: error.storageKey, job: job.data }).catch((recordError: unknown) => {
+          // The database is the thing that could not be reached; if it still
+          // cannot, the log line is the only record, and says so.
+          log.error('the unknown render could not be written down for the sweep; the row may stay generating until settled by hand', {
+            clipId, storageKey: error.storageKey, err: recordError,
+          });
+        });
+      }
+      throw error;
+    }
+
     const message = errorMessage(error);
     log.error('clip generation failed', { err: error });
 
@@ -243,10 +421,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
           boundariesEditedAt: previous.boundariesEditedAt ? new Date(previous.boundariesEditedAt) : null,
           status: previous.status,
         });
-        await markReclipFailed(
-          job.data.reclip.matchId,
-          'The re-cut could not be rendered. The original clip is untouched — try again.',
-        );
+        await markReclipFailed(job.data.reclip.matchId, RECLIP_FAILED_MESSAGE);
       }
       throw error;
     }

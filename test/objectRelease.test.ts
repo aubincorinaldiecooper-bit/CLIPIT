@@ -8,12 +8,21 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 
 const remove = vi.fn();
+const storageKeysInUse = vi.fn();
 vi.mock('../src/services/storage/s3.js', () => ({ getStorage: () => ({ remove }) }));
+vi.mock('../src/db/repositories/objectOwnership.js', () => ({ storageKeysInUse }));
 const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 vi.mock('../src/lib/logger.js', () => ({ logger: { ...log, child: () => log } }));
 vi.mock('../src/db/repositories/verticalMedia.js', () => ({ claimUnkeptPreRenderedMedia: vi.fn() }));
 vi.mock('../src/db/repositories/videos.js', () => ({ listVideosWithUnreachableFootage: vi.fn(async () => []) }));
 vi.mock('../src/services/retention.js', () => ({ expireVideoFootage: vi.fn() }));
+const enqueueObjectRelease = vi.fn();
+vi.mock('../src/queues/index.js', () => ({ enqueueObjectRelease }));
+const drainObjectReleases = vi.fn();
+vi.mock('../src/db/repositories/objectReleases.js', () => ({ drainObjectReleases }));
+const drainUnknownRenders = vi.fn();
+vi.mock('../src/db/repositories/unknownRenders.js', () => ({ drainUnknownRenders }));
+vi.mock('../src/services/media/unknownRender.js', () => ({ settleUnknownRender: vi.fn(async () => 'landed') }));
 
 const { handleRetention } = await import('../src/worker/handlers/retention.js');
 
@@ -21,8 +30,13 @@ const context = { videoId: 'video-1', clipId: 'clip-1', reason: 'superseded_by_r
 const job = (data: Record<string, unknown>) => ({ id: 'job-1', data } as never);
 
 beforeEach(() => {
-  for (const mock of [remove, ...Object.values(log)]) mock.mockReset();
+  for (const mock of [remove, storageKeysInUse, enqueueObjectRelease, drainObjectReleases, ...Object.values(log)]) mock.mockReset();
   remove.mockResolvedValue(undefined);
+  storageKeysInUse.mockResolvedValue(new Set());
+  enqueueObjectRelease.mockResolvedValue(undefined);
+  drainObjectReleases.mockResolvedValue(0);
+  drainUnknownRenders.mockReset();
+  drainUnknownRenders.mockResolvedValue(0);
 });
 
 describe('releasing objects a row no longer names', () => {
@@ -50,9 +64,51 @@ describe('releasing objects a row no longer names', () => {
     );
   });
 
+  it('asks the rows first, and keeps a key one of them names again', async () => {
+    // Devin's finding on #80: a platform shape discarded by a re-render and
+    // asked for again landed at the same key before the release ran. The
+    // release re-takes its decision at the moment it acts.
+    storageKeysInUse.mockResolvedValueOnce(new Set(['clips/video-1/clip-1/9x16-50.mp4']));
+
+    await handleRetention(job({ kind: 'release', keys: ['clips/video-1/clip-1/9x16-50.mp4', 'clips/video-1/clip-1.mp4'], context }));
+
+    expect(storageKeysInUse).toHaveBeenCalledWith(['clips/video-1/clip-1/9x16-50.mp4', 'clips/video-1/clip-1.mp4']);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith('clips/video-1/clip-1.mp4');
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('kept'), expect.objectContaining({ key: 'clips/video-1/clip-1/9x16-50.mp4' }));
+    expect(log.info).toHaveBeenCalledWith('released objects removed', expect.objectContaining({ removed: 1, kept: 1, failed: 0 }));
+  });
+
+  it('removes nothing when the rows cannot be asked, and fails so the queue tries again', async () => {
+    storageKeysInUse.mockRejectedValueOnce(new Error('database unreachable'));
+
+    await expect(
+      handleRetention(job({ kind: 'release', keys: ['clips/video-1/clip-1.mp4'], context })),
+    ).rejects.toThrow('database unreachable');
+
+    expect(remove).not.toHaveBeenCalled();
+  });
+
   it('is not the footage sweep: a sweep job still sweeps', async () => {
     await handleRetention(job({ requestedAt: '2026-09-02T15:00:00Z' }));
     expect(remove).not.toHaveBeenCalled();
     expect(log.info).toHaveBeenCalledWith('no footage to remove');
+  });
+
+  it('the sweep hands releases a render wrote down (queue unreachable at the time) to the queue', async () => {
+    // Devin's finding on #81: on a job's last attempt there is no retry to
+    // read a record on the job, so the database holds one the sweep finds.
+    drainObjectReleases.mockImplementation(async (_limit: number, handOver: (release: unknown) => Promise<void>) => {
+      await handOver({ id: 'rel-1', keys: ['clips/video-1/clip-1-old.mp4'], context: { videoId: 'video-1', clipId: 'clip-1', reason: 'render_outcome_unknown' } });
+      return 1;
+    });
+    // The sweep itself: nothing to remove today.
+    const { listVideosWithUnreachableFootage } = await import('../src/db/repositories/videos.js');
+    (listVideosWithUnreachableFootage as unknown as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+    await handleRetention(job({ requestedAt: '2026-09-02T15:00:00Z' }));
+
+    expect(enqueueObjectRelease).toHaveBeenCalledWith(['clips/video-1/clip-1-old.mp4'], { videoId: 'video-1', clipId: 'clip-1', reason: 'render_outcome_unknown' });
+    expect(log.info).toHaveBeenCalledWith('recorded releases handed to the queue', { releases: 1 });
   });
 });

@@ -3,25 +3,48 @@ import { env } from '../../config/env.js';
 import { logger, type Logger } from '../../lib/logger.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { claimUnkeptPreRenderedMedia } from '../../db/repositories/verticalMedia.js';
+import { storageKeysInUse } from '../../db/repositories/objectOwnership.js';
 import { listVideosWithUnreachableFootage } from '../../db/repositories/videos.js';
 import { expireVideoFootage } from '../../services/retention.js';
-import type { RetentionJob } from '../../queues/index.js';
+import { enqueueObjectRelease, type RetentionJob } from '../../queues/index.js';
+import { drainObjectReleases } from '../../db/repositories/objectReleases.js';
+import { drainUnknownRenders } from '../../db/repositories/unknownRenders.js';
+import { settleUnknownRender } from '../../services/media/unknownRender.js';
 
 /**
  * Objects a render's row stopped naming, removed now that no signed URL to
- * them can still be live (see enqueueObjectRelease for why the wait). One key
- * that will not go must not keep the others; it is named at error level and
- * the job fails so the queue tries again — and if it never goes, the log is
- * the map to the orphan.
+ * them can still be live (see enqueueObjectRelease for why the wait).
+ *
+ * The decision to release was taken an hour or more ago, so it is checked
+ * again now, against the rows: a key some row names at this moment is kept,
+ * whatever it was queued for. Two things make that necessary. A platform
+ * shape discarded by a re-render and asked for again is a new row, and
+ * before its keys carried the row's id it landed on the SAME key as the
+ * file queued for release. And a render whose write landed while its reply
+ * was lost queues both the old objects and its own, and lets this check —
+ * once the database answers again — decide which the row kept.
+ *
+ * If the rows cannot be asked, nothing is removed: the job fails and the
+ * queue tries again, hours if it must. One key that will not go must not
+ * keep the others; it is named at error level and the job fails so the
+ * queue tries again — and if it never goes, the log is the map to the
+ * orphan.
  */
 async function releaseObjectsNow(
   keys: string[],
   context: { videoId: string; clipId: string; reason: string },
   log: Logger,
 ): Promise<void> {
+  const named = await storageKeysInUse(keys);
   const storage = getStorage();
   const failed: string[] = [];
+  let kept = 0;
   for (const key of keys) {
+    if (named.has(key)) {
+      kept += 1;
+      log.warn('a released object is named by a row again; kept', { ...context, key });
+      continue;
+    }
     try {
       await storage.remove(key);
     } catch (error) {
@@ -29,7 +52,7 @@ async function releaseObjectsNow(
       log.error('a released object could not be removed; it is orphaned unless a retry succeeds', { ...context, key, err: error });
     }
   }
-  log.info('released objects removed', { ...context, removed: keys.length - failed.length, failed: failed.length });
+  log.info('released objects removed', { ...context, removed: keys.length - kept - failed.length, kept, failed: failed.length });
   if (failed.length > 0) {
     throw new Error(`${failed.length} of ${keys.length} released objects could not be removed`);
   }
@@ -54,6 +77,12 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
 
   const log = logger.child({ job: 'retention', jobId: job.id });
   const limit = env.RETENTION_VIDEO_LIMIT;
+
+  // First, whatever a render wrote down because the queue could not be
+  // reached, and whatever render could not learn its own outcome: neither
+  // must wait on there being footage to sweep.
+  await handOverRecordedReleases(log);
+  await settleUnknownRenders(log);
 
   const videos = await listVideosWithUnreachableFootage(env.FOOTAGE_IDLE_SECONDS, limit + 1);
   if (videos.length === 0) {
@@ -96,6 +125,39 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
   });
 
   await sweepUnkeptPreRenderedMedia(log);
+}
+
+/**
+ * Renders whose outcome was unknown when their job's last attempt ended
+ * (see RenderOutcomeUnknownError): settled by the row's evidence now that
+ * the database answers — left alone if the write landed, rolled back as a
+ * failed render if it did not. A row that cannot be settled stays for the
+ * next sweep.
+ */
+async function settleUnknownRenders(log: Logger): Promise<void> {
+  try {
+    const settled = await drainUnknownRenders(env.RETENTION_VIDEO_LIMIT, async (render) => {
+      await settleUnknownRender(render, log);
+    });
+    if (settled > 0) log.info('unknown renders settled', { renders: settled });
+  } catch (error) {
+    log.warn('unknown renders could not be settled; they stay for the next sweep', { err: error });
+  }
+}
+
+/**
+ * Releases a render wrote down because the queue could not be reached at
+ * the time (see recordObjectRelease). This sweep runs from the queue, so
+ * the queue is back; each row goes onto it and is deleted only then.
+ */
+async function handOverRecordedReleases(log: Logger): Promise<void> {
+  try {
+    const handed = await drainObjectReleases(env.RETENTION_VIDEO_LIMIT, (release) => enqueueObjectRelease(release.keys, release.context));
+    if (handed > 0) log.info('recorded releases handed to the queue', { releases: handed });
+  } catch (error) {
+    // The rows stay; the next sweep tries again.
+    log.warn('recorded releases could not be handed to the queue', { err: error });
+  }
 }
 
 /**
