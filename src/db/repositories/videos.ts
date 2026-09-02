@@ -31,6 +31,7 @@ interface VideoRow {
   metadata: Record<string, unknown>;
   original_storage_key: string | null;
   proxy_storage_key: string | null;
+  playback_storage_key: string | null;
   poster_storage_key: string | null;
   captions_storage_key: string | null;
   chunk_seconds: number | null;
@@ -70,6 +71,7 @@ function mapVideo(row: VideoRow): Video {
     metadata: row.metadata ?? {},
     originalStorageKey: row.original_storage_key,
     proxyStorageKey: row.proxy_storage_key,
+    playbackStorageKey: row.playback_storage_key ?? null,
     posterStorageKey: row.poster_storage_key,
     captionsStorageKey: row.captions_storage_key,
     chunkSeconds: row.chunk_seconds,
@@ -217,6 +219,7 @@ export interface VideoMediaUpdate {
   originalFilename?: string | null;
   originalStorageKey?: string | null;
   proxyStorageKey?: string | null;
+  playbackStorageKey?: string | null;
   posterStorageKey?: string | null;
   captionsStorageKey?: string | null;
   durationSeconds?: number | null;
@@ -238,6 +241,7 @@ const mediaColumns: Record<keyof VideoMediaUpdate, string> = {
   originalFilename: 'original_filename',
   originalStorageKey: 'original_storage_key',
   proxyStorageKey: 'proxy_storage_key',
+  playbackStorageKey: 'playback_storage_key',
   posterStorageKey: 'poster_storage_key',
   captionsStorageKey: 'captions_storage_key',
   durationSeconds: 'duration_seconds',
@@ -340,6 +344,7 @@ export async function markFootageExpired(videoId: string): Promise<void> {
         SET footage_expired_at = now(),
             original_storage_key = NULL,
             proxy_storage_key = NULL,
+            playback_storage_key = NULL,
             captions_storage_key = NULL,
             updated_at = now()
       WHERE id = $1`,

@@ -8,8 +8,11 @@ import { logger } from '../../lib/logger.js';
 export interface ProbeResult {
   durationSeconds: number;
   sizeBytes: number | null;
+  /** DISPLAY width — the coded width swapped with the height when the file says it is turned. */
   width: number | null;
   height: number | null;
+  /** Degrees the file asks players to turn it by, normalised to 0, 90, 180 or 270. */
+  rotation: number;
   fps: number | null;
   videoCodec: string | null;
   audioCodec: string | null;
@@ -27,6 +30,10 @@ interface FfprobeStream {
   avg_frame_rate?: string;
   r_frame_rate?: string;
   duration?: string;
+  /** Older muxers wrote the phone's orientation here as a string of degrees. */
+  tags?: Record<string, string>;
+  /** Newer files carry it as a display matrix; ffprobe reports its rotation. */
+  side_data_list?: Array<{ side_data_type?: string; rotation?: number }>;
 }
 
 interface FfprobeOutput {
@@ -50,25 +57,40 @@ function toNumber(value: string | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-export async function ffprobe(filePath: string): Promise<ProbeResult> {
-  const { stdout } = await run(
-    env.FFPROBE_PATH,
-    ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', filePath],
-    { timeoutMs: 120_000 },
-  );
+/**
+ * The orientation a file asks to be shown at. A phone held upright records
+ * 1920x1080 and marks the stream "turn me 90°"; every player honours the
+ * mark, and so does ffmpeg when it decodes — but the CODED width and height
+ * still say landscape. Reading those raw would plan a landscape crop for a
+ * portrait video. Both ways the mark has been written are read here.
+ */
+export function probeRotation(stream: FfprobeStream | undefined): number {
+  if (!stream) return 0;
+  const fromMatrix = stream.side_data_list?.find((entry) => typeof entry.rotation === 'number')?.rotation;
+  const fromTag = stream.tags?.rotate !== undefined ? Number(stream.tags.rotate) : undefined;
+  const raw = fromMatrix ?? fromTag;
+  if (raw === undefined || !Number.isFinite(raw)) return 0;
+  // A display matrix reports counter-clockwise (−90 for the common portrait
+  // case); the tag reported clockwise. Only the quadrant matters here.
+  return ((Math.round(raw) % 360) + 360) % 360;
+}
 
-  const parsed = JSON.parse(stdout) as FfprobeOutput;
+/** Exported for the tests: the probe, minus the process. */
+export function interpretProbe(parsed: FfprobeOutput): ProbeResult {
   const streams = parsed.streams ?? [];
   const video = streams.find((stream) => stream.codec_type === 'video');
   const audio = streams.find((stream) => stream.codec_type === 'audio');
 
   const duration = toNumber(parsed.format?.duration) ?? toNumber(video?.duration) ?? 0;
+  const rotation = probeRotation(video);
+  const turned = rotation === 90 || rotation === 270;
 
   return {
     durationSeconds: duration,
     sizeBytes: toNumber(parsed.format?.size),
-    width: video?.width ?? null,
-    height: video?.height ?? null,
+    width: (turned ? video?.height : video?.width) ?? null,
+    height: (turned ? video?.width : video?.height) ?? null,
+    rotation,
     fps: parseFrameRate(video?.avg_frame_rate) ?? parseFrameRate(video?.r_frame_rate),
     videoCodec: video?.codec_name ?? null,
     audioCodec: audio?.codec_name ?? null,
@@ -77,6 +99,15 @@ export async function ffprobe(filePath: string): Promise<ProbeResult> {
     formatName: parsed.format?.format_name ?? null,
     raw: parsed as unknown as Record<string, unknown>,
   };
+}
+
+export async function ffprobe(filePath: string): Promise<ProbeResult> {
+  const { stdout } = await run(
+    env.FFPROBE_PATH,
+    ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', filePath],
+    { timeoutMs: 120_000 },
+  );
+  return interpretProbe(JSON.parse(stdout) as FfprobeOutput);
 }
 
 /**
@@ -276,6 +307,59 @@ export async function extractAudioSegments(
   return segments;
 }
 
+/**
+ * The proxy a PERSON watches. The analysis proxy is built for a model: 360p,
+ * two frames a second, silent. Review cards were playing the original
+ * instead — a multi-gigabyte 4K file, in a browser — and cutting thumbnails
+ * from the model's proxy at 320px. This is the middle: short side capped
+ * (720 by default), real frame rate up to 30, with sound, and streamable
+ * from the first byte.
+ */
+export async function createPlaybackProxy(inputPath: string, outputPath: string): Promise<void> {
+  const side = Math.max(2, Math.floor(env.PLAYBACK_PROXY_SHORT_SIDE / 2) * 2);
+  // A one-pixel side rounds to zero, which ffmpeg reads as "keep the
+  // input" — and 1 is odd. Such a video is not footage; it is scaled to the
+  // two pixels the encoder needs rather than left with no proxy at all.
+  const shortLandscape = `max(2,min(${side},trunc(ih/2)*2))`;
+  const shortPortrait = `max(2,min(${side},trunc(iw/2)*2))`;
+  const proxyWidth = `if(gt(iw,ih),trunc(iw*${shortLandscape}/ih/2)*2,${shortPortrait})`;
+  const proxyHeight = `if(gt(iw,ih),${shortLandscape},trunc(ih*${shortPortrait}/iw/2)*2)`;
+  await run(
+    env.FFMPEG_PATH,
+    [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-y',
+      '-i', inputPath,
+      '-map', '0:v:0',
+      '-map', '0:a:0?',
+      // Shorter side to `side`, never upscaling, whichever way the frame is
+      // turned — ffmpeg has already applied the file's rotation by here.
+      // Both sides come out even and neither exceeds its source side: the
+      // shorter side is min(side, source rounded DOWN to even), because a
+      // 1280x719 recording is under the cap and would otherwise reach the
+      // encoder at 719 lines, which 4:2:0 H.264 refuses; the longer side is
+      // derived from it and floored, because ffmpeg's `-2` rounds to the
+      // nearest even and would make a 1279-wide source 1280.
+      '-vf', `scale='${proxyWidth}':'${proxyHeight}',fps=fps='min(30,source_fps)'`,
+      '-c:v', 'libx264',
+      '-preset', env.PROXY_PRESET,
+      '-crf', String(env.PLAYBACK_PROXY_CRF),
+      '-pix_fmt', 'yuv420p',
+      '-profile:v', 'high',
+      '-level', '4.1',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-ac', '2',
+      '-sn',
+      '-dn',
+      '-movflags', '+faststart',
+      outputPath,
+    ],
+    { timeoutMs: 60 * 60 * 1000 },
+  );
+}
+
 export interface CutClipOptions {
   inputPath: string;
   outputPath: string;
@@ -404,7 +488,14 @@ export async function extractFrameAt(
   seconds: number,
   outputPath: string,
   maxWidth = 320,
+  options: {
+    /** Applied BEFORE the scale: the same crop window the export will use. */
+    cropFilter?: string | null;
+    /** JPEG quality, 2 (best) to 31. The default is a preview; a thumbnail asks for 2. */
+    quality?: number;
+  } = {},
 ): Promise<boolean> {
+  const filters = [...(options.cropFilter ? [options.cropFilter] : []), `scale='min(${maxWidth},iw)':-2`];
   await run(
     env.FFMPEG_PATH,
     [
@@ -414,8 +505,8 @@ export async function extractFrameAt(
       '-ss', Math.max(0, seconds).toFixed(3),
       '-i', inputPath,
       '-frames:v', '1',
-      '-vf', `scale='min(${maxWidth},iw)':-2`,
-      '-q:v', '5',
+      '-vf', filters.join(','),
+      '-q:v', String(options.quality ?? 5),
       outputPath,
     ],
     { timeoutMs: 60_000 },

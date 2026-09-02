@@ -128,6 +128,8 @@ export interface Video {
   metadata: Record<string, unknown>;
   originalStorageKey: string | null;
   proxyStorageKey: string | null;
+  /** The watchable 1080-line proxy; null until preprocessing built one. */
+  playbackStorageKey: string | null;
   /** One frame of the video itself, for the library's card. */
   posterStorageKey: string | null;
   captionsStorageKey: string | null;
@@ -397,6 +399,9 @@ export interface Clip {
   posterStorageKey: string | null;
   posterTimestampSeconds: number | null;
   compositionMode: string | null;
+  /** The chosen focal point, 0..1 against the source frame; null unless smart-cropped. */
+  focalX: number | null;
+  focalY: number | null;
   /** Measured, so the shape a client is told is the file's real shape. */
   sourceWidth: number | null;
   sourceHeight: number | null;

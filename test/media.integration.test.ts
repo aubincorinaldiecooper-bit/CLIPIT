@@ -5,6 +5,7 @@ import { run } from '../src/lib/exec.js';
 import {
   createAnalysisProxy,
   clipResolutionCap,
+  createPlaybackProxy,
   cutClip,
   extractAudioSegments,
   extractFrameAt,
@@ -14,6 +15,8 @@ import {
 } from '../src/services/media/ffmpeg.js';
 import { mapLocalRangeToGlobal } from '../src/services/timestamps.js';
 import { prepareCaptionFilters } from '../src/services/media/captions.js';
+import { planReframe } from '../src/services/media/reframe.js';
+import { thumbnailMaxWidth } from '../src/services/media/thumbnails.js';
 
 /**
  * Exercises the real ffmpeg pipeline. Skipped when ffmpeg is not installed, so
@@ -305,6 +308,73 @@ describe.skipIf(!ffmpegAvailable)('ffmpeg media pipeline', () => {
     expect(probe.height).toBe(1080);
     expect(probe.width).toBe(1440);
     expect(probe.videoCodec).toBe('h264');
+  }, 180_000);
+
+  it('builds a watchable playback proxy: 1080 lines, real frame rate, with sound', async () => {
+    const big = path.join(dir, 'playback-source.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=size=2560x1440:rate=60:duration=1',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', big,
+    ], { timeoutMs: 120_000 });
+
+    const output = path.join(dir, 'playback.mp4');
+    await createPlaybackProxy(big, output);
+    const probe = await ffprobe(output);
+    expect([probe.width, probe.height]).toEqual([1920, 1080]);
+    expect(probe.hasAudio).toBe(true);
+    expect(probe.fps).toBeLessThanOrEqual(30);
+  }, 180_000);
+
+  it('builds the playback proxy from an odd-sized recording', async () => {
+    const odd = path.join(dir, 'odd-playback-source.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=size=1280x719:rate=10:duration=1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv444p', odd,
+    ], { timeoutMs: 120_000 });
+
+    const output = path.join(dir, 'odd-playback.mp4');
+    await createPlaybackProxy(odd, output);
+    const probe = await ffprobe(output);
+    expect(probe.height).toBe(718);
+    expect(probe.width! % 2).toBe(0);
+
+    // And never a pixel larger than the source when only the long side is
+    // odd — ffmpeg's -2 would have rounded 1279 up to 1280.
+    const oddLong = path.join(dir, 'odd-long-playback-source.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=size=1279x720:rate=10:duration=1',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv444p', oddLong,
+    ], { timeoutMs: 120_000 });
+    const outputLong = path.join(dir, 'odd-long-playback.mp4');
+    await createPlaybackProxy(oddLong, outputLong);
+    const probeLong = await ffprobe(outputLong);
+    expect([probeLong.width, probeLong.height]).toEqual([1278, 720]);
+  }, 240_000);
+
+  it('cuts a 9:16 thumbnail through the export window, at its native size', async () => {
+    const proxy = await makeOversized('thumb-source.mp4', '1920x1080');
+    const frame = { width: 1920, height: 1080 };
+    const cropFilter = planReframe({ aspect: '9:16', focusPct: 50 }, frame).filter;
+    const still = path.join(dir, 'thumb-vertical.jpg');
+    expect(await extractFrameAt(proxy, 0.5, still, thumbnailMaxWidth(frame, true), { cropFilter, quality: 2 })).toBe(true);
+
+    // 606 wide is the whole 9:16 window a 1080-line frame holds (607.5,
+    // floored to even). Not stretched to 720: a wider picture than the
+    // source has is invention.
+    const probe = await ffprobe(still);
+    expect([probe.width, probe.height]).toEqual([606, 1080]);
+  }, 180_000);
+
+  it('keeps a landscape thumbnail landscape, 720 lines tall', async () => {
+    const proxy = await makeOversized('thumb-landscape.mp4', '1920x1080');
+    const still = path.join(dir, 'thumb-landscape.jpg');
+    expect(await extractFrameAt(proxy, 0.5, still, thumbnailMaxWidth({ width: 1920, height: 1080 }, false), { quality: 2 })).toBe(true);
+    const probe = await ffprobe(still);
+    expect([probe.width, probe.height]).toEqual([1280, 720]);
   }, 180_000);
 
   it('burns captions into a cut without breaking the encode', async () => {

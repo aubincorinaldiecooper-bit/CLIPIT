@@ -6,8 +6,9 @@ import { logger } from '../../lib/logger.js';
 import { errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { getStorage } from '../../services/storage/s3.js';
-import { chunkKey, proxyKey } from '../../services/storage/types.js';
-import { createAnalysisProxy, extractFrameAt, ffprobe, splitIntoChunks } from '../../services/media/ffmpeg.js';
+import { chunkKey, playbackProxyKey, proxyKey } from '../../services/storage/types.js';
+import { createAnalysisProxy, createPlaybackProxy, extractFrameAt, ffprobe, splitIntoChunks } from '../../services/media/ffmpeg.js';
+import { shouldDiscardOnUploadFailure } from '../../services/media/verticalPipeline.js';
 import { getVideo, replaceChunks, setIndexStatus, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
 import { enqueueIndexing, enqueueTranscription, type PreprocessingJob } from '../../queues/index.js';
 
@@ -83,6 +84,73 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       await updateVideoMedia(videoId, { proxyStorageKey });
 
       log.info('analysis proxy created', { proxyStorageKey });
+
+      // The proxy a person watches — and the one candidate thumbnails are cut
+      // from. Best-effort: analysis does not depend on it, so a failure here
+      // costs review quality, never the ingestion. Both fall back to the
+      // analysis proxy when this key is null.
+      // Retention finds objects through the keys on rows. An object that was
+      // uploaded but whose key never reached the row is invisible to every
+      // sweep, so a failure between the upload and the write removes what
+      // was uploaded — best-effort, logged with the key either way.
+      //
+      // But only what THIS attempt introduced. The key is deterministic, so
+      // a re-run overwrites a proxy the row may already name; deleting that
+      // on a failed write would leave the row pointing at nothing. The same
+      // ownership rule the clip media learned (shouldDiscardOnUploadFailure):
+      // what the row said when the attempt began, and what it says at the
+      // moment of failure, decide whether the object is ours to remove.
+      const snapshotPlaybackKey = video.playbackStorageKey;
+      let uploadedPlaybackKey: string | null = null;
+      try {
+        const playbackStartedAt = performance.now();
+        const playbackPath = path.join(dir, 'playback.mp4');
+        await createPlaybackProxy(sourcePath, playbackPath);
+        const playbackStorageKey = playbackProxyKey(videoId);
+        await storage.uploadFile(playbackStorageKey, playbackPath, 'video/mp4');
+        uploadedPlaybackKey = playbackStorageKey;
+        await updateVideoMedia(videoId, { playbackStorageKey });
+        uploadedPlaybackKey = null;
+        log.info('playback proxy created', {
+          playbackStorageKey,
+          elapsedMs: Math.round(performance.now() - playbackStartedAt),
+        });
+      } catch (cause) {
+        log.warn('could not create a playback proxy; review will use the analysis proxy', {
+          error: errorMessage(cause),
+        });
+        if (uploadedPlaybackKey) {
+          let currentKey: string | null | undefined;
+          let readFailed = false;
+          try {
+            currentKey = (await getVideo(videoId))?.playbackStorageKey ?? null;
+          } catch {
+            readFailed = true;
+          }
+          const ours = shouldDiscardOnUploadFailure({
+            key: uploadedPlaybackKey,
+            snapshotKey: snapshotPlaybackKey,
+            currentKey,
+            readFailed,
+          });
+          if (!ours) {
+            log.warn('playback proxy re-uploaded over one the row already names; keeping it', {
+              videoId,
+              key: uploadedPlaybackKey,
+            });
+          } else {
+            try {
+              await storage.remove(uploadedPlaybackKey);
+            } catch (removeCause) {
+              log.error('playback proxy uploaded but its key was not saved, and it could not be removed; it is now an orphan', {
+                videoId,
+                key: uploadedPlaybackKey,
+                error: errorMessage(removeCause),
+              });
+            }
+          }
+        }
+      }
 
       // A poster frame for the video itself, so the library shows the footage
       // rather than a filename. Pulled from the proxy that is already on disk

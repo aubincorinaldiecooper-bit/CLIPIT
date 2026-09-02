@@ -48,6 +48,7 @@ export async function expireVideoFootage(videoId: string, log: Logger): Promise<
   const keys = [
     video.originalStorageKey,
     video.proxyStorageKey,
+    video.playbackStorageKey,
     video.captionsStorageKey,
     ...chunks.map((chunk) => chunk.storageKey),
     ...clipKeys,

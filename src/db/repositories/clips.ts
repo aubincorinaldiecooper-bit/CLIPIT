@@ -26,6 +26,8 @@ interface ClipRow {
   poster_storage_key: string | null;
   poster_timestamp_seconds: number | string | null;
   composition_mode: string | null;
+  focal_x: number | null;
+  focal_y: number | null;
   source_width: number | null;
   source_height: number | null;
   output_width: number | null;
@@ -66,6 +68,9 @@ function mapClip(row: ClipRow): Clip {
       ? null
       : Number(row.poster_timestamp_seconds),
     compositionMode: row.composition_mode ?? null,
+    // REAL columns come back as numbers; normalised 0..1 against the source frame.
+    focalX: row.focal_x ?? null,
+    focalY: row.focal_y ?? null,
     sourceWidth: row.source_width ?? null,
     sourceHeight: row.source_height ?? null,
     outputWidth: row.output_width ?? null,
