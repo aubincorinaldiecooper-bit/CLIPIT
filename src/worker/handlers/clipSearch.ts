@@ -227,7 +227,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // last run's finished deck while it rebuilds this one.
     const planned = await recordDeckPlan(clipRequestId, {
       presentationTarget: needsVerticalDerivative(intent) ? 'vertical' : 'original',
-      requestedResultCount: intent.requestedCount,
+      // A number in the question is the target. Without one, the answer is
+      // every moment the search finds — a two-minute clip can only hold so
+      // many, and the footage decides that, not a default (owner, 2026-09-02).
+      // Not a number until the search has run, so none is recorded yet.
+      requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
     }, deckAttemptId);
     if (!planned) {
       // Another delivery claimed this request while we were getting here.
@@ -561,7 +565,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         ...(deck
           ? {
               platform: intent.platform,
-              requestedResultCount: intent.requestedCount,
+              requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
               availableCandidateCount: deck.availableCandidateCount,
               effectiveDeckTarget: deck.effectiveDeckTarget,
               readyResultCount: deck.readyCount,
@@ -813,18 +817,13 @@ export async function completeRequestWithDeck(input: {
 }): Promise<{ completed: boolean; deck: VerticalDeckResult | null }> {
   const { clipRequestId, intent, log } = input;
 
-  if (!needsVerticalDerivative(intent)) {
-    const finished = await finishClipRequest(
-      clipRequestId, 'completed', null, input.answeredFrom, input.deckAttemptId,
-    );
-    if (!finished) {
-      log.warn('a superseded attempt tried to complete a request', { clipRequestId });
-      return { completed: false, deck: null };
-    }
-    return { completed: true, deck: null };
-  }
-
-  const deck = await buildVerticalDeck({
+  // Every request owes a deck now, whatever framing it asked for. The owner's
+  // rule (2026-09-02): a moment is cut the moment it is found, and the review
+  // shows finished clips — Keep files one in the library, Skip lets it go.
+  // Only what the deck DELIVERS differs: the canonical cut itself, or a 9:16
+  // derivative of it. Nothing completes through the plain status write any
+  // more; the gate below is the one door.
+  const deck = await buildDeck({
     clipRequestId,
     request: input.request,
     video: input.video,
@@ -841,6 +840,9 @@ export async function completeRequestWithDeck(input: {
   });
 
   const completion = deckCompletion(deck);
+  // What the creator is told is written for what they asked for: a platform
+  // question was about posting, a plain question was about clips.
+  const owesVertical = needsVerticalDerivative(intent);
 
   // The footage is gone. The moments are real and we cannot cut them, so the
   // creator is told that — not that their video had nothing in it.
@@ -848,7 +850,9 @@ export async function completeRequestWithDeck(input: {
     await finishClipRequest(
       clipRequestId,
       'failed',
-      'The original video is no longer available, so these moments could not be made ready to post.',
+      owesVertical
+        ? 'The original video is no longer available, so these moments could not be made ready to post.'
+        : 'The original video is no longer available, so these moments could not be cut.',
       null,
       input.deckAttemptId,
     );
@@ -867,7 +871,9 @@ export async function completeRequestWithDeck(input: {
     await finishClipRequest(
       clipRequestId,
       'failed',
-      'We found the moments but could not finish making them ready to post. Please try again.',
+      owesVertical
+        ? 'We found the moments but could not finish making them ready to post. Please try again.'
+        : 'We found the moments but could not finish cutting them. Please try again.',
       null,
       input.deckAttemptId,
     );
@@ -948,7 +954,7 @@ interface VerticalDeckResult {
  * refuses it spends a GPU call and an encode on something that was never
  * eligible.
  */
-async function buildVerticalDeck(input: {
+async function buildDeck(input: {
   clipRequestId: string;
   request: ClipRequest;
   video: Video;
@@ -962,6 +968,10 @@ async function buildVerticalDeck(input: {
   deckAttemptId: string | null;
 }): Promise<VerticalDeckResult> {
   const { clipRequestId, request, video, intent, log } = input;
+  // What each finished moment must have. Decided once, here, and handed to
+  // the orchestrator and the reveal alike — the same fact recordDeckPlan
+  // wrote on the request row.
+  const presentation = needsVerticalDerivative(intent) ? 'vertical' as const : 'original' as const;
   const empty: VerticalDeckResult = {
     complete: false, readyCount: 0, availableCandidateCount: 0, effectiveDeckTarget: 0,
     failedCandidateCount: 0, renderedButSkippedCount: 0, timeToCompleteDeckMs: null,
@@ -991,13 +1001,15 @@ async function buildVerticalDeck(input: {
       confidence: match.confidence,
       startSeconds: match.globalStartSeconds,
       endSeconds: match.globalEndSeconds,
-      derivativeStatus: 'pending' as const,
+      // A derivative is owed only for a vertical deck; 'pending' about work
+      // that will never happen would be a lie in the data.
+      derivativeStatus: presentation === 'vertical' ? 'pending' as const : null,
       derivativeStorageKey: null,
       posterStorageKey: null,
     }));
 
   if (candidates.length === 0) {
-    log.info('no eligible candidates for a vertical deck', {
+    log.info('no eligible candidates for a deck', {
       storedMatches: stored.length,
       hardMaxSeconds: intent.hardMaxSeconds,
     });
@@ -1032,19 +1044,24 @@ async function buildVerticalDeck(input: {
   // at all, never one then two.
   // Three separate limits, and each is recorded as itself: what they asked
   // for, what the video had, and what we are willing to render.
-  const effectiveDeckTarget = Math.min(
-    intent.requestedCount,
-    candidates.length,
-    intent.renderCeiling,
-  );
+  //
+  // What counts as "asked for" depends on the question. A number in it
+  // ("give me 5") is the target. Without one, the footage decides: every
+  // eligible moment the search found is cut, up to the ceiling — a
+  // two-minute clip can only hold so many moments, and a default of three
+  // would be a guess standing in for that fact (owner, 2026-09-02). This
+  // holds for a platform question and a plain one alike.
+  const wanted = intent.countExplicit ? intent.requestedCount : candidates.length;
+  const effectiveDeckTarget = Math.min(wanted, candidates.length, intent.renderCeiling);
   await recordDeckAvailability(clipRequestId, {
     availableCandidateCount: candidates.length,
     effectiveDeckTarget,
   }, input.deckAttemptId);
-  if (effectiveDeckTarget < intent.requestedCount) {
-    log.info('fewer eligible moments than the creator asked for', {
-      requested: intent.requestedCount,
+  if (effectiveDeckTarget < wanted) {
+    log.info('fewer moments will be cut than were asked for', {
+      requested: wanted,
       available: candidates.length,
+      renderCeiling: intent.renderCeiling,
       effectiveDeckTarget,
     });
   }
@@ -1060,7 +1077,8 @@ async function buildVerticalDeck(input: {
     hasAudio: video.hasAudio ?? true,
     videoDurationSeconds: video.durationSeconds ?? null,
     intent,
-    requestedResultCount: intent.requestedCount,
+    presentation,
+    requestedResultCount: wanted,
     effectiveDeckTarget,
     candidates,
     log,

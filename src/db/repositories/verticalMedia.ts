@@ -66,6 +66,7 @@ export async function setVerticalMedia(clipId: string, input: VerticalMediaInput
             derivative_generation_ms = $14,
             poster_generation_ms     = $15,
             pre_rendered             = TRUE,
+            presentation             = 'vertical',
             -- Never demotes: a clip already kept stays 'owned' even if its
             -- media is re-derived, because the person's choice outlives the
             -- file it was made about.
@@ -118,8 +119,141 @@ export async function markVerticalFailed(clipId: string, message: string): Promi
         SET derivative_status = 'failed',
             derivative_error  = $2,
             pre_rendered      = TRUE,
+            presentation      = 'vertical',
             retention_class   = CASE WHEN clips.approved_at IS NOT NULL THEN 'owned' ELSE 'temporary' END,
             updated_at        = now()
+      WHERE id = $1`,
+    [clipId, message.slice(0, 500)],
+  );
+}
+
+export interface OriginalMediaInput {
+  posterStorageKey: string;
+  posterTimestampSeconds: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  canonicalGenerationMs: number | null;
+  posterGenerationMs: number | null;
+  /** 'temporary' until someone keeps it. See retentionClassFor. */
+  retentionClass: 'temporary' | 'owned';
+}
+
+/**
+ * Write READY for a moment whose deliverable is the canonical cut itself.
+ *
+ * The owner's rule (2026-09-02): every moment is cut when it is found, and
+ * the review shows finished clips whatever framing was asked for. For an
+ * original-framing deck the file the creator will receive is the canonical
+ * cut, so "finished" means that cut plus a poster taken from inside it — no
+ * derivative is owed, and the derivative columns are cleared rather than left
+ * saying 'pending' about work that will never happen.
+ *
+ * One statement, for the same reason setVerticalMedia is: the poster and the
+ * pre-rendered flag land together or not at all.
+ */
+export async function setOriginalMedia(clipId: string, input: OriginalMediaInput): Promise<void> {
+  const result = await query(
+    `UPDATE clips
+        SET poster_storage_key       = $2,
+            poster_timestamp_seconds = $3,
+            source_width             = $4,
+            source_height            = $5,
+            -- The deliverable IS the canonical file, so its size is the output.
+            output_width             = $4,
+            output_height            = $5,
+            composition_mode         = 'original',
+            derivative_storage_key   = NULL,
+            derivative_status        = NULL,
+            derivative_error         = NULL,
+            canonical_generation_ms  = $6,
+            composition_decision_ms  = NULL,
+            derivative_generation_ms = NULL,
+            poster_generation_ms     = $7,
+            pre_rendered             = TRUE,
+            presentation             = 'original',
+            retention_class          = CASE WHEN clips.approved_at IS NOT NULL THEN 'owned' ELSE $8 END,
+            updated_at               = now()
+      WHERE id = $1`,
+    [
+      clipId,
+      input.posterStorageKey,
+      input.posterTimestampSeconds,
+      input.sourceWidth,
+      input.sourceHeight,
+      input.canonicalGenerationMs,
+      input.posterGenerationMs,
+      input.retentionClass,
+    ],
+  );
+
+  if (result.rowCount === 0) {
+    throw new Error(`Clip ${clipId} no longer exists — its finished media has nowhere to be recorded`);
+  }
+}
+
+export interface PosterFromCutInput {
+  posterStorageKey: string;
+  posterTimestampSeconds: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  posterGenerationMs: number | null;
+}
+
+/**
+ * A re-render put a different file under the same clip id — a Re-clip's new
+ * boundaries, or a caption Replace — so the card's picture is taken again
+ * from the new cut. Only the poster and the measured size move: approval,
+ * retention and the derivative columns are not this write's to touch, and
+ * a vertical moment is not either (its poster comes from its derivative).
+ */
+export async function setPosterFromCut(clipId: string, input: PosterFromCutInput): Promise<void> {
+  const result = await query(
+    `UPDATE clips
+        SET poster_storage_key       = $2,
+            poster_timestamp_seconds = $3,
+            source_width             = $4,
+            source_height            = $5,
+            output_width             = $4,
+            output_height            = $5,
+            poster_generation_ms     = $6,
+            updated_at               = now()
+      WHERE id = $1
+        AND pre_rendered = TRUE
+        AND presentation = 'original'`,
+    [
+      clipId,
+      input.posterStorageKey,
+      input.posterTimestampSeconds,
+      input.sourceWidth,
+      input.sourceHeight,
+      input.posterGenerationMs,
+    ],
+  );
+
+  if (result.rowCount === 0) {
+    throw new Error(`Clip ${clipId} is not a pre-rendered original moment — its new poster has nowhere to be recorded`);
+  }
+}
+
+/**
+ * Record that an original-framing pre-render failed.
+ *
+ * Unlike a vertical failure, there is no separate presentation to blame: the
+ * cut itself, or the poster from it, is what did not finish, so the clip's
+ * own status says failed. The row is marked pre-rendered and temporary for
+ * the same reason markVerticalFailed does it — a canonical file that reached
+ * storage before the poster gave way is an object nobody will ever see, and
+ * the sweep must be able to find it.
+ */
+export async function markOriginalFailed(clipId: string, message: string): Promise<void> {
+  await query(
+    `UPDATE clips
+        SET status          = 'failed',
+            error_message   = $2,
+            pre_rendered    = TRUE,
+            presentation    = 'original',
+            retention_class = CASE WHEN clips.approved_at IS NOT NULL THEN 'owned' ELSE 'temporary' END,
+            updated_at      = now()
       WHERE id = $1`,
     [clipId, message.slice(0, 500)],
   );
@@ -132,6 +266,10 @@ export async function markVerticalFailed(clipId: string, message: string): Promi
  * creator without its files, approving it would mint an 'owned' row pointing
  * at nothing, and the sweep below would then protect that nothing forever.
  * Returns whether the approval took, so the route can answer honestly.
+ *
+ * The sweep clears storage_key along with the other pointers, so a Keep that
+ * lands after it is refused here for an original-framing moment exactly as
+ * it is for a vertical one.
  */
 export async function approveClip(clipId: string): Promise<boolean> {
   const row = await queryOne<{ id: string }>(
@@ -141,10 +279,15 @@ export async function approveClip(clipId: string): Promise<boolean> {
             updated_at      = now()
       WHERE id = $1
         AND status = 'ready'
+        AND storage_key IS NOT NULL
+        -- A pre-rendered moment is finished when its poster and its
+        -- deliverable both exist: the canonical file for an original-framing
+        -- deck, the 9:16 derivative as well for a vertical one.
         AND (pre_rendered = FALSE
-             OR (derivative_status = 'ready'
-                 AND derivative_storage_key IS NOT NULL
-                 AND poster_storage_key IS NOT NULL))
+             OR (poster_storage_key IS NOT NULL
+                 AND (presentation = 'original'
+                      OR (derivative_status = 'ready'
+                          AND derivative_storage_key IS NOT NULL))))
       RETURNING id`,
     [clipId],
   );

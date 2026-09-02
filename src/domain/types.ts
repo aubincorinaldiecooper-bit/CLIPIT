@@ -409,6 +409,12 @@ export interface Clip {
   outputHeight: number | null;
   /** True when the media was made before anyone chose this moment. */
   preRendered: boolean;
+  /**
+   * Which deliverable a pre-rendered row was made for: the canonical cut
+   * itself, or a 9:16 derivative of it. Null on rows cut on demand, whose
+   * deliverable was always the canonical file.
+   */
+  presentation: 'original' | 'vertical' | null;
   /** Set on Keep. Null means nobody has chosen it. */
   approvedAt: Date | null;
   retentionClass: 'temporary' | 'owned';

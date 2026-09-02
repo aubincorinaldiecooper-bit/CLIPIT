@@ -107,11 +107,18 @@ export function clipKey(videoId: string, clipId: string): string {
  * canonical clip, which keeps its own key and its original framing — the
  * derivative never overwrites the excerpt it was made from.
  */
-export function verticalDerivativeKey(videoId: string, clipId: string): string {
-  return `${StoragePrefix.clips}/${videoId}/${clipId}-vertical.mp4`;
+export function verticalDerivativeKey(videoId: string, clipId: string, render?: string): string {
+  return `${StoragePrefix.clips}/${videoId}/${clipId}${render ? `-${render}` : ''}-vertical.mp4`;
 }
 
 /** The poster still for a clip: a real frame chosen from inside it. */
-export function clipPosterKey(videoId: string, clipId: string): string {
-  return `posters/${videoId}/${clipId}.jpg`;
+/**
+ * `render` names one re-render's objects. A moment's first media sits at the
+ * plain key; a re-render (a Re-clip, a caption Replace) writes NEW objects
+ * beside it, so a failure part-way leaves the previous cut and its previous
+ * media exactly as they were, and the old objects go only once the row
+ * names the new ones.
+ */
+export function clipPosterKey(videoId: string, clipId: string, render?: string): string {
+  return `posters/${videoId}/${clipId}${render ? `-${render}` : ''}.jpg`;
 }

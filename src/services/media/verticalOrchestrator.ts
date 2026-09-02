@@ -9,19 +9,20 @@ import { clipKey } from '../storage/types.js';
 import { createAnalysisProxy, cutClip } from './ffmpeg.js';
 import { applyClipPadding } from '../timestamps.js';
 import { getClip, upsertClipForMatch, setClipStatus } from '../../db/repositories/clips.js';
-import { setVerticalMedia, markVerticalFailed } from '../../db/repositories/verticalMedia.js';
+import { markOriginalFailed, markVerticalFailed, setOriginalMedia, setVerticalMedia } from '../../db/repositories/verticalMedia.js';
 import { markAttemptsRecovered, recordVerticalRenderAttempt } from '../../db/repositories/verticalRenders.js';
 import { recordModelUsage } from '../../db/repositories/usage.js';
 import { askVideoModel, videoPartFromFile, type ContentPart } from '../search/openrouterVideo.js';
 import { COMPOSITION_SYSTEM_PROMPT, COMPOSITION_INSTRUCTION } from '../search/composition.js';
 import {
   discardUploadedObjects,
+  runOriginalPipeline,
   runVerticalPipeline,
   shouldDiscardOnUploadFailure,
   VerticalPipelineFailure,
 } from './verticalPipeline.js';
 import { assembleDeck, deckMetrics, planDeck, type DeckOutcome, type PreparedCandidate } from './deckAssembly.js';
-import type { FailureStage, VerticalCandidate } from './verticalVisibility.js';
+import type { DeckPresentation, FailureStage, VerticalCandidate } from './verticalVisibility.js';
 import type { PlatformIntent } from '../search/platformIntent.js';
 import type { UsageTally } from '../usageTally.js';
 
@@ -65,6 +66,14 @@ export interface OrchestrateInput {
   hasAudio: boolean;
   videoDurationSeconds: number | null;
   intent: PlatformIntent;
+  /**
+   * Which deliverable this deck owes: the canonical cut itself ('original')
+   * or a 9:16 derivative of it ('vertical'). Every candidate is cut either
+   * way — the owner's rule (2026-09-02) is that a moment is cut when it is
+   * found — and only the second spends a framing decision and a second
+   * encode.
+   */
+  presentation: DeckPresentation;
   /** Exactly what the creator asked for, before any availability cap. */
   requestedResultCount: number;
   /** What is actually obtainable: min(requested, available). */
@@ -211,6 +220,20 @@ async function discardWhatThisAttemptMade(
 }
 
 /**
+ * This attempt succeeded after an earlier one failed, so the earlier failure
+ * rows are marked recovered. Without this, retryRecoveryRate is computed from
+ * a column nothing ever sets and reads zero forever — a metric that reports
+ * "retries never help" while they are helping, which is worse than having no
+ * metric at all.
+ */
+async function noteRecovery(input: OrchestrateInput, matchId: string, attempt: number): Promise<void> {
+  if (attempt <= 1) return;
+  await markAttemptsRecovered(matchId).catch((error) => {
+    input.log.error('could not mark earlier attempts recovered', { matchId, err: error });
+  });
+}
+
+/**
  * Take one candidate all the way to READY, or fail it with a named stage.
  *
  * Idempotent by construction, at two levels. upsertClipForMatch returns the
@@ -227,6 +250,10 @@ async function prepareCandidate(
   attempt: number,
 ): Promise<PreparedCandidate> {
   const base = { ...candidate, attempts: attempt, failureStage: null as FailureStage | null };
+  // Read once, strictly: only an explicit 'original' takes the original path,
+  // so a caller that forgot the field gets the vertical pipeline it always had.
+  const original = input.presentation === 'original';
+  const presentation: DeckPresentation = original ? 'original' : 'vertical';
   const startedAt = performance.now();
   let clipId: string | null = null;
   let stage: FailureStage = 'canonical_generation';
@@ -244,21 +271,29 @@ async function prepareCandidate(
     clipId = clip.id;
 
     // Everything already exists: this is a repeat, not new work.
-    if (
-      clip.status === 'ready'
-      && clip.storageKey
-      && clip.derivativeStatus === 'ready'
-      && clip.derivativeStorageKey
-      && clip.posterStorageKey
-    ) {
-      input.log.info('vertical candidate already finished, reusing', {
+    const canonicalDone = clip.status === 'ready' && Boolean(clip.storageKey);
+    const finishedAlready = !original
+      ? canonicalDone
+        && clip.derivativeStatus === 'ready'
+        && Boolean(clip.derivativeStorageKey)
+        && Boolean(clip.posterStorageKey)
+      // Finished by its own pipeline only: a ready canonical with no poster is
+      // a clip cut on demand, not a card.
+      : canonicalDone
+        && clip.preRendered
+        && clip.presentation === 'original'
+        && Boolean(clip.posterStorageKey);
+    if (finishedAlready) {
+      input.log.info('candidate already finished, reusing', {
         matchId: candidate.matchId,
         clipId: clip.id,
+        presentation,
       });
       return {
         ...base,
-        derivativeStatus: 'ready',
-        derivativeStorageKey: clip.derivativeStorageKey,
+        derivativeStatus: original ? null : 'ready',
+        derivativeStorageKey: original ? null : clip.derivativeStorageKey,
+        canonicalStorageKey: clip.storageKey,
         posterStorageKey: clip.posterStorageKey,
       };
     }
@@ -354,6 +389,96 @@ async function prepareCandidate(
     }
     canonicalGenerationMs = Math.round(performance.now() - startedAt);
 
+    if (original) {
+      // The cut IS the deliverable. All that stands between it and a card is
+      // the poster; no framing is decided and no second file is encoded.
+      stage = 'poster_generation';
+      const media = await runOriginalPipeline({
+        videoId: input.videoId,
+        clipId: clip.id,
+        canonicalPath,
+        workDir: input.workDir,
+        durationSeconds: cut.durationSeconds,
+        width: cut.width,
+        height: cut.height,
+        currentPosterKey: async () => (await getClip(clip.id))?.posterStorageKey ?? null,
+        snapshotPosterKey: clip.posterStorageKey,
+      });
+
+      // READY is a PERSISTED fact here too — see the vertical path below for
+      // why, and for why a failed write takes the poster back out of storage.
+      stage = 'serialization';
+      try {
+        await setOriginalMedia(clip.id, {
+          posterStorageKey: media.posterStorageKey,
+          posterTimestampSeconds: media.posterTimestampSeconds,
+          sourceWidth: media.sourceWidth,
+          sourceHeight: media.sourceHeight,
+          canonicalGenerationMs,
+          posterGenerationMs: media.posterGenerationMs,
+          // Made before anyone chose it, so it is temporary until they do.
+          retentionClass: 'temporary',
+        });
+      } catch (error) {
+        await discardWhatThisAttemptMade(
+          clip.id,
+          [{
+            key: media.posterStorageKey,
+            snapshotKey: clip.posterStorageKey,
+            read: async () => (await getClip(clip.id))?.posterStorageKey ?? null,
+          }],
+          { videoId: input.videoId, clipId: clip.id, reason: 'persist_failed' },
+        );
+        throw new VerticalPipelineFailure(
+          'serialization',
+          'persist_failed',
+          'The finished media could not be recorded',
+          error,
+        );
+      }
+
+      await recordVerticalRenderAttempt({
+        videoId: input.videoId,
+        clipRequestId: input.clipRequestId,
+        matchId: candidate.matchId,
+        clipId: clip.id,
+        workspaceId: input.workspaceId,
+        sessionId: input.sessionId,
+        requestedPlatform: input.intent.platform,
+        presentationTarget: 'original',
+        sourceWidth: media.sourceWidth,
+        sourceHeight: media.sourceHeight,
+        sourceAspect: media.sourceAspectRatio,
+        // Delivered as it came: the target is the source's own shape.
+        targetAspect: media.sourceAspectRatio,
+        targetWidth: media.sourceWidth,
+        targetHeight: media.sourceHeight,
+        compositionMode: 'original',
+        provider: null,
+        model: null,
+        outcome: 'succeeded',
+        failureStage: null,
+        failureCode: null,
+        failureMessage: null,
+        attemptNumber: attempt,
+        totalAttempts: attempt,
+        canonicalGenerationMs,
+        compositionDecisionMs: null,
+        derivativeRenderMs: null,
+        posterGenerationMs: media.posterGenerationMs,
+      });
+
+      await noteRecovery(input, candidate.matchId, attempt);
+
+      return {
+        ...base,
+        derivativeStatus: null,
+        derivativeStorageKey: null,
+        canonicalStorageKey: canonicalKey,
+        posterStorageKey: media.posterStorageKey,
+      };
+    }
+
     // Framing, derivative, poster. Every failure inside here arrives as a
     // VerticalPipelineFailure carrying the stage that gave way.
     stage = 'composition_decision';
@@ -434,7 +559,7 @@ async function prepareCandidate(
       workspaceId: input.workspaceId,
       sessionId: input.sessionId,
       requestedPlatform: input.intent.platform,
-      presentationTarget: input.intent.presentationTarget,
+      presentationTarget: presentation,
       sourceWidth: media.sourceWidth,
       sourceHeight: media.sourceHeight,
       sourceAspect: media.sourceAspectRatio,
@@ -456,23 +581,13 @@ async function prepareCandidate(
       posterGenerationMs: media.posterGenerationMs,
     });
 
-    // This attempt succeeded after an earlier one failed, so the earlier
-    // failure rows are marked recovered. Without this, retryRecoveryRate is
-    // computed from a column nothing ever sets and reads zero forever — a
-    // metric that reports "retries never help" while they are helping, which
-    // is worse than having no metric at all.
-    if (attempt > 1) {
-      await markAttemptsRecovered(candidate.matchId).catch((error) => {
-        input.log.error('could not mark earlier attempts recovered', {
-          matchId: candidate.matchId, err: error,
-        });
-      });
-    }
+    await noteRecovery(input, candidate.matchId, attempt);
 
     return {
       ...base,
       derivativeStatus: 'ready',
       derivativeStorageKey: media.derivativeStorageKey,
+      canonicalStorageKey: canonicalKey,
       posterStorageKey: media.posterStorageKey,
     };
   } catch (error) {
@@ -481,7 +596,10 @@ async function prepareCandidate(
     const code = failure?.code ?? 'unexpected';
     const message = errorMessage(error);
 
-    if (clipId) await markVerticalFailed(clipId, message).catch(() => undefined);
+    if (clipId) {
+      await (original ? markOriginalFailed(clipId, message) : markVerticalFailed(clipId, message))
+        .catch(() => undefined);
+    }
 
     // The candidate vanishes from the creator's view. It must not vanish from
     // ours: without this row, a pipeline quietly dropping a third of its
@@ -494,11 +612,11 @@ async function prepareCandidate(
       workspaceId: input.workspaceId,
       sessionId: input.sessionId,
       requestedPlatform: input.intent.platform,
-      presentationTarget: input.intent.presentationTarget,
+      presentationTarget: presentation,
       sourceWidth: null,
       sourceHeight: null,
       sourceAspect: null,
-      targetAspect: '9:16',
+      targetAspect: original ? null : '9:16',
       targetWidth: null,
       targetHeight: null,
       compositionMode: null,
@@ -524,14 +642,20 @@ async function prepareCandidate(
       input.log.error('could not record a vertical render failure', { err: recordError });
     });
 
-    input.log.warn('vertical candidate failed', {
+    input.log.warn('candidate failed', {
       matchId: candidate.matchId,
+      presentation,
       stage: failureStage,
       code,
       attempt,
     });
 
-    return { ...base, derivativeStatus: 'failed', failureStage };
+    return {
+      ...base,
+      derivativeStatus: original ? null : 'failed',
+      canonicalStorageKey: null,
+      failureStage,
+    };
   }
 }
 
@@ -549,7 +673,13 @@ export interface OrchestrationResult {
  */
 export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<OrchestrationResult> {
   const startedAt = input.startedAtMs;
-  const plan = planDeck(input.effectiveDeckTarget, env.VERTICAL_CANDIDATE_OVERFETCH, env.VERTICAL_CANDIDATE_CEILING);
+  const presentation: DeckPresentation = input.presentation === 'original' ? 'original' : 'vertical';
+  const plan = planDeck(
+    input.effectiveDeckTarget,
+    env.VERTICAL_CANDIDATE_OVERFETCH,
+    env.VERTICAL_CANDIDATE_CEILING,
+    presentation,
+  );
 
   const outcome = await assembleDeck(
     input.candidates,
@@ -562,8 +692,9 @@ export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<
     requestedResultCount: input.requestedResultCount,
     internalCandidateCount: input.candidates.length,
   });
-  input.log.info('vertical deck assembled', {
+  input.log.info('deck assembled', {
     platform: input.intent.platform,
+    presentation,
     candidateCeiling: plan.candidateTarget,
     complete: outcome.complete,
     ...metrics,

@@ -346,6 +346,8 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       if (!existing?.preRendered) return false;
       return keepAction({
         preRendered: true,
+        presentation: existing.presentation,
+        storageKey: existing.storageKey,
         derivativeStatus: existing.derivativeStatus,
         derivativeStorageKey: existing.derivativeStorageKey,
         posterStorageKey: existing.posterStorageKey,
@@ -374,17 +376,21 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
         endSeconds: bounds?.endSeconds ?? match.globalEndSeconds,
       });
 
-      // What Keep means now depends on whether the media already exists.
+      // What Keep means depends on whether the media already exists.
       //
-      // On the post-ready path the file was made before the card was ever
-      // shown, so Keep is an APPROVAL. Re-rendering would spend a second GPU
-      // call re-deciding framing that was already decided, and could hand
-      // back a differently-cropped clip from the one the person just chose:
-      // they would have kept one clip and received another.
+      // Every moment is now cut when it is found, so the file was made before
+      // the card was ever shown and Keep is an APPROVAL: it files the clip in
+      // the library. Re-rendering would spend a second GPU call re-deciding
+      // framing that was already decided, and could hand back a
+      // differently-cropped clip from the one the person just chose: they
+      // would have kept one clip and received another.
       //
-      // Everywhere else Keep still cuts the clip, exactly as before.
+      // Only a moment from before that rule — nothing cut behind it — is
+      // still cut here.
       const action = keepAction({
         preRendered: clip.preRendered,
+        presentation: clip.presentation,
+        storageKey: clip.storageKey,
         derivativeStatus: clip.derivativeStatus,
         derivativeStorageKey: clip.derivativeStorageKey,
         posterStorageKey: clip.posterStorageKey,

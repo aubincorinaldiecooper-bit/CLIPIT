@@ -27,25 +27,25 @@ const candidate = (over: Partial<VerticalCandidate> = {}): VerticalCandidate => 
 
 describe('isCreatorVisible — finished, and actually finished', () => {
   it('shows a ready candidate that really has its files', () => {
-    expect(isCreatorVisible(candidate())).toBe(true);
+    expect(isCreatorVisible(candidate(), 'vertical')).toBe(true);
   });
 
   it('withholds a derivative still being made', () => {
-    expect(isCreatorVisible(candidate({ derivativeStatus: 'pending', derivativeStorageKey: null }))).toBe(false);
+    expect(isCreatorVisible(candidate({ derivativeStatus: 'pending', derivativeStorageKey: null }), 'vertical')).toBe(false);
   });
 
   it('withholds a derivative that failed for good', () => {
-    expect(isCreatorVisible(candidate({ derivativeStatus: 'failed', derivativeStorageKey: null }))).toBe(false);
+    expect(isCreatorVisible(candidate({ derivativeStatus: 'failed', derivativeStorageKey: null }), 'vertical')).toBe(false);
   });
 
   it('trusts the FILE over the label: ready with no derivative is not ready', () => {
     // A row marked ready with nothing behind it is a bug upstream. Believing
     // the label would put a card on screen that plays nothing.
-    expect(isCreatorVisible(candidate({ derivativeStorageKey: null }))).toBe(false);
+    expect(isCreatorVisible(candidate({ derivativeStorageKey: null }), 'vertical')).toBe(false);
   });
 
   it('requires the poster too — a post-ready card with no still is not post-ready', () => {
-    expect(isCreatorVisible(candidate({ posterStorageKey: null }))).toBe(false);
+    expect(isCreatorVisible(candidate({ posterStorageKey: null }), 'vertical')).toBe(false);
   });
 });
 
@@ -106,7 +106,7 @@ describe('selectCreatorVisible — a failure must not cost a result', () => {
     // The canonical clip existing changes nothing: the creator asked for
     // something postable to TikTok, and a 16:9 file is not that.
     const withCanonical = { ...failed, canonicalUrl: 'clips/v1/c1.mp4' } as VerticalCandidate;
-    expect(isCreatorVisible(withCanonical)).toBe(false);
+    expect(isCreatorVisible(withCanonical, 'vertical')).toBe(false);
   });
 });
 
@@ -171,6 +171,30 @@ describe('retry policy — automatic, bounded, and only where it could differ', 
     // Attempt 1 failed transiently and was retryable; attempt 2 produced the
     // files, and the candidate is now visible on exactly the same rules.
     expect(shouldRetry('storage_upload', 1, 2)).toBe(true);
-    expect(isCreatorVisible(candidate())).toBe(true);
+    expect(isCreatorVisible(candidate(), 'vertical')).toBe(true);
+  });
+});
+
+describe('an original-framing moment is finished by its cut and its poster', () => {
+  const original = {
+    matchId: 'a',
+    confidence: 0.9,
+    derivativeStatus: null,
+    derivativeStorageKey: null,
+    canonicalStorageKey: 'clips/a.mp4',
+    posterStorageKey: 'poster/a.jpg',
+  };
+
+  it('is visible with a canonical cut and a poster, and no derivative', () => {
+    expect(isCreatorVisible(original, 'original')).toBe(true);
+  });
+
+  it('is not visible without the cut, or without the poster', () => {
+    expect(isCreatorVisible({ ...original, canonicalStorageKey: null }, 'original')).toBe(false);
+    expect(isCreatorVisible({ ...original, posterStorageKey: null }, 'original')).toBe(false);
+  });
+
+  it('is not a finished VERTICAL moment — the rule is asked, never assumed', () => {
+    expect(isCreatorVisible(original, 'vertical')).toBe(false);
   });
 });

@@ -2,6 +2,7 @@ import {
   candidateTargetFor,
   isCreatorVisible,
   shouldRetry,
+  type DeckPresentation,
   type FailureStage,
   type VerticalCandidate,
 } from './verticalVisibility.js';
@@ -41,14 +42,17 @@ export interface DeckPlan {
   requested: number;
   /** How many candidates may be prepared before giving up. */
   candidateTarget: number;
+  /** What each finished moment must have: a canonical cut, or a 9:16 derivative too. */
+  presentation: DeckPresentation;
 }
 
 export function planDeck(
   requested: number,
   overfetchRatio: number,
   ceiling: number,
+  presentation: DeckPresentation = 'vertical',
 ): DeckPlan {
-  return { requested, candidateTarget: candidateTargetFor(requested, overfetchRatio, ceiling) };
+  return { requested, candidateTarget: candidateTargetFor(requested, overfetchRatio, ceiling), presentation };
 }
 
 export interface DeckOutcome {
@@ -122,13 +126,13 @@ export async function assembleDeck(
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       renderAttempts += 1;
       prepared = await prepare(candidate, attempt);
-      if (isCreatorVisible(prepared)) break;
+      if (isCreatorVisible(prepared, plan.presentation)) break;
       // Bounded, automatic, and only where another go could genuinely differ.
       // The creator never presses anything to recover from our faults.
       if (!prepared.failureStage || !shouldRetry(prepared.failureStage, attempt, maxAttempts)) break;
     }
 
-    if (prepared && isCreatorVisible(prepared)) ready.push(prepared);
+    if (prepared && isCreatorVisible(prepared, plan.presentation)) ready.push(prepared);
     else if (prepared) failed.push(prepared);
   }
 

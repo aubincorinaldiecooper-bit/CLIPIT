@@ -33,6 +33,7 @@ interface ClipRow {
   output_width: number | null;
   output_height: number | null;
   pre_rendered: boolean | null;
+  presentation: 'original' | 'vertical' | null;
   approved_at: Date | null;
   retention_class: 'temporary' | 'owned' | null;
   created_at: Date;
@@ -76,6 +77,7 @@ function mapClip(row: ClipRow): Clip {
     outputWidth: row.output_width ?? null,
     outputHeight: row.output_height ?? null,
     preRendered: row.pre_rendered ?? false,
+    presentation: row.presentation ?? null,
     approvedAt: row.approved_at ?? null,
     // Matches the column default: a clip nothing has said otherwise about is
     // owned, so a reader that predates these columns cannot make an old clip
