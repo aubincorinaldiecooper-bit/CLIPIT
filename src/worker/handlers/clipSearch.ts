@@ -227,10 +227,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // last run's finished deck while it rebuilds this one.
     const planned = await recordDeckPlan(clipRequestId, {
       presentationTarget: needsVerticalDerivative(intent) ? 'vertical' : 'original',
-      // A number in the question, or a platform's default, is the target. A
-      // plain question without a number means every moment the search finds,
-      // which is not a number until it has — so none is recorded yet.
-      requestedResultCount: intent.countExplicit || intent.platform !== null ? intent.requestedCount : null,
+      // A number in the question is the target. Without one, the answer is
+      // every moment the search finds — a two-minute clip can only hold so
+      // many, and the footage decides that, not a default (owner, 2026-09-02).
+      // Not a number until the search has run, so none is recorded yet.
+      requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
     }, deckAttemptId);
     if (!planned) {
       // Another delivery claimed this request while we were getting here.
@@ -564,7 +565,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         ...(deck
           ? {
               platform: intent.platform,
-              requestedResultCount: intent.requestedCount,
+              requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
               availableCandidateCount: deck.availableCandidateCount,
               effectiveDeckTarget: deck.effectiveDeckTarget,
               readyResultCount: deck.readyCount,
@@ -1045,13 +1046,12 @@ async function buildDeck(input: {
   // for, what the video had, and what we are willing to render.
   //
   // What counts as "asked for" depends on the question. A number in it
-  // ("give me 5") is the target. A platform question without one keeps its
-  // default. A plain question without a number — "find the funny moments" —
-  // was answered with every match it found before moments were cut on find,
-  // and cutting them all is what keeps that answer whole, up to the ceiling.
-  const wanted = intent.countExplicit || intent.platform !== null
-    ? intent.requestedCount
-    : candidates.length;
+  // ("give me 5") is the target. Without one, the footage decides: every
+  // eligible moment the search found is cut, up to the ceiling — a
+  // two-minute clip can only hold so many moments, and a default of three
+  // would be a guess standing in for that fact (owner, 2026-09-02). This
+  // holds for a platform question and a plain one alike.
+  const wanted = intent.countExplicit ? intent.requestedCount : candidates.length;
   const effectiveDeckTarget = Math.min(wanted, candidates.length, intent.renderCeiling);
   await recordDeckAvailability(clipRequestId, {
     availableCandidateCount: candidates.length,

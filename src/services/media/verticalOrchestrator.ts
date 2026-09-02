@@ -250,6 +250,10 @@ async function prepareCandidate(
   attempt: number,
 ): Promise<PreparedCandidate> {
   const base = { ...candidate, attempts: attempt, failureStage: null as FailureStage | null };
+  // Read once, strictly: only an explicit 'original' takes the original path,
+  // so a caller that forgot the field gets the vertical pipeline it always had.
+  const original = input.presentation === 'original';
+  const presentation: DeckPresentation = original ? 'original' : 'vertical';
   const startedAt = performance.now();
   let clipId: string | null = null;
   let stage: FailureStage = 'canonical_generation';
@@ -268,7 +272,7 @@ async function prepareCandidate(
 
     // Everything already exists: this is a repeat, not new work.
     const canonicalDone = clip.status === 'ready' && Boolean(clip.storageKey);
-    const finishedAlready = input.presentation === 'vertical'
+    const finishedAlready = !original
       ? canonicalDone
         && clip.derivativeStatus === 'ready'
         && Boolean(clip.derivativeStorageKey)
@@ -283,12 +287,12 @@ async function prepareCandidate(
       input.log.info('candidate already finished, reusing', {
         matchId: candidate.matchId,
         clipId: clip.id,
-        presentation: input.presentation,
+        presentation,
       });
       return {
         ...base,
-        derivativeStatus: input.presentation === 'vertical' ? 'ready' : null,
-        derivativeStorageKey: input.presentation === 'vertical' ? clip.derivativeStorageKey : null,
+        derivativeStatus: original ? null : 'ready',
+        derivativeStorageKey: original ? null : clip.derivativeStorageKey,
         canonicalStorageKey: clip.storageKey,
         posterStorageKey: clip.posterStorageKey,
       };
@@ -385,7 +389,7 @@ async function prepareCandidate(
     }
     canonicalGenerationMs = Math.round(performance.now() - startedAt);
 
-    if (input.presentation === 'original') {
+    if (original) {
       // The cut IS the deliverable. All that stands between it and a card is
       // the poster; no framing is decided and no second file is encoded.
       stage = 'poster_generation';
@@ -555,7 +559,7 @@ async function prepareCandidate(
       workspaceId: input.workspaceId,
       sessionId: input.sessionId,
       requestedPlatform: input.intent.platform,
-      presentationTarget: input.presentation,
+      presentationTarget: presentation,
       sourceWidth: media.sourceWidth,
       sourceHeight: media.sourceHeight,
       sourceAspect: media.sourceAspectRatio,
@@ -593,10 +597,8 @@ async function prepareCandidate(
     const message = errorMessage(error);
 
     if (clipId) {
-      await (input.presentation === 'vertical'
-        ? markVerticalFailed(clipId, message)
-        : markOriginalFailed(clipId, message)
-      ).catch(() => undefined);
+      await (original ? markOriginalFailed(clipId, message) : markVerticalFailed(clipId, message))
+        .catch(() => undefined);
     }
 
     // The candidate vanishes from the creator's view. It must not vanish from
@@ -610,11 +612,11 @@ async function prepareCandidate(
       workspaceId: input.workspaceId,
       sessionId: input.sessionId,
       requestedPlatform: input.intent.platform,
-      presentationTarget: input.presentation,
+      presentationTarget: presentation,
       sourceWidth: null,
       sourceHeight: null,
       sourceAspect: null,
-      targetAspect: input.presentation === 'vertical' ? '9:16' : null,
+      targetAspect: original ? null : '9:16',
       targetWidth: null,
       targetHeight: null,
       compositionMode: null,
@@ -642,7 +644,7 @@ async function prepareCandidate(
 
     input.log.warn('candidate failed', {
       matchId: candidate.matchId,
-      presentation: input.presentation,
+      presentation,
       stage: failureStage,
       code,
       attempt,
@@ -650,7 +652,7 @@ async function prepareCandidate(
 
     return {
       ...base,
-      derivativeStatus: input.presentation === 'vertical' ? 'failed' : null,
+      derivativeStatus: original ? null : 'failed',
       canonicalStorageKey: null,
       failureStage,
     };
@@ -671,11 +673,12 @@ export interface OrchestrationResult {
  */
 export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<OrchestrationResult> {
   const startedAt = input.startedAtMs;
+  const presentation: DeckPresentation = input.presentation === 'original' ? 'original' : 'vertical';
   const plan = planDeck(
     input.effectiveDeckTarget,
     env.VERTICAL_CANDIDATE_OVERFETCH,
     env.VERTICAL_CANDIDATE_CEILING,
-    input.presentation,
+    presentation,
   );
 
   const outcome = await assembleDeck(
@@ -691,7 +694,7 @@ export async function orchestrateVerticalDeck(input: OrchestrateInput): Promise<
   });
   input.log.info('deck assembled', {
     platform: input.intent.platform,
-    presentation: input.presentation,
+    presentation,
     candidateCeiling: plan.candidateTarget,
     complete: outcome.complete,
     ...metrics,

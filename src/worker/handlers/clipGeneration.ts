@@ -11,8 +11,7 @@ import { appendReclipVersion, clearReclipPending, markReclipFailed } from '../..
 import { captionsSchema, prepareCaptionFilters } from '../../services/media/captions.js';
 import { applyClipPadding } from '../../services/timestamps.js';
 import { getClip, setClipStatus, restoreClipBoundaries } from '../../db/repositories/clips.js';
-import { setPosterFromCut } from '../../db/repositories/verticalMedia.js';
-import { runOriginalPipeline } from '../../services/media/verticalPipeline.js';
+import { renderDeliveredMedia } from '../../services/media/rerender.js';
 import { discardVariants } from '../../db/repositories/clipVariants.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import type { ClipGenerationJob } from '../../queues/index.js';
@@ -90,53 +89,50 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         ...(videoFilters ? { videoFilters } : {}),
       });
 
+      // The card's picture — and for a vertical moment the 9:16 file — were
+      // made from the cut, so they are made again from THIS one, first, at
+      // fresh keys beside the old. If any of it fails, the previous cut and
+      // its media are untouched and the failure below rolls this render back
+      // like any other; nothing has been replaced yet.
+      const delivered = await renderDeliveredMedia({
+        clip,
+        videoId: video.id,
+        canonicalPath: outputPath,
+        workDir: dir,
+        hasAudio: video.hasAudio ?? true,
+        cut: result,
+        log,
+      });
+
       await job.updateProgress({ stage: 'uploading', percent: 80 });
 
       const key = clipKey(video.id, clipId);
-      await getStorage().uploadFile(key, outputPath, 'video/mp4');
+      try {
+        await getStorage().uploadFile(key, outputPath, 'video/mp4');
 
-      await setClipStatus(clipId, 'ready', {
-        storageKey: key,
-        durationSeconds: Number(result.durationSeconds.toFixed(3)),
-        sizeBytes: result.sizeBytes,
-        // A Replace's spec becomes the row's truth only now, when the file
-        // that carries it exists.
-        ...(job.data.captions !== undefined ? { captions: job.data.captions } : {}),
-      });
+        await setClipStatus(clipId, 'ready', {
+          storageKey: key,
+          durationSeconds: Number(result.durationSeconds.toFixed(3)),
+          sizeBytes: result.sizeBytes,
+          // A Replace's spec becomes the row's truth only now, when the file
+          // that carries it exists.
+          ...(job.data.captions !== undefined ? { captions: job.data.captions } : {}),
+        });
+      } catch (error) {
+        // The new cut did not land, so the media made from it goes too.
+        await delivered?.discard('canonical_replace_failed');
+        throw error;
+      }
 
-      // The card's picture is a frame of the file it stands for. This render
-      // put a different file under the same id, so a moment that was cut on
-      // find takes its poster again from the new cut — the same step that made
-      // the first one, over the same key. Best-effort: the cut is already the
-      // truth, and failing it here would leave the row describing a file that
-      // no longer exists. What cannot be helped is said out loud instead.
-      if (clip.preRendered && clip.presentation === 'original') {
-        try {
-          const poster = await runOriginalPipeline({
-            videoId: video.id,
-            clipId,
-            canonicalPath: outputPath,
-            workDir: dir,
-            durationSeconds: result.durationSeconds,
-            width: result.width,
-            height: result.height,
-            currentPosterKey: async () => (await getClip(clipId))?.posterStorageKey ?? null,
-            snapshotPosterKey: clip.posterStorageKey,
-          });
-          await setPosterFromCut(clipId, {
-            posterStorageKey: poster.posterStorageKey,
-            posterTimestampSeconds: poster.posterTimestampSeconds,
-            sourceWidth: poster.sourceWidth,
-            sourceHeight: poster.sourceHeight,
-            posterGenerationMs: poster.posterGenerationMs,
-          });
-        } catch (posterError) {
-          // The previous poster still stands at the same key, so the card
-          // keeps showing a frame of the earlier cut of this moment rather
-          // than nothing. Logged at error level: this is the one way a
-          // card's picture can disagree with its file.
-          log.error('the re-cut clip kept its previous poster', { err: posterError });
-        }
+      // The new cut is the truth now, so the row takes the media made from
+      // it and the previous objects go. A failure here cannot fail the
+      // render — that would leave the row describing a file that no longer
+      // exists — so it is said out loud instead: the one way a card's
+      // picture can disagree with its file.
+      if (delivered) {
+        await delivered.commit().catch((commitError) => {
+          log.error('the re-cut clip kept its previous delivered media', { err: commitError });
+        });
       }
 
       // The master changed, so every platform shape cut from the OLD master

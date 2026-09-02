@@ -259,16 +259,18 @@ describe('an original-framing request is cut on find too', () => {
     );
   });
 
-  it('keeps a platform question at its default of three when no number was named', async () => {
+  it('lets the footage decide for a platform question with no number, too', async () => {
     listMatches.mockResolvedValue(fourMatches as never);
     await completeRequestWithDeck({
       clipRequestId: 'request-1', request: request as any, video: video as any,
       intent: resolvePlatformIntent('find me moments to post on TikTok', 90),
       workDir: '/tmp', log, tally, answeredFrom: 'footage', deckAttemptId: 'attempt-1', deckStartedAtMs: 0,
     });
+    // No default of three: a two-minute clip can only hold so many moments,
+    // and what it holds is the answer (owner, 2026-09-02).
     expect(recordDeckAvailability).toHaveBeenCalledWith(
       'request-1',
-      { availableCandidateCount: 4, effectiveDeckTarget: 3 },
+      { availableCandidateCount: 4, effectiveDeckTarget: 4 },
       'attempt-1',
     );
   });

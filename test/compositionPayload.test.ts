@@ -42,6 +42,8 @@ const setVerticalMedia = vi.fn(async () => undefined);
 vi.mock('../src/db/repositories/verticalMedia.js', () => ({
   setVerticalMedia,
   markVerticalFailed: vi.fn(async () => undefined),
+  setOriginalMedia: vi.fn(async () => undefined),
+  markOriginalFailed: vi.fn(async () => undefined),
 }));
 vi.mock('../src/db/repositories/verticalRenders.js', () => ({
   markAttemptsRecovered: vi.fn(async () => undefined),
@@ -83,6 +85,7 @@ async function runOneCandidate() {
     hasAudio: true,
     videoDurationSeconds: 20,
     intent: resolvePlatformIntent('find a moment to post on TikTok', 90),
+    presentation: 'vertical' as const,
     requestedResultCount: 1,
     effectiveDeckTarget: 1,
     candidates: [{

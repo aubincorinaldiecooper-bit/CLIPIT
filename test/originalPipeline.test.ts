@@ -113,6 +113,12 @@ describe.skipIf(!ffmpegAvailable)('finishing an original-framing moment', () => 
     expect(removed).toEqual([]);
   });
 
+  it('writes a re-render\'s poster beside the first one, never over it', async () => {
+    const result = await runOriginalPipeline({ ...input(), render: 'r7' });
+    expect(result.posterStorageKey).toBe('posters/video-1/clip-1-r7.jpg');
+    expect(uploaded.map((entry) => entry.key)).toEqual(['posters/video-1/clip-1-r7.jpg']);
+  });
+
   it('refuses a cut with no usable size before touching ffmpeg or storage', async () => {
     await expect(runOriginalPipeline({ ...input(), width: 0, height: 0 })).rejects.toBeInstanceOf(VerticalPipelineFailure);
     expect(uploaded).toEqual([]);

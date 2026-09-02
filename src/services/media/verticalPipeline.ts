@@ -79,6 +79,12 @@ export interface VerticalPipelineInput {
    * read above cannot answer. See shouldDiscardOnUploadFailure.
    */
   snapshotDerivativeKey?: string | null;
+  /**
+   * Set by a re-render: its objects take fresh keys beside the previous
+   * ones, so nothing here can overwrite media a row still names. See
+   * clipPosterKey.
+   */
+  render?: string;
 }
 
 export interface VerticalPipelineResult {
@@ -298,7 +304,7 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
   }
   const derivativeGenerationMs = Math.round(performance.now() - renderStartedAt);
 
-  const derivativeStorageKey = verticalDerivativeKey(input.videoId, input.clipId);
+  const derivativeStorageKey = verticalDerivativeKey(input.videoId, input.clipId, input.render);
   try {
     await getStorage().uploadFile(derivativeStorageKey, derivativePath, 'video/mp4');
   } catch (error) {
@@ -337,7 +343,7 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
   const posterStartedAt = performance.now();
   const posterTimestampSeconds = posterOffsetSeconds(rendered.durationSeconds);
   const posterPath = path.join(input.workDir, `${input.clipId}-poster.jpg`);
-  const posterStorageKey = clipPosterKey(input.videoId, input.clipId);
+  const posterStorageKey = clipPosterKey(input.videoId, input.clipId, input.render);
   // ATTEMPTED, not succeeded, and the difference is a real orphan.
   //
   // A PUT can reach the bucket and store the object while the response is
@@ -424,6 +430,8 @@ export interface OriginalPipelineInput {
   /** See VerticalPipelineInput.currentDerivativeKey — the same rule, for the poster. */
   currentPosterKey?: () => Promise<string | null>;
   snapshotPosterKey?: string | null;
+  /** See VerticalPipelineInput.render. */
+  render?: string;
 }
 
 export interface OriginalPipelineResult {
@@ -457,7 +465,7 @@ export async function runOriginalPipeline(input: OriginalPipelineInput): Promise
   const posterStartedAt = performance.now();
   const posterTimestampSeconds = posterOffsetSeconds(input.durationSeconds);
   const posterPath = path.join(input.workDir, `${input.clipId}-poster.jpg`);
-  const posterStorageKey = clipPosterKey(input.videoId, input.clipId);
+  const posterStorageKey = clipPosterKey(input.videoId, input.clipId, input.render);
 
   let posterWritten = false;
   try {
