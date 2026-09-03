@@ -163,3 +163,59 @@ describe.skipIf(!ffmpegAvailable)('watching chunks close', () => {
     expect(done).toEqual([0, 1]);
   }, 60_000);
 });
+
+describe.skipIf(!ffmpegAvailable)('ordering past the four-digit name', () => {
+  const dir2 = path.join('/tmp', `clipit-segment-order-${process.pid}`);
+
+  beforeEach(async () => {
+    await rm(dir2, { recursive: true, force: true });
+    await mkdir(dir2, { recursive: true });
+  });
+  afterEach(async () => {
+    await rm(dir2, { recursive: true, force: true });
+  });
+
+  /** Named exactly as ffmpeg names them: %04d is a minimum width, not a cap. */
+  async function numbered(index: number, seconds: number): Promise<void> {
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `testsrc=size=64x48:rate=5:duration=${seconds}`,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-an',
+      path.join(dir2, `chunk_${String(index).padStart(4, '0')}.mp4`),
+    ], { timeoutMs: 60_000 });
+  }
+
+  it('places the ten-thousandth chunk after the nine-thousandth, not beside the thousandth', async () => {
+    // As text, chunk_10000 sorts between chunk_1000 and chunk_1001. A long
+    // enough video reaches this inside the supported settings, and every
+    // timestamp after that point would then be wrong — a found moment would
+    // point at a different part of the footage than the one it came from.
+    await numbered(1000, 1);
+    await numbered(1001, 2);
+    await numbered(9999, 3);
+    await numbered(10000, 4);
+
+    const segments = await measureSegments(dir2, 30);
+    expect(segments.map((segment) => path.basename(segment.filePath))).toEqual([
+      'chunk_1000.mp4', 'chunk_1001.mp4', 'chunk_9999.mp4', 'chunk_10000.mp4',
+    ]);
+    // Start seconds accumulate in that order, so they stay truthful.
+    expect(segments.map((segment) => Math.round(segment.globalStartSeconds))).toEqual([0, 1, 3, 6]);
+  }, 120_000);
+
+  it('announces the same indices the final list uses, whatever the names look like', async () => {
+    await numbered(1000, 1);
+    await numbered(1001, 2);
+    await numbered(9999, 3);
+    await numbered(10000, 4);
+
+    const seen: number[] = [];
+    const watcher = watchClosedSegments(dir2, 30, (i) => { seen.push(i); });
+    await watcher.flush();
+    // The indices are positions, not the numbers in the filenames, and both
+    // sides derive them the same way. This pins that agreement; the ordering
+    // itself is what the test above catches.
+    const kept = await measureSegments(dir2, 30);
+    expect(seen).toEqual(kept.map((segment) => segment.index));
+  }, 120_000);
+});

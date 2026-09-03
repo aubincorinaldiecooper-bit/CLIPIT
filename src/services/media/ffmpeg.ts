@@ -212,6 +212,25 @@ export async function splitIntoChunks(
  * files directly, the older two-pass route writes them with a copy — so the
  * grid, its clamping and its keyframe guard cannot differ between them.
  */
+/**
+ * Orders segment files by the number in their name, never by the text of it.
+ *
+ * ffmpeg's %04d is a minimum width, not a maximum: the ten-thousandth chunk is
+ * chunk_10000.mp4, and as text that sorts between chunk_1000 and chunk_1001.
+ * Every segment after it would then be measured against the wrong neighbour,
+ * and the global start seconds — the numbers every found moment is reported
+ * against — would be wrong from that point to the end of the video. A long
+ * enough source with a short enough chunk reaches this inside the supported
+ * settings: 360000 seconds cut every 30 makes twelve thousand pieces.
+ */
+function inSegmentOrder(files: string[], pattern: RegExp): string[] {
+  return files
+    .map((file) => ({ file, position: Number(pattern.exec(file)?.[1]) }))
+    .filter((entry) => Number.isFinite(entry.position))
+    .sort((a, b) => a.position - b.position)
+    .map((entry) => entry.file);
+}
+
 /** How often the chunk directory is checked while ffmpeg runs. */
 const SEGMENT_POLL_MS = 250;
 
@@ -297,9 +316,10 @@ export function watchClosedSegments(
    * process has exited, when the newest file is closed too.
    */
   const drain = async (includeFinal: boolean): Promise<void> => {
-    const files = (await readdir(chunkDir).catch(() => [] as string[]))
-      .filter((file) => /^chunk_\d+\.mp4$/.test(file))
-      .sort();
+    const files = inSegmentOrder(
+      await readdir(chunkDir).catch(() => [] as string[]),
+      /^chunk_(\d+)\.mp4$/,
+    );
     const limit = includeFinal ? files.length : files.length - 1;
 
     while (!stopped && !doomed && nextIndex < limit) {
@@ -373,9 +393,7 @@ export function watchClosedSegments(
 }
 
 export async function measureSegments(outputDir: string, chunkSeconds: number): Promise<ProxySegment[]> {
-  const files = (await readdir(outputDir))
-    .filter((file) => /^chunk_\d+\.mp4$/.test(file))
-    .sort();
+  const files = inSegmentOrder(await readdir(outputDir), /^chunk_(\d+)\.mp4$/);
 
   const segments: ProxySegment[] = [];
   let cursor = 0;
@@ -611,9 +629,7 @@ export async function extractAudioSegments(
     { timeoutMs: 6 * 60 * 60 * 1000 },
   );
 
-  const files = (await readdir(outputDir))
-    .filter((file) => /^audio_\d+\.mp3$/.test(file))
-    .sort();
+  const files = inSegmentOrder(await readdir(outputDir), /^audio_(\d+)\.mp3$/);
 
   const segments: AudioSegment[] = [];
 
