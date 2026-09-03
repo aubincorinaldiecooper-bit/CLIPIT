@@ -62,6 +62,21 @@ describe('planWindows', () => {
     expect(windows.at(-1)!.endSeconds - windows.at(-1)!.startSeconds).toBe(10);
   });
 
+  it('does not discard a full window to a rounding hair', () => {
+    // Devin's finding on #93, and it was real. Rounding start and end
+    // separately and subtracting can land a hair under the width the window
+    // was built to have. At a 1s window every 0.501s with only full windows
+    // eligible, six windows whose stored width reads exactly 1.000 were
+    // dropped, and half a second of the video went unindexed.
+    const grid = { windowSeconds: 1, strideSeconds: 0.501, minWindowSeconds: 1 };
+    const windows = planWindows(30, grid);
+    expect(uncoveredSeconds(windows, 30)).toEqual([]);
+    // Every window kept really is a full one, to the stored precision.
+    for (const window of windows.slice(0, -1)) {
+      expect(window.endSeconds - window.startSeconds).toBeCloseTo(1, 6);
+    }
+  });
+
   it('covers every second of every grid it is given', () => {
     // The property the case above is one instance of. Every grid the sweep
     // can run, against durations that land on, just before and just after a
@@ -71,6 +86,11 @@ describe('planWindows', () => {
       { windowSeconds: 10, strideSeconds: 5, minWindowSeconds: 3 },
       { windowSeconds: 10, strideSeconds: 10, minWindowSeconds: 3 },
       { windowSeconds: 20, strideSeconds: 10, minWindowSeconds: 5 },
+      // Fractional strides, and minimum equal to the window — both accepted
+      // by the settings, and both where the float arithmetic bites.
+      { windowSeconds: 1, strideSeconds: 0.501, minWindowSeconds: 1 },
+      { windowSeconds: 7.5, strideSeconds: 2.5, minWindowSeconds: 7.5 },
+      { windowSeconds: 10, strideSeconds: 3.3, minWindowSeconds: 10 },
     ];
     for (const grid of grids) {
       for (const duration of [19.5, 20, 20.5, 30, 31, 47, 60, 121.004, 300]) {

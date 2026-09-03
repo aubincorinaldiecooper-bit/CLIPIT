@@ -48,6 +48,13 @@ export const DEFAULT_WINDOW_PLAN: WindowPlan = {
   minWindowSeconds: 3,
 };
 
+/**
+ * Slack for the last bits of a float. Small enough that it can never admit a
+ * window anybody would call short, large enough to absorb the error in adding
+ * a stride to itself a few hundred times.
+ */
+const EPSILON = 1e-9;
+
 /** Three decimals everywhere, so a window key is stable across re-planning. */
 function round(seconds: number): number {
   return Number(seconds.toFixed(3));
@@ -144,13 +151,22 @@ export function planWindows(durationSeconds: number, plan: WindowPlan = DEFAULT_
 
   const windows: IndexWindow[] = [];
   for (let start = 0; start < durationSeconds; start += strideSeconds) {
+    const rawEnd = Math.min(start + windowSeconds, durationSeconds);
     const startSeconds = round(start);
-    const endSeconds = round(Math.min(start + windowSeconds, durationSeconds));
+    const endSeconds = round(rawEnd);
 
     // A sliver at the end is not worth its own embedding — a real row, a real
     // GPU call, and a fraction of a second of footage. It is skipped here and
     // the seconds it would have held are picked up below.
-    if (endSeconds - startSeconds >= minWindowSeconds) {
+    //
+    // Measured on the UNROUNDED interval, which is not fussiness. Rounding
+    // start and end separately and subtracting can land a hair under the
+    // width they were built to have: at a 1s window every 0.501s, with only
+    // full windows eligible, six windows whose stored width reads exactly
+    // 1.000 were discarded and half a second of the video went unindexed.
+    // A window is or is not long enough by the arithmetic that made it; the
+    // rounding is for the coordinates that get stored, and only that.
+    if (rawEnd - start >= minWindowSeconds - EPSILON) {
       windows.push({ startSeconds, endSeconds });
     }
 
