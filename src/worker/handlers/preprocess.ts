@@ -34,43 +34,6 @@ interface DerivedMedia {
   lastChunkReadyMs: number | null;
 }
 
-/**
- * Notices each finished chunk while ffmpeg is still running.
- *
- * The segment muxer opens the next file at the moment it closes the current
- * one, so chunk N is complete when chunk N+1 appears — and the last one when
- * the process exits. That is what makes "time to first chunk" a real number
- * rather than the total, and it is the measurement the indexing work will be
- * judged on: today nothing downstream can start until every chunk exists.
- */
-function watchChunks(chunkDir: string, startedAt: number) {
-  const appeared = new Map<string, number>();
-  const timer = setInterval(() => {
-    readdir(chunkDir)
-      .then((files) => {
-        for (const file of files) {
-          if (/^chunk_\d+\.mp4$/.test(file) && !appeared.has(file)) {
-            appeared.set(file, performance.now() - startedAt);
-          }
-        }
-      })
-      .catch(() => undefined);
-  }, 250);
-  timer.unref?.();
-  return {
-    stop(): { firstChunkReadyMs: number | null; lastChunkReadyMs: number | null } {
-      clearInterval(timer);
-      const times = [...appeared.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, at]) => at);
-      // The Nth file appearing is the (N-1)th finishing; the final chunk
-      // finishes with the process, which the caller times.
-      return {
-        firstChunkReadyMs: times.length > 1 ? Math.round(times[1]!) : null,
-        lastChunkReadyMs: null,
-      };
-    },
-  };
-}
-
 /** Bytes currently held in the working directory — the temporary-disk figure. */
 async function dirBytes(dir: string): Promise<number> {
   let total = 0;
@@ -105,20 +68,28 @@ async function deriveMedia(input: {
 
   if (env.PREPROCESS_SINGLE_PASS) {
     const startedAt = performance.now();
-    const watcher = watchChunks(chunkDir, startedAt);
+    // Each chunk reports itself the moment the muxer closes it, so this is when
+    // a piece of the video genuinely became readable — not when the whole job
+    // finished. It is the measurement the indexing work will be judged on:
+    // today nothing downstream can start until every chunk exists.
+    const closedAtMs: number[] = [];
     try {
-      const result = await createProxiesAndChunks({ sourcePath, proxyPath, playbackPath, chunkDir });
-      const timings = watcher.stop();
+      const result = await createProxiesAndChunks({
+        sourcePath,
+        proxyPath,
+        playbackPath,
+        chunkDir,
+        onSegmentClosed: () => closedAtMs.push(Math.round(performance.now() - startedAt)),
+      });
       return {
         playbackPath: result.playbackPath,
         segments: result.segments,
         decodePasses: 1,
         route: 'single-pass',
-        firstChunkReadyMs: timings.firstChunkReadyMs,
+        firstChunkReadyMs: closedAtMs[0] ?? null,
         lastChunkReadyMs: Math.round(performance.now() - startedAt),
       };
     } catch (cause) {
-      watcher.stop();
       log.warn('single decode failed; falling back to separate passes', { error: errorMessage(cause) });
       // A run that died partway may have left segments behind. The fallback
       // writes the same names from zero, so anything it does not overwrite
