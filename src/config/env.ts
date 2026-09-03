@@ -356,6 +356,22 @@ const envSchema = z.object({
   // --- Media pipeline -----------------------------------------------------
   MAX_SOURCE_DURATION_SECONDS: int(21_600, 1, 360_000),
   ANALYSIS_CHUNK_SECONDS: int(120, 30, 3_600),
+
+  /**
+   * Decode the source once and feed every derived output from it, instead of
+   * decoding the original separately for the analysis proxy and again for the
+   * playback proxy. An off switch rather than a rewrite: set false and
+   * preprocessing takes the older two-pass route, unchanged.
+   */
+  PREPROCESS_SINGLE_PASS: bool(true),
+
+  /**
+   * Threads the DECODER may use. Frame threading buys speed by keeping one
+   * full-resolution frame in flight per thread, which at 4096x2160 is about
+   * 12 MB each, so on a many-core box the decoder's memory scales with cores
+   * rather than with the work. 0 leaves the choice to ffmpeg.
+   */
+  PREPROCESS_DECODE_THREADS: int(2, 0, 32),
   /**
    * On start, the worker sweeps videos whose matches predate stills and gives
    * them one, so results already on a user's screen do not stay text-only

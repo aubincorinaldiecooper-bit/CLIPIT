@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import type { Job } from 'bullmq';
 import { env } from '../../config/env.js';
 import { logger } from '../../lib/logger.js';
@@ -7,10 +8,152 @@ import { errorMessage } from '../../lib/errors.js';
 import { withWorkDir } from '../../lib/workdir.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { chunkKey, playbackProxyKey, proxyKey } from '../../services/storage/types.js';
-import { createAnalysisProxy, createPlaybackProxy, extractFrameAt, ffprobe, splitIntoChunks } from '../../services/media/ffmpeg.js';
+import {
+  createAnalysisProxy,
+  createPlaybackProxy,
+  createProxiesAndChunks,
+  extractFrameAt,
+  ffprobe,
+  splitIntoChunks,
+  type ProxySegment,
+} from '../../services/media/ffmpeg.js';
+import { mib, readContainerMemory } from '../../lib/containerMemory.js';
 import { shouldDiscardOnUploadFailure } from '../../services/media/verticalPipeline.js';
 import { getVideo, replaceChunks, setIndexStatus, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
 import { enqueueIndexing, enqueueTranscription, type PreprocessingJob } from '../../queues/index.js';
+
+
+interface DerivedMedia {
+  playbackPath: string | null;
+  segments: ProxySegment[];
+  /** 1 once the single pass is doing the work, 2 on the older route. */
+  decodePasses: number;
+  route: 'single-pass' | 'separate-passes';
+  /** When the first chunk was finished and readable, from the start of decoding. */
+  firstChunkReadyMs: number | null;
+  lastChunkReadyMs: number | null;
+}
+
+/**
+ * Notices each finished chunk while ffmpeg is still running.
+ *
+ * The segment muxer opens the next file at the moment it closes the current
+ * one, so chunk N is complete when chunk N+1 appears — and the last one when
+ * the process exits. That is what makes "time to first chunk" a real number
+ * rather than the total, and it is the measurement the indexing work will be
+ * judged on: today nothing downstream can start until every chunk exists.
+ */
+function watchChunks(chunkDir: string, startedAt: number) {
+  const appeared = new Map<string, number>();
+  const timer = setInterval(() => {
+    readdir(chunkDir)
+      .then((files) => {
+        for (const file of files) {
+          if (/^chunk_\d+\.mp4$/.test(file) && !appeared.has(file)) {
+            appeared.set(file, performance.now() - startedAt);
+          }
+        }
+      })
+      .catch(() => undefined);
+  }, 250);
+  timer.unref?.();
+  return {
+    stop(): { firstChunkReadyMs: number | null; lastChunkReadyMs: number | null } {
+      clearInterval(timer);
+      const times = [...appeared.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, at]) => at);
+      // The Nth file appearing is the (N-1)th finishing; the final chunk
+      // finishes with the process, which the caller times.
+      return {
+        firstChunkReadyMs: times.length > 1 ? Math.round(times[1]!) : null,
+        lastChunkReadyMs: null,
+      };
+    },
+  };
+}
+
+/** Bytes currently held in the working directory — the temporary-disk figure. */
+async function dirBytes(dir: string): Promise<number> {
+  let total = 0;
+  const walk = async (at: string): Promise<void> => {
+    for (const entry of await readdir(at, { withFileTypes: true })) {
+      const full = path.join(at, entry.name);
+      if (entry.isDirectory()) await walk(full);
+      else total += (await stat(full).catch(() => null))?.size ?? 0;
+    }
+  };
+  await walk(dir).catch(() => undefined);
+  return total;
+}
+
+/**
+ * Builds the analysis proxy, its chunks and the playback proxy.
+ *
+ * Prefers one decode of the source feeding all three. If that command fails
+ * for any reason the older route runs instead, unchanged — a new ffmpeg
+ * invocation on the ingestion path should not be able to cost an upload while
+ * it is proving itself, and the fallback is the code that has been running in
+ * production. Which route ran is logged either way.
+ */
+async function deriveMedia(input: {
+  sourcePath: string;
+  proxyPath: string;
+  playbackPath: string;
+  chunkDir: string;
+  log: ReturnType<typeof logger.child>;
+}): Promise<DerivedMedia> {
+  const { sourcePath, proxyPath, playbackPath, chunkDir, log } = input;
+
+  if (env.PREPROCESS_SINGLE_PASS) {
+    const startedAt = performance.now();
+    const watcher = watchChunks(chunkDir, startedAt);
+    try {
+      const result = await createProxiesAndChunks({ sourcePath, proxyPath, playbackPath, chunkDir });
+      const timings = watcher.stop();
+      return {
+        playbackPath: result.playbackPath,
+        segments: result.segments,
+        decodePasses: 1,
+        route: 'single-pass',
+        firstChunkReadyMs: timings.firstChunkReadyMs,
+        lastChunkReadyMs: Math.round(performance.now() - startedAt),
+      };
+    } catch (cause) {
+      watcher.stop();
+      log.warn('single decode failed; falling back to separate passes', { error: errorMessage(cause) });
+      // A run that died partway may have left segments behind. The fallback
+      // writes the same names from zero, so anything it does not overwrite
+      // would survive and be measured as a real chunk — a piece of the video
+      // that appears to have been indexed and never was.
+      await rm(chunkDir, { recursive: true, force: true }).catch(() => undefined);
+      await mkdir(chunkDir, { recursive: true });
+    }
+  }
+
+  const startedAt = performance.now();
+  await createAnalysisProxy(sourcePath, proxyPath);
+  const segments = await splitIntoChunks(proxyPath, chunkDir, env.ANALYSIS_CHUNK_SECONDS);
+  const chunksAt = Math.round(performance.now() - startedAt);
+
+  let playbackProduced: string | null = null;
+  try {
+    await createPlaybackProxy(sourcePath, playbackPath);
+    playbackProduced = playbackPath;
+  } catch (cause) {
+    log.warn('could not create a playback proxy; review will use the analysis proxy', {
+      error: errorMessage(cause),
+    });
+  }
+
+  return {
+    playbackPath: playbackProduced,
+    segments,
+    decodePasses: 2,
+    route: 'separate-passes',
+    // Nothing is readable until the whole proxy has been encoded and copied.
+    firstChunkReadyMs: chunksAt,
+    lastChunkReadyMs: chunksAt,
+  };
+}
 
 /**
  * Probes the source, builds the analysis proxy, and cuts it into the fixed
@@ -76,9 +219,52 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       });
       await job.updateProgress({ stage: 'probed', percent: 40 });
 
-      // 2. Build the low-resolution analysis proxy.
+      // 2. Derive the analysis proxy, its chunks and the playback proxy.
+      //
+      // One decode of the source feeds all three. Before this, the original
+      // was decoded once for the analysis proxy and again for the playback
+      // proxy, then copied a third time into chunks — on a 4K master that is
+      // the most expensive thing preprocessing does, paid twice.
       const proxyPath = path.join(dir, 'proxy.mp4');
-      await createAnalysisProxy(sourcePath, proxyPath);
+      const playbackFilePath = path.join(dir, 'playback.mp4');
+      const chunkDir = path.join(dir, 'chunks');
+      await mkdir(chunkDir, { recursive: true });
+
+      const memoryBefore = await readContainerMemory();
+      const derivedStartedAt = performance.now();
+      const derived = await deriveMedia({
+        sourcePath,
+        proxyPath,
+        playbackPath: playbackFilePath,
+        chunkDir,
+        log,
+      });
+      const derivedMs = Math.round(performance.now() - derivedStartedAt);
+      const memoryAfter = await readContainerMemory();
+      const tempDiskBytes = await dirBytes(dir);
+
+      // The measurement the 4K memory question turns on. A container's memory
+      // figure counts file cache alongside real allocations, so `anon` is what
+      // this job actually held and `file` is cache the kernel will drop under
+      // pressure. One is a cost, the other is bookkeeping, and a graph cannot
+      // tell them apart.
+      log.info('source decoded', {
+        route: derived.route,
+        decodePasses: derived.decodePasses,
+        elapsedMs: derivedMs,
+        firstChunkReadyMs: derived.firstChunkReadyMs,
+        lastChunkReadyMs: derived.lastChunkReadyMs,
+        chunks: derived.segments.length,
+        playbackProduced: derived.playbackPath !== null,
+        tempDiskMb: Math.round(tempDiskBytes / 1_000_000),
+        memorySource: memoryAfter.source,
+        anonMbBefore: mib(memoryBefore.anonBytes),
+        anonMbAfter: mib(memoryAfter.anonBytes),
+        fileCacheMbBefore: mib(memoryBefore.fileBytes),
+        fileCacheMbAfter: mib(memoryAfter.fileBytes),
+        containerPeakMb: mib(memoryAfter.peakBytes),
+      });
+
       const proxyStorageKey = proxyKey(videoId);
       await storage.uploadFile(proxyStorageKey, proxyPath, 'video/mp4');
       await updateVideoMedia(videoId, { proxyStorageKey });
@@ -100,53 +286,49 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       // ownership rule the clip media learned (shouldDiscardOnUploadFailure):
       // what the row said when the attempt began, and what it says at the
       // moment of failure, decide whether the object is ours to remove.
-      const snapshotPlaybackKey = video.playbackStorageKey;
-      let uploadedPlaybackKey: string | null = null;
-      try {
-        const playbackStartedAt = performance.now();
-        const playbackPath = path.join(dir, 'playback.mp4');
-        await createPlaybackProxy(sourcePath, playbackPath);
-        const playbackStorageKey = playbackProxyKey(videoId);
-        await storage.uploadFile(playbackStorageKey, playbackPath, 'video/mp4');
-        uploadedPlaybackKey = playbackStorageKey;
-        await updateVideoMedia(videoId, { playbackStorageKey });
-        uploadedPlaybackKey = null;
-        log.info('playback proxy created', {
-          playbackStorageKey,
-          elapsedMs: Math.round(performance.now() - playbackStartedAt),
-        });
-      } catch (cause) {
-        log.warn('could not create a playback proxy; review will use the analysis proxy', {
-          error: errorMessage(cause),
-        });
-        if (uploadedPlaybackKey) {
-          let currentKey: string | null | undefined;
-          let readFailed = false;
-          try {
-            currentKey = (await getVideo(videoId))?.playbackStorageKey ?? null;
-          } catch {
-            readFailed = true;
-          }
-          const ours = shouldDiscardOnUploadFailure({
-            key: uploadedPlaybackKey,
-            snapshotKey: snapshotPlaybackKey,
-            currentKey,
-            readFailed,
+      if (derived.playbackPath) {
+        const snapshotPlaybackKey = video.playbackStorageKey;
+        let uploadedPlaybackKey: string | null = null;
+        try {
+          const playbackStorageKey = playbackProxyKey(videoId);
+          await storage.uploadFile(playbackStorageKey, derived.playbackPath, 'video/mp4');
+          uploadedPlaybackKey = playbackStorageKey;
+          await updateVideoMedia(videoId, { playbackStorageKey });
+          uploadedPlaybackKey = null;
+          log.info('playback proxy stored', { playbackStorageKey });
+        } catch (cause) {
+          log.warn('could not store the playback proxy; review will use the analysis proxy', {
+            error: errorMessage(cause),
           });
-          if (!ours) {
-            log.warn('playback proxy re-uploaded over one the row already names; keeping it', {
-              videoId,
-              key: uploadedPlaybackKey,
-            });
-          } else {
+          if (uploadedPlaybackKey) {
+            let currentKey: string | null | undefined;
+            let readFailed = false;
             try {
-              await storage.remove(uploadedPlaybackKey);
-            } catch (removeCause) {
-              log.error('playback proxy uploaded but its key was not saved, and it could not be removed; it is now an orphan', {
+              currentKey = (await getVideo(videoId))?.playbackStorageKey ?? null;
+            } catch {
+              readFailed = true;
+            }
+            const ours = shouldDiscardOnUploadFailure({
+              key: uploadedPlaybackKey,
+              snapshotKey: snapshotPlaybackKey,
+              currentKey,
+              readFailed,
+            });
+            if (!ours) {
+              log.warn('playback proxy re-uploaded over one the row already names; keeping it', {
                 videoId,
                 key: uploadedPlaybackKey,
-                error: errorMessage(removeCause),
               });
+            } else {
+              try {
+                await storage.remove(uploadedPlaybackKey);
+              } catch (removeCause) {
+                log.error('playback proxy uploaded but its key was not saved, and it could not be removed; it is now an orphan', {
+                  videoId,
+                  key: uploadedPlaybackKey,
+                  error: errorMessage(removeCause),
+                });
+              }
             }
           }
         }
@@ -172,10 +354,8 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
 
       await job.updateProgress({ stage: 'proxy_created', percent: 60 });
 
-      // 3. Split the proxy into analysis chunks and record their global bounds.
-      const chunkDir = path.join(dir, 'chunks');
-      await mkdir(chunkDir, { recursive: true });
-      const segments = await splitIntoChunks(proxyPath, chunkDir, env.ANALYSIS_CHUNK_SECONDS);
+      // 3. Place the chunks produced above on the source timeline.
+      const segments = derived.segments;
 
       if (segments.length === 0) {
         throw new Error('Splitting the proxy produced no analysis chunks');

@@ -195,6 +195,24 @@ export async function splitIntoChunks(
     { timeoutMs: 2 * 60 * 60 * 1000 },
   );
 
+  return measureSegments(outputDir, chunkSeconds);
+}
+
+
+/**
+ * Reads the segments the muxer produced and gives each one its place on the
+ * source timeline.
+ *
+ * Boundaries are measured from the files rather than assumed, because the
+ * segment muxer only cuts on keyframes: a chunk's real duration drifts from
+ * the target, and a grid built from arithmetic would slowly diverge from the
+ * footage every later stage maps back to.
+ *
+ * Shared by both preprocessing paths — the single-decode pass writes these
+ * files directly, the older two-pass route writes them with a copy — so the
+ * grid, its clamping and its keyframe guard cannot differ between them.
+ */
+export async function measureSegments(outputDir: string, chunkSeconds: number): Promise<ProxySegment[]> {
   const files = (await readdir(outputDir))
     .filter((file) => /^chunk_\d+\.mp4$/.test(file))
     .sort();
@@ -234,6 +252,141 @@ export async function splitIntoChunks(
   }
 
   return segments;
+}
+
+
+export interface SinglePassOutputs {
+  /** The whole analysis proxy, still the artefact Re-clip and posters read. */
+  proxyPath: string;
+  /** The playback proxy, or null when only its branch failed. */
+  playbackPath: string | null;
+  /** The analysis grid, measured from the files the muxer wrote. */
+  segments: ProxySegment[];
+}
+
+/**
+ * Every derived output from ONE decode of the source.
+ *
+ * Preprocessing used to decode the original twice: once to build the analysis
+ * proxy and once to build the playback proxy, then a third pass to copy the
+ * analysis proxy into chunks. On a 4096x2160 master that is two full 4K
+ * decodes, and on 2026-09-02 production spent 4 minutes on the first and 6
+ * minutes 39 on the second for one 12-minute video.
+ *
+ * `split` clones frame REFERENCES, not pixels, so the decoder runs once and
+ * both branches read the same frames. `fps` is placed BEFORE `scale` on the
+ * analysis branch: at 2 frames a second that is 15x fewer frames to scale
+ * than scaling first and dropping after.
+ *
+ * The analysis branch splits again after it has been made small, so the whole
+ * proxy and the chunks are both written here. That second encode costs a few
+ * hundred 640x360 frames — nothing beside a 4K decode — and it means the
+ * chunks land progressively, one finished file at a time, while the playback
+ * proxy is still being written. Nothing downstream has to wait for the whole
+ * video any more.
+ *
+ * Quality settings, the keyframe grid and the rotation handling are the same
+ * expressions the separate passes used, so the outputs are the ones the rest
+ * of the system already expects.
+ */
+export async function createProxiesAndChunks(input: {
+  sourcePath: string;
+  proxyPath: string;
+  playbackPath: string;
+  chunkDir: string;
+  chunkSeconds?: number;
+  /** Fires with the chunk index each time one is finished, for progress. */
+  onSegmentClosed?: (index: number) => void;
+}): Promise<SinglePassOutputs> {
+  const chunkSeconds = input.chunkSeconds ?? env.ANALYSIS_CHUNK_SECONDS;
+  const gopFrames = Math.max(1, Math.round(chunkSeconds * env.PROXY_FPS));
+  const decodeThreads = env.PREPROCESS_DECODE_THREADS;
+
+  // The playback proxy's shorter side, never upscaled, whichever way the
+  // frame is turned. ffmpeg has applied the file's rotation before the graph
+  // sees it, so iw/ih are already the displayed dimensions — the same
+  // reasoning, and the same expressions, the separate pass used.
+  const side = Math.max(2, Math.floor(env.PLAYBACK_PROXY_SHORT_SIDE / 2) * 2);
+  const shortLandscape = `max(2,min(${side},trunc(ih/2)*2))`;
+  const shortPortrait = `max(2,min(${side},trunc(iw/2)*2))`;
+  const playWidth = `if(gt(iw,ih),trunc(iw*${shortLandscape}/ih/2)*2,${shortPortrait})`;
+  const playHeight = `if(gt(iw,ih),${shortLandscape},trunc(ih*${shortPortrait}/iw/2)*2)`;
+
+  const graph = [
+    `[0:v]split=2[srcan][srcpl]`,
+    `[srcan]fps=${env.PROXY_FPS},scale=-2:${env.PROXY_HEIGHT}:flags=bicubic,split=2[anwhole][anseg]`,
+    `[srcpl]scale='${playWidth}':'${playHeight}',fps=fps='min(30,source_fps)'[play]`,
+  ].join(';');
+
+  // Shared by the whole proxy and the segments: identical pictures either way,
+  // and a keyframe exactly where the muxer needs to cut.
+  const analysisEncode = [
+    '-c:v', 'libx264',
+    '-preset', env.PROXY_PRESET,
+    '-crf', String(env.PROXY_CRF),
+    '-pix_fmt', 'yuv420p',
+    '-force_key_frames', `expr:gte(t,n_forced*${chunkSeconds})`,
+    '-g', String(gopFrames),
+    '-keyint_min', String(gopFrames),
+    '-sc_threshold', '0',
+    '-an', '-sn', '-dn',
+  ];
+
+  await run(
+    env.FFMPEG_PATH,
+    [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-y',
+      // Frame threading holds a full-resolution frame per thread, so at 4K
+      // this is the single biggest lever on the decoder's memory. 0 leaves
+      // ffmpeg to choose, which is one frame per core.
+      ...(decodeThreads > 0 ? ['-threads', String(decodeThreads)] : []),
+      '-i', input.sourcePath,
+      '-filter_complex', graph,
+
+      // 1. The whole analysis proxy.
+      '-map', '[anwhole]',
+      ...analysisEncode,
+      '-movflags', '+faststart',
+      input.proxyPath,
+
+      // 2. The same pictures as chunks, written progressively.
+      '-map', '[anseg]',
+      ...analysisEncode,
+      '-f', 'segment',
+      '-segment_time', String(chunkSeconds),
+      // Rounding between the forced keyframe and the muxer's cut point: the
+      // documented allowance is half a frame interval.
+      '-segment_time_delta', String(1 / (2 * Math.max(1, env.PROXY_FPS))),
+      '-reset_timestamps', '1',
+      '-segment_format', 'mp4',
+      '-segment_format_options', 'movflags=+faststart',
+      path.join(input.chunkDir, 'chunk_%04d.mp4'),
+
+      // 3. The proxy a person watches, with its audio.
+      '-map', '[play]',
+      '-map', '0:a:0?',
+      '-c:v', 'libx264',
+      '-preset', env.PROXY_PRESET,
+      '-crf', String(env.PLAYBACK_PROXY_CRF),
+      '-pix_fmt', 'yuv420p',
+      '-profile:v', 'high',
+      '-level', '4.1',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-ac', '2',
+      '-sn', '-dn',
+      '-movflags', '+faststart',
+      input.playbackPath,
+    ],
+    { timeoutMs: 6 * 60 * 60 * 1000 },
+  );
+
+  const segments = await measureSegments(input.chunkDir, chunkSeconds);
+  for (const segment of segments) input.onSegmentClosed?.(segment.index);
+
+  return { proxyPath: input.proxyPath, playbackPath: input.playbackPath, segments };
 }
 
 /**
