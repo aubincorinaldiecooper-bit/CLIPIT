@@ -212,6 +212,67 @@ export async function splitIntoChunks(
  * files directly, the older two-pass route writes them with a copy — so the
  * grid, its clamping and its keyframe guard cannot differ between them.
  */
+/** How often the chunk directory is checked while ffmpeg runs. */
+const SEGMENT_POLL_MS = 250;
+
+/**
+ * Reports each analysis segment as it finishes, while ffmpeg is still running.
+ *
+ * The segment muxer opens the next file at the moment it closes the current
+ * one, so segment N is complete exactly when segment N+1 appears. The final
+ * segment is only complete when the process exits, which is what `flush` is
+ * for — and why a failed run calls `stop` instead: the file it was still
+ * writing is not a finished segment and must not be announced as one.
+ *
+ * A caller's callback can never take an encode down with it. A throw is
+ * caught and logged, because losing a whole preprocessing job to a bad
+ * progress handler would be absurd.
+ */
+function watchClosedSegments(chunkDir: string, onClosed: (index: number) => void) {
+  let highestSeen = -1;
+  let announced = -1;
+
+  const announceThrough = (index: number): void => {
+    while (announced < index) {
+      announced += 1;
+      try {
+        onClosed(announced);
+      } catch (cause) {
+        logger.warn('a segment progress callback threw; the encode continues', {
+          index: announced,
+          error: cause instanceof Error ? cause.message : String(cause),
+        });
+      }
+    }
+  };
+
+  const poll = async (): Promise<void> => {
+    const files = await readdir(chunkDir).catch(() => [] as string[]);
+    for (const file of files) {
+      const match = /^chunk_(\d+)\.mp4$/.exec(file);
+      if (match) highestSeen = Math.max(highestSeen, Number(match[1]));
+    }
+    // Everything below the newest file is closed. The newest is still open.
+    announceThrough(highestSeen - 1);
+  };
+
+  const timer = setInterval(() => void poll(), SEGMENT_POLL_MS);
+  timer.unref?.();
+
+  return {
+    /** Abandons the watch without claiming the segment still being written. */
+    stop(): void {
+      clearInterval(timer);
+    },
+    /** Stops, then reports the final segment, which closes with the process. */
+    async flush(): Promise<void> {
+      clearInterval(timer);
+      await poll();
+      announceThrough(highestSeen);
+    },
+  };
+}
+
 export async function measureSegments(outputDir: string, chunkSeconds: number): Promise<ProxySegment[]> {
   const files = (await readdir(outputDir))
     .filter((file) => /^chunk_\d+\.mp4$/.test(file))
@@ -295,7 +356,11 @@ export async function createProxiesAndChunks(input: {
   playbackPath: string;
   chunkDir: string;
   chunkSeconds?: number;
-  /** Fires with the chunk index each time one is finished, for progress. */
+  /**
+   * Fires with the chunk index as each one is finished, while the encode is
+   * still running — not in a batch at the end. A chunk is announced only once
+   * the muxer has closed it, so the file it names is complete and safe to read.
+   */
   onSegmentClosed?: (index: number) => void;
 }): Promise<SinglePassOutputs> {
   const chunkSeconds = input.chunkSeconds ?? env.ANALYSIS_CHUNK_SECONDS;
@@ -332,59 +397,69 @@ export async function createProxiesAndChunks(input: {
     '-an', '-sn', '-dn',
   ];
 
-  await run(
-    env.FFMPEG_PATH,
-    [
-      '-hide_banner',
-      '-loglevel', 'error',
-      '-y',
-      // Frame threading holds a full-resolution frame per thread, so at 4K
-      // this is the single biggest lever on the decoder's memory. 0 leaves
-      // ffmpeg to choose, which is one frame per core.
-      ...(decodeThreads > 0 ? ['-threads', String(decodeThreads)] : []),
-      '-i', input.sourcePath,
-      '-filter_complex', graph,
+  // Nothing polls unless somebody is listening.
+  const watcher = input.onSegmentClosed
+    ? watchClosedSegments(input.chunkDir, input.onSegmentClosed)
+    : null;
 
-      // 1. The whole analysis proxy.
-      '-map', '[anwhole]',
-      ...analysisEncode,
-      '-movflags', '+faststart',
-      input.proxyPath,
+  try {
+    await run(
+      env.FFMPEG_PATH,
+      [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-y',
+        // Frame threading holds a full-resolution frame per thread, so at 4K
+        // this is the single biggest lever on the decoder's memory. 0 leaves
+        // ffmpeg to choose, which is one frame per core.
+        ...(decodeThreads > 0 ? ['-threads', String(decodeThreads)] : []),
+        '-i', input.sourcePath,
+        '-filter_complex', graph,
 
-      // 2. The same pictures as chunks, written progressively.
-      '-map', '[anseg]',
-      ...analysisEncode,
-      '-f', 'segment',
-      '-segment_time', String(chunkSeconds),
-      // Rounding between the forced keyframe and the muxer's cut point: the
-      // documented allowance is half a frame interval.
-      '-segment_time_delta', String(1 / (2 * Math.max(1, env.PROXY_FPS))),
-      '-reset_timestamps', '1',
-      '-segment_format', 'mp4',
-      '-segment_format_options', 'movflags=+faststart',
-      path.join(input.chunkDir, 'chunk_%04d.mp4'),
+        // 1. The whole analysis proxy.
+        '-map', '[anwhole]',
+        ...analysisEncode,
+        '-movflags', '+faststart',
+        input.proxyPath,
 
-      // 3. The proxy a person watches, with its audio.
-      '-map', '[play]',
-      '-map', '0:a:0?',
-      '-c:v', 'libx264',
-      '-preset', env.PROXY_PRESET,
-      '-crf', String(env.PLAYBACK_PROXY_CRF),
-      '-pix_fmt', 'yuv420p',
-      '-profile:v', 'high',
-      '-level', '4.1',
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-ac', '2',
-      '-sn', '-dn',
-      '-movflags', '+faststart',
-      input.playbackPath,
-    ],
-    { timeoutMs: 6 * 60 * 60 * 1000 },
-  );
+        // 2. The same pictures as chunks, written progressively.
+        '-map', '[anseg]',
+        ...analysisEncode,
+        '-f', 'segment',
+        '-segment_time', String(chunkSeconds),
+        // Rounding between the forced keyframe and the muxer's cut point: the
+        // documented allowance is half a frame interval.
+        '-segment_time_delta', String(1 / (2 * Math.max(1, env.PROXY_FPS))),
+        '-reset_timestamps', '1',
+        '-segment_format', 'mp4',
+        '-segment_format_options', 'movflags=+faststart',
+        path.join(input.chunkDir, 'chunk_%04d.mp4'),
+
+        // 3. The proxy a person watches, with its audio.
+        '-map', '[play]',
+        '-map', '0:a:0?',
+        '-c:v', 'libx264',
+        '-preset', env.PROXY_PRESET,
+        '-crf', String(env.PLAYBACK_PROXY_CRF),
+        '-pix_fmt', 'yuv420p',
+        '-profile:v', 'high',
+        '-level', '4.1',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-ac', '2',
+        '-sn', '-dn',
+        '-movflags', '+faststart',
+        input.playbackPath,
+      ],
+      { timeoutMs: 6 * 60 * 60 * 1000 },
+    );
+  } catch (cause) {
+    watcher?.stop();
+    throw cause;
+  }
+  await watcher?.flush();
 
   const segments = await measureSegments(input.chunkDir, chunkSeconds);
-  for (const segment of segments) input.onSegmentClosed?.(segment.index);
 
   return { proxyPath: input.proxyPath, playbackPath: input.playbackPath, segments };
 }

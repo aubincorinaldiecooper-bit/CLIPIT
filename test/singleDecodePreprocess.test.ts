@@ -171,29 +171,45 @@ describe.skipIf(!ffmpegAvailable)('one decode, three outputs', () => {
     expect((await ffprobe(one.playbackPath)).hasAudio).toBe(false);
   }, 300_000);
 
-  it('writes the chunks as it goes, not all at the end', async () => {
+  it('announces each chunk while the encode is still running, not in a batch at the end', async () => {
     const o = outputs('progress');
     await mkdir(o.chunkDir, { recursive: true });
-    const appeared: number[] = [];
+    const announced: Array<{ index: number; atMs: number }> = [];
     const started = Date.now();
-    const poll = setInterval(() => {
-      readdir(o.chunkDir)
-        .then((files) => {
-          const n = files.filter((f) => /^chunk_\d+\.mp4$/.test(f)).length;
-          while (appeared.length < n) appeared.push(Date.now() - started);
-        })
-        .catch(() => undefined);
-    }, 20);
-    try {
-      await createProxiesAndChunks({ sourcePath: landscape, ...o });
-    } finally {
-      clearInterval(poll);
-    }
+    const result = await createProxiesAndChunks({
+      sourcePath: landscape,
+      ...o,
+      onSegmentClosed: (index) => announced.push({ index, atMs: Date.now() - started }),
+    });
     const total = Date.now() - started;
-    // The second chunk file opening is the first one finishing, and it
-    // happened before the run was over. Under the old route no chunk existed
-    // until the whole proxy had been written and then read back a second time.
-    expect(appeared.length).toBeGreaterThan(1);
-    expect(appeared[1]!).toBeLessThan(total);
+
+    // One per chunk, in order, none repeated — including the last, which only
+    // closes when the process exits.
+    expect(announced.map((a) => a.index)).toEqual(result.segments.map((s) => s.index));
+    expect(new Set(announced.map((a) => a.index)).size).toBe(announced.length);
+
+    // The point of the whole change: the first chunk was reported before the
+    // run was over. Announcing them all at the end would satisfy every
+    // assertion above and still be useless.
+    expect(announced[0]!.atMs).toBeLessThan(total);
+    // And each file named was complete when it was announced.
+    for (const { index } of announced.slice(0, -1)) {
+      const chunk = path.join(o.chunkDir, `chunk_${String(index).padStart(4, '0')}.mp4`);
+      expect((await ffprobe(chunk)).durationSeconds).toBeGreaterThan(0);
+    }
   }, 300_000);
+
+  it('does not let a broken progress callback take the encode down with it', async () => {
+    const o = outputs('throwing');
+    await mkdir(o.chunkDir, { recursive: true });
+    const result = await createProxiesAndChunks({
+      sourcePath: landscape,
+      ...o,
+      onSegmentClosed: () => { throw new Error('a caller with a bug'); },
+    });
+    // The job it was reporting on is worth more than the reporting.
+    expect(result.segments.length).toBe(3);
+    expect((await ffprobe(o.playbackPath)).hasAudio).toBe(true);
+  }, 300_000);
+
 });
