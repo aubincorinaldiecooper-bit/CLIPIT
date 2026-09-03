@@ -281,6 +281,26 @@ async function embedAllWindows(input: {
       `${result.failed.length > 0 ? ` (${result.failed.length} failed)` : ''}\n`,
     );
   }
+
+  // The identity was read before the first signed URL was minted, and the
+  // proxy key is a mutable one — re-processing the video overwrites it. If it
+  // moved while this was running, some of these vectors are of one version of
+  // the video and some of another, and the remote cache is now holding new
+  // bytes under the old identity, which would poison every later call too.
+  //
+  // Nothing here can tell which vectors are which, so none of them are
+  // believed. (Pinning the download to an exact object version would prevent
+  // the race rather than detect it; that needs to be tried against the real
+  // store, which this environment cannot reach.)
+  const after = await sourceIdentity(input.proxyKey);
+  if (after !== input.identity) {
+    throw new Error(
+      `The analysis proxy changed while it was being indexed (${input.identity.split('#')[1]} → ` +
+        `${after.split('#')[1]}). Some of these vectors describe footage that has been replaced, and ` +
+        'nothing here can tell which. Re-run once the video has finished re-processing.',
+    );
+  }
+
   return { vectors, failed, metrics };
 }
 

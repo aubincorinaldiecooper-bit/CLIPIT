@@ -23,7 +23,8 @@ import time
 
 import modal
 
-from clipit_embedding import decode_interval, fetch_once, scrub  # same transport, one copy
+from clipit_embedding import decode_interval  # same frame extraction, one copy
+from sourcecache import fetch_once, scrub
 from sampling import Sampling
 
 APP_NAME = "clipit-reranker"
@@ -42,7 +43,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "curl")
     .pip_install("torch", "transformers", "accelerate", "pillow", "numpy")
-    .add_local_python_source("clipit_embedding", "sampling")
+    .add_local_python_source("clipit_embedding", "sampling", "sourcecache")
 )
 
 app = modal.App(APP_NAME, image=image)
