@@ -95,6 +95,27 @@ export function defaultSampling(): Sampling {
   };
 }
 
+/**
+ * The ids being asked about, having checked they are distinct.
+ *
+ * Every reply is matched by id, so two items sharing one makes the answer
+ * unreadable — and the client would reject the perfectly ordinary reply as a
+ * duplicate AFTER the GPU had already done the work. Checked here, before the
+ * call, so a caller's mistake costs nothing.
+ */
+function uniqueIds(ids: string[], label: string, noun: string): Set<string> {
+  const unique = new Set(ids);
+  if (unique.size !== ids.length) {
+    const repeated = ids.filter((id, index) => ids.indexOf(id) !== index);
+    throw new ExternalServiceError(
+      label,
+      `${noun} ids must be unique within one call; "${repeated[0]}" appears more than once`,
+      { retryable: false },
+    );
+  }
+  return unique;
+}
+
 function asVector(value: unknown, dims: number, label: string, id: string): Float32Array {
   if (!Array.isArray(value)) {
     throw new ExternalServiceError(label, `Embedding for "${id}" was not an array`, { retryable: false });
@@ -256,10 +277,7 @@ export async function embedVideoIntervals(input: {
     return { model: env.MEDIA_INDEX_EMBED_MODEL, dims: env.MEDIA_INDEX_EMBED_DIMS, sampling: {}, embedded: [], failed: [], metrics: {} };
   }
   const sampling = input.sampling ?? defaultSampling();
-  const asked = new Set(input.intervals.map((interval) => interval.id));
-  if (asked.size !== input.intervals.length) {
-    throw new ExternalServiceError(EMBED_VIDEO.label, 'Interval ids must be unique within one call', { retryable: false });
-  }
+  const asked = uniqueIds(input.intervals.map((interval) => interval.id), EMBED_VIDEO.label, 'Interval');
 
   const reply = await invokeModal<RawEmbedReply>(EMBED_VIDEO, {
     video_url: input.videoUrl,
@@ -287,7 +305,7 @@ export async function embedTexts(input: {
   if (input.texts.length === 0) {
     return { model: env.MEDIA_INDEX_EMBED_MODEL, dims: env.MEDIA_INDEX_EMBED_DIMS, sampling: {}, embedded: [], failed: [], metrics: {} };
   }
-  const asked = new Set(input.texts.map((row) => row.id));
+  const asked = uniqueIds(input.texts.map((row) => row.id), EMBED_TEXT.label, 'Text');
   const reply = await invokeModal<RawEmbedReply>(EMBED_TEXT, {
     texts: input.texts,
     is_query: input.isQuery,
@@ -326,7 +344,7 @@ export async function rerankVideoIntervals(input: {
     return { model: '', ranked: [], failed: [], metrics: {} };
   }
   const sampling = input.sampling ?? defaultSampling();
-  const asked = new Set(input.candidates.map((candidate) => candidate.id));
+  const asked = uniqueIds(input.candidates.map((candidate) => candidate.id), RERANK.label, 'Candidate');
 
   const reply = await invokeModal<Record<string, unknown>>(RERANK, {
     query: input.query,

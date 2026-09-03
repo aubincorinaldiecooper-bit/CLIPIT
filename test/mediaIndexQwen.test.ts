@@ -188,11 +188,25 @@ describe('embedVideoIntervals', () => {
       .rejects.toThrow(/both answered and failed/);
   });
 
-  it('refuses duplicate ids in the request', async () => {
+  it('refuses duplicate ids in the request, before paying for the call', async () => {
     await expect(embedVideoIntervals({
       videoUrl: 'u', videoKey: 'k',
       intervals: [intervals[0]!, { ...intervals[0]! }],
     })).rejects.toThrow(/unique/);
+    // The point is that the GPU is never asked: the reply would have been
+    // ordinary and the client would have rejected it as duplicated anyway.
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses duplicate ids on the text and rerank calls too', async () => {
+    await expect(embedTexts({
+      texts: [{ id: 'a', text: 'one' }, { id: 'a', text: 'two' }], isQuery: false,
+    })).rejects.toThrow(/unique/);
+    await expect(rerankVideoIntervals({
+      query: 'q', videoUrl: 'u', videoKey: 'k',
+      candidates: [intervals[0]!, { ...intervals[0]! }],
+    })).rejects.toThrow(/unique/);
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it('does not call the GPU for an empty list', async () => {

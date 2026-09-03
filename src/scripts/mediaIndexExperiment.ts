@@ -105,17 +105,69 @@ interface Probe {
   note?: string;
 }
 
+const PROBE_KINDS: ProbeKind[] = ['object', 'motion', 'visible-text', 'speech', 'mixed', 'audio'];
+
+/**
+ * A probe is GROUND TRUTH, and a broken one is not a retrieval failure.
+ *
+ * Left unchecked, a reversed range, a missing number or a timestamp past the
+ * end of the video comes out of this run as "the model did not find it" —
+ * a typo in a JSON file, reported as evidence about a model. That is the
+ * whole experiment answering the wrong question, so every field is checked
+ * before a single GPU second is spent.
+ */
+function checkRange(
+  range: unknown, where: string, durationSeconds: number | null,
+): { startSeconds: number; endSeconds: number } {
+  const value = range as { startSeconds?: unknown; endSeconds?: unknown } | null;
+  const start = value?.startSeconds;
+  const end = value?.endSeconds;
+  if (typeof start !== 'number' || !Number.isFinite(start)) {
+    throw new Error(`${where}: startSeconds must be a number, got ${JSON.stringify(start)}`);
+  }
+  if (typeof end !== 'number' || !Number.isFinite(end)) {
+    throw new Error(`${where}: endSeconds must be a number, got ${JSON.stringify(end)}`);
+  }
+  if (start < 0) throw new Error(`${where}: startSeconds is negative (${start})`);
+  if (end <= start) throw new Error(`${where}: endSeconds (${end}) must be after startSeconds (${start})`);
+  if (durationSeconds !== null && end > durationSeconds) {
+    throw new Error(
+      `${where}: ends at ${end}s but the video is only ${durationSeconds.toFixed(1)}s long`,
+    );
+  }
+  return { startSeconds: start, endSeconds: end };
+}
+
 async function loadProbes(path: string): Promise<Probe[]> {
   const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
   const rows = Array.isArray(parsed) ? parsed : (parsed as { probes?: unknown }).probes;
   if (!Array.isArray(rows)) throw new Error(`${path} should hold a JSON array of probes`);
   return rows.map((row, index) => {
     const probe = row as Probe;
-    if (typeof probe.query !== 'string' || !probe.expect) {
-      throw new Error(`probe ${index} needs a "query" and an "expect" range`);
+    const where = `probe ${index}`;
+    if (typeof probe.query !== 'string' || probe.query.trim() === '') {
+      throw new Error(`${where}: "query" must be a non-empty string`);
     }
-    return probe;
+    if (!PROBE_KINDS.includes(probe.kind)) {
+      throw new Error(`${where}: "kind" must be one of ${PROBE_KINDS.join(', ')}, got ${JSON.stringify(probe.kind)}`);
+    }
+    // Duration is not known yet; the ranges are re-checked against it below.
+    const expect = checkRange(probe.expect, `${where} ("${probe.query}") expect`, null);
+    const distractor = probe.distractor
+      ? checkRange(probe.distractor, `${where} ("${probe.query}") distractor`, null)
+      : undefined;
+    return { ...probe, expect, ...(distractor ? { distractor } : {}) };
   });
+}
+
+/** Re-checked once the video's real length is known. */
+function assertProbesFitVideo(probes: Probe[], durationSeconds: number): void {
+  for (const [index, probe] of probes.entries()) {
+    checkRange(probe.expect, `probe ${index} ("${probe.query}") expect`, durationSeconds);
+    if (probe.distractor) {
+      checkRange(probe.distractor, `probe ${index} ("${probe.query}") distractor`, durationSeconds);
+    }
+  }
 }
 
 // ------------------------------------------------------------------ scoring
@@ -337,6 +389,9 @@ async function main(): Promise<void> {
       }];
 
   const probes = args.probesPath ? await loadProbes(args.probesPath) : [];
+  // Now that the video's real length is known, a probe pointing past its end
+  // fails the run rather than counting as a moment the model could not find.
+  assertProbesFitVideo(probes, duration);
   if (probes.length === 0 && !args.ask) {
     console.error('Nothing to measure. Pass --probes <file> for numbers, or --ask "<question>" to look around.');
     process.exit(2);
@@ -374,7 +429,12 @@ async function main(): Promise<void> {
     // batches rather than swallowed: a window whose speech could not be
     // embedded has no speech channel, and the summary below must not report
     // that as a window with nothing said in it.
-    const spoken = await speechPerWindow(video.id, covered);
+    // Over EVERY planned window, not only the ones the pictures worked for.
+    // Coupling them meant a failed video window silently deleted that
+    // window's speech too, so the speech column understated itself and the
+    // comparison this experiment exists to make — are these channels
+    // interchangeable? — was measured on a set one channel had pruned.
+    const spoken = await speechPerWindow(video.id, windows);
     let speechVectors = new Map<string, Float32Array>();
     if (spoken.size > 0) {
       const texts = [...spoken.entries()].map(([id, text]) => ({ id, text }));
@@ -387,7 +447,7 @@ async function main(): Promise<void> {
         for (const row of said.embedded as EmbeddedInterval[]) speechVectors.set(row.id, row.embedding);
         speechFailures.push(...said.failed);
       }
-      console.log(`  ${speechVectors.size} of ${texts.length} windows also carry speech`);
+      console.log(`  ${speechVectors.size} of ${texts.length} windows carry speech `+ `(counted over all ${windows.length} planned windows, independently of the pictures)`);
       if (speechFailures.length > 0) {
         console.log(`  ${speechFailures.length} transcript windows could not be embedded: ` +
           `${speechFailures.slice(0, 3).map((row) => row.reason).join('; ')}`);
@@ -396,11 +456,16 @@ async function main(): Promise<void> {
       console.log('  no transcript for this video — the speech channel is empty, and speech probes below measure nothing');
     }
 
+    // Every window this run knows about, by key, so a channel can be ranked
+    // over the windows IT has vectors for rather than over the other
+    // channel's successes.
+    const byKey = new Map(windows.map((window) => [windowKey(window), window]));
+
     const rank = (queryVector: Float32Array, channel: Map<string, Float32Array>): Scored[] =>
-      covered
-        .map((window) => {
-          const vector = channel.get(windowKey(window));
-          return vector ? { window, score: similarity(queryVector, vector) } : null;
+      [...channel.entries()]
+        .map(([key, vector]) => {
+          const window = byKey.get(key);
+          return window ? { window, score: similarity(queryVector, vector) } : null;
         })
         .filter((row): row is Scored => row !== null)
         .sort((a, b) => b.score - a.score);
