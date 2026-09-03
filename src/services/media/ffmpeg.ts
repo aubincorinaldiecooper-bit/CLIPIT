@@ -248,13 +248,19 @@ function isOversizedChunk(durationSeconds: number, chunkSeconds: number): boolea
  * before this resolves, so nothing is left running after the job is reported
  * done. Losing a whole preprocessing job to a bad progress handler would be
  * absurd: the job is worth more than the reporting.
+ *
+ * Exported for its own tests: stopping the watch while a probe is outstanding
+ * has no deterministic route through createProxiesAndChunks, and it is the
+ * case that decides whether a failed run can announce a chunk that is about to
+ * be deleted.
  */
-function watchClosedSegments(
+export function watchClosedSegments(
   chunkDir: string,
   chunkSeconds: number,
   onClosed: (index: number) => void | Promise<void>,
 ) {
   let nextIndex = 0;
+  let stopped = false;
   const pending: Array<Promise<void>> = [];
 
   const announce = (index: number): void => {
@@ -281,18 +287,27 @@ function watchClosedSegments(
     }
   };
 
-  /** Considers every closed file up to `limit`, in order. */
-  const drain = async (limit: number): Promise<void> => {
+  /**
+   * Considers each closed file in order. `includeFinal` is only true once the
+   * process has exited, when the newest file is closed too.
+   */
+  const drain = async (includeFinal: boolean): Promise<void> => {
     const files = (await readdir(chunkDir).catch(() => [] as string[]))
       .filter((file) => /^chunk_\d+\.mp4$/.test(file))
       .sort();
+    const limit = includeFinal ? files.length : files.length - 1;
 
-    while (nextIndex < Math.min(limit, files.length)) {
+    while (!stopped && nextIndex < limit) {
       const index = nextIndex;
       nextIndex += 1;
       const duration = await ffprobe(path.join(chunkDir, files[index]!))
         .then((probe) => probe.durationSeconds)
         .catch(() => Number.NaN);
+      // The run can fail while that probe is outstanding. Clearing the timer
+      // does not cancel a poll already in flight, and the fallback deletes
+      // this directory — so without this check a caller could be handed a
+      // chunk from a failed run that is about to stop existing.
+      if (stopped) return;
       // Silence here is deliberate: measureSegments reports the empty chunk and
       // fails the job over the oversized one. Announcing either would hand a
       // caller a chunk that is about to be dropped or to fail the whole run.
@@ -301,11 +316,18 @@ function watchClosedSegments(
     }
   };
 
-  let timer: ReturnType<typeof setInterval> | null = setInterval(() => {
-    // Everything but the newest file is closed.
-    void readdir(chunkDir)
-      .then((files) => drain(files.filter((file) => /^chunk_\d+\.mp4$/.test(file)).length - 1))
+  // Drains run one at a time. Two overlapping polls — easy once a probe takes
+  // longer than the poll interval — could otherwise announce out of order.
+  let inFlight: Promise<void> = Promise.resolve();
+  const enqueue = (includeFinal: boolean): Promise<void> => {
+    inFlight = inFlight
+      .then(() => (stopped ? undefined : drain(includeFinal)))
       .catch(() => undefined);
+    return inFlight;
+  };
+
+  let timer: ReturnType<typeof setInterval> | null = setInterval(() => {
+    void enqueue(false);
   }, SEGMENT_POLL_MS);
   timer.unref?.();
 
@@ -315,14 +337,21 @@ function watchClosedSegments(
   };
 
   return {
-    /** Abandons the watch without claiming the segment still being written. */
+    /**
+     * Abandons the watch without claiming the segment still being written, and
+     * without letting a poll already in flight announce anything more.
+     */
     stop(): void {
+      stopped = true;
       halt();
     },
     /** Reports the final segment, which closes with the process, then settles. */
     async flush(): Promise<void> {
       halt();
-      await drain(Number.POSITIVE_INFINITY);
+      // Let a poll that is already running finish before the last look, so
+      // indices stay in order.
+      await inFlight;
+      await drain(true);
       await Promise.all(pending);
     },
   };
