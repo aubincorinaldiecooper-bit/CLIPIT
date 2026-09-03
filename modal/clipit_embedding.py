@@ -60,6 +60,8 @@ from dataclasses import dataclass
 
 import modal
 
+from sampling import DECODE_OVERSAMPLE, Sampling, decode_rate_for, pick_evenly
+
 APP_NAME = "clipit-embedding"
 MODEL_ID = "Qwen/Qwen3-VL-Embedding-2B"
 MODEL_REVISION = None  # pin once a known-good revision is confirmed
@@ -72,6 +74,7 @@ QUERY_INSTRUCTION = "Given a search query, retrieve the moment of video that mat
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "curl")
+    .add_local_python_source("sampling")
     .pip_install(
         "torch",
         "transformers",
@@ -84,21 +87,6 @@ image = (
 
 app = modal.App(APP_NAME, image=image)
 weights = modal.Volume.from_name("clipit-qwen-weights", create_if_missing=True)
-
-
-@dataclass(frozen=True)
-class Sampling:
-    """How frames are chosen inside an interval. Part of a vector's identity."""
-
-    fps: float
-    max_frames: int
-    short_side: int
-
-    def describe(self) -> dict:
-        # `fps` is the CEILING. A window long enough that max_frames would
-        # not reach its end is sampled slower; each result carries the rate
-        # it actually got.
-        return {"max_fps": self.fps, "max_frames": self.max_frames, "short_side": self.short_side}
 
 
 def cache_path(video_key: str) -> str:
@@ -122,39 +110,18 @@ def fetch_once(video_url: str, video_key: str) -> tuple[str, bool]:
     partial = f"{path}.partial"
     # curl rather than requests: this is a large binary over a signed URL, and
     # curl streams it to disk without holding it in memory.
+    # No --location. A presigned GET does not redirect, so following one only
+    # means the container fetched something other than what Clipit signed.
+    # This deployment is private compute — invoking it already needs Clipit's
+    # own Modal token — so this is not closing an open door; it is declining
+    # to open a second one for no benefit.
     subprocess.run(
-        ["curl", "--silent", "--show-error", "--fail", "--location",
+        ["curl", "--silent", "--show-error", "--fail",
          "--max-time", "900", "--output", partial, video_url],
         check=True,
     )
     os.replace(partial, path)
     return path, True
-
-
-def frame_rate_for(duration: float, sampling: Sampling) -> float:
-    """
-    The rate that spreads at most `max_frames` across the WHOLE interval.
-
-    Sampling at a fixed rate and then stopping at the cap does not sample the
-    interval — it samples the beginning of it. Measured with ffmpeg on a
-    synthetic clip: at 2 fps capped to 16 frames, a 10-second window's frames
-    all came from its first 7.5 seconds, and a 20-second window saw the same
-    first 7.5 seconds. The vector was then stored against the full interval,
-    and a moment near the end of a window simply did not exist as far as
-    retrieval was concerned — while the reported coverage said otherwise.
-
-    Worse for the experiment than for production: the 20-second grid in the
-    sweep would have scored badly because it was shown 8 seconds, and the
-    conclusion "longer windows retrieve worse" would have been an artefact of
-    this line rather than anything about window length.
-
-    Lowering the rate rather than raising the cap keeps the cost per window
-    fixed. Never raised above what was asked for: a short window stays at the
-    requested rate rather than being padded with frames nobody wanted.
-    """
-    if duration <= 0:
-        return sampling.fps
-    return min(sampling.fps, sampling.max_frames / duration)
 
 
 def decode_interval(path: str, start: float, end: float, sampling: Sampling):
@@ -170,7 +137,7 @@ def decode_interval(path: str, start: float, end: float, sampling: Sampling):
     import numpy as np
 
     duration = max(0.05, end - start)
-    fps = frame_rate_for(duration, sampling)
+    fps = decode_rate_for(duration, sampling)
 
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -186,10 +153,10 @@ def decode_interval(path: str, start: float, end: float, sampling: Sampling):
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
          "-ss", f"{start:.3f}", "-i", path, "-t", f"{duration:.3f}",
          "-vf", f"fps={fps:.6f},scale={width}:{height}",
-         # A hard ceiling, not the sampling rule: the rate above already
-         # spreads the frames across the interval, and this only catches a
-         # rounding overshoot.
-         "-frames:v", str(sampling.max_frames),
+         # Deliberately NOT capped at max_frames here. Truncating the stream is
+         # what sampled only the start of a window; the cap is applied by
+         # choosing between the decoded frames below, not by stopping early.
+         # decode_rate_for bounds how many can arrive.
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
         capture_output=True, check=True,
     )
@@ -199,9 +166,10 @@ def decode_interval(path: str, start: float, end: float, sampling: Sampling):
     if count == 0:
         return []
     buffer = np.frombuffer(result.stdout[: count * frame_bytes], dtype=np.uint8)
+    keep = pick_evenly(count, sampling.max_frames)
     return [
         Image.fromarray(buffer[i * frame_bytes : (i + 1) * frame_bytes].reshape(height, width, 3))
-        for i in range(count)
+        for i in keep
     ]
 
 
@@ -350,12 +318,12 @@ class QwenEmbeddingService:
                     "end": interval["end"],
                     "embedding": vector,
                     "frames": len(frames),
-                    # The rate this interval was ACTUALLY sampled at, which is
-                    # lowered on a long window so the frames span all of it.
-                    # Part of the vector's identity, so it travels with it
+                    # The grid this interval was decoded on before frames were
+                    # chosen from it. Part of the vector's identity — change it
+                    # and the vector changes — so it travels with the result
                     # rather than being inferred from the request.
-                    "sampled_fps": round(
-                        frame_rate_for(float(interval["end"]) - float(interval["start"]), sampling), 4
+                    "decode_fps": round(
+                        decode_rate_for(float(interval["end"]) - float(interval["start"]), sampling), 4
                     ),
                 })
             except Exception as error:  # noqa: BLE001 - reported, never swallowed

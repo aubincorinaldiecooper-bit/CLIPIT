@@ -140,6 +140,55 @@ function assertNormalized(vector: Float32Array, label: string, id: string): void
   }
 }
 
+/**
+ * The failures a service reported, held to the same identity rules as its
+ * results, plus the ones it forgot to mention at all.
+ *
+ * Shared by both services deliberately. They had different rules for a while
+ * and the difference was not a decision — it was an oversight, and the kind
+ * that only shows up as a coverage number nobody can explain.
+ */
+function readFailures(
+  raw: unknown,
+  asked: Set<string>,
+  succeeded: Set<string>,
+  label: string,
+  words: { kind: string; missing: string },
+): FailedInterval[] {
+  const failed: FailedInterval[] = [];
+  const named = new Set<string>();
+
+  for (const row of (Array.isArray(raw) ? raw : []) as Array<Record<string, unknown>>) {
+    const id = typeof row.id === 'string' ? row.id : '';
+    if (!asked.has(id)) {
+      throw new ExternalServiceError(label, `The ${words.kind} service failed an id nobody asked for: "${id}"`, {
+        retryable: false,
+      });
+    }
+    if (succeeded.has(id)) {
+      // Both answered and failed. One of the two is wrong, nothing says which,
+      // so neither is believed.
+      throw new ExternalServiceError(label, `The ${words.kind} service both answered and failed "${id}"`, {
+        retryable: false,
+      });
+    }
+    if (named.has(id)) {
+      throw new ExternalServiceError(label, `The ${words.kind} service failed "${id}" twice`, { retryable: false });
+    }
+    named.add(id);
+    failed.push({ id, reason: typeof row.reason === 'string' ? row.reason : 'no reason given' });
+  }
+
+  // Anything asked for that came back in neither list is a silent hole. Naming
+  // it is the difference between an index that knows what it is missing and
+  // one that cannot tell.
+  for (const id of asked) {
+    if (!succeeded.has(id) && !named.has(id)) failed.push({ id, reason: words.missing });
+  }
+
+  return failed;
+}
+
 function readEmbedReply(reply: RawEmbedReply, asked: Set<string>, label: string): EmbedResult {
   const model = typeof reply.model === 'string' ? reply.model : '';
   if (model !== env.MEDIA_INDEX_EMBED_MODEL) {
@@ -175,21 +224,16 @@ function readEmbedReply(reply: RawEmbedReply, asked: Set<string>, label: string)
     embedded.push({ id, embedding, frames: typeof row.frames === 'number' ? row.frames : 0 });
   }
 
-  const failed: FailedInterval[] = (Array.isArray(reply.failed) ? reply.failed : [])
-    .map((row) => row as Record<string, unknown>)
-    .map((row) => ({
-      id: typeof row.id === 'string' ? row.id : 'unknown',
-      reason: typeof row.reason === 'string' ? row.reason : 'no reason given',
-    }));
-
-  // Anything asked for that came back neither embedded nor named as failed is
-  // a silent hole. Naming it here is the difference between an index that
-  // knows what it is missing and one that cannot tell.
-  for (const id of asked) {
-    if (!seen.has(id) && !failed.some((row) => row.id === id)) {
-      failed.push({ id, reason: 'the service returned neither an embedding nor a failure for this range' });
-    }
-  }
+  // The failure list gets the same scrutiny the results do. It did not, at
+  // first, and the asymmetry mattered: an unknown id would have attached a
+  // failure to a stretch of video nobody asked about, a duplicate would have
+  // counted one gap twice, and an id in BOTH lists would have reported a
+  // window as embedded and as missing at the same time. Coverage is the
+  // honesty channel of this index; a wrong entry in it is not a small error.
+  const failed = readFailures(reply.failed, asked, seen, label, {
+    kind: 'embedding',
+    missing: 'the service returned neither an embedding nor a failure for this range',
+  });
 
   return {
     model,
@@ -299,6 +343,20 @@ export async function rerankVideoIntervals(input: {
   // five candidates still sorts, still looks like a considered ranking, and
   // the caller would take unread footage for footage that was read and judged
   // irrelevant. A shorter list is not a verdict.
+  // Which model answered, checked exactly as the embedding side checks it. A
+  // stale or misrouted deployment scores every candidate, returns a clean
+  // ranking, and quietly invalidates the comparison the experiment exists to
+  // make — with nothing in the output to say so.
+  const model = typeof reply.model === 'string' ? reply.model : '';
+  if (model !== env.MEDIA_INDEX_RERANK_MODEL) {
+    throw new ExternalServiceError(
+      RERANK.label,
+      `Reranker answered for model "${model || '(none given)'}", but this index expects ` +
+        `"${env.MEDIA_INDEX_RERANK_MODEL}".`,
+      { retryable: false },
+    );
+  }
+
   const rows = Array.isArray(reply.results) ? reply.results : [];
   const ranked: RankedInterval[] = [];
   const scored = new Set<string>();
@@ -319,34 +377,15 @@ export async function rerankVideoIntervals(input: {
   }
   ranked.sort((a, b) => b.score - a.score);
 
-  const failed: FailedInterval[] = [];
-  const named = new Set<string>();
-  for (const row of (Array.isArray(reply.failed) ? reply.failed : []) as Array<Record<string, unknown>>) {
-    const id = typeof row.id === 'string' ? row.id : '';
-    if (!asked.has(id)) {
-      throw new ExternalServiceError(RERANK.label, `Reranker failed an id nobody asked for: "${id}"`, { retryable: false });
-    }
-    if (scored.has(id)) {
-      // Both scored and failed. One of the two is wrong and there is no way
-      // to tell which, so neither is believed.
-      throw new ExternalServiceError(
-        RERANK.label, `Reranker both scored and failed "${id}"`, { retryable: false },
-      );
-    }
-    named.add(id);
-    failed.push({ id, reason: typeof row.reason === 'string' ? row.reason : 'no reason given' });
-  }
-
-  // A candidate in neither list. Named as a failure rather than left out, so
+  // A candidate in neither list is named as a failure rather than left out, so
   // "we did not look at this one" can never read as "this one lost".
-  for (const id of asked) {
-    if (!scored.has(id) && !named.has(id)) {
-      failed.push({ id, reason: 'the reranker returned neither a score nor a failure for this candidate' });
-    }
-  }
+  const failed = readFailures(reply.failed, asked, scored, RERANK.label, {
+    kind: 'reranker',
+    missing: 'the reranker returned neither a score nor a failure for this candidate',
+  });
 
   return {
-    model: typeof reply.model === 'string' ? reply.model : '',
+    model,
     ranked,
     failed,
     metrics: (reply.metrics as Record<string, unknown>) ?? {},

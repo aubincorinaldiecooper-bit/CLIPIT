@@ -67,6 +67,48 @@ export function windowKey(window: IndexWindow): string {
 }
 
 /**
+ * A plan that cannot keep the coverage promise is refused, not worked around.
+ *
+ * The three settings are independent knobs and two combinations inside their
+ * own valid ranges quietly break the guarantee this module is built on. Both
+ * were reachable from configuration alone:
+ *
+ *  - a stride LONGER than a window leaves a hole between every pair of
+ *    windows. At window 10 / stride 30 over two minutes, 60 of 120 seconds
+ *    are never indexed;
+ *  - a minimum LONGER than a window disqualifies every window, so the whole
+ *    video collapses to the single one the tail rule adds at the end. At
+ *    window 10 / minimum 20, a two-minute video is indexed from 110 seconds
+ *    onward and nothing else.
+ *
+ * `uncoveredSeconds` would have named those holes, so the index would not have
+ * lied about itself. But a planner whose documented job is to cover the
+ * timeline should fail loudly on a plan that cannot, rather than quietly
+ * producing one and leaving the honesty to something downstream. Startup
+ * validation refuses the same combinations, so this is the second line rather
+ * than the first.
+ */
+export function assertPlannable(plan: WindowPlan): void {
+  const { windowSeconds, strideSeconds, minWindowSeconds } = plan;
+  if (!(windowSeconds > 0) || !(strideSeconds > 0)) {
+    throw new Error('planWindows needs a positive window length and stride');
+  }
+  if (strideSeconds > windowSeconds) {
+    throw new Error(
+      `A stride of ${strideSeconds}s with a ${windowSeconds}s window leaves ` +
+        `${strideSeconds - windowSeconds}s unindexed between every pair of windows. ` +
+        'The stride must be at most the window length.',
+    );
+  }
+  if (minWindowSeconds > windowSeconds) {
+    throw new Error(
+      `A minimum of ${minWindowSeconds}s disqualifies every ${windowSeconds}s window. ` +
+        'The minimum must be at most the window length.',
+    );
+  }
+}
+
+/**
  * Lays the whole timeline out in windows.
  *
  * Two promises, and the second one was got wrong the first time.
@@ -93,9 +135,7 @@ export function windowKey(window: IndexWindow): string {
 export function planWindows(durationSeconds: number, plan: WindowPlan = DEFAULT_WINDOW_PLAN): IndexWindow[] {
   const { windowSeconds, strideSeconds, minWindowSeconds } = plan;
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return [];
-  if (!(windowSeconds > 0) || !(strideSeconds > 0)) {
-    throw new Error('planWindows needs a positive window length and stride');
-  }
+  assertPlannable(plan);
 
   // A video shorter than one window is one window: the whole thing.
   if (durationSeconds <= windowSeconds) {

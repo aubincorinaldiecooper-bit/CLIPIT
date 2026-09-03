@@ -366,15 +366,32 @@ async function main(): Promise<void> {
     }
 
     // The transcript as its own channel.
+    //
+    // Batched exactly as the video windows are. A six-hour video at a five
+    // second stride is over four thousand transcript windows, and handing all
+    // of them to one call would fail the whole run on a video long enough to
+    // be worth indexing in the first place. Failures are carried across
+    // batches rather than swallowed: a window whose speech could not be
+    // embedded has no speech channel, and the summary below must not report
+    // that as a window with nothing said in it.
     const spoken = await speechPerWindow(video.id, covered);
     let speechVectors = new Map<string, Float32Array>();
     if (spoken.size > 0) {
-      const said = await embedTexts({
-        texts: [...spoken.entries()].map(([id, text]) => ({ id, text })),
-        isQuery: false,
-      });
-      speechVectors = new Map(said.embedded.map((row: EmbeddedInterval) => [row.id, row.embedding]));
-      console.log(`  ${speechVectors.size} windows also carry speech`);
+      const texts = [...spoken.entries()].map(([id, text]) => ({ id, text }));
+      const speechFailures: Array<{ id: string; reason: string }> = [];
+      for (let offset = 0; offset < texts.length; offset += env.MEDIA_INDEX_BATCH_WINDOWS) {
+        const said = await embedTexts({
+          texts: texts.slice(offset, offset + env.MEDIA_INDEX_BATCH_WINDOWS),
+          isQuery: false,
+        });
+        for (const row of said.embedded as EmbeddedInterval[]) speechVectors.set(row.id, row.embedding);
+        speechFailures.push(...said.failed);
+      }
+      console.log(`  ${speechVectors.size} of ${texts.length} windows also carry speech`);
+      if (speechFailures.length > 0) {
+        console.log(`  ${speechFailures.length} transcript windows could not be embedded: ` +
+          `${speechFailures.slice(0, 3).map((row) => row.reason).join('; ')}`);
+      }
     } else {
       console.log('  no transcript for this video — the speech channel is empty, and speech probes below measure nothing');
     }

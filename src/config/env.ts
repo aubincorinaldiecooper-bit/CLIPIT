@@ -237,6 +237,8 @@ const envSchema = z.object({
    */
   MEDIA_INDEX_EMBED_MODEL: z.string().trim().default('Qwen/Qwen3-VL-Embedding-2B'),
   MEDIA_INDEX_EMBED_DIMS: int(2048, 8, 16_000),
+  /** Same rule for the reranker: a misrouted deployment ranks confidently. */
+  MEDIA_INDEX_RERANK_MODEL: z.string().trim().default('Qwen/Qwen3-VL-Reranker-2B'),
   /**
    * Bumped by hand whenever anything that changes the MEANING of a vector
    * changes: the model, the pooling, the frame sampling, the window grid.
@@ -245,7 +247,12 @@ const envSchema = z.object({
    * would look exactly like working search and would not be.
    */
   MEDIA_INDEX_VERSION: z.string().trim().default('v1'),
-  /** The timeline grid. Experiment variables until the measurement settles them. */
+  /**
+   * The timeline grid. Experiment variables until the measurement settles
+   * them — but not independent ones: the three are checked against each other
+   * below, because two combinations inside these ranges leave parts of a
+   * video with no embedding at all.
+   */
   MEDIA_INDEX_WINDOW_SECONDS: num(10, 1, 120),
   MEDIA_INDEX_STRIDE_SECONDS: num(5, 0.5, 120),
   MEDIA_INDEX_MIN_WINDOW_SECONDS: num(3, 0.5, 120),
@@ -544,6 +551,21 @@ function loadEnv(): Env {
 
   if (value.MAX_CLIP_SECONDS < value.MIN_CLIP_SECONDS) {
     problems.push('MAX_CLIP_SECONDS must be >= MIN_CLIP_SECONDS');
+  }
+  // The Media Index grid has to be able to cover a timeline. Two combinations
+  // inside the individual ranges cannot: a stride longer than a window leaves
+  // a hole between every pair, and a minimum longer than a window disqualifies
+  // all of them. Caught at startup rather than at the first video, and again
+  // in planWindows for anything that builds a plan by hand.
+  if (value.MEDIA_INDEX_STRIDE_SECONDS > value.MEDIA_INDEX_WINDOW_SECONDS) {
+    problems.push(
+      'MEDIA_INDEX_STRIDE_SECONDS must be <= MEDIA_INDEX_WINDOW_SECONDS, or parts of every video go unindexed',
+    );
+  }
+  if (value.MEDIA_INDEX_MIN_WINDOW_SECONDS > value.MEDIA_INDEX_WINDOW_SECONDS) {
+    problems.push(
+      'MEDIA_INDEX_MIN_WINDOW_SECONDS must be <= MEDIA_INDEX_WINDOW_SECONDS, or no window ever qualifies',
+    );
   }
   if (value.TRANSCRIPTION_ENABLED && !value.OPENROUTER_API_KEY) {
     problems.push(

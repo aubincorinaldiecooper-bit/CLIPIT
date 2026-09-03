@@ -23,7 +23,8 @@ import time
 
 import modal
 
-from clipit_embedding import Sampling, decode_interval, fetch_once  # same transport, one copy
+from clipit_embedding import decode_interval, fetch_once  # same transport, one copy
+from sampling import Sampling
 
 APP_NAME = "clipit-reranker"
 MODEL_ID = "Qwen/Qwen3-VL-Reranker-2B"
@@ -32,7 +33,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "curl")
     .pip_install("torch", "transformers", "accelerate", "pillow", "numpy")
-    .add_local_python_source("clipit_embedding")
+    .add_local_python_source("clipit_embedding", "sampling")
 )
 
 app = modal.App(APP_NAME, image=image)

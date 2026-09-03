@@ -28,6 +28,7 @@ const { embedTexts, embedVideoIntervals, rerankVideoIntervals } = await import(
   '../src/services/mediaIndex/qwen.js'
 );
 const MODEL = 'Qwen/Qwen3-VL-Embedding-2B';
+const RERANK_MODEL = 'Qwen/Qwen3-VL-Reranker-2B';
 const DIMS = 2048;
 
 /** A unit vector, as the service promises to return. */
@@ -157,6 +158,36 @@ describe('embedVideoIntervals', () => {
     expect(result.embedded.some((row) => row.id === intervals[1]!.id)).toBe(false);
   });
 
+  it('refuses a failure for a range nobody asked for', async () => {
+    // The failure list is coverage. A wrong entry attaches a hole to a stretch
+    // of video that was never in question.
+    invokeMock.mockResolvedValue(reply({
+      results: [], failed: [{ id: '000900000-000910000', reason: 'x' }],
+    }));
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals }))
+      .rejects.toThrow(/nobody asked for/);
+  });
+
+  it('refuses the same range failed twice', async () => {
+    invokeMock.mockResolvedValue(reply({
+      results: [],
+      failed: [{ id: intervals[0]!.id, reason: 'a' }, { id: intervals[0]!.id, reason: 'b' }],
+    }));
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals }))
+      .rejects.toThrow(/twice/);
+  });
+
+  it('refuses a range that is both embedded and failed', async () => {
+    // Reported as indexed and as missing at once. One is wrong, nothing says
+    // which, so neither is believed.
+    invokeMock.mockResolvedValue(reply({
+      results: [{ id: intervals[0]!.id, embedding: unit(1), frames: 16 }],
+      failed: [{ id: intervals[0]!.id, reason: 'could not decode' }],
+    }));
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals }))
+      .rejects.toThrow(/both answered and failed/);
+  });
+
   it('refuses duplicate ids in the request', async () => {
     await expect(embedVideoIntervals({
       videoUrl: 'u', videoKey: 'k',
@@ -187,7 +218,7 @@ describe('embedTexts', () => {
 describe('rerankVideoIntervals', () => {
   it('returns candidates best first, by id', async () => {
     invokeMock.mockResolvedValue({
-      model: 'Qwen/Qwen3-VL-Reranker-2B',
+      model: RERANK_MODEL,
       results: [
         { id: intervals[0]!.id, start: 0, end: 10, score: 0.21 },
         { id: intervals[1]!.id, start: 5, end: 15, score: 0.88 },
@@ -198,9 +229,27 @@ describe('rerankVideoIntervals', () => {
     expect(result.ranked.map((row) => row.id)).toEqual([intervals[1]!.id, intervals[0]!.id]);
   });
 
+  it('refuses a ranking from a different reranker', async () => {
+    // A stale or misrouted deployment scores every candidate and returns a
+    // clean ranking. Nothing in the output would say the comparison the
+    // experiment exists to make had been invalidated.
+    invokeMock.mockResolvedValue({
+      model: 'Qwen/Qwen3-VL-Reranker-8B',
+      results: [{ id: intervals[0]!.id, score: 0.9 }], failed: [], metrics: {},
+    });
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+      .rejects.toThrow(/Reranker-8B/);
+  });
+
+  it('refuses a ranking that names no model at all', async () => {
+    invokeMock.mockResolvedValue({ results: [{ id: intervals[0]!.id, score: 0.9 }], failed: [], metrics: {} });
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+      .rejects.toThrow(/none given/);
+  });
+
   it('refuses a score that is not a number', async () => {
     invokeMock.mockResolvedValue({
-      model: 'r', results: [{ id: intervals[0]!.id, score: 'very relevant' }], failed: [], metrics: {},
+      model: RERANK_MODEL, results: [{ id: intervals[0]!.id, score: 'very relevant' }], failed: [], metrics: {},
     });
     await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
       .rejects.toThrow(/non-numeric/);
@@ -212,7 +261,7 @@ describe('rerankVideoIntervals', () => {
     // experiment would have counted unread footage as footage that was read
     // and judged irrelevant. A shorter list is not a verdict.
     invokeMock.mockResolvedValue({
-      model: 'r', results: [{ id: intervals[0]!.id, score: 0.7 }], failed: [], metrics: {},
+      model: RERANK_MODEL, results: [{ id: intervals[0]!.id, score: 0.7 }], failed: [], metrics: {},
     });
     const result = await rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals });
     expect(result.ranked).toHaveLength(1);
@@ -223,7 +272,7 @@ describe('rerankVideoIntervals', () => {
 
   it('refuses a score for an id nobody asked for', async () => {
     invokeMock.mockResolvedValue({
-      model: 'r', results: [{ id: '000900000-000910000', score: 0.9 }], failed: [], metrics: {},
+      model: RERANK_MODEL, results: [{ id: '000900000-000910000', score: 0.9 }], failed: [], metrics: {},
     });
     await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
       .rejects.toThrow(/nobody asked for/);
@@ -231,7 +280,7 @@ describe('rerankVideoIntervals', () => {
 
   it('refuses a failure for an id nobody asked for', async () => {
     invokeMock.mockResolvedValue({
-      model: 'r', results: [], failed: [{ id: 'not-ours', reason: 'x' }], metrics: {},
+      model: RERANK_MODEL, results: [], failed: [{ id: 'not-ours', reason: 'x' }], metrics: {},
     });
     await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
       .rejects.toThrow(/nobody asked for/);
@@ -239,7 +288,7 @@ describe('rerankVideoIntervals', () => {
 
   it('refuses the same candidate scored twice', async () => {
     invokeMock.mockResolvedValue({
-      model: 'r',
+      model: RERANK_MODEL,
       results: [{ id: intervals[0]!.id, score: 0.7 }, { id: intervals[0]!.id, score: 0.2 }],
       failed: [], metrics: {},
     });
@@ -249,21 +298,22 @@ describe('rerankVideoIntervals', () => {
 
   it('refuses a candidate that is both scored and failed', async () => {
     // One of the two is wrong and nothing says which, so neither is believed.
+    // Same wording as the embedding side: one rule, one message, one helper.
     invokeMock.mockResolvedValue({
-      model: 'r',
+      model: RERANK_MODEL,
       results: [{ id: intervals[0]!.id, score: 0.7 }],
       failed: [{ id: intervals[0]!.id, reason: 'could not decode' }],
       metrics: {},
     });
     await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
-      .rejects.toThrow(/both scored and failed/);
+      .rejects.toThrow(/both answered and failed/);
   });
 
   it('reports an unreadable candidate rather than scoring it zero', async () => {
     // A zero would sort last and read exactly like a considered judgement
     // that the moment was irrelevant.
     invokeMock.mockResolvedValue({
-      model: 'r',
+      model: RERANK_MODEL,
       results: [{ id: intervals[0]!.id, score: 0.5 }],
       failed: [{ id: intervals[1]!.id, reason: 'no frames decoded for this range' }],
       metrics: {},

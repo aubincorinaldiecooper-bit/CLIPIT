@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assertPlannable,
   DEFAULT_WINDOW_PLAN,
   planWindows,
   uncoveredSeconds,
@@ -100,6 +101,33 @@ describe('planWindows', () => {
     const again = planWindows(187.5);
     expect(again).toEqual(once);
     expect(new Set(once.map(windowKey)).size).toBe(once.length);
+  });
+
+  it('refuses a stride that leaves holes between windows', () => {
+    // Both numbers sit inside their own configured ranges. Measured before
+    // fixing: window 10 / stride 30 over two minutes left 60 of 120 seconds
+    // with no embedding at all.
+    expect(() => planWindows(120, { windowSeconds: 10, strideSeconds: 30, minWindowSeconds: 3 }))
+      .toThrow(/stride must be at most the window length/);
+  });
+
+  it('refuses a minimum no window could ever meet', () => {
+    // Same shape: window 10 / minimum 20 collapsed a two-minute video to a
+    // single window covering its last ten seconds.
+    expect(() => planWindows(120, { windowSeconds: 10, strideSeconds: 5, minWindowSeconds: 20 }))
+      .toThrow(/minimum must be at most the window length/);
+  });
+
+  it('accepts every grid the sweep actually runs', () => {
+    for (const grid of [
+      { windowSeconds: 6, strideSeconds: 3, minWindowSeconds: 2 },
+      { windowSeconds: 10, strideSeconds: 5, minWindowSeconds: 3 },
+      { windowSeconds: 10, strideSeconds: 10, minWindowSeconds: 3 },
+      { windowSeconds: 20, strideSeconds: 10, minWindowSeconds: 5 },
+      DEFAULT_WINDOW_PLAN,
+    ]) {
+      expect(() => assertPlannable(grid)).not.toThrow();
+    }
   });
 
   it('has nothing to plan for a video of no length', () => {
