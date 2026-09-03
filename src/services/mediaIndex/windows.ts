@@ -67,14 +67,28 @@ export function windowKey(window: IndexWindow): string {
 }
 
 /**
- * Lays the whole timeline out in overlapping windows.
+ * Lays the whole timeline out in windows.
  *
- * The last window ENDS AT THE END OF THE VIDEO rather than running past it,
- * which matters more than it sounds: a window that claims seconds the video
- * does not have would let a match be reported at a timestamp nothing can be
- * cut from. Overlap is what stops a moment falling into a seam — a ten-second
- * window every five seconds means every instant of the video sits in the
- * middle of some window, not just at the edge of one.
+ * Two promises, and the second one was got wrong the first time.
+ *
+ * No window ever claims seconds the video does not have. A window running
+ * past the end would let a match be reported at a timestamp nothing can be
+ * cut from.
+ *
+ * And the windows COVER THE WHOLE VIDEO. A tail too short to deserve a
+ * window of its own does not simply get dropped — the last window is pulled
+ * back to start a full window's length from the end, so it reaches the final
+ * second at full size. Dropping it is safe only when the windows overlap and
+ * the one before already covers the tail, which is why the bug hid: at the
+ * default ten-second window every five seconds it is invisible, and at the
+ * sweep's ten-second window every ten seconds a 31-second video lost its last
+ * second entirely. `uncoveredSeconds` would have named that stretch, so it was
+ * never going to be a silent hole — but a needless hole is still a stretch of
+ * somebody's video that nothing can retrieve.
+ *
+ * Overlap remains the reason the grid works at all: a ten-second window every
+ * five seconds means every instant sits in the middle of some window rather
+ * than only at the edge of one.
  */
 export function planWindows(durationSeconds: number, plan: WindowPlan = DEFAULT_WINDOW_PLAN): IndexWindow[] {
   const { windowSeconds, strideSeconds, minWindowSeconds } = plan;
@@ -93,17 +107,29 @@ export function planWindows(durationSeconds: number, plan: WindowPlan = DEFAULT_
     const startSeconds = round(start);
     const endSeconds = round(Math.min(start + windowSeconds, durationSeconds));
 
-    // The tail. Everything from here on would be shorter than a full window,
-    // so this is the last one either way — the only question is whether it is
-    // long enough to be worth an embedding of its own.
-    if (endSeconds >= durationSeconds) {
-      if (endSeconds - startSeconds >= minWindowSeconds || windows.length === 0) {
-        windows.push({ startSeconds, endSeconds });
-      }
-      break;
+    // A sliver at the end is not worth its own embedding — a real row, a real
+    // GPU call, and a fraction of a second of footage. It is skipped here and
+    // the seconds it would have held are picked up below.
+    if (endSeconds - startSeconds >= minWindowSeconds) {
+      windows.push({ startSeconds, endSeconds });
     }
 
-    windows.push({ startSeconds, endSeconds });
+    // Everything after this would start past the end of the video.
+    if (endSeconds >= durationSeconds) break;
+  }
+
+  // Whatever the stride did, the grid reaches the end of the video. Pulled
+  // back a full window's length rather than left short, so the final window
+  // is the same size as every other one and the last seconds are covered at
+  // the same quality as the first.
+  const last = windows.at(-1);
+  if (!last || last.endSeconds < durationSeconds - 1e-6) {
+    const startSeconds = round(Math.max(0, durationSeconds - windowSeconds));
+    const endSeconds = round(durationSeconds);
+    // A grid that lands exactly here already has this window; extend it in
+    // place rather than storing the same seconds twice.
+    if (last && last.startSeconds === startSeconds) windows[windows.length - 1] = { startSeconds, endSeconds };
+    else windows.push({ startSeconds, endSeconds });
   }
 
   return windows;

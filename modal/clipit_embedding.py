@@ -17,6 +17,16 @@ Everything below exists to make that contract cheap and honest.
     every request, so a cache keyed on the URL string would never hit once and
     would silently re-download the same file forever.
 
+    `video_key` is a CONTENT identity, not a path. Clipit's derived keys are
+    deterministic — an analysis proxy always lives at
+    `proxies/{videoId}/proxy.mp4` — so re-processing a video overwrites the
+    object while the key stays put. A warm container caching on the path alone
+    would go on embedding the previous footage, producing vectors that are
+    well formed, correctly normalized, attached to real timestamps, and about
+    a video that no longer exists. Clipit sends `key#etag` (see
+    services/mediaIndex/sourceIdentity.ts); this side only has to treat the
+    whole string as opaque and never shorten it.
+
   * Every interval carries an `id` chosen by the caller and echoed back
     verbatim. Results are matched by that id, never by position in the list.
     Array position has already cost Clipit real bugs, and a reordered or
@@ -53,6 +63,11 @@ import modal
 APP_NAME = "clipit-embedding"
 MODEL_ID = "Qwen/Qwen3-VL-Embedding-2B"
 MODEL_REVISION = None  # pin once a known-good revision is confirmed
+
+# What a question is asking the model to do. Part of a query vector's
+# identity: change this wording and every stored vector stays valid while
+# every future query lands somewhere slightly different.
+QUERY_INSTRUCTION = "Given a search query, retrieve the moment of video that matches it"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -184,17 +199,42 @@ class QwenEmbeddingService:
     # only part that depends on how Qwen3-VL-Embedding wants to be called, and
     # it is deliberately alone so it can be reconciled with the implementation
     # already proven in the deployed service without touching the contract
-    # around it. Whatever it does, it must return L2-NORMALIZED vectors and it
-    # must treat a query and a document consistently — an instruction prefix
-    # applied to one and not the other silently wrecks retrieval while still
-    # returning confident, plausible rankings.
+    # around it. Whatever it does, it must return L2-NORMALIZED vectors.
+    #
+    # ASYMMETRY IS THE WHOLE DIFFICULTY. These models want a question and a
+    # document phrased differently, and applying the instruction to one side
+    # and not the other does not raise anything — it returns confident,
+    # well-ordered, wrong rankings. `prepare_text` below is what makes the
+    # difference visible, and `describe_formatting` exists so a caller can
+    # prove the flag is actually doing something rather than trusting that it
+    # is. (The first version of this file took `is_query` and ignored it,
+    # which is exactly the failure the paragraph above warns about.)
 
-    def _encode(self, *, frames=None, texts=None, is_query: bool):
+    def prepare_text(self, text: str, is_query: bool) -> str:
+        """
+        A question and a document, phrased the way the model expects.
+
+        The Qwen embedding family's convention: a query carries an
+        instruction, a document is passed as it is. CONFIRM THIS AGAINST THE
+        DEPLOYED IMPLEMENTATION — if the live service already formats queries
+        some other way, that formatting wins and this should match it, because
+        vectors made under two different conventions cannot be compared and
+        nothing about the resulting rankings would look wrong.
+        """
+        if not is_query:
+            return text
+        return f"Instruct: {QUERY_INSTRUCTION}\nQuery: {text}"
+
+    def _encode(self, *, frames=None, texts=None, is_query: bool = False):
         torch = self.torch
         with torch.inference_mode():
             if texts is not None:
-                batch = self.processor(text=texts, return_tensors="pt", padding=True).to("cuda")
+                prepared = [self.prepare_text(text, is_query) for text in texts]
+                batch = self.processor(text=prepared, return_tensors="pt", padding=True).to("cuda")
             else:
+                # A video is always a document. There is no such thing as
+                # asking a question with footage here, so the flag does not
+                # reach this branch.
                 batch = self.processor(videos=frames, return_tensors="pt", padding=True).to("cuda")
             output = self.model(**batch)
             hidden = getattr(output, "last_hidden_state", output)
@@ -208,6 +248,23 @@ class QwenEmbeddingService:
             else:
                 pooled = hidden
             return torch.nn.functional.normalize(pooled.float(), p=2, dim=-1).cpu().tolist()
+
+    @modal.method()
+    def describe_formatting(self, text: str) -> dict:
+        """
+        What this service actually does to a question versus a document.
+
+        Cheap, no GPU inference, and it exists so the asymmetry can be PROVEN
+        rather than assumed. If `query` and `document` come back identical,
+        the flag is doing nothing and retrieval is quietly running on
+        symmetric embeddings.
+        """
+        return {
+            "model": MODEL_ID,
+            "instruction": QUERY_INSTRUCTION,
+            "query": self.prepare_text(text, True),
+            "document": self.prepare_text(text, False),
+        }
 
     # ---- the contract ----------------------------------------------------
 
@@ -252,7 +309,7 @@ class QwenEmbeddingService:
                     failed.append({"id": interval_id, "reason": "no frames decoded for this range"})
                     continue
                 at = time.time()
-                vector = self._encode(frames=[frames], is_query=False)[0]
+                vector = self._encode(frames=[frames])[0]
                 infer_ms += int((time.time() - at) * 1000)
                 results.append({
                     "id": interval_id,

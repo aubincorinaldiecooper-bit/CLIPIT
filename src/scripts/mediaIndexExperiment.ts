@@ -61,6 +61,7 @@ import {
   rerankVideoIntervals,
   type EmbeddedInterval,
 } from '../services/mediaIndex/qwen.js';
+import { sourceIdentity } from '../services/mediaIndex/sourceIdentity.js';
 
 // ---------------------------------------------------------------- arguments
 
@@ -164,6 +165,8 @@ function describe(window: IndexWindow): string {
  */
 async function embedAllWindows(input: {
   proxyKey: string;
+  /** Key plus content tag: see sourceIdentity. Never the signed URL. */
+  identity: string;
   windows: IndexWindow[];
 }): Promise<{ vectors: Map<string, Float32Array>; failed: Array<{ id: string; reason: string }>; metrics: Array<Record<string, unknown>> }> {
   const vectors = new Map<string, Float32Array>();
@@ -178,7 +181,7 @@ async function embedAllWindows(input: {
     });
     const result = await embedVideoIntervals({
       videoUrl,
-      videoKey: input.proxyKey,
+      videoKey: input.identity,
       // The proxy IS the source timeline, so window seconds need no rebasing.
       intervals: batch.map((window) => ({
         id: windowKey(window), start: window.startSeconds, end: window.endSeconds,
@@ -259,7 +262,38 @@ async function main(): Promise<void> {
   console.log(`duration   ${timecode(duration)}`);
   console.log(`proxy      ${env.PROXY_HEIGHT}p at ${env.PROXY_FPS} fps (one continuous file — no chunks are used here)`);
   console.log(`model      ${env.MEDIA_INDEX_EMBED_MODEL} at ${env.MEDIA_INDEX_EMBED_DIMS} dimensions`);
-  console.log(`sampling   ${env.MEDIA_INDEX_SAMPLE_FPS} fps, up to ${env.MEDIA_INDEX_MAX_FRAMES} frames per window\n`);
+  console.log(`sampling   ${env.MEDIA_INDEX_SAMPLE_FPS} fps, up to ${env.MEDIA_INDEX_MAX_FRAMES} frames per window`);
+
+  // Resolved once, before any GPU work: the proxy key plus the store's tag for
+  // its current bytes. A re-processed video overwrites the key, and a warm
+  // container caching on the key alone would embed the previous footage.
+  const identity = await sourceIdentity(proxyKey);
+  console.log(`identity   ${identity.split('#')[1]}  (content tag — a re-processed video gets a new one)\n`);
+
+  /**
+   * Before anything else: is the question actually being phrased differently
+   * from the footage?
+   *
+   * These models are asymmetric, and getting it wrong does not raise — it
+   * returns confident, well-ordered, wrong rankings, which is indistinguishable
+   * from working retrieval unless something checks. So the same sentence is
+   * embedded both ways and the two vectors compared. Identical vectors mean
+   * the flag is inert and every number printed below would be measuring
+   * symmetric embeddings while claiming otherwise.
+   */
+  const SAME = 'a red pickup truck pulls out of the driveway';
+  const [asQuery, asDocument] = await Promise.all([
+    embedTexts({ texts: [{ id: 'probe', text: SAME }], isQuery: true }),
+    embedTexts({ texts: [{ id: 'probe', text: SAME }], isQuery: false }),
+  ]);
+  const asymmetry = 1 - similarity(asQuery.embedded[0]!.embedding, asDocument.embedded[0]!.embedding);
+  if (asymmetry < 1e-6) {
+    console.log('WARNING  the same sentence embeds identically as a question and as a document.');
+    console.log('         The query/document distinction is doing nothing, so every number below');
+    console.log('         is measuring symmetric embeddings. Fix the service before trusting it.\n');
+  } else {
+    console.log(`asymmetry  question and document differ by ${asymmetry.toFixed(4)} — the distinction is live\n`);
+  }
 
   // Which grids to try. One by default, because every extra grid is a whole
   // second pass over the video on a real GPU.
@@ -292,7 +326,7 @@ async function main(): Promise<void> {
     console.log(`  ${windows.length} windows over ${timecode(duration)}`);
 
     const startedAt = performance.now();
-    const { vectors, failed, metrics } = await embedAllWindows({ proxyKey, windows });
+    const { vectors, failed, metrics } = await embedAllWindows({ proxyKey, identity, windows });
     const embedMs = Math.round(performance.now() - startedAt);
 
     const covered = windows.filter((window) => vectors.has(windowKey(window)));
@@ -404,7 +438,7 @@ async function main(): Promise<void> {
           expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
         });
         const reranked = await rerankVideoIntervals({
-          query: probe.query, videoUrl, videoKey: proxyKey,
+          query: probe.query, videoUrl, videoKey: identity,
           candidates: shortlist.map((entry) => ({
             id: windowKey(entry.window), start: entry.window.startSeconds, end: entry.window.endSeconds,
           })),

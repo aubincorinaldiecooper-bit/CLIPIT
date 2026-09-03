@@ -48,6 +48,46 @@ describe('planWindows', () => {
     expect(uncoveredSeconds(windows, 31)).toEqual([]);
   });
 
+  it('reaches the end of the video even when the windows do not overlap', () => {
+    // Devin's finding on #93, and it was real. Dropping a short tail is only
+    // safe when an overlapping window already covers it. At the sweep's
+    // 10s-window/10s-stride grid a 31-second video lost its final second:
+    // windows 0-10, 10-20, 20-30, and nothing for 30-31.
+    const grid = { windowSeconds: 10, strideSeconds: 10, minWindowSeconds: 3 };
+    const windows = planWindows(31, grid);
+    expect(windows.at(-1)!.endSeconds).toBe(31);
+    expect(uncoveredSeconds(windows, 31)).toEqual([]);
+    // And the final window is a full window, not a stub.
+    expect(windows.at(-1)!.endSeconds - windows.at(-1)!.startSeconds).toBe(10);
+  });
+
+  it('covers every second of every grid it is given', () => {
+    // The property the case above is one instance of. Every grid the sweep
+    // can run, against durations that land on, just before and just after a
+    // stride boundary.
+    const grids = [
+      { windowSeconds: 6, strideSeconds: 3, minWindowSeconds: 2 },
+      { windowSeconds: 10, strideSeconds: 5, minWindowSeconds: 3 },
+      { windowSeconds: 10, strideSeconds: 10, minWindowSeconds: 3 },
+      { windowSeconds: 20, strideSeconds: 10, minWindowSeconds: 5 },
+    ];
+    for (const grid of grids) {
+      for (const duration of [19.5, 20, 20.5, 30, 31, 47, 60, 121.004, 300]) {
+        const windows = planWindows(duration, grid);
+        expect(uncoveredSeconds(windows, duration), `${grid.windowSeconds}/${grid.strideSeconds} @ ${duration}s`).toEqual([]);
+        expect(windows.every((window) => window.endSeconds <= duration + 1e-9)).toBe(true);
+      }
+    }
+  });
+
+  it('does not store the same seconds twice when the grid lands on the end', () => {
+    // A duration that is an exact multiple of the stride already ends on a
+    // window boundary. Reaching for the end must not append a duplicate.
+    const windows = planWindows(30, { windowSeconds: 10, strideSeconds: 10, minWindowSeconds: 3 });
+    expect(windows.map(windowKey)).toEqual([...new Set(windows.map(windowKey))]);
+    expect(windows.at(-1)).toEqual({ startSeconds: 20, endSeconds: 30 });
+  });
+
   it('makes one window of a video shorter than a window', () => {
     expect(planWindows(4)).toEqual([{ startSeconds: 0, endSeconds: 4 }]);
     // Even below the minimum: a 2-second video is still a video, and one

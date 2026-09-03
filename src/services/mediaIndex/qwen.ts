@@ -294,30 +294,61 @@ export async function rerankVideoIntervals(input: {
     short_side: sampling.shortSide,
   }, { context: { videoKey: input.videoKey, candidates: input.candidates.length } });
 
+  // The reranker is held to exactly the identity contract the embedding path
+  // is held to, and for the same reason. A reply that quietly drops two of
+  // five candidates still sorts, still looks like a considered ranking, and
+  // the caller would take unread footage for footage that was read and judged
+  // irrelevant. A shorter list is not a verdict.
   const rows = Array.isArray(reply.results) ? reply.results : [];
   const ranked: RankedInterval[] = [];
+  const scored = new Set<string>();
+
   for (const row of rows as Array<Record<string, unknown>>) {
     const id = typeof row.id === 'string' ? row.id : '';
     if (!asked.has(id)) {
       throw new ExternalServiceError(RERANK.label, `Reranker returned an id nobody asked for: "${id}"`, { retryable: false });
     }
+    if (scored.has(id)) {
+      throw new ExternalServiceError(RERANK.label, `Reranker returned "${id}" twice`, { retryable: false });
+    }
     if (typeof row.score !== 'number' || !Number.isFinite(row.score)) {
       throw new ExternalServiceError(RERANK.label, `Reranker returned a non-numeric score for "${id}"`, { retryable: false });
     }
+    scored.add(id);
     ranked.push({ id, score: row.score });
   }
   ranked.sort((a, b) => b.score - a.score);
 
+  const failed: FailedInterval[] = [];
+  const named = new Set<string>();
+  for (const row of (Array.isArray(reply.failed) ? reply.failed : []) as Array<Record<string, unknown>>) {
+    const id = typeof row.id === 'string' ? row.id : '';
+    if (!asked.has(id)) {
+      throw new ExternalServiceError(RERANK.label, `Reranker failed an id nobody asked for: "${id}"`, { retryable: false });
+    }
+    if (scored.has(id)) {
+      // Both scored and failed. One of the two is wrong and there is no way
+      // to tell which, so neither is believed.
+      throw new ExternalServiceError(
+        RERANK.label, `Reranker both scored and failed "${id}"`, { retryable: false },
+      );
+    }
+    named.add(id);
+    failed.push({ id, reason: typeof row.reason === 'string' ? row.reason : 'no reason given' });
+  }
+
+  // A candidate in neither list. Named as a failure rather than left out, so
+  // "we did not look at this one" can never read as "this one lost".
+  for (const id of asked) {
+    if (!scored.has(id) && !named.has(id)) {
+      failed.push({ id, reason: 'the reranker returned neither a score nor a failure for this candidate' });
+    }
+  }
+
   return {
     model: typeof reply.model === 'string' ? reply.model : '',
     ranked,
-    failed: (Array.isArray(reply.failed) ? reply.failed : []).map((row) => {
-      const record = row as Record<string, unknown>;
-      return {
-        id: typeof record.id === 'string' ? record.id : 'unknown',
-        reason: typeof record.reason === 'string' ? record.reason : 'no reason given',
-      };
-    }),
+    failed,
     metrics: (reply.metrics as Record<string, unknown>) ?? {},
   };
 }

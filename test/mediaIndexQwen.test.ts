@@ -206,6 +206,59 @@ describe('rerankVideoIntervals', () => {
       .rejects.toThrow(/non-numeric/);
   });
 
+  it('names a candidate that came back with neither a score nor a reason', async () => {
+    // Devin's finding on #93, and it was real. A reply that quietly drops a
+    // candidate still sorts and still reads as a considered ranking — and the
+    // experiment would have counted unread footage as footage that was read
+    // and judged irrelevant. A shorter list is not a verdict.
+    invokeMock.mockResolvedValue({
+      model: 'r', results: [{ id: intervals[0]!.id, score: 0.7 }], failed: [], metrics: {},
+    });
+    const result = await rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals });
+    expect(result.ranked).toHaveLength(1);
+    expect(result.failed).toEqual([
+      { id: intervals[1]!.id, reason: expect.stringContaining('neither a score nor a failure') },
+    ]);
+  });
+
+  it('refuses a score for an id nobody asked for', async () => {
+    invokeMock.mockResolvedValue({
+      model: 'r', results: [{ id: '000900000-000910000', score: 0.9 }], failed: [], metrics: {},
+    });
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+      .rejects.toThrow(/nobody asked for/);
+  });
+
+  it('refuses a failure for an id nobody asked for', async () => {
+    invokeMock.mockResolvedValue({
+      model: 'r', results: [], failed: [{ id: 'not-ours', reason: 'x' }], metrics: {},
+    });
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+      .rejects.toThrow(/nobody asked for/);
+  });
+
+  it('refuses the same candidate scored twice', async () => {
+    invokeMock.mockResolvedValue({
+      model: 'r',
+      results: [{ id: intervals[0]!.id, score: 0.7 }, { id: intervals[0]!.id, score: 0.2 }],
+      failed: [], metrics: {},
+    });
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+      .rejects.toThrow(/twice/);
+  });
+
+  it('refuses a candidate that is both scored and failed', async () => {
+    // One of the two is wrong and nothing says which, so neither is believed.
+    invokeMock.mockResolvedValue({
+      model: 'r',
+      results: [{ id: intervals[0]!.id, score: 0.7 }],
+      failed: [{ id: intervals[0]!.id, reason: 'could not decode' }],
+      metrics: {},
+    });
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+      .rejects.toThrow(/both scored and failed/);
+  });
+
   it('reports an unreadable candidate rather than scoring it zero', async () => {
     // A zero would sort last and read exactly like a considered judgement
     // that the moment was irrelevant.

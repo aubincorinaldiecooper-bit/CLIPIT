@@ -214,6 +214,8 @@ export class S3StorageAdapter implements StorageAdapter {
         key,
         sizeBytes: Number(response.ContentLength ?? 0),
         ...(response.ContentType ? { contentType: response.ContentType } : {}),
+        // Quoted by the protocol; the quotes are noise to every caller.
+        ...(response.ETag ? { etag: response.ETag.replace(/"/g, '') } : {}),
       };
     } catch (error) {
       const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;

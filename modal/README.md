@@ -30,9 +30,22 @@ proxy asked for 144 windows would otherwise be downloaded 144 times.
 
 **Caching is keyed on `video_key`, never on the URL.** Clipit signs a fresh URL
 for every request, so a cache keyed on the URL string would never hit once and
-would silently re-download the same file forever. The key is the video's stable
-storage key; the URL is a credential with an expiry. They are different things
-and both are required.
+would silently re-download the same file forever. The URL is a credential with
+an expiry; the key is what identifies the bytes. Both are required.
+
+**`video_key` is a content identity, not a path.** Clipit's derived keys are
+deterministic — an analysis proxy always lives at `proxies/{videoId}/proxy.mp4`
+— so re-processing a video overwrites the object while the key stays put. A
+warm container caching on the path alone would go on embedding the *previous*
+footage, and its vectors would be well formed, correctly normalized, attached
+to real timestamps, and about a video that no longer exists. Clipit sends
+`key#etag`; this side treats the whole string as opaque and never shortens it.
+
+**A question and a document are phrased differently, and it is provable.**
+`prepare_text` applies the query instruction; `describe_formatting` returns
+what both sides actually become, so a caller can check rather than assume. If
+they come back identical the flag is inert, and retrieval is quietly running on
+symmetric embeddings while looking perfectly healthy.
 
 **Every interval carries an id chosen by the caller, echoed back verbatim.**
 Nothing is ever matched by position in a list. Array position has already cost

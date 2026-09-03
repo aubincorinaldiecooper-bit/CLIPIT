@@ -2,6 +2,16 @@ export interface StoredObject {
   key: string;
   sizeBytes: number;
   contentType?: string;
+  /**
+   * The store's own tag for THIS content. Changes when the bytes change,
+   * which is what makes it usable as a cache identity: Clipit's derived keys
+   * are deterministic (`proxies/{videoId}/proxy.mp4`), so re-processing a
+   * video overwrites the object while the key stays the same. Anything
+   * caching on the key alone would go on serving the previous video.
+   *
+   * Optional because not every store has one.
+   */
+  etag?: string;
 }
 
 /**
