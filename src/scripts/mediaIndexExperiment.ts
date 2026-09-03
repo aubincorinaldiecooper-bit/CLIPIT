@@ -43,6 +43,7 @@
  * Nothing is written to the database and no signed URL is ever printed.
  */
 import { readFile, writeFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 import { env } from '../config/env.js';
 import { queryRows } from '../db/pool.js';
 import { getStorage } from '../services/storage/s3.js';
@@ -138,7 +139,7 @@ function checkRange(
   return { startSeconds: start, endSeconds: end };
 }
 
-async function loadProbes(path: string): Promise<Probe[]> {
+export async function loadProbes(path: string): Promise<Probe[]> {
   const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
   const rows = Array.isArray(parsed) ? parsed : (parsed as { probes?: unknown }).probes;
   if (!Array.isArray(rows)) throw new Error(`${path} should hold a JSON array of probes`);
@@ -153,15 +154,48 @@ async function loadProbes(path: string): Promise<Probe[]> {
     }
     // Duration is not known yet; the ranges are re-checked against it below.
     const expect = checkRange(probe.expect, `${where} ("${probe.query}") expect`, null);
-    const distractor = probe.distractor
+
+    // `in` rather than truthiness: a distractor written as null, 0 or "" is a
+    // mistake somebody made, and silently treating it as absent would turn a
+    // typo into a quietly weaker experiment.
+    const supplied = Object.prototype.hasOwnProperty.call(probe, 'distractor');
+    const distractor = supplied
       ? checkRange(probe.distractor, `${where} ("${probe.query}") distractor`, null)
       : undefined;
+
+    // The visible-text probe is the one that decides whether a separate text
+    // channel is needed, and it cannot decide anything without a near-twin to
+    // rank against. "Found a sign" and "found the RIGHT sign" score the same
+    // when there is nothing to compare with, so a missing distractor here
+    // would report plain object recognition as successful text retrieval —
+    // the exact conclusion this probe exists to rule out.
+    if (probe.kind === 'visible-text' && !distractor) {
+      throw new Error(
+        `${where} ("${probe.query}"): a visible-text probe needs a "distractor" — a second, different ` +
+          'piece of visible text to rank against. Without one it cannot tell reading from recognising.',
+      );
+    }
+
+    // A distractor overlapping the answer is not a distractor. The two would
+    // share windows, and the margin between them would be a number about
+    // nothing.
+    if (
+      distractor &&
+      distractor.startSeconds < expect.endSeconds &&
+      distractor.endSeconds > expect.startSeconds
+    ) {
+      throw new Error(
+        `${where} ("${probe.query}"): the distractor (${distractor.startSeconds}-${distractor.endSeconds}s) ` +
+          `overlaps the expected moment (${expect.startSeconds}-${expect.endSeconds}s), so comparing them means nothing.`,
+      );
+    }
+
     return { ...probe, expect, ...(distractor ? { distractor } : {}) };
   });
 }
 
 /** Re-checked once the video's real length is known. */
-function assertProbesFitVideo(probes: Probe[], durationSeconds: number): void {
+export function assertProbesFitVideo(probes: Probe[], durationSeconds: number): void {
   for (const [index, probe] of probes.entries()) {
     checkRange(probe.expect, `probe ${index} ("${probe.query}") expect`, durationSeconds);
     if (probe.distractor) {
@@ -326,6 +360,16 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // The probe file is read and structurally checked FIRST, before the database
+  // is touched at all. It needs nothing but itself to be judged, and a typo in
+  // it should cost nothing — not a query, not a signed URL, and certainly not
+  // the two embedding calls it used to cost.
+  const probes = args.probesPath ? await loadProbes(args.probesPath) : [];
+  if (probes.length === 0 && !args.ask) {
+    console.error('Nothing to measure. Pass --probes <file> for numbers, or --ask "<question>" to look around.');
+    process.exit(2);
+  }
+
   const [video] = await queryRows<{ id: string; title: string | null; duration_seconds: number | null; proxy_storage_key: string | null }>(
     `SELECT id, title, duration_seconds, proxy_storage_key FROM videos WHERE id = $1`, [args.videoId],
   );
@@ -341,6 +385,11 @@ async function main(): Promise<void> {
   console.log(`proxy      ${env.PROXY_HEIGHT}p at ${env.PROXY_FPS} fps (one continuous file — no chunks are used here)`);
   console.log(`model      ${env.MEDIA_INDEX_EMBED_MODEL} at ${env.MEDIA_INDEX_EMBED_DIMS} dimensions`);
   console.log(`sampling   ${env.MEDIA_INDEX_SAMPLE_FPS} fps, up to ${env.MEDIA_INDEX_MAX_FRAMES} frames per window`);
+
+  // The one probe check that needs the video: a moment past its end fails the
+  // run rather than counting as something the model could not find. Still
+  // ahead of every signed URL and every GPU call.
+  assertProbesFitVideo(probes, duration);
 
   // Resolved once, before any GPU work: the proxy key plus the store's tag for
   // its current bytes. A re-processed video overwrites the key, and a warm
@@ -388,14 +437,6 @@ async function main(): Promise<void> {
         minWindowSeconds: env.MEDIA_INDEX_MIN_WINDOW_SECONDS,
       }];
 
-  const probes = args.probesPath ? await loadProbes(args.probesPath) : [];
-  // Now that the video's real length is known, a probe pointing past its end
-  // fails the run rather than counting as a moment the model could not find.
-  assertProbesFitVideo(probes, duration);
-  if (probes.length === 0 && !args.ask) {
-    console.error('Nothing to measure. Pass --probes <file> for numbers, or --ask "<question>" to look around.');
-    process.exit(2);
-  }
 
   const report: Record<string, unknown>[] = [];
 
@@ -636,10 +677,15 @@ async function main(): Promise<void> {
   console.log('nothing was written to the database, and no signed URL was printed.');
 }
 
-main().then(
-  () => process.exit(0),
-  (error: unknown) => {
-    console.error('\nexperiment failed:', error instanceof Error ? error.message : error);
-    process.exit(1);
-  },
-);
+// Only when run directly. The probe rules below are the experiment's ground
+// truth, and a bug in them turns a typo into a conclusion about a model — so
+// they are importable and tested rather than sealed inside a script.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().then(
+    () => process.exit(0),
+    (error: unknown) => {
+      console.error('\nexperiment failed:', error instanceof Error ? error.message : error);
+      process.exit(1);
+    },
+  );
+}
