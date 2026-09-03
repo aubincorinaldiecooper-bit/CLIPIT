@@ -234,6 +234,17 @@ function inSegmentOrder(files: string[], pattern: RegExp): string[] {
 /** How often the chunk directory is checked while ffmpeg runs. */
 const SEGMENT_POLL_MS = 250;
 
+/**
+ * How many times a closed chunk is probed before it is called unreadable.
+ *
+ * A probe can fail for reasons that have nothing to do with the file — the
+ * process could not be launched, or it timed out under load. measureSegments
+ * probes again after the encode and may well succeed, so treating the first
+ * failure as proof would silence progress on a video that is perfectly fine.
+ */
+const PROBE_ATTEMPTS = 3;
+const PROBE_RETRY_MS = 200;
+
 /** A chunk with no playable content. measureSegments drops these. */
 function isEmptyChunk(durationSeconds: number): boolean {
   return !Number.isFinite(durationSeconds) || durationSeconds <= 0;
@@ -280,7 +291,11 @@ export function watchClosedSegments(
   chunkDir: string,
   chunkSeconds: number,
   onClosed: (index: number) => void | Promise<void>,
+  /** Retry pacing. Only the tests pass this, to remove a race from a race test. */
+  probe: { attempts?: number; retryMs?: number } = {},
 ) {
+  const probeAttempts = probe.attempts ?? PROBE_ATTEMPTS;
+  const probeRetryMs = probe.retryMs ?? PROBE_RETRY_MS;
   let nextIndex = 0;
   let stopped = false;
   // Set once a chunk is found that will make measureSegments fail the run.
@@ -312,6 +327,26 @@ export function watchClosedSegments(
   };
 
   /**
+   * Probes a closed chunk, giving a failed probe a couple more chances before
+   * calling the file unreadable. A blip costs 400ms; a genuinely broken chunk
+   * costs the same 400ms once, and then nothing, because the run is over.
+   */
+  const probeUntilSure = async (
+    filePath: string,
+  ): Promise<{ readable: boolean; seconds: number }> => {
+    for (let attempt = 1; attempt <= probeAttempts; attempt += 1) {
+      const probed = await ffprobe(filePath).then(
+        (probe) => ({ readable: true, seconds: probe.durationSeconds }),
+        () => null,
+      );
+      if (probed) return probed;
+      if (stopped || attempt === probeAttempts) break;
+      await new Promise((resolve) => setTimeout(resolve, probeRetryMs));
+    }
+    return { readable: false, seconds: Number.NaN };
+  };
+
+  /**
    * Considers each closed file in order. `includeFinal` is only true once the
    * process has exited, when the newest file is closed too.
    */
@@ -325,10 +360,7 @@ export function watchClosedSegments(
     while (!stopped && !doomed && nextIndex < limit) {
       const index = nextIndex;
       nextIndex += 1;
-      const probed = await ffprobe(path.join(chunkDir, files[index]!)).then(
-        (probe) => ({ readable: true, seconds: probe.durationSeconds }),
-        () => ({ readable: false, seconds: Number.NaN }),
-      );
+      const probed = await probeUntilSure(path.join(chunkDir, files[index]!));
       // The run can fail while that probe is outstanding. Clearing the timer
       // does not cancel a poll already in flight, and the fallback deletes
       // this directory — so without this check a caller could be handed a
@@ -336,7 +368,8 @@ export function watchClosedSegments(
       if (stopped) return;
 
       // measureSegments probes without catching, and throws on an oversized
-      // segment, so either of these fails the whole job. Every later chunk is
+      // segment, so either of these fails the whole job — and by here the
+      // probe has been retried, so an unreadable file really is unreadable. Every later chunk is
       // then doomed too, however healthy it looks: the fallback deletes the
       // lot. Skipping just this one and carrying on would announce chunks
       // from a run that is already over.

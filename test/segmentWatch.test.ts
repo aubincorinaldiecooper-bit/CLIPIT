@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { run } from '../src/lib/exec.js';
@@ -147,6 +147,42 @@ describe.skipIf(!ffmpegAvailable)('watching chunks close', () => {
     expect(seen).toEqual([0]);
     // measureSegments probes without catching, so the run dies here too.
     await expect(measureSegments(dir, CHUNK_SECONDS)).rejects.toThrow();
+  }, 60_000);
+
+  it('recovers when a probe fails and the chunk turns out to be fine', async () => {
+    await chunk(0, 2);
+    await chunk(2, 2);
+    await chunk(3, 2);
+    // Built up front and swapped in by rename, which is atomic — so the watch
+    // sees either the unreadable file or the good one, never a half-written
+    // file that could pass by accident.
+    const ready = path.join(dir, 'replacement.bin');
+    await chunk(1, 2);
+    await rename(path.join(dir, 'chunk_0001.mp4'), ready);
+    await writeFile(path.join(dir, 'chunk_0001.mp4'), 'not readable yet');
+
+    const seen: number[] = [];
+    // Retries slowed right down so the swap below cannot land in the wrong
+    // gap on a loaded machine. At the shipped 200ms this test passes and fails
+    // by luck, which is worse than not having it.
+    const watcher = watchClosedSegments(dir, CHUNK_SECONDS, (i) => { seen.push(i); },
+      { retryMs: 1_500 });
+    // The first probe fails; this lands well after it and well before the
+    // second — which is what a probe that could not launch, or timed out under
+    // load, looks like from here. measureSegments probes again after the
+    // encode and would read the file fine, so going quiet for good would lose
+    // progress on a video that is not broken.
+    const swap = setTimeout(() => { void rename(ready, path.join(dir, 'chunk_0001.mp4')); }, 900);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 4_000));
+      await watcher.flush();
+    } finally {
+      clearTimeout(swap);
+    }
+
+    expect(seen).toEqual([0, 1, 2, 3]);
+    const kept = await measureSegments(dir, CHUNK_SECONDS);
+    expect(kept.map((segment) => segment.index)).toEqual(seen);
   }, 60_000);
 
   it('waits for an async callback before it reports itself finished', async () => {
