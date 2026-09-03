@@ -45,6 +45,23 @@ async function empty(index: number): Promise<void> {
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 400));
 
+/**
+ * Wait for the watch to have announced what we are waiting for, rather than
+ * sleeping a guessed interval and hoping.
+ *
+ * A fixed wait passed alone and failed inside the full suite, where a probe
+ * takes longer than the poll it is racing. Waiting on the condition is right
+ * whenever there IS one; the "expect nothing" cases below still sleep,
+ * because you cannot wait for an absence.
+ */
+async function until(predicate: () => boolean, whatFor: string, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${whatFor}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 beforeEach(async () => {
   await rm(dir, { recursive: true, force: true });
   await mkdir(dir, { recursive: true });
@@ -60,8 +77,9 @@ describe.skipIf(!ffmpegAvailable)('watching chunks close', () => {
     await chunk(2, 2);
     const seen: number[] = [];
     const watcher = watchClosedSegments(dir, CHUNK_SECONDS, (i) => { seen.push(i); });
+    await until(() => seen.length >= 2, 'the two closed chunks');
+    // The newest file is the one ffmpeg still has open, so it never arrives.
     await settle();
-    // The newest file is the one ffmpeg still has open.
     expect(seen).toEqual([0, 1]);
 
     await watcher.flush();

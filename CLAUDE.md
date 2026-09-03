@@ -60,6 +60,34 @@ What that means in practice:
 Commit messages, pull request descriptions, and code comments are the place
 for precision and detail. Chat is the place for being understood.
 
+## Every clip is vertical. Never landscape. Ever.
+
+The owner's decision, 3 September 2026, and it is permanent. 9:16 is not a
+default, a preference, or something the person's wording can influence. It is
+what this product delivers.
+
+It replaced a rule that read the shape out of the instruction: "3 moments for
+TikTok" earned a 9:16 derivative, "the part where they introduce themselves"
+came back as shot. That was defensible — building a vertical cut for everyone
+costs a framing call and an encode per clip — and it failed in a way worth
+remembering. A search whose wording happened to carry no platform word
+produced a landscape clip, and the review card, fixed at 9:16, drew it as a
+narrow band floating in a tall black box. Nothing had failed. The clip was cut
+quickly and correctly and still looked broken, because its shape had been
+decided by whether the person typed "TikTok".
+
+Deliberately gone with it: the "keep the original framing" escape hatch. No
+phrase returns landscape now. That is what "never, ever" means.
+
+The rule lives in `src/services/search/presentationTarget.ts`. Change it there
+or not at all.
+
+One boundary, and it matters: **the rule governs what is MADE, not how what
+already exists is described.** A clip cut before this rule is landscape, and
+it is still served, still played, still labelled 16:9. Re-cutting one produces
+9:16 like everything else. Hiding somebody's existing library behind a rule
+about future work would be its own kind of lie.
+
 ## Ask before changing direction
 
 **Never change the product's direction as a side effect of another change.** If

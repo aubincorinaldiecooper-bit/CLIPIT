@@ -68,7 +68,13 @@ export async function handleThumbnailBackfill(job: Job<ThumbnailBackfillJob>): P
           videoId: video.videoId,
           proxyStorageKey: video.proxyStorageKey,
           playbackStorageKey,
-          presentation: request?.presentationTarget === 'vertical' ? 'vertical' : 'original',
+          // The REQUEST's own target, not the rule. This backfill only draws a
+        // still for a clip that already exists, and a still must match the
+        // file it stands for. Forcing 9:16 here would centre-crop a preview
+        // of a clip that is still served, and still played, landscape —
+        // promising a framing the file does not deliver. The rule governs
+        // what is made; this makes nothing.
+        presentation: request?.presentationTarget === 'vertical' ? 'vertical' : 'original',
           matches: group,
           workDir: dir,
           log,

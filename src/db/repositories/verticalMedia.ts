@@ -310,6 +310,13 @@ export async function commitRender(clipId: string, input: RenderCommit, client?:
     const media = input.media.media;
     set('derivative_storage_key', media.derivativeStorageKey);
     sets.push("derivative_status = 'ready'", 'derivative_error = NULL');
+    // The row says what the file is. A re-cut of a clip made before the
+    // always-vertical rule now produces a 9:16 deliverable, and without this
+    // the row would still read 'original' — so the API would keep serving the
+    // landscape canonical and the new derivative would sit there ignored.
+    // Same write as the media itself, so the two can never disagree. A no-op
+    // for a clip that was already vertical.
+    sets.push("presentation = 'vertical'");
     set('composition_mode', media.compositionMode);
     set('focal_x', media.focalX);
     set('focal_y', media.focalY);

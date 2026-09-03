@@ -2,7 +2,7 @@ import type { Logger } from '../../lib/logger.js';
 import { getClip } from '../../db/repositories/clips.js';
 import { enqueueObjectRelease } from '../../queues/index.js';
 import type { RenderedMedia } from '../../db/repositories/verticalMedia.js';
-import { discardUploadedObjects, runOriginalPipeline, runVerticalPipeline } from './verticalPipeline.js';
+import { discardUploadedObjects, runVerticalPipeline } from './verticalPipeline.js';
 import type { Clip } from '../../domain/types.js';
 
 /**
@@ -91,37 +91,16 @@ export async function renderDeliveredMedia(input: {
 
   const context = { videoId, clipId: clip.id };
 
-  // Rows older than the column all came from the vertical pipeline.
-  if ((clip.presentation ?? 'vertical') === 'original') {
-    const poster = await runOriginalPipeline({
-      videoId,
-      clipId: clip.id,
-      canonicalPath: input.canonicalPath,
-      workDir: input.workDir,
-      durationSeconds: input.cut.durationSeconds,
-      width: input.cut.width,
-      height: input.cut.height,
-      render,
-      snapshotPosterKey: clip.posterStorageKey,
-      currentPosterKey: async () => (await getClip(clip.id))?.posterStorageKey ?? null,
-    });
-    return {
-      media: {
-        kind: 'original',
-        poster: {
-          posterStorageKey: poster.posterStorageKey,
-          posterTimestampSeconds: poster.posterTimestampSeconds,
-          sourceWidth: poster.sourceWidth,
-          sourceHeight: poster.sourceHeight,
-          posterGenerationMs: poster.posterGenerationMs,
-        },
-      },
-      freshKeys: [poster.posterStorageKey],
-      oldKeys: [clip.posterStorageKey].filter((key): key is string => typeof key === 'string'),
-      discard: (reason) => discardUploadedObjects([poster.posterStorageKey], { ...context, reason }),
-    };
-  }
-
+  // Every re-cut comes back 9:16, including one of a clip that was made
+  // landscape before the rule (owner, 2026-09-03). This used to follow the
+  // clip's stored presentation and send an old one through the original
+  // pipeline, which quietly produced another landscape deliverable — the
+  // rule with a hole in it exactly where somebody would press Re-clip.
+  //
+  // No model call is needed to convert one. storedCompositionAnswer has no
+  // framing to reuse for a clip that was never framed, and its fallback is
+  // the whole frame on a blurred background: 9:16, and nothing cropped away.
+  // A clip that WAS framed keeps its own focal point, as it always did.
   const media = await runVerticalPipeline({
     videoId,
     clipId: clip.id,

@@ -209,9 +209,18 @@ export function resolvePlatformIntent(
   };
 }
 
-/** Does a vertical derivative need making for this request? */
-export function needsVerticalDerivative(intent: PlatformIntent): boolean {
-  return intent.platform !== null && intent.presentationTarget === 'vertical';
+/**
+ * Does a vertical derivative need making for this request? Always.
+ *
+ * This used to require a named platform AND a vertical framing target, so a
+ * search that never said "TikTok" produced a landscape clip. Every clip is
+ * 9:16 now — the owner's rule of 2026-09-03, and the reasoning lives in
+ * presentationTarget.ts. The intent is still read for everything else it
+ * decides: which platform's limits apply, how many moments, how long each
+ * may run.
+ */
+export function needsVerticalDerivative(_intent: PlatformIntent): boolean {
+  return true;
 }
 
 /**

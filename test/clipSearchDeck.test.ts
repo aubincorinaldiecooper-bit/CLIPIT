@@ -189,7 +189,13 @@ describe('the deck gate every finished request passes through', () => {
  * the status write with nothing cut behind it; now it owes a deck like any
  * platform question, and only what the deck delivers differs.
  */
-describe('an original-framing request is cut on find too', () => {
+/**
+ * This block used to be about the original-framing path: a request with no
+ * platform word built a landscape deck and owed no derivative. The owner
+ * ended that on 2026-09-03 — every clip is 9:16, never landscape, ever — so
+ * the same requests now take the vertical path like everything else.
+ */
+describe('a request that never mentions a platform is still cut vertical', () => {
   const plain = resolvePlatformIntent('find the funny moments', 90);
   const counted = resolvePlatformIntent('give me 2 funny moments', 90);
   const fourMatches = [0.9, 0.8, 0.7, 0.6].map((confidence, index) => ({
@@ -199,7 +205,7 @@ describe('an original-framing request is cut on find too', () => {
     globalEndSeconds: index * 20 + 15,
   }));
 
-  it('builds an original-framing deck and releases it through the gate', async () => {
+  it('builds a vertical deck and releases it through the gate', async () => {
     const result = await completeRequestWithDeck({
       clipRequestId: 'request-1',
       request: request as any,
@@ -214,20 +220,22 @@ describe('an original-framing request is cut on find too', () => {
     });
 
     expect(result.completed).toBe(true);
-    expect(orchestrateVerticalDeck).toHaveBeenCalledWith(expect.objectContaining({ presentation: 'original' }));
+    // 'find the funny moments' names no platform and still gets 9:16.
+    expect(orchestrateVerticalDeck).toHaveBeenCalledWith(expect.objectContaining({ presentation: 'vertical' }));
     // Same door as a vertical deck: released and completed in one statement,
     // never the plain status write that used to answer these questions.
     expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'footage');
     expect(finishClipRequest).not.toHaveBeenCalled();
   });
 
-  it('owes no derivative for its candidates', async () => {
+  it('owes a derivative for its candidates, so each one is pending', async () => {
     await completeRequestWithDeck({
       clipRequestId: 'request-1', request: request as any, video: video as any, intent: plain,
       workDir: '/tmp', log, tally, answeredFrom: 'notes', deckAttemptId: 'attempt-1', deckStartedAtMs: 0,
     });
     const input = orchestrateVerticalDeck.mock.calls[0]![0] as { candidates: Array<{ derivativeStatus: unknown }> };
-    expect(input.candidates.map((c) => c.derivativeStatus)).toEqual([null]);
+    // Was [null] — nothing owed. Now every candidate is owed its 9:16 file.
+    expect(input.candidates.map((c) => c.derivativeStatus)).toEqual(['pending']);
   });
 
   it('cuts every moment it found when the question named no number', async () => {
