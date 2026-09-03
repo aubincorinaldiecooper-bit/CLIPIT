@@ -212,71 +212,225 @@ export async function splitIntoChunks(
  * files directly, the older two-pass route writes them with a copy — so the
  * grid, its clamping and its keyframe guard cannot differ between them.
  */
+/**
+ * Orders segment files by the number in their name, never by the text of it.
+ *
+ * ffmpeg's %04d is a minimum width, not a maximum: the ten-thousandth chunk is
+ * chunk_10000.mp4, and as text that sorts between chunk_1000 and chunk_1001.
+ * Every segment after it would then be measured against the wrong neighbour,
+ * and the global start seconds — the numbers every found moment is reported
+ * against — would be wrong from that point to the end of the video. A long
+ * enough source with a short enough chunk reaches this inside the supported
+ * settings: 360000 seconds cut every 30 makes twelve thousand pieces.
+ */
+function inSegmentOrder(files: string[], pattern: RegExp): string[] {
+  return files
+    .map((file) => ({ file, position: Number(pattern.exec(file)?.[1]) }))
+    .filter((entry) => Number.isFinite(entry.position))
+    .sort((a, b) => a.position - b.position)
+    .map((entry) => entry.file);
+}
+
 /** How often the chunk directory is checked while ffmpeg runs. */
 const SEGMENT_POLL_MS = 250;
+
+/**
+ * How many times a closed chunk is probed before it is called unreadable.
+ *
+ * A probe can fail for reasons that have nothing to do with the file — the
+ * process could not be launched, or it timed out under load. measureSegments
+ * probes again after the encode and may well succeed, so treating the first
+ * failure as proof would silence progress on a video that is perfectly fine.
+ */
+const PROBE_ATTEMPTS = 3;
+const PROBE_RETRY_MS = 200;
+
+/** A chunk with no playable content. measureSegments drops these. */
+function isEmptyChunk(durationSeconds: number): boolean {
+  return !Number.isFinite(durationSeconds) || durationSeconds <= 0;
+}
+
+/**
+ * A chunk far longer than asked for, which means the muxer had nowhere to cut
+ * and the model would receive several chunks' worth of video in one request.
+ * measureSegments treats this as a hard failure.
+ */
+function isOversizedChunk(durationSeconds: number, chunkSeconds: number): boolean {
+  return durationSeconds > chunkSeconds * 1.5;
+}
 
 /**
  * Reports each analysis segment as it finishes, while ffmpeg is still running.
  *
  * The segment muxer opens the next file at the moment it closes the current
- * one, so segment N is complete exactly when segment N+1 appears. The final
- * segment is only complete when the process exits, which is what `flush` is
- * for — and why a failed run calls `stop` instead: the file it was still
- * writing is not a finished segment and must not be announced as one.
+ * one, so every file but the newest is complete. The newest is still being
+ * written and is never probed or announced until the process exits, which is
+ * what `flush` is for — and why a failed run calls `stop` instead: the file
+ * ffmpeg died holding is not a finished segment.
  *
- * A caller's callback can never take an encode down with it. A throw is
- * caught and logged, because losing a whole preprocessing job to a bad
- * progress handler would be absurd.
+ * Only chunks that measureSegments would keep are announced, and under the
+ * index it would give them, so a caller acting on progress never sees a chunk
+ * that is missing from the final result. A chunk that would make
+ * measureSegments fail — unreadable, or far longer than the target — ends the
+ * announcements altogether rather than being skipped, because that run is over
+ * and every later chunk goes with it. That costs one probe per chunk which
+ * measureSegments later repeats; the duplicate is worth the guarantee.
+ *
+ * A caller's callback can never take an encode down with it. Both a throw and
+ * a rejected promise are caught and logged, and the callbacks are awaited
+ * before this resolves, so nothing is left running after the job is reported
+ * done. Losing a whole preprocessing job to a bad progress handler would be
+ * absurd: the job is worth more than the reporting.
+ *
+ * Exported for its own tests: stopping the watch while a probe is outstanding
+ * has no deterministic route through createProxiesAndChunks, and it is the
+ * case that decides whether a failed run can announce a chunk that is about to
+ * be deleted.
  */
-function watchClosedSegments(chunkDir: string, onClosed: (index: number) => void) {
-  let highestSeen = -1;
-  let announced = -1;
+export function watchClosedSegments(
+  chunkDir: string,
+  chunkSeconds: number,
+  onClosed: (index: number) => void | Promise<void>,
+  /** Retry pacing. Only the tests pass this, to remove a race from a race test. */
+  probe: { attempts?: number; retryMs?: number } = {},
+) {
+  const probeAttempts = probe.attempts ?? PROBE_ATTEMPTS;
+  const probeRetryMs = probe.retryMs ?? PROBE_RETRY_MS;
+  let nextIndex = 0;
+  let stopped = false;
+  // Set once a chunk is found that will make measureSegments fail the run.
+  let doomed = false;
+  const pending: Array<Promise<void>> = [];
 
-  const announceThrough = (index: number): void => {
-    while (announced < index) {
-      announced += 1;
-      try {
-        onClosed(announced);
-      } catch (cause) {
-        logger.warn('a segment progress callback threw; the encode continues', {
-          index: announced,
-          error: cause instanceof Error ? cause.message : String(cause),
-        });
+  const announce = (index: number): void => {
+    try {
+      const outcome = onClosed(index);
+      // `void` in the signature still accepts an async callback, so a
+      // rejection here would otherwise escape as an unhandled rejection and
+      // take the process with it.
+      if (outcome && typeof (outcome as PromiseLike<void>).then === 'function') {
+        pending.push(
+          Promise.resolve(outcome).catch((cause: unknown) => {
+            logger.warn('a segment progress callback rejected; the encode continues', {
+              index,
+              error: cause instanceof Error ? cause.message : String(cause),
+            });
+          }),
+        );
       }
+    } catch (cause) {
+      logger.warn('a segment progress callback threw; the encode continues', {
+        index,
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
     }
   };
 
-  const poll = async (): Promise<void> => {
-    const files = await readdir(chunkDir).catch(() => [] as string[]);
-    for (const file of files) {
-      const match = /^chunk_(\d+)\.mp4$/.exec(file);
-      if (match) highestSeen = Math.max(highestSeen, Number(match[1]));
+  /**
+   * Probes a closed chunk, giving a failed probe a couple more chances before
+   * calling the file unreadable. A blip costs 400ms; a genuinely broken chunk
+   * costs the same 400ms once, and then nothing, because the run is over.
+   */
+  const probeUntilSure = async (
+    filePath: string,
+  ): Promise<{ readable: boolean; seconds: number }> => {
+    for (let attempt = 1; attempt <= probeAttempts; attempt += 1) {
+      const probed = await ffprobe(filePath).then(
+        (probe) => ({ readable: true, seconds: probe.durationSeconds }),
+        () => null,
+      );
+      if (probed) return probed;
+      if (stopped || attempt === probeAttempts) break;
+      await new Promise((resolve) => setTimeout(resolve, probeRetryMs));
+      // The run can fail while we are waiting to try again. Without this the
+      // next probe launches anyway, and a stray ffprobe on a file that is
+      // about to be deleted can sit there until its own timeout.
+      if (stopped) break;
     }
-    // Everything below the newest file is closed. The newest is still open.
-    announceThrough(highestSeen - 1);
+    return { readable: false, seconds: Number.NaN };
   };
 
-  const timer = setInterval(() => void poll(), SEGMENT_POLL_MS);
+  /**
+   * Considers each closed file in order. `includeFinal` is only true once the
+   * process has exited, when the newest file is closed too.
+   */
+  const drain = async (includeFinal: boolean): Promise<void> => {
+    const files = inSegmentOrder(
+      await readdir(chunkDir).catch(() => [] as string[]),
+      /^chunk_(\d+)\.mp4$/,
+    );
+    const limit = includeFinal ? files.length : files.length - 1;
+
+    while (!stopped && !doomed && nextIndex < limit) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const probed = await probeUntilSure(path.join(chunkDir, files[index]!));
+      // The run can fail while that probe is outstanding. Clearing the timer
+      // does not cancel a poll already in flight, and the fallback deletes
+      // this directory — so without this check a caller could be handed a
+      // chunk from a failed run that is about to stop existing.
+      if (stopped) return;
+
+      // measureSegments probes without catching, and throws on an oversized
+      // segment, so either of these fails the whole job — and by here the
+      // probe has been retried, so an unreadable file really is unreadable. Every later chunk is
+      // then doomed too, however healthy it looks: the fallback deletes the
+      // lot. Skipping just this one and carrying on would announce chunks
+      // from a run that is already over.
+      if (!probed.readable || isOversizedChunk(probed.seconds, chunkSeconds)) {
+        doomed = true;
+        return;
+      }
+      // A chunk that probed cleanly with nothing in it. measureSegments drops
+      // this one and keeps going, so it is a silent skip, not a failure.
+      if (isEmptyChunk(probed.seconds)) continue;
+      announce(index);
+    }
+  };
+
+  // Drains run one at a time. Two overlapping polls — easy once a probe takes
+  // longer than the poll interval — could otherwise announce out of order.
+  let inFlight: Promise<void> = Promise.resolve();
+  const enqueue = (includeFinal: boolean): Promise<void> => {
+    inFlight = inFlight
+      .then(() => (stopped || doomed ? undefined : drain(includeFinal)))
+      .catch(() => undefined);
+    return inFlight;
+  };
+
+  let timer: ReturnType<typeof setInterval> | null = setInterval(() => {
+    void enqueue(false);
+  }, SEGMENT_POLL_MS);
   timer.unref?.();
 
+  const halt = (): void => {
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
+
   return {
-    /** Abandons the watch without claiming the segment still being written. */
+    /**
+     * Abandons the watch without claiming the segment still being written, and
+     * without letting a poll already in flight announce anything more.
+     */
     stop(): void {
-      clearInterval(timer);
+      stopped = true;
+      halt();
     },
-    /** Stops, then reports the final segment, which closes with the process. */
+    /** Reports the final segment, which closes with the process, then settles. */
     async flush(): Promise<void> {
-      clearInterval(timer);
-      await poll();
-      announceThrough(highestSeen);
+      halt();
+      // Let a poll that is already running finish before the last look, so
+      // indices stay in order.
+      await inFlight;
+      await drain(true);
+      await Promise.all(pending);
     },
   };
 }
 
 export async function measureSegments(outputDir: string, chunkSeconds: number): Promise<ProxySegment[]> {
-  const files = (await readdir(outputDir))
-    .filter((file) => /^chunk_\d+\.mp4$/.test(file))
-    .sort();
+  const files = inSegmentOrder(await readdir(outputDir), /^chunk_(\d+)\.mp4$/);
 
   const segments: ProxySegment[] = [];
   let cursor = 0;
@@ -286,7 +440,7 @@ export async function measureSegments(outputDir: string, chunkSeconds: number): 
     const probe = await ffprobe(filePath);
     const duration = probe.durationSeconds;
 
-    if (!Number.isFinite(duration) || duration <= 0) {
+    if (isEmptyChunk(duration)) {
       logger.warn('skipping zero-length chunk', { file });
       continue;
     }
@@ -304,7 +458,7 @@ export async function measureSegments(outputDir: string, chunkSeconds: number): 
   // Guard against a silent regression in keyframe placement: an oversized
   // segment means the muxer had nowhere to cut, and the model would receive far
   // more than one chunk's worth of video in a single request.
-  const oversized = segments.find((segment) => segment.durationSeconds > chunkSeconds * 1.5);
+  const oversized = segments.find((segment) => isOversizedChunk(segment.durationSeconds, chunkSeconds));
   if (oversized) {
     throw new Error(
       `Chunking produced a ${Math.round(oversized.durationSeconds)}s segment for a ${chunkSeconds}s target — ` +
@@ -359,9 +513,14 @@ export async function createProxiesAndChunks(input: {
   /**
    * Fires with the chunk index as each one is finished, while the encode is
    * still running — not in a batch at the end. A chunk is announced only once
-   * the muxer has closed it, so the file it names is complete and safe to read.
+   * the muxer has closed it and it has passed the same checks the returned
+   * segments pass, so every index announced appears in `segments` and the file
+   * it names is complete and safe to read.
+   *
+   * May be async: this call does not resolve until every callback has settled,
+   * and neither a throw nor a rejection can fail the encode.
    */
-  onSegmentClosed?: (index: number) => void;
+  onSegmentClosed?: (index: number) => void | Promise<void>;
 }): Promise<SinglePassOutputs> {
   const chunkSeconds = input.chunkSeconds ?? env.ANALYSIS_CHUNK_SECONDS;
   const gopFrames = Math.max(1, Math.round(chunkSeconds * env.PROXY_FPS));
@@ -399,7 +558,7 @@ export async function createProxiesAndChunks(input: {
 
   // Nothing polls unless somebody is listening.
   const watcher = input.onSegmentClosed
-    ? watchClosedSegments(input.chunkDir, input.onSegmentClosed)
+    ? watchClosedSegments(input.chunkDir, chunkSeconds, input.onSegmentClosed)
     : null;
 
   try {
@@ -507,9 +666,7 @@ export async function extractAudioSegments(
     { timeoutMs: 6 * 60 * 60 * 1000 },
   );
 
-  const files = (await readdir(outputDir))
-    .filter((file) => /^audio_\d+\.mp3$/.test(file))
-    .sort();
+  const files = inSegmentOrder(await readdir(outputDir), /^audio_(\d+)\.mp3$/);
 
   const segments: AudioSegment[] = [];
 
