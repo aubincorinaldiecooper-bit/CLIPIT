@@ -240,7 +240,10 @@ function isOversizedChunk(durationSeconds: number, chunkSeconds: number): boolea
  *
  * Only chunks that measureSegments would keep are announced, and under the
  * index it would give them, so a caller acting on progress never sees a chunk
- * that is missing from the final result. That costs one probe per chunk which
+ * that is missing from the final result. A chunk that would make
+ * measureSegments fail — unreadable, or far longer than the target — ends the
+ * announcements altogether rather than being skipped, because that run is over
+ * and every later chunk goes with it. That costs one probe per chunk which
  * measureSegments later repeats; the duplicate is worth the guarantee.
  *
  * A caller's callback can never take an encode down with it. Both a throw and
@@ -261,6 +264,8 @@ export function watchClosedSegments(
 ) {
   let nextIndex = 0;
   let stopped = false;
+  // Set once a chunk is found that will make measureSegments fail the run.
+  let doomed = false;
   const pending: Array<Promise<void>> = [];
 
   const announce = (index: number): void => {
@@ -297,21 +302,31 @@ export function watchClosedSegments(
       .sort();
     const limit = includeFinal ? files.length : files.length - 1;
 
-    while (!stopped && nextIndex < limit) {
+    while (!stopped && !doomed && nextIndex < limit) {
       const index = nextIndex;
       nextIndex += 1;
-      const duration = await ffprobe(path.join(chunkDir, files[index]!))
-        .then((probe) => probe.durationSeconds)
-        .catch(() => Number.NaN);
+      const probed = await ffprobe(path.join(chunkDir, files[index]!)).then(
+        (probe) => ({ readable: true, seconds: probe.durationSeconds }),
+        () => ({ readable: false, seconds: Number.NaN }),
+      );
       // The run can fail while that probe is outstanding. Clearing the timer
       // does not cancel a poll already in flight, and the fallback deletes
       // this directory — so without this check a caller could be handed a
       // chunk from a failed run that is about to stop existing.
       if (stopped) return;
-      // Silence here is deliberate: measureSegments reports the empty chunk and
-      // fails the job over the oversized one. Announcing either would hand a
-      // caller a chunk that is about to be dropped or to fail the whole run.
-      if (isEmptyChunk(duration) || isOversizedChunk(duration, chunkSeconds)) continue;
+
+      // measureSegments probes without catching, and throws on an oversized
+      // segment, so either of these fails the whole job. Every later chunk is
+      // then doomed too, however healthy it looks: the fallback deletes the
+      // lot. Skipping just this one and carrying on would announce chunks
+      // from a run that is already over.
+      if (!probed.readable || isOversizedChunk(probed.seconds, chunkSeconds)) {
+        doomed = true;
+        return;
+      }
+      // A chunk that probed cleanly with nothing in it. measureSegments drops
+      // this one and keeps going, so it is a silent skip, not a failure.
+      if (isEmptyChunk(probed.seconds)) continue;
       announce(index);
     }
   };
@@ -321,7 +336,7 @@ export function watchClosedSegments(
   let inFlight: Promise<void> = Promise.resolve();
   const enqueue = (includeFinal: boolean): Promise<void> => {
     inFlight = inFlight
-      .then(() => (stopped ? undefined : drain(includeFinal)))
+      .then(() => (stopped || doomed ? undefined : drain(includeFinal)))
       .catch(() => undefined);
     return inFlight;
   };

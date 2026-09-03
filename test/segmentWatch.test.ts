@@ -2,7 +2,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { run } from '../src/lib/exec.js';
-import { watchClosedSegments } from '../src/services/media/ffmpeg.js';
+import { measureSegments, watchClosedSegments } from '../src/services/media/ffmpeg.js';
 
 /**
  * The watch that tells the rest of the system a piece of video is ready.
@@ -29,6 +29,16 @@ async function chunk(index: number, seconds: number): Promise<void> {
     '-hide_banner', '-loglevel', 'error', '-y',
     '-f', 'lavfi', '-i', `testsrc=size=64x48:rate=5:duration=${seconds}`,
     '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-an',
+    path.join(dir, `chunk_${String(index).padStart(4, '0')}.mp4`),
+  ], { timeoutMs: 60_000 });
+}
+
+/** A chunk that probes cleanly and holds nothing: no frames, no duration. */
+async function empty(index: number): Promise<void> {
+  await run('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'testsrc=size=64x48:rate=5:duration=1',
+    '-frames:v', '0', '-c:v', 'libx264', '-an',
     path.join(dir, `chunk_${String(index).padStart(4, '0')}.mp4`),
   ], { timeoutMs: 60_000 });
 }
@@ -90,21 +100,53 @@ describe.skipIf(!ffmpegAvailable)('watching chunks close', () => {
     expect(seen).toEqual([0, 1]);
   }, 60_000);
 
-  it('never announces a chunk that would be dropped or would fail the run', async () => {
+  it('keeps going past an empty chunk, which the final list simply drops', async () => {
     await chunk(0, 2);
-    // Far longer than the target: the muxer had nowhere to cut, and
-    // measureSegments fails the whole job over it.
-    await chunk(1, CHUNK_SECONDS * 2);
+    await empty(1);
     await chunk(2, 2);
-    // A file that is not video at all — nothing to measure, nothing to hand on.
-    await writeFile(path.join(dir, 'chunk_0003.mp4'), 'not a video');
-    await chunk(4, 2);
+    await chunk(3, 2);
 
     const seen: number[] = [];
     const watcher = watchClosedSegments(dir, CHUNK_SECONDS, (i) => { seen.push(i); });
     await watcher.flush();
-    // 1 is oversized, 3 is unreadable. Both are silent.
-    expect(seen).toEqual([0, 2, 4]);
+    // measureSegments logs this one and carries on, so the watch does too —
+    // and the two agree exactly, which is the whole promise of the callback.
+    expect(seen).toEqual([0, 2, 3]);
+    const kept = await measureSegments(dir, CHUNK_SECONDS);
+    expect(kept.map((segment) => segment.index)).toEqual(seen);
+  }, 60_000);
+
+  it('goes quiet for good at a chunk that will fail the whole run', async () => {
+    await chunk(0, 2);
+    // Far longer than the target: the muxer had nowhere to cut, and
+    // measureSegments throws over it rather than dropping it.
+    await chunk(1, CHUNK_SECONDS * 2);
+    await chunk(2, 2);
+    await chunk(3, 2);
+
+    const seen: number[] = [];
+    const watcher = watchClosedSegments(dir, CHUNK_SECONDS, (i) => { seen.push(i); });
+    await watcher.flush();
+    // 2 and 3 look perfectly healthy and are still never announced: this run
+    // is already over, and the fallback is about to delete all of them.
+    expect(seen).toEqual([0]);
+    // The reason it is over.
+    await expect(measureSegments(dir, CHUNK_SECONDS)).rejects.toThrow(/no keyframe/);
+  }, 60_000);
+
+  it('goes quiet for good at a chunk it cannot read', async () => {
+    await chunk(0, 2);
+    // measureSegments probes without catching, so this ends the run.
+    await writeFile(path.join(dir, 'chunk_0001.mp4'), 'not a video');
+    await chunk(2, 2);
+    await chunk(3, 2);
+
+    const seen: number[] = [];
+    const watcher = watchClosedSegments(dir, CHUNK_SECONDS, (i) => { seen.push(i); });
+    await watcher.flush();
+    expect(seen).toEqual([0]);
+    // measureSegments probes without catching, so the run dies here too.
+    await expect(measureSegments(dir, CHUNK_SECONDS)).rejects.toThrow();
   }, 60_000);
 
   it('waits for an async callback before it reports itself finished', async () => {
