@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -89,6 +90,22 @@ app = modal.App(APP_NAME, image=image)
 weights = modal.Volume.from_name("clipit-qwen-weights", create_if_missing=True)
 
 
+# Anything URL-shaped, removed from text that is about to travel.
+_URLISH = re.compile(r"https?://\S+")
+
+
+def scrub(text: str) -> str:
+    """
+    Text that is safe to hand back to a caller and safe to log.
+
+    Applied to every failure message leaving this service. A signed URL is a
+    temporary key to someone's footage; the rule here is that it is never
+    logged, and a failure `reason` is logged like anything else. One place to
+    enforce that beats remembering at every raise site.
+    """
+    return _URLISH.sub("<signed url>", text)
+
+
 def cache_path(video_key: str) -> str:
     safe = hashlib.sha256(video_key.encode("utf-8")).hexdigest()[:32]
     return os.path.join(tempfile.gettempdir(), f"clipit-source-{safe}.mp4")
@@ -108,18 +125,38 @@ def fetch_once(video_url: str, video_key: str) -> tuple[str, bool]:
         return path, False
 
     partial = f"{path}.partial"
-    # curl rather than requests: this is a large binary over a signed URL, and
-    # curl streams it to disk without holding it in memory.
-    # No --location. A presigned GET does not redirect, so following one only
-    # means the container fetched something other than what Clipit signed.
-    # This deployment is private compute — invoking it already needs Clipit's
-    # own Modal token — so this is not closing an open door; it is declining
-    # to open a second one for no benefit.
-    subprocess.run(
-        ["curl", "--silent", "--show-error", "--fail",
-         "--max-time", "900", "--output", partial, video_url],
-        check=True,
-    )
+
+    # The URL never touches the command line.
+    #
+    # A signed URL is a temporary key to somebody's footage, and this codebase
+    # already holds that a logged signed URL is a logged copy of the video. On
+    # the argv route it escaped twice over: into the process listing, and —
+    # worse — into CalledProcessError, whose text is the entire command. That
+    # text went straight back to Clipit as a failure `reason`, and from there
+    # into the logs. Verified before fixing: the signature was in the string.
+    #
+    # curl reads its configuration from stdin instead, so the URL is in
+    # neither place, and a failure is re-raised carrying only curl's own
+    # message and its exit status.
+    #
+    # No `location`, either. A presigned GET does not redirect, so following
+    # one would only mean fetching something other than what Clipit signed.
+    config = "\n".join([
+        f'url = "{video_url}"',
+        f'output = "{partial}"',
+        "silent", "show-error", "fail", "max-time = 900",
+    ]) + "\n"
+    try:
+        subprocess.run(
+            ["curl", "--config", "-"], input=config, text=True,
+            capture_output=True, check=True, timeout=960,
+        )
+    except subprocess.CalledProcessError as error:
+        detail = scrub((error.stderr or "").strip()) or f"curl exited {error.returncode}"
+        raise RuntimeError(f"could not download the source video: {detail}") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("could not download the source video: timed out") from None
+
     os.replace(partial, path)
     return path, True
 
@@ -327,7 +364,7 @@ class QwenEmbeddingService:
                     ),
                 })
             except Exception as error:  # noqa: BLE001 - reported, never swallowed
-                failed.append({"id": interval_id, "reason": f"{type(error).__name__}: {error}"})
+                failed.append({"id": interval_id, "reason": scrub(f"{type(error).__name__}: {error}")})
 
         return {
             "model": MODEL_ID,

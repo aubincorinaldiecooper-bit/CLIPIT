@@ -333,6 +333,36 @@ function gpuMsFrom(metrics: Array<Record<string, unknown>>): number {
   return metrics.reduce((sum, row) => sum + (typeof row.total_ms === 'number' ? row.total_ms : 0), 0);
 }
 
+/**
+ * Can this grid tell a probe's answer from its distractor at all?
+ *
+ * Two ranges that do not overlap EACH OTHER can still both sit inside one
+ * window — likelier the coarser the grid, and likelier still where windows
+ * overlap. When that happens there is no window holding the twin and not the
+ * answer, and the visible-text comparison has nothing to compare: the margin
+ * would come out at zero and read as "the model cannot tell these apart",
+ * when in truth nothing was ever put side by side.
+ *
+ * Checked per grid, because it is a property of the grid and not of the
+ * probe, and the sweep runs several.
+ */
+function assertDistractorsSeparable(probes: Probe[], windows: IndexWindow[], grid: string): void {
+  for (const [index, probe] of probes.entries()) {
+    if (!probe.distractor) continue;
+    const separable = windows.some(
+      (window) => overlaps(window, probe.distractor!) && !overlaps(window, probe.expect),
+    );
+    if (!separable) {
+      throw new Error(
+        `probe ${index} ("${probe.query}") at ${grid}: no window holds the distractor ` +
+          `(${probe.distractor.startSeconds}-${probe.distractor.endSeconds}s) without also holding the ` +
+          `answer (${probe.expect.startSeconds}-${probe.expect.endSeconds}s), so comparing them would ` +
+          'measure one piece of footage against itself. Move them further apart, or drop this grid.',
+      );
+    }
+  }
+}
+
 // --------------------------------------------------------------------- main
 
 async function main(): Promise<void> {
@@ -415,9 +445,17 @@ async function main(): Promise<void> {
   ]);
   const asymmetry = 1 - similarity(asQuery.embedded[0]!.embedding, asDocument.embedded[0]!.embedding);
   if (asymmetry < 1e-6) {
-    console.log('WARNING  the same sentence embeds identically as a question and as a document.');
-    console.log('         The query/document distinction is doing nothing, so every number below');
-    console.log('         is measuring symmetric embeddings. Fix the service before trusting it.\n');
+    // A measurement run STOPS here. Printing a warning and carrying on would
+    // write a report file that looks like every other report file, with the
+    // one fact that invalidates it two hundred lines up the scrollback. An
+    // exploration run (--ask) may continue: it makes no claims and produces
+    // no numbers to be believed.
+    const complaint =
+      'The same sentence embeds identically as a question and as a document, so the ' +
+      'query/document distinction is inert. Every measurement below would be of symmetric ' +
+      'embeddings while claiming otherwise. Fix the service before running this again.';
+    if (probes.length > 0) throw new Error(complaint);
+    console.log(`WARNING  ${complaint}\n`);
   } else {
     console.log(`asymmetry  question and document differ by ${asymmetry.toFixed(4)} — the distinction is live\n`);
   }
@@ -446,6 +484,7 @@ async function main(): Promise<void> {
 
     const windows = planWindows(duration, grid);
     console.log(`  ${windows.length} windows over ${timecode(duration)}`);
+    assertDistractorsSeparable(probes, windows, label);
 
     const startedAt = performance.now();
     const { vectors, failed, metrics } = await embedAllWindows({ proxyKey, identity, windows });
@@ -569,7 +608,14 @@ async function main(): Promise<void> {
           margin: correct && wrong !== null ? Number((correct.score - wrong).toFixed(4)) : null,
           ...(probe.distractor
             ? (() => {
-                const twin = ranked.find((entry) => overlaps(entry.window, probe.distractor!));
+                // The twin has to be footage the answer is NOT also in.
+                // Two ranges that do not overlap each other can still land
+                // inside one ten-second window, and comparing a window with
+                // itself yields a margin of zero — which would read as "the
+                // model cannot tell these apart" when nothing was compared.
+                const twin = ranked.find(
+                  (entry) => overlaps(entry.window, probe.distractor!) && !overlaps(entry.window, probe.expect),
+                );
                 return {
                   distractorScore: twin ? Number(twin.score.toFixed(4)) : null,
                   // The visible-text verdict. Positive means the model read
