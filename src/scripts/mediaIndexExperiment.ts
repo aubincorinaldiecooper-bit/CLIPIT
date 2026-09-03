@@ -536,6 +536,7 @@ async function main(): Promise<void> {
     // interchangeable? — was measured on a set one channel had pruned.
     const spoken = await speechPerWindow(video.id, windows);
     let speechVectors = new Map<string, Float32Array>();
+    const speechMetrics: Array<Record<string, unknown>> = [];
     if (spoken.size > 0) {
       const texts = [...spoken.entries()].map(([id, text]) => ({ id, text }));
       const speechFailures: Array<{ id: string; reason: string }> = [];
@@ -546,6 +547,10 @@ async function main(): Promise<void> {
         });
         for (const row of said.embedded as EmbeddedInterval[]) speechVectors.set(row.id, row.embedding);
         speechFailures.push(...said.failed);
+        // Counted, not discarded. Indexing a video with speech means both
+        // passes, and a cost figure that quietly covers only the pictures is
+        // worse than the missing figure it replaced — it looks answered.
+        speechMetrics.push(said.metrics);
       }
       console.log(`  ${speechVectors.size} of ${texts.length} windows carry speech `+ `(counted over all ${windows.length} planned windows, independently of the pictures)`);
       if (speechFailures.length > 0) {
@@ -696,10 +701,19 @@ async function main(): Promise<void> {
         const pct = (n: number) => `${Math.round((100 * n) / rows.length)}%`.padStart(7);
         console.log(`  ${kind.padEnd(13)} ${String(rows.length).padStart(2)}  ${pct(at('visual', 1))}  ${pct(at('speech', 1))}  ${pct(at('both', 1))}  ${pct(at('both', 3))}`);
       }
-      const embedCost = estimateGpuCost(gpuMsFrom(metrics));
+      // Indexing is BOTH passes. Splitting them out as well, because "the
+      // pictures cost this much and the words cost that much" is the number
+      // that decides whether a channel earns its place.
+      const visualCost = estimateGpuCost(gpuMsFrom(metrics));
+      const speechCost = estimateGpuCost(gpuMsFrom(speechMetrics));
+      const indexCost = estimateGpuCost(gpuMsFrom([...metrics, ...speechMetrics]));
       const rerankCost = estimateGpuCost(gpuMsFrom(rerankMetrics));
-      console.log(`\n  indexing this video: ${embedCost.usd === null ? embedCost.note : `~$${embedCost.usd} (${embedCost.note})`}`);
-      console.log(`  reranking ${probeResults.length} questions: ${rerankCost.usd === null ? rerankCost.note : `~$${rerankCost.usd} (${rerankCost.note})`}`);
+      const money = (cost: { usd: number | null; note: string }) =>
+        cost.usd === null ? cost.note : `~$${cost.usd} (${cost.note})`;
+      console.log(`\n  indexing this video: ${money(indexCost)}`);
+      console.log(`    of which pictures: ${money(visualCost)}`);
+      console.log(`    of which speech:   ${money(speechCost)}`);
+      console.log(`  reranking ${probeResults.length} questions: ${money(rerankCost)}`);
 
       const improved = probeResults.filter((row) => {
         const r = row.reranked as { rankBefore: number | null; rankAfter: number | null } | undefined;
@@ -722,10 +736,13 @@ async function main(): Promise<void> {
       secondsOfVideoPerSecond: Number((duration / (embedMs / 1000)).toFixed(2)),
       speechWindows: speechVectors.size,
       remoteMetrics: metrics,
+      remoteSpeechMetrics: speechMetrics,
       // Estimated, never measured: Modal exposes no billing API to this SDK,
       // so this is the service's own wall-clock times a configured rate.
       estimatedCost: {
-        indexing: estimateGpuCost(gpuMsFrom(metrics)),
+        indexing: estimateGpuCost(gpuMsFrom([...metrics, ...speechMetrics])),
+        indexingVisual: estimateGpuCost(gpuMsFrom(metrics)),
+        indexingSpeech: estimateGpuCost(gpuMsFrom(speechMetrics)),
         reranking: estimateGpuCost(gpuMsFrom(rerankMetrics)),
       },
       probes: probeResults,
