@@ -199,6 +199,35 @@ describe.skipIf(!ffmpegAvailable)('one decode, three outputs', () => {
     }
   }, 300_000);
 
+  it('survives a progress callback that rejects after an await, without an unhandled rejection', async () => {
+    const o = outputs('async-throw');
+    await mkdir(o.chunkDir, { recursive: true });
+
+    // The signature says the callback returns nothing, but TypeScript lets an
+    // async function satisfy that — so a rejection here would escape the
+    // try/catch entirely and, unhandled, take the worker down with it.
+    const unhandled: unknown[] = [];
+    const record = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', record);
+    try {
+      const result = await createProxiesAndChunks({
+        sourcePath: landscape,
+        ...o,
+        onSegmentClosed: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          throw new Error('a caller whose async work failed');
+        },
+      });
+      expect(result.segments.length).toBe(3);
+      // The callbacks are awaited before this resolves, so anything that was
+      // going to reject has already rejected by now.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', record);
+    }
+  }, 300_000);
+
   it('does not let a broken progress callback take the encode down with it', async () => {
     const o = outputs('throwing');
     await mkdir(o.chunkDir, { recursive: true });
@@ -212,4 +241,34 @@ describe.skipIf(!ffmpegAvailable)('one decode, three outputs', () => {
     expect((await ffprobe(o.playbackPath)).hasAudio).toBe(true);
   }, 300_000);
 
+});
+
+describe.skipIf(!ffmpegAvailable)('the guards a chunk has to pass', () => {
+  const dir2 = path.join('/tmp', `clipit-chunk-guards-${process.pid}`);
+
+  beforeAll(async () => {
+    await rm(dir2, { recursive: true, force: true });
+    await mkdir(path.join(dir2, 'chunks'), { recursive: true });
+  });
+  afterAll(async () => {
+    await rm(dir2, { recursive: true, force: true });
+  });
+
+  it('refuses a proxy whose keyframes are nowhere near the cut points', async () => {
+    // The real shape of this failure: keyframes forced every 30s, asked to cut
+    // every 4s. The muxer has nowhere to cut, so one segment swallows the lot
+    // — and the model would be handed several chunks' worth of video in a
+    // single request while the timestamps claimed otherwise.
+    const source = path.join(dir2, 'sparse.mp4');
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=size=320x180:rate=5:duration=40',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+      '-g', '150', '-keyint_min', '150', '-sc_threshold', '0', '-an',
+      source,
+    ], { timeoutMs: 120_000 });
+
+    await expect(splitIntoChunks(source, path.join(dir2, 'chunks'), 4))
+      .rejects.toThrow(/no keyframe at the chunk boundary/);
+  }, 300_000);
 });

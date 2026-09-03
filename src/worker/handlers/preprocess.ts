@@ -79,7 +79,9 @@ async function deriveMedia(input: {
         proxyPath,
         playbackPath,
         chunkDir,
-        onSegmentClosed: () => closedAtMs.push(Math.round(performance.now() - startedAt)),
+        onSegmentClosed: () => {
+          closedAtMs.push(Math.round(performance.now() - startedAt));
+        },
       });
       return {
         playbackPath: result.playbackPath,

@@ -215,60 +215,115 @@ export async function splitIntoChunks(
 /** How often the chunk directory is checked while ffmpeg runs. */
 const SEGMENT_POLL_MS = 250;
 
+/** A chunk with no playable content. measureSegments drops these. */
+function isEmptyChunk(durationSeconds: number): boolean {
+  return !Number.isFinite(durationSeconds) || durationSeconds <= 0;
+}
+
+/**
+ * A chunk far longer than asked for, which means the muxer had nowhere to cut
+ * and the model would receive several chunks' worth of video in one request.
+ * measureSegments treats this as a hard failure.
+ */
+function isOversizedChunk(durationSeconds: number, chunkSeconds: number): boolean {
+  return durationSeconds > chunkSeconds * 1.5;
+}
+
 /**
  * Reports each analysis segment as it finishes, while ffmpeg is still running.
  *
  * The segment muxer opens the next file at the moment it closes the current
- * one, so segment N is complete exactly when segment N+1 appears. The final
- * segment is only complete when the process exits, which is what `flush` is
- * for — and why a failed run calls `stop` instead: the file it was still
- * writing is not a finished segment and must not be announced as one.
+ * one, so every file but the newest is complete. The newest is still being
+ * written and is never probed or announced until the process exits, which is
+ * what `flush` is for — and why a failed run calls `stop` instead: the file
+ * ffmpeg died holding is not a finished segment.
  *
- * A caller's callback can never take an encode down with it. A throw is
- * caught and logged, because losing a whole preprocessing job to a bad
- * progress handler would be absurd.
+ * Only chunks that measureSegments would keep are announced, and under the
+ * index it would give them, so a caller acting on progress never sees a chunk
+ * that is missing from the final result. That costs one probe per chunk which
+ * measureSegments later repeats; the duplicate is worth the guarantee.
+ *
+ * A caller's callback can never take an encode down with it. Both a throw and
+ * a rejected promise are caught and logged, and the callbacks are awaited
+ * before this resolves, so nothing is left running after the job is reported
+ * done. Losing a whole preprocessing job to a bad progress handler would be
+ * absurd: the job is worth more than the reporting.
  */
-function watchClosedSegments(chunkDir: string, onClosed: (index: number) => void) {
-  let highestSeen = -1;
-  let announced = -1;
+function watchClosedSegments(
+  chunkDir: string,
+  chunkSeconds: number,
+  onClosed: (index: number) => void | Promise<void>,
+) {
+  let nextIndex = 0;
+  const pending: Array<Promise<void>> = [];
 
-  const announceThrough = (index: number): void => {
-    while (announced < index) {
-      announced += 1;
-      try {
-        onClosed(announced);
-      } catch (cause) {
-        logger.warn('a segment progress callback threw; the encode continues', {
-          index: announced,
-          error: cause instanceof Error ? cause.message : String(cause),
-        });
+  const announce = (index: number): void => {
+    try {
+      const outcome = onClosed(index);
+      // `void` in the signature still accepts an async callback, so a
+      // rejection here would otherwise escape as an unhandled rejection and
+      // take the process with it.
+      if (outcome && typeof (outcome as PromiseLike<void>).then === 'function') {
+        pending.push(
+          Promise.resolve(outcome).catch((cause: unknown) => {
+            logger.warn('a segment progress callback rejected; the encode continues', {
+              index,
+              error: cause instanceof Error ? cause.message : String(cause),
+            });
+          }),
+        );
       }
+    } catch (cause) {
+      logger.warn('a segment progress callback threw; the encode continues', {
+        index,
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
     }
   };
 
-  const poll = async (): Promise<void> => {
-    const files = await readdir(chunkDir).catch(() => [] as string[]);
-    for (const file of files) {
-      const match = /^chunk_(\d+)\.mp4$/.exec(file);
-      if (match) highestSeen = Math.max(highestSeen, Number(match[1]));
+  /** Considers every closed file up to `limit`, in order. */
+  const drain = async (limit: number): Promise<void> => {
+    const files = (await readdir(chunkDir).catch(() => [] as string[]))
+      .filter((file) => /^chunk_\d+\.mp4$/.test(file))
+      .sort();
+
+    while (nextIndex < Math.min(limit, files.length)) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const duration = await ffprobe(path.join(chunkDir, files[index]!))
+        .then((probe) => probe.durationSeconds)
+        .catch(() => Number.NaN);
+      // Silence here is deliberate: measureSegments reports the empty chunk and
+      // fails the job over the oversized one. Announcing either would hand a
+      // caller a chunk that is about to be dropped or to fail the whole run.
+      if (isEmptyChunk(duration) || isOversizedChunk(duration, chunkSeconds)) continue;
+      announce(index);
     }
-    // Everything below the newest file is closed. The newest is still open.
-    announceThrough(highestSeen - 1);
   };
 
-  const timer = setInterval(() => void poll(), SEGMENT_POLL_MS);
+  let timer: ReturnType<typeof setInterval> | null = setInterval(() => {
+    // Everything but the newest file is closed.
+    void readdir(chunkDir)
+      .then((files) => drain(files.filter((file) => /^chunk_\d+\.mp4$/.test(file)).length - 1))
+      .catch(() => undefined);
+  }, SEGMENT_POLL_MS);
   timer.unref?.();
+
+  const halt = (): void => {
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
 
   return {
     /** Abandons the watch without claiming the segment still being written. */
     stop(): void {
-      clearInterval(timer);
+      halt();
     },
-    /** Stops, then reports the final segment, which closes with the process. */
+    /** Reports the final segment, which closes with the process, then settles. */
     async flush(): Promise<void> {
-      clearInterval(timer);
-      await poll();
-      announceThrough(highestSeen);
+      halt();
+      await drain(Number.POSITIVE_INFINITY);
+      await Promise.all(pending);
     },
   };
 }
@@ -286,7 +341,7 @@ export async function measureSegments(outputDir: string, chunkSeconds: number): 
     const probe = await ffprobe(filePath);
     const duration = probe.durationSeconds;
 
-    if (!Number.isFinite(duration) || duration <= 0) {
+    if (isEmptyChunk(duration)) {
       logger.warn('skipping zero-length chunk', { file });
       continue;
     }
@@ -304,7 +359,7 @@ export async function measureSegments(outputDir: string, chunkSeconds: number): 
   // Guard against a silent regression in keyframe placement: an oversized
   // segment means the muxer had nowhere to cut, and the model would receive far
   // more than one chunk's worth of video in a single request.
-  const oversized = segments.find((segment) => segment.durationSeconds > chunkSeconds * 1.5);
+  const oversized = segments.find((segment) => isOversizedChunk(segment.durationSeconds, chunkSeconds));
   if (oversized) {
     throw new Error(
       `Chunking produced a ${Math.round(oversized.durationSeconds)}s segment for a ${chunkSeconds}s target — ` +
@@ -359,9 +414,14 @@ export async function createProxiesAndChunks(input: {
   /**
    * Fires with the chunk index as each one is finished, while the encode is
    * still running — not in a batch at the end. A chunk is announced only once
-   * the muxer has closed it, so the file it names is complete and safe to read.
+   * the muxer has closed it and it has passed the same checks the returned
+   * segments pass, so every index announced appears in `segments` and the file
+   * it names is complete and safe to read.
+   *
+   * May be async: this call does not resolve until every callback has settled,
+   * and neither a throw nor a rejection can fail the encode.
    */
-  onSegmentClosed?: (index: number) => void;
+  onSegmentClosed?: (index: number) => void | Promise<void>;
 }): Promise<SinglePassOutputs> {
   const chunkSeconds = input.chunkSeconds ?? env.ANALYSIS_CHUNK_SECONDS;
   const gopFrames = Math.max(1, Math.round(chunkSeconds * env.PROXY_FPS));
@@ -399,7 +459,7 @@ export async function createProxiesAndChunks(input: {
 
   // Nothing polls unless somebody is listening.
   const watcher = input.onSegmentClosed
-    ? watchClosedSegments(input.chunkDir, input.onSegmentClosed)
+    ? watchClosedSegments(input.chunkDir, chunkSeconds, input.onSegmentClosed)
     : null;
 
   try {
