@@ -1,0 +1,490 @@
+/**
+ * Does searching the video itself actually work?
+ *
+ * This is the experiment the whole Media Index rests on, run against one real
+ * Clipit video and writing nothing anywhere. It answers, with numbers:
+ *
+ *   1. Can a typed question find the right ten seconds of footage?
+ *   2. Which KIND of question does it work for — objects, motion, visible
+ *      text, speech, or a mix?
+ *   3. Does the reranker improve the shortlist, or just reorder it?
+ *   4. What window length and overlap actually retrieve best?
+ *   5. What do the pictures alone find, what does the transcript alone find,
+ *      and what does using both find? They are NOT interchangeable and this
+ *      measures the difference rather than assuming it.
+ *   6. What does it cost, and how long does it take?
+ *
+ * Run it where the real credentials live (a Railway shell, or locally with the
+ * production environment):
+ *
+ *     node dist/scripts/mediaIndexExperiment.js --video <videoId> --probes probes.json
+ *     node dist/scripts/mediaIndexExperiment.js --video <videoId> --ask "the red truck"
+ *     node dist/scripts/mediaIndexExperiment.js --list
+ *
+ * `--ask` is exploration: it prints the best-matching moments for one question
+ * so you can watch them and see for yourself. `--probes` is measurement, and
+ * needs a file saying what the right answer is. Nothing here can tell you
+ * whether retrieval is good without you first saying what good would be.
+ *
+ * The probes file is a list of:
+ *
+ *   {
+ *     "kind": "object" | "motion" | "visible-text" | "speech" | "mixed",
+ *     "query": "the sign that says LOADING BAY",
+ *     "expect": { "startSeconds": 402, "endSeconds": 412 },
+ *     "distractor": { "startSeconds": 631, "endSeconds": 641 },
+ *     "note": "there is a second sign at 10:31 reading FIRE EXIT"
+ *   }
+ *
+ * `distractor` is what makes the visible-text question answerable. Without a
+ * near-twin to rank against, "found a sign" and "found the RIGHT sign" look
+ * identical, and only the second one is retrieval.
+ *
+ * Nothing is written to the database and no signed URL is ever printed.
+ */
+import { readFile, writeFile } from 'node:fs/promises';
+import { env } from '../config/env.js';
+import { queryRows } from '../db/pool.js';
+import { getStorage } from '../services/storage/s3.js';
+import { listTranscriptSegments } from '../db/repositories/transcripts.js';
+import {
+  DEFAULT_WINDOW_PLAN,
+  planWindows,
+  uncoveredSeconds,
+  windowKey,
+  type IndexWindow,
+  type WindowPlan,
+} from '../services/mediaIndex/windows.js';
+import {
+  embedTexts,
+  embedVideoIntervals,
+  rerankVideoIntervals,
+  type EmbeddedInterval,
+} from '../services/mediaIndex/qwen.js';
+
+// ---------------------------------------------------------------- arguments
+
+interface Args {
+  videoId?: string;
+  probesPath?: string;
+  ask?: string;
+  list: boolean;
+  sweep: boolean;
+  topK: number;
+  rerankTop: number;
+  out: string;
+}
+
+function parseArgs(argv: string[]): Args {
+  const args: Args = { list: false, sweep: false, topK: 10, rerankTop: 5, out: 'media-index-experiment.json' };
+  for (let i = 0; i < argv.length; i += 1) {
+    const flag = argv[i];
+    const value = argv[i + 1];
+    if (flag === '--video') { args.videoId = value; i += 1; }
+    else if (flag === '--probes') { args.probesPath = value; i += 1; }
+    else if (flag === '--ask') { args.ask = value; i += 1; }
+    else if (flag === '--top') { args.topK = Number(value); i += 1; }
+    else if (flag === '--rerank-top') { args.rerankTop = Number(value); i += 1; }
+    else if (flag === '--out') { args.out = value!; i += 1; }
+    else if (flag === '--list') args.list = true;
+    else if (flag === '--sweep') args.sweep = true;
+  }
+  return args;
+}
+
+// ------------------------------------------------------------------- probes
+
+type ProbeKind = 'object' | 'motion' | 'visible-text' | 'speech' | 'mixed' | 'audio';
+
+interface Probe {
+  kind: ProbeKind;
+  query: string;
+  expect: { startSeconds: number; endSeconds: number };
+  distractor?: { startSeconds: number; endSeconds: number };
+  note?: string;
+}
+
+async function loadProbes(path: string): Promise<Probe[]> {
+  const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
+  const rows = Array.isArray(parsed) ? parsed : (parsed as { probes?: unknown }).probes;
+  if (!Array.isArray(rows)) throw new Error(`${path} should hold a JSON array of probes`);
+  return rows.map((row, index) => {
+    const probe = row as Probe;
+    if (typeof probe.query !== 'string' || !probe.expect) {
+      throw new Error(`probe ${index} needs a "query" and an "expect" range`);
+    }
+    return probe;
+  });
+}
+
+// ------------------------------------------------------------------ scoring
+
+/** Cosine similarity. Both sides are unit vectors, so this is a dot product. */
+function similarity(a: Float32Array, b: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i += 1) sum += a[i]! * b[i]!;
+  return sum;
+}
+
+/** Whether a window shows the moment a probe is asking about. */
+function overlaps(window: IndexWindow, range: { startSeconds: number; endSeconds: number }): boolean {
+  return window.startSeconds < range.endSeconds && window.endSeconds > range.startSeconds;
+}
+
+interface Scored { window: IndexWindow; score: number }
+
+function rankOf(ranked: Scored[], range: { startSeconds: number; endSeconds: number }): number | null {
+  const index = ranked.findIndex((row) => overlaps(row.window, range));
+  return index === -1 ? null : index + 1;
+}
+
+/** Highest score among windows that do NOT show the answer. The bar to beat. */
+function bestWrongScore(ranked: Scored[], range: { startSeconds: number; endSeconds: number }): number | null {
+  const wrong = ranked.find((row) => !overlaps(row.window, range));
+  return wrong?.score ?? null;
+}
+
+// ------------------------------------------------------------------ helpers
+
+function timecode(seconds: number): string {
+  const whole = Math.floor(seconds);
+  return `${String(Math.floor(whole / 60)).padStart(2, '0')}:${String(whole % 60).padStart(2, '0')}`;
+}
+
+function describe(window: IndexWindow): string {
+  return `${timecode(window.startSeconds)}–${timecode(window.endSeconds)}`;
+}
+
+/**
+ * Embeds every window of the video, in batches.
+ *
+ * One signed URL per batch, and the remote container caches its download under
+ * the STABLE key, so a whole video costs one fetch however many batches it
+ * takes. The URL is re-signed per batch so a long run cannot expire halfway.
+ */
+async function embedAllWindows(input: {
+  proxyKey: string;
+  windows: IndexWindow[];
+}): Promise<{ vectors: Map<string, Float32Array>; failed: Array<{ id: string; reason: string }>; metrics: Array<Record<string, unknown>> }> {
+  const vectors = new Map<string, Float32Array>();
+  const failed: Array<{ id: string; reason: string }> = [];
+  const metrics: Array<Record<string, unknown>> = [];
+  const size = env.MEDIA_INDEX_BATCH_WINDOWS;
+
+  for (let offset = 0; offset < input.windows.length; offset += size) {
+    const batch = input.windows.slice(offset, offset + size);
+    const videoUrl = await getStorage().createDownloadUrl(input.proxyKey, {
+      expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
+    });
+    const result = await embedVideoIntervals({
+      videoUrl,
+      videoKey: input.proxyKey,
+      // The proxy IS the source timeline, so window seconds need no rebasing.
+      intervals: batch.map((window) => ({
+        id: windowKey(window), start: window.startSeconds, end: window.endSeconds,
+      })),
+    });
+    for (const row of result.embedded) vectors.set(row.id, row.embedding);
+    failed.push(...result.failed);
+    metrics.push(result.metrics);
+    process.stdout.write(
+      `  embedded ${Math.min(offset + size, input.windows.length)}/${input.windows.length} windows` +
+      `${result.failed.length > 0 ? ` (${result.failed.length} failed)` : ''}\n`,
+    );
+  }
+  return { vectors, failed, metrics };
+}
+
+/**
+ * The words spoken inside each window, as one string.
+ *
+ * This is the transcript AS A SEPARATE SIGNAL, not as a caption on the video
+ * vector. The video model is vision and language — it does not hear — so what
+ * was SAID reaches the index only through here. Measuring the two channels
+ * apart is the point: a question about speech and a question about a red
+ * truck are not the same retrieval problem and must not be assumed to be.
+ */
+async function speechPerWindow(videoId: string, windows: IndexWindow[]): Promise<Map<string, string>> {
+  const segments = await listTranscriptSegments(videoId);
+  const spoken = new Map<string, string>();
+  for (const window of windows) {
+    const words = segments
+      .filter((segment) => segment.startSeconds < window.endSeconds && segment.endSeconds > window.startSeconds)
+      .map((segment) => segment.text.trim())
+      .filter(Boolean)
+      .join(' ');
+    if (words) spoken.set(windowKey(window), words);
+  }
+  return spoken;
+}
+
+// --------------------------------------------------------------------- main
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
+    console.error('MODAL_TOKEN_ID and MODAL_TOKEN_SECRET must be set. VIDEO_PROVIDER does not need changing.');
+    process.exit(2);
+  }
+
+  if (args.list) {
+    const rows = await queryRows<{ id: string; title: string | null; duration_seconds: number | null }>(
+      `SELECT id, title, duration_seconds FROM videos
+        WHERE proxy_storage_key IS NOT NULL AND status = 'ready'
+        ORDER BY created_at DESC LIMIT 20`,
+    );
+    for (const row of rows) {
+      console.log(`${row.id}  ${row.duration_seconds ? timecode(row.duration_seconds) : '  ?  '}  ${row.title ?? '(untitled)'}`);
+    }
+    return;
+  }
+
+  if (!args.videoId) {
+    console.error('Pass --video <videoId>, or --list to see what is available.');
+    process.exit(2);
+  }
+
+  const [video] = await queryRows<{ id: string; title: string | null; duration_seconds: number | null; proxy_storage_key: string | null }>(
+    `SELECT id, title, duration_seconds, proxy_storage_key FROM videos WHERE id = $1`, [args.videoId],
+  );
+  if (!video) { console.error(`No video ${args.videoId}`); process.exit(2); }
+  if (!video.proxy_storage_key) { console.error('That video has no analysis proxy to index.'); process.exit(2); }
+  if (!video.duration_seconds) { console.error('That video has no measured duration.'); process.exit(2); }
+
+  const proxyKey = video.proxy_storage_key;
+  const duration = Number(video.duration_seconds);
+
+  console.log(`video      ${video.id}  ${video.title ?? '(untitled)'}`);
+  console.log(`duration   ${timecode(duration)}`);
+  console.log(`proxy      ${env.PROXY_HEIGHT}p at ${env.PROXY_FPS} fps (one continuous file — no chunks are used here)`);
+  console.log(`model      ${env.MEDIA_INDEX_EMBED_MODEL} at ${env.MEDIA_INDEX_EMBED_DIMS} dimensions`);
+  console.log(`sampling   ${env.MEDIA_INDEX_SAMPLE_FPS} fps, up to ${env.MEDIA_INDEX_MAX_FRAMES} frames per window\n`);
+
+  // Which grids to try. One by default, because every extra grid is a whole
+  // second pass over the video on a real GPU.
+  const grids: WindowPlan[] = args.sweep
+    ? [
+        { windowSeconds: 6, strideSeconds: 3, minWindowSeconds: 2 },
+        { ...DEFAULT_WINDOW_PLAN },
+        { windowSeconds: 10, strideSeconds: 10, minWindowSeconds: 3 },
+        { windowSeconds: 20, strideSeconds: 10, minWindowSeconds: 5 },
+      ]
+    : [{
+        windowSeconds: env.MEDIA_INDEX_WINDOW_SECONDS,
+        strideSeconds: env.MEDIA_INDEX_STRIDE_SECONDS,
+        minWindowSeconds: env.MEDIA_INDEX_MIN_WINDOW_SECONDS,
+      }];
+
+  const probes = args.probesPath ? await loadProbes(args.probesPath) : [];
+  if (probes.length === 0 && !args.ask) {
+    console.error('Nothing to measure. Pass --probes <file> for numbers, or --ask "<question>" to look around.');
+    process.exit(2);
+  }
+
+  const report: Record<string, unknown>[] = [];
+
+  for (const grid of grids) {
+    const label = `${grid.windowSeconds}s window / ${grid.strideSeconds}s stride`;
+    console.log(`\n=== ${label} ===`);
+
+    const windows = planWindows(duration, grid);
+    console.log(`  ${windows.length} windows over ${timecode(duration)}`);
+
+    const startedAt = performance.now();
+    const { vectors, failed, metrics } = await embedAllWindows({ proxyKey, windows });
+    const embedMs = Math.round(performance.now() - startedAt);
+
+    const covered = windows.filter((window) => vectors.has(windowKey(window)));
+    const gaps = uncoveredSeconds(covered, duration);
+    console.log(`  ${covered.length}/${windows.length} embedded in ${(embedMs / 1000).toFixed(1)}s` +
+      `  (${(duration / (embedMs / 1000)).toFixed(1)}s of video per second)`);
+    if (gaps.length > 0) {
+      // Named, never implied. A stretch with no vector is a stretch nothing
+      // can retrieve from, and it must not read as a stretch with nothing in it.
+      console.log(`  NOT INDEXED: ${gaps.map(describe).join(', ')}`);
+    }
+
+    // The transcript as its own channel.
+    const spoken = await speechPerWindow(video.id, covered);
+    let speechVectors = new Map<string, Float32Array>();
+    if (spoken.size > 0) {
+      const said = await embedTexts({
+        texts: [...spoken.entries()].map(([id, text]) => ({ id, text })),
+        isQuery: false,
+      });
+      speechVectors = new Map(said.embedded.map((row: EmbeddedInterval) => [row.id, row.embedding]));
+      console.log(`  ${speechVectors.size} windows also carry speech`);
+    } else {
+      console.log('  no transcript for this video — the speech channel is empty, and speech probes below measure nothing');
+    }
+
+    const rank = (queryVector: Float32Array, channel: Map<string, Float32Array>): Scored[] =>
+      covered
+        .map((window) => {
+          const vector = channel.get(windowKey(window));
+          return vector ? { window, score: similarity(queryVector, vector) } : null;
+        })
+        .filter((row): row is Scored => row !== null)
+        .sort((a, b) => b.score - a.score);
+
+    /** Both channels at once: a window is as good as its best evidence. */
+    const rankFused = (queryVector: Float32Array): Scored[] => {
+      const seen = new Map<string, Scored>();
+      for (const row of [...rank(queryVector, vectors), ...rank(queryVector, speechVectors)]) {
+        const key = windowKey(row.window);
+        const best = seen.get(key);
+        if (!best || row.score > best.score) seen.set(key, row);
+      }
+      return [...seen.values()].sort((a, b) => b.score - a.score);
+    };
+
+    // ---- exploration -----------------------------------------------------
+    if (args.ask) {
+      const asked = await embedTexts({ texts: [{ id: 'q', text: args.ask }], isQuery: true });
+      const queryVector = asked.embedded[0]!.embedding;
+      console.log(`\n  "${args.ask}"`);
+      for (const [name, ranked] of [
+        ['pictures', rank(queryVector, vectors)],
+        ['speech', rank(queryVector, speechVectors)],
+        ['both', rankFused(queryVector)],
+      ] as const) {
+        if (ranked.length === 0) continue;
+        console.log(`    ${name.padEnd(9)} ${ranked.slice(0, args.topK).map((row) => `${describe(row.window)} (${row.score.toFixed(3)})`).join('  ')}`);
+      }
+    }
+
+    // ---- measurement -----------------------------------------------------
+    const probeResults: Record<string, unknown>[] = [];
+
+    for (const probe of probes) {
+      const asked = await embedTexts({ texts: [{ id: 'q', text: probe.query }], isQuery: true });
+      const queryVector = asked.embedded[0]!.embedding;
+
+      const channels = {
+        visual: rank(queryVector, vectors),
+        speech: rank(queryVector, speechVectors),
+        both: rankFused(queryVector),
+      };
+
+      const row: Record<string, unknown> = {
+        kind: probe.kind, query: probe.query,
+        expect: `${describe({ startSeconds: probe.expect.startSeconds, endSeconds: probe.expect.endSeconds })}`,
+      };
+
+      for (const [name, ranked] of Object.entries(channels)) {
+        if (ranked.length === 0) { row[name] = null; continue; }
+        const correctRank = rankOf(ranked, probe.expect);
+        const correct = ranked.find((entry) => overlaps(entry.window, probe.expect));
+        const wrong = bestWrongScore(ranked, probe.expect);
+        row[name] = {
+          rank: correctRank,
+          score: correct ? Number(correct.score.toFixed(4)) : null,
+          // How far clear of the best wrong answer. A rank of 1 with a margin
+          // of 0.001 is a coin toss that happened to land right.
+          margin: correct && wrong !== null ? Number((correct.score - wrong).toFixed(4)) : null,
+          ...(probe.distractor
+            ? (() => {
+                const twin = ranked.find((entry) => overlaps(entry.window, probe.distractor!));
+                return {
+                  distractorScore: twin ? Number(twin.score.toFixed(4)) : null,
+                  // The visible-text verdict. Positive means the model read
+                  // the words; near zero means it recognised "a sign".
+                  beatsDistractor: correct && twin ? Number((correct.score - twin.score).toFixed(4)) : null,
+                };
+              })()
+            : {}),
+        };
+      }
+
+      // ---- does reranking help? -------------------------------------------
+      const shortlist = channels.both.slice(0, args.rerankTop);
+      if (shortlist.length > 1) {
+        const videoUrl = await getStorage().createDownloadUrl(proxyKey, {
+          expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
+        });
+        const reranked = await rerankVideoIntervals({
+          query: probe.query, videoUrl, videoKey: proxyKey,
+          candidates: shortlist.map((entry) => ({
+            id: windowKey(entry.window), start: entry.window.startSeconds, end: entry.window.endSeconds,
+          })),
+        });
+        const byKey = new Map(shortlist.map((entry) => [windowKey(entry.window), entry.window]));
+        const rerankedWindows: Scored[] = reranked.ranked
+          .map((entry) => { const window = byKey.get(entry.id); return window ? { window, score: entry.score } : null; })
+          .filter((entry): entry is Scored => entry !== null);
+        row.reranked = {
+          rankBefore: rankOf(shortlist, probe.expect),
+          rankAfter: rankOf(rerankedWindows, probe.expect),
+          failed: reranked.failed.length,
+          ms: reranked.metrics.total_ms ?? null,
+        };
+      }
+
+      probeResults.push(row);
+      const both = row.both as { rank: number | null } | null;
+      console.log(`  [${probe.kind.padEnd(12)}] rank ${String(both?.rank ?? '—').padStart(3)}  ${probe.query}`);
+    }
+
+    // ---- the summary that decides the configuration -----------------------
+    const byKind = new Map<string, Array<Record<string, unknown>>>();
+    for (const row of probeResults) {
+      const list = byKind.get(row.kind as string) ?? [];
+      list.push(row);
+      byKind.set(row.kind as string, list);
+    }
+
+    if (probeResults.length > 0) {
+      console.log('\n  kind          n   visual@1  speech@1   both@1   both@3');
+      for (const [kind, rows] of byKind) {
+        const at = (channel: string, within: number) =>
+          rows.filter((row) => {
+            const entry = row[channel] as { rank: number | null } | null;
+            return entry?.rank !== null && entry !== null && (entry.rank as number) <= within;
+          }).length;
+        const pct = (n: number) => `${Math.round((100 * n) / rows.length)}%`.padStart(7);
+        console.log(`  ${kind.padEnd(13)} ${String(rows.length).padStart(2)}  ${pct(at('visual', 1))}  ${pct(at('speech', 1))}  ${pct(at('both', 1))}  ${pct(at('both', 3))}`);
+      }
+      const improved = probeResults.filter((row) => {
+        const r = row.reranked as { rankBefore: number | null; rankAfter: number | null } | undefined;
+        return r?.rankBefore != null && r.rankAfter != null && r.rankAfter < r.rankBefore;
+      }).length;
+      const worsened = probeResults.filter((row) => {
+        const r = row.reranked as { rankBefore: number | null; rankAfter: number | null } | undefined;
+        return r?.rankBefore != null && r.rankAfter != null && r.rankAfter > r.rankBefore;
+      }).length;
+      console.log(`\n  reranking moved the right answer up on ${improved} probes and down on ${worsened}`);
+    }
+
+    report.push({
+      grid: label,
+      windows: windows.length,
+      embedded: covered.length,
+      failedWindows: failed,
+      notIndexed: gaps.map(describe),
+      embedMs,
+      secondsOfVideoPerSecond: Number((duration / (embedMs / 1000)).toFixed(2)),
+      speechWindows: speechVectors.size,
+      remoteMetrics: metrics,
+      probes: probeResults,
+    });
+  }
+
+  await writeFile(args.out, JSON.stringify({
+    video: { id: video.id, title: video.title, durationSeconds: duration },
+    model: env.MEDIA_INDEX_EMBED_MODEL,
+    dims: env.MEDIA_INDEX_EMBED_DIMS,
+    sampling: { fps: env.MEDIA_INDEX_SAMPLE_FPS, maxFrames: env.MEDIA_INDEX_MAX_FRAMES, shortSide: env.MEDIA_INDEX_FRAME_SHORT_SIDE },
+    runs: report,
+  }, null, 2));
+  console.log(`\nfull results written to ${args.out}`);
+  console.log('nothing was written to the database, and no signed URL was printed.');
+}
+
+main().then(
+  () => process.exit(0),
+  (error: unknown) => {
+    console.error('\nexperiment failed:', error instanceof Error ? error.message : error);
+    process.exit(1);
+  },
+);

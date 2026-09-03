@@ -1,0 +1,39 @@
+[
+  {
+    "kind": "object",
+    "query": "the red pickup truck parked outside",
+    "expect": { "startSeconds": 74, "endSeconds": 88 },
+    "note": "plain object retrieval — the easy case, and the control for everything below"
+  },
+  {
+    "kind": "motion",
+    "query": "someone throws a box down from the tailgate",
+    "expect": { "startSeconds": 132, "endSeconds": 141 },
+    "note": "an action, not a thing. Tests whether frames sampled seconds apart still carry movement"
+  },
+  {
+    "kind": "visible-text",
+    "query": "the sign that reads LOADING BAY",
+    "expect": { "startSeconds": 402, "endSeconds": 412 },
+    "distractor": { "startSeconds": 631, "endSeconds": 641 },
+    "note": "THE decisive probe. The distractor is a different sign. If the two score about the same, the model recognises 'a sign' and cannot read it — and that is the evidence for whether a separate text channel is needed. Pick pairs that differ ONLY in the words: two signs, two jersey numbers, two scoreboard readings."
+  },
+  {
+    "kind": "speech",
+    "query": "where they explain the pricing",
+    "expect": { "startSeconds": 512, "endSeconds": 540 },
+    "note": "should be found by the transcript channel and probably NOT by the pictures. If the visual column finds it too, that is worth knowing"
+  },
+  {
+    "kind": "mixed",
+    "query": "he holds up the invoice while saying it doubled",
+    "expect": { "startSeconds": 548, "endSeconds": 560 },
+    "note": "needs both channels. The interesting number is whether 'both' beats either alone"
+  },
+  {
+    "kind": "audio",
+    "query": "the crowd starts applauding",
+    "expect": { "startSeconds": 700, "endSeconds": 712 },
+    "note": "expected to FAIL unless the applause is also visible or transcribed. Included deliberately: nothing in the current stack hears non-speech sound, and the report should show that as a measured gap rather than an assumption"
+  }
+]

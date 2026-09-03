@@ -220,6 +220,50 @@ const envSchema = z.object({
       const parsed = Number(value);
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
     }),
+  // --- Media Index: Qwen embeddings and reranking on Modal ---------------
+  /**
+   * The two deployed Qwen services. Separate apps from the video model, so
+   * each has its own name here rather than sharing MODAL_APP_NAME — one
+   * setting for three deployments is how the wrong class gets invoked.
+   */
+  MEDIA_INDEX_EMBED_APP: z.string().trim().default('clipit-embedding'),
+  MEDIA_INDEX_EMBED_CLASS: z.string().trim().default('QwenEmbeddingService'),
+  MEDIA_INDEX_RERANK_APP: z.string().trim().default('clipit-reranker'),
+  MEDIA_INDEX_RERANK_CLASS: z.string().trim().default('QwenRerankerService'),
+  /**
+   * Frozen onto every row. A vector is only comparable with another made by
+   * the same model at the same dimension, and a stored embedding that cannot
+   * say which model produced it is a vector nobody can ever safely use again.
+   */
+  MEDIA_INDEX_EMBED_MODEL: z.string().trim().default('Qwen/Qwen3-VL-Embedding-2B'),
+  MEDIA_INDEX_EMBED_DIMS: int(2048, 8, 16_000),
+  /**
+   * Bumped by hand whenever anything that changes the MEANING of a vector
+   * changes: the model, the pooling, the frame sampling, the window grid.
+   * Retrieval only ever compares within one version, so an index built under
+   * the old rules is retired rather than quietly mixed with the new — which
+   * would look exactly like working search and would not be.
+   */
+  MEDIA_INDEX_VERSION: z.string().trim().default('v1'),
+  /** The timeline grid. Experiment variables until the measurement settles them. */
+  MEDIA_INDEX_WINDOW_SECONDS: num(10, 1, 120),
+  MEDIA_INDEX_STRIDE_SECONDS: num(5, 0.5, 120),
+  MEDIA_INDEX_MIN_WINDOW_SECONDS: num(3, 0.5, 120),
+  /** How the model is shown a window. Part of a vector's identity. */
+  MEDIA_INDEX_SAMPLE_FPS: num(2, 0.1, 30),
+  MEDIA_INDEX_MAX_FRAMES: int(16, 1, 128),
+  MEDIA_INDEX_FRAME_SHORT_SIDE: int(256, 64, 1080),
+  /** How many windows ride in one Modal call. One fetch, many vectors. */
+  MEDIA_INDEX_BATCH_WINDOWS: int(32, 1, 512),
+  /**
+   * In-flight Modal calls. Every one can hold its own L4 and the bill is per
+   * GPU-second, so this stays low until measured — the same reasoning that
+   * keeps MINICPM_VIDEO_CONCURRENCY at one.
+   */
+  MEDIA_INDEX_CONCURRENCY: int(1, 1, 8),
+  MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
+  MEDIA_INDEX_MAX_RETRIES: int(2, 0, 5),
+
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
   OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
   /**

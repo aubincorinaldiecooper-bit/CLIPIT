@@ -1,0 +1,323 @@
+import { env } from '../../config/env.js';
+import { ExternalServiceError } from '../../lib/errors.js';
+import { invokeModal, type ModalTarget } from '../modal/invoke.js';
+
+/**
+ * Clipit's side of the two Qwen deployments.
+ *
+ * The contract both services share: ONE private video URL plus a list of time
+ * ranges, each range carrying an id the caller chose. Nothing is ever matched
+ * by position in the returned array. That is not fussiness — this codebase has
+ * already been bitten by treating array position as identity, and a batch that
+ * comes back reordered, short, or partially failed would be silently misread.
+ *
+ * A signed URL and a video key are two different things and both are needed.
+ * The URL is minted fresh for every call and expires; the key is the video's
+ * stable identity, and it is what the remote container caches its download
+ * under. Caching by URL would never hit, because no two URLs for the same
+ * video are ever the same string.
+ *
+ * Everything a service returns is checked before it is believed. A reply that
+ * names a different model, returns the wrong number of dimensions, or answers
+ * about ids nobody asked for is rejected rather than stored — a vector from an
+ * unexpected model is not a slightly worse vector, it is a meaningless one,
+ * and it would look exactly like a working index.
+ */
+
+const EMBED_VIDEO: ModalTarget = {
+  app: env.MEDIA_INDEX_EMBED_APP,
+  className: env.MEDIA_INDEX_EMBED_CLASS,
+  method: 'embed_video_intervals',
+  label: 'qwen-embedding',
+};
+
+const EMBED_TEXT: ModalTarget = { ...EMBED_VIDEO, method: 'embed_texts' };
+
+const RERANK: ModalTarget = {
+  app: env.MEDIA_INDEX_RERANK_APP,
+  className: env.MEDIA_INDEX_RERANK_CLASS,
+  method: 'rerank_video_intervals',
+  label: 'qwen-reranker',
+};
+
+export interface IntervalRequest {
+  id: string;
+  /** Seconds INTO THE FILE at the URL — not source seconds. The caller maps. */
+  start: number;
+  end: number;
+}
+
+export interface EmbeddedInterval {
+  id: string;
+  embedding: Float32Array;
+  frames: number;
+}
+
+export interface FailedInterval {
+  id: string;
+  reason: string;
+}
+
+export interface EmbedResult {
+  model: string;
+  dims: number;
+  sampling: Record<string, unknown>;
+  embedded: EmbeddedInterval[];
+  /**
+   * Ranges the service could not read. Reported, never dropped and never
+   * turned into a zero vector: a caller has to be able to tell a stretch that
+   * holds nothing from a stretch nobody managed to look at.
+   */
+  failed: FailedInterval[];
+  metrics: Record<string, unknown>;
+}
+
+interface RawEmbedReply {
+  model?: unknown;
+  dim?: unknown;
+  sampling?: unknown;
+  results?: unknown;
+  failed?: unknown;
+  metrics?: unknown;
+}
+
+export interface Sampling {
+  fps: number;
+  maxFrames: number;
+  shortSide: number;
+}
+
+export function defaultSampling(): Sampling {
+  return {
+    fps: env.MEDIA_INDEX_SAMPLE_FPS,
+    maxFrames: env.MEDIA_INDEX_MAX_FRAMES,
+    shortSide: env.MEDIA_INDEX_FRAME_SHORT_SIDE,
+  };
+}
+
+function asVector(value: unknown, dims: number, label: string, id: string): Float32Array {
+  if (!Array.isArray(value)) {
+    throw new ExternalServiceError(label, `Embedding for "${id}" was not an array`, { retryable: false });
+  }
+  if (value.length !== dims) {
+    throw new ExternalServiceError(
+      label,
+      `Embedding for "${id}" has ${value.length} dimensions, expected ${dims}`,
+      { retryable: false },
+    );
+  }
+  const vector = new Float32Array(dims);
+  for (let i = 0; i < dims; i += 1) {
+    const component = value[i];
+    if (typeof component !== 'number' || !Number.isFinite(component)) {
+      throw new ExternalServiceError(label, `Embedding for "${id}" holds a non-finite value`, { retryable: false });
+    }
+    vector[i] = component;
+  }
+  return vector;
+}
+
+/**
+ * How far from unit length a vector may be and still be believed.
+ *
+ * The services normalize, so a vector far off unit length means something
+ * changed on the other side — a different pooling, a different model, a
+ * half-loaded checkpoint. Cosine similarity of unnormalized vectors is still a
+ * number, and it still sorts, so nothing downstream would notice.
+ */
+const NORM_TOLERANCE = 0.02;
+
+function assertNormalized(vector: Float32Array, label: string, id: string): void {
+  let sum = 0;
+  for (const component of vector) sum += component * component;
+  const norm = Math.sqrt(sum);
+  if (Math.abs(norm - 1) > NORM_TOLERANCE) {
+    throw new ExternalServiceError(
+      label,
+      `Embedding for "${id}" is not normalized (length ${norm.toFixed(4)}) — the service may have changed`,
+      { retryable: false },
+    );
+  }
+}
+
+function readEmbedReply(reply: RawEmbedReply, asked: Set<string>, label: string): EmbedResult {
+  const model = typeof reply.model === 'string' ? reply.model : '';
+  if (model !== env.MEDIA_INDEX_EMBED_MODEL) {
+    throw new ExternalServiceError(
+      label,
+      `Service answered for model "${model}", but this index stores "${env.MEDIA_INDEX_EMBED_MODEL}". ` +
+        'Mixing vectors from two models would look like working retrieval and would not be.',
+      { retryable: false },
+    );
+  }
+
+  const rows = Array.isArray(reply.results) ? reply.results : [];
+  const dims = env.MEDIA_INDEX_EMBED_DIMS;
+  if (rows.length > 0 && reply.dim !== dims) {
+    throw new ExternalServiceError(
+      label, `Service returned ${String(reply.dim)}-dimensional vectors, expected ${dims}`, { retryable: false },
+    );
+  }
+
+  const embedded: EmbeddedInterval[] = [];
+  const seen = new Set<string>();
+  for (const row of rows as Array<Record<string, unknown>>) {
+    const id = typeof row.id === 'string' ? row.id : '';
+    if (!asked.has(id)) {
+      throw new ExternalServiceError(label, `Service returned an id nobody asked for: "${id}"`, { retryable: false });
+    }
+    if (seen.has(id)) {
+      throw new ExternalServiceError(label, `Service returned "${id}" twice`, { retryable: false });
+    }
+    seen.add(id);
+    const embedding = asVector(row.embedding, dims, label, id);
+    assertNormalized(embedding, label, id);
+    embedded.push({ id, embedding, frames: typeof row.frames === 'number' ? row.frames : 0 });
+  }
+
+  const failed: FailedInterval[] = (Array.isArray(reply.failed) ? reply.failed : [])
+    .map((row) => row as Record<string, unknown>)
+    .map((row) => ({
+      id: typeof row.id === 'string' ? row.id : 'unknown',
+      reason: typeof row.reason === 'string' ? row.reason : 'no reason given',
+    }));
+
+  // Anything asked for that came back neither embedded nor named as failed is
+  // a silent hole. Naming it here is the difference between an index that
+  // knows what it is missing and one that cannot tell.
+  for (const id of asked) {
+    if (!seen.has(id) && !failed.some((row) => row.id === id)) {
+      failed.push({ id, reason: 'the service returned neither an embedding nor a failure for this range' });
+    }
+  }
+
+  return {
+    model,
+    dims,
+    sampling: (reply.sampling as Record<string, unknown>) ?? {},
+    embedded,
+    failed,
+    metrics: (reply.metrics as Record<string, unknown>) ?? {},
+  };
+}
+
+export async function embedVideoIntervals(input: {
+  videoUrl: string;
+  /** The video's stable identity, so the container caches one download. */
+  videoKey: string;
+  intervals: IntervalRequest[];
+  sampling?: Sampling;
+}): Promise<EmbedResult> {
+  if (input.intervals.length === 0) {
+    return { model: env.MEDIA_INDEX_EMBED_MODEL, dims: env.MEDIA_INDEX_EMBED_DIMS, sampling: {}, embedded: [], failed: [], metrics: {} };
+  }
+  const sampling = input.sampling ?? defaultSampling();
+  const asked = new Set(input.intervals.map((interval) => interval.id));
+  if (asked.size !== input.intervals.length) {
+    throw new ExternalServiceError(EMBED_VIDEO.label, 'Interval ids must be unique within one call', { retryable: false });
+  }
+
+  const reply = await invokeModal<RawEmbedReply>(EMBED_VIDEO, {
+    video_url: input.videoUrl,
+    video_key: input.videoKey,
+    intervals: input.intervals,
+    fps: sampling.fps,
+    max_frames: sampling.maxFrames,
+    short_side: sampling.shortSide,
+  }, { context: { videoKey: input.videoKey, intervals: input.intervals.length } });
+
+  return readEmbedReply(reply, asked, EMBED_VIDEO.label);
+}
+
+/**
+ * Text into the same space as the video vectors.
+ *
+ * `isQuery` is explicit because these models are asymmetric: a question and a
+ * document are labelled differently for the model, and swapping them does not
+ * raise anything. It returns well-ordered, confident, wrong results.
+ */
+export async function embedTexts(input: {
+  texts: Array<{ id: string; text: string }>;
+  isQuery: boolean;
+}): Promise<EmbedResult> {
+  if (input.texts.length === 0) {
+    return { model: env.MEDIA_INDEX_EMBED_MODEL, dims: env.MEDIA_INDEX_EMBED_DIMS, sampling: {}, embedded: [], failed: [], metrics: {} };
+  }
+  const asked = new Set(input.texts.map((row) => row.id));
+  const reply = await invokeModal<RawEmbedReply>(EMBED_TEXT, {
+    texts: input.texts,
+    is_query: input.isQuery,
+  }, { context: { texts: input.texts.length, isQuery: input.isQuery } });
+
+  return readEmbedReply(reply, asked, EMBED_TEXT.label);
+}
+
+export interface RankedInterval {
+  id: string;
+  score: number;
+}
+
+export interface RerankResult {
+  model: string;
+  ranked: RankedInterval[];
+  failed: FailedInterval[];
+  metrics: Record<string, unknown>;
+}
+
+/**
+ * Order candidate intervals by watching them.
+ *
+ * Scores are comparable WITHIN one call and nothing promises they are
+ * comparable across calls, so callers rank and take the top few rather than
+ * applying a fixed threshold.
+ */
+export async function rerankVideoIntervals(input: {
+  query: string;
+  videoUrl: string;
+  videoKey: string;
+  candidates: IntervalRequest[];
+  sampling?: Sampling;
+}): Promise<RerankResult> {
+  if (input.candidates.length === 0) {
+    return { model: '', ranked: [], failed: [], metrics: {} };
+  }
+  const sampling = input.sampling ?? defaultSampling();
+  const asked = new Set(input.candidates.map((candidate) => candidate.id));
+
+  const reply = await invokeModal<Record<string, unknown>>(RERANK, {
+    query: input.query,
+    video_url: input.videoUrl,
+    video_key: input.videoKey,
+    candidates: input.candidates,
+    fps: sampling.fps,
+    max_frames: sampling.maxFrames,
+    short_side: sampling.shortSide,
+  }, { context: { videoKey: input.videoKey, candidates: input.candidates.length } });
+
+  const rows = Array.isArray(reply.results) ? reply.results : [];
+  const ranked: RankedInterval[] = [];
+  for (const row of rows as Array<Record<string, unknown>>) {
+    const id = typeof row.id === 'string' ? row.id : '';
+    if (!asked.has(id)) {
+      throw new ExternalServiceError(RERANK.label, `Reranker returned an id nobody asked for: "${id}"`, { retryable: false });
+    }
+    if (typeof row.score !== 'number' || !Number.isFinite(row.score)) {
+      throw new ExternalServiceError(RERANK.label, `Reranker returned a non-numeric score for "${id}"`, { retryable: false });
+    }
+    ranked.push({ id, score: row.score });
+  }
+  ranked.sort((a, b) => b.score - a.score);
+
+  return {
+    model: typeof reply.model === 'string' ? reply.model : '',
+    ranked,
+    failed: (Array.isArray(reply.failed) ? reply.failed : []).map((row) => {
+      const record = row as Record<string, unknown>;
+      return {
+        id: typeof record.id === 'string' ? record.id : 'unknown',
+        reason: typeof record.reason === 'string' ? record.reason : 'no reason given',
+      };
+    }),
+    metrics: (reply.metrics as Record<string, unknown>) ?? {},
+  };
+}
