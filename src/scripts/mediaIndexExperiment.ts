@@ -221,6 +221,32 @@ async function speechPerWindow(videoId: string, windows: IndexWindow[]): Promise
   return spoken;
 }
 
+/**
+ * What the GPU time this run held is worth, in dollars.
+ *
+ * An ESTIMATE, and labelled as one everywhere it is printed. Modal's JS SDK
+ * exposes no supported billing API, so this is measured wall-clock inside the
+ * service multiplied by a rate somebody typed in — the same arithmetic, and
+ * the same honesty rule, the evaluation page already uses. With no rate
+ * configured it returns null and the report says the rate is not set, rather
+ * than pricing GPU seconds at zero and calling it free.
+ */
+function estimateGpuCost(msHeld: number): { usd: number | null; note: string } {
+  const rate = env.MODAL_L4_USD_PER_GPU_HOUR;
+  if (rate === null) {
+    return { usd: null, note: 'MODAL_L4_USD_PER_GPU_HOUR is not set, so no cost can be estimated' };
+  }
+  return {
+    usd: Number(((msHeld / 3_600_000) * rate).toFixed(4)),
+    note: `estimated from ${(msHeld / 1000).toFixed(1)}s of measured GPU time at $${rate}/hour`,
+  };
+}
+
+/** The service's own measurement of how long it held the GPU. */
+function gpuMsFrom(metrics: Array<Record<string, unknown>>): number {
+  return metrics.reduce((sum, row) => sum + (typeof row.total_ms === 'number' ? row.total_ms : 0), 0);
+}
+
 // --------------------------------------------------------------------- main
 
 async function main(): Promise<void> {
@@ -390,6 +416,7 @@ async function main(): Promise<void> {
 
     // ---- measurement -----------------------------------------------------
     const probeResults: Record<string, unknown>[] = [];
+    const rerankMetrics: Array<Record<string, unknown>> = [];
 
     for (const probe of probes) {
       const asked = await embedTexts({ texts: [{ id: 'q', text: probe.query }], isQuery: true });
@@ -447,6 +474,7 @@ async function main(): Promise<void> {
         const rerankedWindows: Scored[] = reranked.ranked
           .map((entry) => { const window = byKey.get(entry.id); return window ? { window, score: entry.score } : null; })
           .filter((entry): entry is Scored => entry !== null);
+        rerankMetrics.push(reranked.metrics);
         row.reranked = {
           rankBefore: rankOf(shortlist, probe.expect),
           rankAfter: rankOf(rerankedWindows, probe.expect),
@@ -479,6 +507,11 @@ async function main(): Promise<void> {
         const pct = (n: number) => `${Math.round((100 * n) / rows.length)}%`.padStart(7);
         console.log(`  ${kind.padEnd(13)} ${String(rows.length).padStart(2)}  ${pct(at('visual', 1))}  ${pct(at('speech', 1))}  ${pct(at('both', 1))}  ${pct(at('both', 3))}`);
       }
+      const embedCost = estimateGpuCost(gpuMsFrom(metrics));
+      const rerankCost = estimateGpuCost(gpuMsFrom(rerankMetrics));
+      console.log(`\n  indexing this video: ${embedCost.usd === null ? embedCost.note : `~$${embedCost.usd} (${embedCost.note})`}`);
+      console.log(`  reranking ${probeResults.length} questions: ${rerankCost.usd === null ? rerankCost.note : `~$${rerankCost.usd} (${rerankCost.note})`}`);
+
       const improved = probeResults.filter((row) => {
         const r = row.reranked as { rankBefore: number | null; rankAfter: number | null } | undefined;
         return r?.rankBefore != null && r.rankAfter != null && r.rankAfter < r.rankBefore;
@@ -500,6 +533,12 @@ async function main(): Promise<void> {
       secondsOfVideoPerSecond: Number((duration / (embedMs / 1000)).toFixed(2)),
       speechWindows: speechVectors.size,
       remoteMetrics: metrics,
+      // Estimated, never measured: Modal exposes no billing API to this SDK,
+      // so this is the service's own wall-clock times a configured rate.
+      estimatedCost: {
+        indexing: estimateGpuCost(gpuMsFrom(metrics)),
+        reranking: estimateGpuCost(gpuMsFrom(rerankMetrics)),
+      },
       probes: probeResults,
     });
   }

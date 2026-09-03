@@ -95,7 +95,10 @@ class Sampling:
     short_side: int
 
     def describe(self) -> dict:
-        return {"fps": self.fps, "max_frames": self.max_frames, "short_side": self.short_side}
+        # `fps` is the CEILING. A window long enough that max_frames would
+        # not reach its end is sampled slower; each result carries the rate
+        # it actually got.
+        return {"max_fps": self.fps, "max_frames": self.max_frames, "short_side": self.short_side}
 
 
 def cache_path(video_key: str) -> str:
@@ -128,9 +131,35 @@ def fetch_once(video_url: str, video_key: str) -> tuple[str, bool]:
     return path, True
 
 
+def frame_rate_for(duration: float, sampling: Sampling) -> float:
+    """
+    The rate that spreads at most `max_frames` across the WHOLE interval.
+
+    Sampling at a fixed rate and then stopping at the cap does not sample the
+    interval — it samples the beginning of it. Measured with ffmpeg on a
+    synthetic clip: at 2 fps capped to 16 frames, a 10-second window's frames
+    all came from its first 7.5 seconds, and a 20-second window saw the same
+    first 7.5 seconds. The vector was then stored against the full interval,
+    and a moment near the end of a window simply did not exist as far as
+    retrieval was concerned — while the reported coverage said otherwise.
+
+    Worse for the experiment than for production: the 20-second grid in the
+    sweep would have scored badly because it was shown 8 seconds, and the
+    conclusion "longer windows retrieve worse" would have been an artefact of
+    this line rather than anything about window length.
+
+    Lowering the rate rather than raising the cap keeps the cost per window
+    fixed. Never raised above what was asked for: a short window stays at the
+    requested rate rather than being padded with frames nobody wanted.
+    """
+    if duration <= 0:
+        return sampling.fps
+    return min(sampling.fps, sampling.max_frames / duration)
+
+
 def decode_interval(path: str, start: float, end: float, sampling: Sampling):
     """
-    The frames of ONE interval, as PIL images.
+    The frames of ONE interval, as PIL images, spread across all of it.
 
     Seeks before the input so ffmpeg jumps rather than decoding from zero —
     on a proxy with frequent keyframes that makes an arbitrary window as cheap
@@ -141,6 +170,7 @@ def decode_interval(path: str, start: float, end: float, sampling: Sampling):
     import numpy as np
 
     duration = max(0.05, end - start)
+    fps = frame_rate_for(duration, sampling)
 
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -155,7 +185,10 @@ def decode_interval(path: str, start: float, end: float, sampling: Sampling):
     result = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
          "-ss", f"{start:.3f}", "-i", path, "-t", f"{duration:.3f}",
-         "-vf", f"fps={sampling.fps},scale={width}:{height}",
+         "-vf", f"fps={fps:.6f},scale={width}:{height}",
+         # A hard ceiling, not the sampling rule: the rate above already
+         # spreads the frames across the interval, and this only catches a
+         # rounding overshoot.
          "-frames:v", str(sampling.max_frames),
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
         capture_output=True, check=True,
@@ -317,6 +350,13 @@ class QwenEmbeddingService:
                     "end": interval["end"],
                     "embedding": vector,
                     "frames": len(frames),
+                    # The rate this interval was ACTUALLY sampled at, which is
+                    # lowered on a long window so the frames span all of it.
+                    # Part of the vector's identity, so it travels with it
+                    # rather than being inferred from the request.
+                    "sampled_fps": round(
+                        frame_rate_for(float(interval["end"]) - float(interval["start"]), sampling), 4
+                    ),
                 })
             except Exception as error:  # noqa: BLE001 - reported, never swallowed
                 failed.append({"id": interval_id, "reason": f"{type(error).__name__}: {error}"})
