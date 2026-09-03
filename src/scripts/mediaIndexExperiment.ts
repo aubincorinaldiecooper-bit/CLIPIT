@@ -349,9 +349,30 @@ function estimateGpuCost(msHeld: number): { usd: number | null; note: string } {
   };
 }
 
-/** The service's own measurement of how long it held the GPU. */
+/**
+ * How long the GPU was actually held.
+ *
+ * The per-call timers start inside the remote method, which is AFTER the
+ * model has been loaded onto the GPU — and loading it is real, billed time.
+ * A cost built from the call timers alone understates every cold container,
+ * which is precisely the container an experiment starts on.
+ *
+ * So the load is added, once per container rather than once per call: each
+ * reply carries the id of the container that served it and how long that
+ * container spent starting up. Twenty calls to one warm container pay for one
+ * startup, which is what actually happened.
+ */
 function gpuMsFrom(metrics: Array<Record<string, unknown>>): number {
-  return metrics.reduce((sum, row) => sum + (typeof row.total_ms === 'number' ? row.total_ms : 0), 0);
+  const calls = metrics.reduce((sum, row) => sum + (typeof row.total_ms === 'number' ? row.total_ms : 0), 0);
+
+  const startupByContainer = new Map<string, number>();
+  for (const row of metrics) {
+    if (typeof row.container !== 'string' || typeof row.startup_ms !== 'number') continue;
+    startupByContainer.set(row.container, row.startup_ms);
+  }
+  const startup = [...startupByContainer.values()].reduce((sum, ms) => sum + ms, 0);
+
+  return calls + startup;
 }
 
 /**
@@ -479,8 +500,12 @@ async function main(): Promise<void> {
     if (probes.length > 0) throw new Error(complaint);
     console.log(`WARNING  ${complaint}\n`);
   } else {
-    console.log(`asymmetry  question and document differ by ${asymmetry.toFixed(4)} — the distinction is live\n`);
+    console.log(`asymmetry  question and document differ by ${asymmetry.toFixed(4)} — the distinction is live`);
   }
+  // Which weights produced everything below. 'unpinned' means the service
+  // loaded whatever the hub was serving, so this run is reproducible only
+  // until those weights change.
+  console.log(`weights    ${asQuery.revision}${asQuery.revision === 'unpinned' ? '  (pin before the index becomes durable)' : ''}\n`);
 
   // Which grids to try. One by default, because every extra grid is a whole
   // second pass over the video on a real GPU.
@@ -754,6 +779,9 @@ async function main(): Promise<void> {
   await writeFile(args.out, JSON.stringify({
     video: { id: video.id, title: video.title, durationSeconds: duration },
     model: env.MEDIA_INDEX_EMBED_MODEL,
+    // Recorded with the results: numbers that cannot be traced to weights
+    // cannot be reproduced, and this file is the record of the measurement.
+    revision: asQuery.revision,
     dims: env.MEDIA_INDEX_EMBED_DIMS,
     sampling: { fps: env.MEDIA_INDEX_SAMPLE_FPS, maxFrames: env.MEDIA_INDEX_MAX_FRAMES, shortSide: env.MEDIA_INDEX_FRAME_SHORT_SIDE },
     runs: report,

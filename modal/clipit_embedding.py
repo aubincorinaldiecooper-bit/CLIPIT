@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
+import uuid
 import subprocess
 import tempfile
 import time
@@ -66,7 +66,20 @@ from sourcecache import cache_path, evict_cache, fetch_once, scrub
 
 APP_NAME = "clipit-embedding"
 MODEL_ID = "Qwen/Qwen3-VL-Embedding-2B"
-MODEL_REVISION = None  # pin once a known-good revision is confirmed
+# The exact weights, not just the name.
+#
+# Unset, the service loads whatever the hub currently serves under that model
+# name. If those weights are ever republished, later vectors come from a
+# different model while still reporting the same name — and Clipit's model
+# check, which exists precisely to stop two models' vectors being compared,
+# waves them through. The name is not the identity; the name plus the
+# revision is.
+#
+# Every reply carries the revision actually loaded, so a run is always
+# traceable to weights even while this is None. PIN IT BEFORE THE INDEX
+# BECOMES DURABLE: vectors that outlive a weight change cannot be re-derived
+# and cannot be told apart.
+MODEL_REVISION = os.environ.get("QWEN_EMBED_REVISION") or None
 
 # What a question is asking the model to do. Part of a query vector's
 # identity: change this wording and every stored vector stays valid while
@@ -153,6 +166,7 @@ class QwenEmbeddingService:
         from transformers import AutoModel, AutoProcessor
 
         os.environ.setdefault("HF_HOME", "/weights/hf")
+        started = time.time()
         kwargs = {"revision": MODEL_REVISION} if MODEL_REVISION else {}
         self.processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True, **kwargs)
         self.model = AutoModel.from_pretrained(
@@ -160,6 +174,19 @@ class QwenEmbeddingService:
             trust_remote_code=True, **kwargs,
         ).eval()
         self.torch = torch
+
+        # Loading the model holds the GPU, and it is not free. The call timers
+        # below start after this, so a cost built from them alone understates
+        # a cold container — which is exactly the container an experiment
+        # starts on. Reported with an id for THIS container so a caller can
+        # count it once rather than once per call.
+        self.startup_ms = int((time.time() - started) * 1000)
+        self.container = uuid.uuid4().hex[:12]
+        # The pin if there is one; otherwise whatever the hub actually
+        # resolved, so the reply is never silent about which weights ran.
+        self.revision = MODEL_REVISION or getattr(
+            getattr(self.model, "config", None), "_commit_hash", None
+        ) or "unpinned"
 
     # ---- the one model-specific seam -------------------------------------
     #
@@ -229,6 +256,7 @@ class QwenEmbeddingService:
         """
         return {
             "model": MODEL_ID,
+            "revision": self.revision,
             "instruction": QUERY_INSTRUCTION,
             "query": self.prepare_text(text, True),
             "document": self.prepare_text(text, False),
@@ -299,6 +327,7 @@ class QwenEmbeddingService:
 
         return {
             "model": MODEL_ID,
+            "revision": self.revision,
             "modality": "visual",
             "dim": len(results[0]["embedding"]) if results else None,
             "sampling": sampling.describe(),
@@ -307,6 +336,9 @@ class QwenEmbeddingService:
             "metrics": {
                 "requested": len(intervals),
                 "downloaded": downloaded,
+                # Count once per container, not once per call.
+                "container": self.container,
+                "startup_ms": self.startup_ms,
                 "fetch_ms": fetch_ms,
                 "decode_ms": decode_ms,
                 "inference_ms": infer_ms,
@@ -331,6 +363,7 @@ class QwenEmbeddingService:
         vectors = self._encode(texts=[item["text"] for item in texts], is_query=is_query)
         return {
             "model": MODEL_ID,
+            "revision": self.revision,
             "modality": "text",
             "dim": len(vectors[0]) if vectors else None,
             "is_query": is_query,
@@ -338,5 +371,10 @@ class QwenEmbeddingService:
                 {"id": item["id"], "embedding": vector} for item, vector in zip(texts, vectors)
             ],
             "failed": [],
-            "metrics": {"requested": len(texts), "total_ms": int((time.time() - started) * 1000)},
+            "metrics": {
+                "requested": len(texts),
+                "container": self.container,
+                "startup_ms": self.startup_ms,
+                "total_ms": int((time.time() - started) * 1000),
+            },
         }

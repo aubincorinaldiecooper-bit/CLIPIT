@@ -46,6 +46,7 @@ const intervals = [
 function reply(overrides: Record<string, unknown> = {}) {
   return {
     model: MODEL,
+    revision: 'abc123def456',
     dim: DIMS,
     sampling: { fps: 2, max_frames: 16 },
     results: intervals.map((interval, index) => ({
@@ -104,6 +105,22 @@ describe('embedVideoIntervals', () => {
     await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals })).rejects.toThrow(
       /Qwen3-VL-Embedding-8B/,
     );
+  });
+
+  it('carries the weights that actually ran', async () => {
+    // The model NAME is not the identity. The same name can serve different
+    // weights after a republish, and their vectors are no more comparable
+    // than two different models' would be.
+    invokeMock.mockResolvedValue(reply());
+    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals });
+    expect(result.revision).toBe('abc123def456');
+  });
+
+  it('records an unpinned revision rather than refusing it', async () => {
+    // The experiment has to run before anyone knows which commit to pin.
+    invokeMock.mockResolvedValue(reply({ revision: 'unpinned' }));
+    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals });
+    expect(result.revision).toBe('unpinned');
   });
 
   it('refuses vectors of the wrong length', async () => {

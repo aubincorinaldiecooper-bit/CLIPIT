@@ -60,6 +60,13 @@ export interface FailedInterval {
 
 export interface EmbedResult {
   model: string;
+  /**
+   * The weights that actually ran. The model NAME is not the identity: the
+   * same name can serve different weights after a republish, and vectors from
+   * two sets of weights are no more comparable than vectors from two models.
+   * 'unpinned' means the service resolved whatever the hub was serving.
+   */
+  revision: string;
   dims: number;
   sampling: Record<string, unknown>;
   embedded: EmbeddedInterval[];
@@ -74,6 +81,7 @@ export interface EmbedResult {
 
 interface RawEmbedReply {
   model?: unknown;
+  revision?: unknown;
   dim?: unknown;
   sampling?: unknown;
   results?: unknown;
@@ -221,6 +229,19 @@ function readEmbedReply(reply: RawEmbedReply, asked: Set<string>, label: string)
     );
   }
 
+  // A pin, if one is configured, is enforced exactly as the model name is.
+  // Unset, the revision is recorded rather than demanded — the experiment has
+  // to be able to run before anybody knows which commit to pin.
+  const revision = typeof reply.revision === 'string' ? reply.revision : 'unknown';
+  if (env.MEDIA_INDEX_EMBED_REVISION && revision !== env.MEDIA_INDEX_EMBED_REVISION) {
+    throw new ExternalServiceError(
+      label,
+      `Service is running weights "${revision}" but this index expects "${env.MEDIA_INDEX_EMBED_REVISION}". ` +
+        'The same model name can serve different weights, and their vectors are not comparable.',
+      { retryable: false },
+    );
+  }
+
   const rows = Array.isArray(reply.results) ? reply.results : [];
   const dims = env.MEDIA_INDEX_EMBED_DIMS;
   if (rows.length > 0 && reply.dim !== dims) {
@@ -258,6 +279,7 @@ function readEmbedReply(reply: RawEmbedReply, asked: Set<string>, label: string)
 
   return {
     model,
+    revision,
     dims,
     sampling: (reply.sampling as Record<string, unknown>) ?? {},
     embedded,
@@ -281,7 +303,10 @@ export async function embedVideoIntervals(input: {
   sampling?: Sampling;
 }): Promise<EmbedResult> {
   if (input.intervals.length === 0) {
-    return { model: env.MEDIA_INDEX_EMBED_MODEL, dims: env.MEDIA_INDEX_EMBED_DIMS, sampling: {}, embedded: [], failed: [], metrics: {} };
+    return {
+      model: env.MEDIA_INDEX_EMBED_MODEL, revision: 'not asked', dims: env.MEDIA_INDEX_EMBED_DIMS,
+      sampling: {}, embedded: [], failed: [], metrics: {},
+    };
   }
   const sampling = input.sampling ?? defaultSampling();
   const asked = uniqueIds(input.intervals.map((interval) => interval.id), EMBED_VIDEO.label, 'Interval');
@@ -311,7 +336,10 @@ export async function embedTexts(input: {
   isQuery: boolean;
 }): Promise<EmbedResult> {
   if (input.texts.length === 0) {
-    return { model: env.MEDIA_INDEX_EMBED_MODEL, dims: env.MEDIA_INDEX_EMBED_DIMS, sampling: {}, embedded: [], failed: [], metrics: {} };
+    return {
+      model: env.MEDIA_INDEX_EMBED_MODEL, revision: 'not asked', dims: env.MEDIA_INDEX_EMBED_DIMS,
+      sampling: {}, embedded: [], failed: [], metrics: {},
+    };
   }
   const asked = uniqueIds(input.texts.map((row) => row.id), EMBED_TEXT.label, 'Text');
   const reply = await invokeModal<RawEmbedReply>(EMBED_TEXT, {
@@ -329,6 +357,8 @@ export interface RankedInterval {
 
 export interface RerankResult {
   model: string;
+  /** The weights that ran. See EmbedResult.revision. */
+  revision: string;
   ranked: RankedInterval[];
   failed: FailedInterval[];
   metrics: Record<string, unknown>;
@@ -351,7 +381,7 @@ export async function rerankVideoIntervals(input: {
   sampling?: Sampling;
 }): Promise<RerankResult> {
   if (input.candidates.length === 0) {
-    return { model: '', ranked: [], failed: [], metrics: {} };
+    return { model: '', revision: 'not asked', ranked: [], failed: [], metrics: {} };
   }
   const sampling = input.sampling ?? defaultSampling();
   const asked = uniqueIds(input.candidates.map((candidate) => candidate.id), RERANK.label, 'Candidate');
@@ -415,6 +445,7 @@ export async function rerankVideoIntervals(input: {
 
   return {
     model,
+    revision: typeof reply.revision === 'string' ? reply.revision : 'unknown',
     ranked,
     failed,
     metrics: (reply.metrics as Record<string, unknown>) ?? {},

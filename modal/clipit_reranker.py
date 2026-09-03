@@ -19,7 +19,9 @@ footage — scoring a prose summary would rank the summary, not the video.
 
 from __future__ import annotations
 
+import os
 import time
+import uuid
 
 import modal
 
@@ -38,6 +40,11 @@ RELEVANCE_PROMPT = (
     "Answer with a single word, yes or no."
 )
 MODEL_ID = "Qwen/Qwen3-VL-Reranker-2B"
+# Same rule as the embedding service: the name is not the identity. Scores are
+# only ever compared within one call, so a weight change cannot corrupt stored
+# data here — but a sweep whose numbers cannot be traced to weights is not
+# reproducible, which is the whole point of running one.
+MODEL_REVISION = os.environ.get("QWEN_RERANK_REVISION") or None
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -54,16 +61,26 @@ weights = modal.Volume.from_name("clipit-qwen-weights", create_if_missing=True)
 class QwenRerankerService:
     @modal.enter()
     def load(self) -> None:
-        import os
         import torch
         from transformers import AutoModelForCausalLM, AutoProcessor
 
         os.environ.setdefault("HF_HOME", "/weights/hf")
-        self.processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+        started = time.time()
+        kwargs = {"revision": MODEL_REVISION} if MODEL_REVISION else {}
+        self.processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True, **kwargs)
         self.model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID, torch_dtype=torch.float16, device_map="cuda", trust_remote_code=True,
+            MODEL_ID, torch_dtype=torch.float16, device_map="cuda",
+            trust_remote_code=True, **kwargs,
         ).eval()
         self.torch = torch
+
+        # Loading holds the GPU too. Reported with a per-container id so the
+        # caller counts it once rather than once per question.
+        self.startup_ms = int((time.time() - started) * 1000)
+        self.container = uuid.uuid4().hex[:12]
+        self.revision = MODEL_REVISION or getattr(
+            getattr(self.model, "config", None), "_commit_hash", None
+        ) or "unpinned"
 
     def _score(self, query: str, frames_per_candidate: list) -> list[float]:
         """
@@ -166,12 +183,15 @@ class QwenRerankerService:
 
         return {
             "model": MODEL_ID,
+            "revision": self.revision,
             "sampling": sampling.describe(),
             "results": ranked,
             "failed": failed,
             "metrics": {
                 "requested": len(candidates),
                 "downloaded": downloaded,
+                "container": self.container,
+                "startup_ms": self.startup_ms,
                 "total_ms": int((time.time() - started) * 1000),
             },
         }

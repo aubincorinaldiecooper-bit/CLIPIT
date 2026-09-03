@@ -248,6 +248,15 @@ const envSchema = z.object({
    */
   MEDIA_INDEX_VERSION: z.string().trim().default('v1'),
   /**
+   * The exact weights, when they are known. A model NAME is not an identity:
+   * the same name can serve different weights after a republish, and vectors
+   * from two sets of weights are no more comparable than vectors from two
+   * models. Left empty the revision is recorded on every reply but not
+   * demanded — the experiment has to run before anyone knows what to pin.
+   * Set it before the index becomes durable.
+   */
+  MEDIA_INDEX_EMBED_REVISION: z.string().trim().default(''),
+  /**
    * The timeline grid. Experiment variables until the measurement settles
    * them — but not independent ones: the three are checked against each other
    * below, because two combinations inside these ranges leave parts of a
