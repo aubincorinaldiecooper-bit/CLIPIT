@@ -270,6 +270,13 @@ export async function embedVideoIntervals(input: {
   videoUrl: string;
   /** The video's stable identity, so the container caches one download. */
   videoKey: string;
+  /**
+   * What the object measured when that identity was read. The far side
+   * refuses bytes of a different size — the identity is resolved before the
+   * URL is signed, and a re-process landing between the two would otherwise
+   * be embedded as though it were the version the identity names.
+   */
+  expectedBytes: number;
   intervals: IntervalRequest[];
   sampling?: Sampling;
 }): Promise<EmbedResult> {
@@ -282,6 +289,7 @@ export async function embedVideoIntervals(input: {
   const reply = await invokeModal<RawEmbedReply>(EMBED_VIDEO, {
     video_url: input.videoUrl,
     video_key: input.videoKey,
+    expect_bytes: input.expectedBytes,
     intervals: input.intervals,
     fps: sampling.fps,
     max_frames: sampling.maxFrames,
@@ -337,6 +345,8 @@ export async function rerankVideoIntervals(input: {
   query: string;
   videoUrl: string;
   videoKey: string;
+  /** As above: the far side refuses bytes the identity does not describe. */
+  expectedBytes: number;
   candidates: IntervalRequest[];
   sampling?: Sampling;
 }): Promise<RerankResult> {
@@ -350,6 +360,7 @@ export async function rerankVideoIntervals(input: {
     query: input.query,
     video_url: input.videoUrl,
     video_key: input.videoKey,
+    expect_bytes: input.expectedBytes,
     candidates: input.candidates,
     fps: sampling.fps,
     max_frames: sampling.maxFrames,

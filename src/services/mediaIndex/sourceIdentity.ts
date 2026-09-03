@@ -24,8 +24,24 @@ import { getStorage } from '../storage/s3.js';
  * Over-invalidating is safe: the worst case is one extra download. Under-
  * invalidating silently indexes the wrong video. When the store offers no
  * tag, this refuses rather than falling back to the key alone.
+ *
+ * The SIZE comes back too, and it is not decoration. There is a gap between
+ * reading this tag and the signed GET that follows it, and a re-process
+ * landing in that gap hands the container bytes belonging to a version the
+ * identity does not name. Nothing this side can close that gap — binding the
+ * fetch to an exact object version would, and needs trying against real
+ * storage — but the far side can refuse bytes that are not the size the tag
+ * was read from, which catches it before a single vector is made rather than
+ * after the whole run.
  */
-export async function sourceIdentity(storageKey: string): Promise<string> {
+export interface SourceIdentity {
+  /** What the remote container caches under: the key and its content tag. */
+  identity: string;
+  /** What the object measured when that tag was read. */
+  sizeBytes: number;
+}
+
+export async function sourceIdentity(storageKey: string): Promise<SourceIdentity> {
   const object = await getStorage().head(storageKey);
   if (!object) {
     throw new ExternalServiceError('storage', `Nothing in storage at ${storageKey}`, { retryable: false });
@@ -40,5 +56,5 @@ export async function sourceIdentity(storageKey: string): Promise<string> {
       { retryable: false },
     );
   }
-  return `${storageKey}#${object.etag}`;
+  return { identity: `${storageKey}#${object.etag}`, sizeBytes: object.sizeBytes };
 }

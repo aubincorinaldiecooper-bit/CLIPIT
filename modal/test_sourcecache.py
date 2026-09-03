@@ -14,7 +14,7 @@ import tempfile
 import time
 
 import sourcecache
-from sourcecache import cache_path, evict_cache, scrub
+from sourcecache import _assert_expected, cache_path, evict_cache, scrub
 
 FAILURES = []
 
@@ -88,6 +88,34 @@ def main():
     leak = 'failed: https://b.example/p.mp4?X-Amz-Signature=SECRET and more'
     check("SECRET" not in scrub(leak), "scrub must remove a signed URL")
     check("failed:" in scrub(leak), "scrub must keep the part that explains the failure")
+
+    # --- bytes that are not the ones the caller identified -----------------
+    #
+    # Clipit reads the object's content tag, then signs the URL this service
+    # fetches. A re-process landing between the two hands us a different
+    # version of the video under an identity that does not name it — and those
+    # vectors would be cached and indistinguishable from correct work.
+    sized = write(os.path.join(root, "clipit-source-sized"), 500)
+    raised = False
+    try:
+        _assert_expected(sized, 400)
+    except RuntimeError as error:
+        raised = "500 bytes" in str(error) and "400" in str(error)
+    check(raised, "a file of the wrong size should be refused, saying both sizes")
+
+    ok = True
+    try:
+        _assert_expected(sized, 500)
+    except Exception:
+        ok = False
+    check(ok, "the right size must pass")
+
+    ok = True
+    try:
+        _assert_expected(sized, None)
+    except Exception:
+        ok = False
+    check(ok, "no expectation means no check, not a failure")
 
     if FAILURES:
         print(f"{len(FAILURES)} failure(s):")

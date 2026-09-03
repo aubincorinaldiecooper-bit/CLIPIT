@@ -91,7 +91,33 @@ def cache_path(video_key: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"clipit-source-{safe}.mp4")
 
 
-def fetch_once(video_url: str, video_key: str) -> tuple[str, bool]:
+def _assert_expected(path: str, expect_bytes: int | None) -> None:
+    """
+    Refuses a file that is not the one the caller identified.
+
+    Clipit reads the object's content tag, and only then signs the URL this
+    service fetches. A video re-processed in between overwrites the same key,
+    so the bytes arriving here can belong to a version the identity does not
+    name — and they would be embedded, cached under that identity, and
+    indistinguishable from correct work. The caller detects it after the fact;
+    this catches it before a single vector is made.
+
+    Size, because it is what the caller already knows from the same reply the
+    tag came from, and it costs nothing. It is not a content hash: two
+    versions could in principle match. Binding the download to an exact object
+    version is the airtight fix and needs trying against real storage.
+    """
+    if expect_bytes is None:
+        return
+    actual = os.path.getsize(path)
+    if actual != expect_bytes:
+        raise RuntimeError(
+            f"the source video is {actual} bytes but the caller identified one of {expect_bytes}; "
+            "it was most likely replaced between the two, so these bytes are not the ones asked for"
+        )
+
+
+def fetch_once(video_url: str, video_key: str, expect_bytes: int | None = None) -> tuple[str, bool]:
     """
     Pull the source down once and keep it for the life of the container.
 
@@ -102,6 +128,7 @@ def fetch_once(video_url: str, video_key: str) -> tuple[str, bool]:
     """
     path = cache_path(video_key)
     if os.path.exists(path) and os.path.getsize(path) > 0:
+        _assert_expected(path, expect_bytes)
         return path, False
 
     partial = f"{path}.partial"
@@ -138,6 +165,14 @@ def fetch_once(video_url: str, video_key: str) -> tuple[str, bool]:
     except subprocess.TimeoutExpired:
         _remove(partial)
         raise RuntimeError("could not download the source video: timed out") from None
+
+    try:
+        _assert_expected(partial, expect_bytes)
+    except Exception:
+        # Never let bytes the caller did not ask for enter the cache under an
+        # identity that does not describe them.
+        _remove(partial)
+        raise
 
     os.replace(partial, path)
     evict_cache(keep=path)

@@ -127,6 +127,7 @@ class QwenRerankerService:
         video_url: str,
         video_key: str,
         candidates: list[dict],
+        expect_bytes: int | None = None,
         fps: float = 2.0,
         max_frames: int = 16,
         short_side: int = 256,
@@ -141,7 +142,7 @@ class QwenRerankerService:
         """
         started = time.time()
         sampling = Sampling(fps=fps, max_frames=max_frames, short_side=short_side)
-        path, downloaded = fetch_once(video_url, video_key)
+        path, downloaded = fetch_once(video_url, video_key, expect_bytes)
 
         readable, failed = [], []
         for candidate in candidates:

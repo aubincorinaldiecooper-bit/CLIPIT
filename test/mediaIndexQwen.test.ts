@@ -68,12 +68,16 @@ describe('embedVideoIntervals', () => {
     await embedVideoIntervals({
       videoUrl: 'https://storage.example/proxy.mp4?signature=abc',
       videoKey: 'proxies/vid-1/proxy.mp4',
+      expectedBytes: 12_345_678,
       intervals,
     });
     const [, kwargs] = invokeMock.mock.calls[0]!;
     expect(kwargs).toMatchObject({
       video_url: 'https://storage.example/proxy.mp4?signature=abc',
       video_key: 'proxies/vid-1/proxy.mp4',
+      // The size the identity was read at. The far side refuses anything
+      // else, which catches a video re-processed between the two.
+      expect_bytes: 12_345_678,
       intervals,
     });
   });
@@ -88,7 +92,7 @@ describe('embedVideoIntervals', () => {
         { id: intervals[0]!.id, embedding: unit(1), frames: 16 },
       ],
     }));
-    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals });
+    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals });
     const byId = new Map(result.embedded.map((row) => [row.id, row.embedding[0]]));
     expect(byId.get(intervals[0]!.id)).toBeCloseTo(unit(1)[0]!, 6);
     expect(byId.get(intervals[1]!.id)).toBeCloseTo(unit(2)[0]!, 6);
@@ -97,7 +101,7 @@ describe('embedVideoIntervals', () => {
   it('refuses vectors from a different model', async () => {
     // Two models' vectors in one index look exactly like working retrieval.
     invokeMock.mockResolvedValue(reply({ model: 'Qwen/Qwen3-VL-Embedding-8B' }));
-    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals })).rejects.toThrow(
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals })).rejects.toThrow(
       /Qwen3-VL-Embedding-8B/,
     );
   });
@@ -107,7 +111,7 @@ describe('embedVideoIntervals', () => {
       dim: 1024,
       results: [{ id: intervals[0]!.id, embedding: unit(1).slice(0, 1024), frames: 8 }],
     }));
-    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals })).rejects.toThrow(/1024/);
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals })).rejects.toThrow(/1024/);
   });
 
   it('refuses a vector that is not normalized', async () => {
@@ -117,20 +121,20 @@ describe('embedVideoIntervals', () => {
     invokeMock.mockResolvedValue(reply({
       results: [{ id: intervals[0]!.id, embedding: unit(1).map((v) => v * 3), frames: 16 }],
     }));
-    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals })).rejects.toThrow(/not normalized/);
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals })).rejects.toThrow(/not normalized/);
   });
 
   it('refuses an id nobody asked for', async () => {
     invokeMock.mockResolvedValue(reply({
       results: [{ id: '000900000-000910000', embedding: unit(1), frames: 16 }],
     }));
-    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals })).rejects.toThrow(/nobody asked for/);
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals })).rejects.toThrow(/nobody asked for/);
   });
 
   it('refuses a non-finite component', async () => {
     const broken = unit(1); broken[7] = Number.NaN;
     invokeMock.mockResolvedValue(reply({ results: [{ id: intervals[0]!.id, embedding: broken, frames: 16 }] }));
-    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals })).rejects.toThrow(/non-finite/);
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals })).rejects.toThrow(/non-finite/);
   });
 
   it('names a range that came back with neither a vector nor a reason', async () => {
@@ -141,7 +145,7 @@ describe('embedVideoIntervals', () => {
       results: [{ id: intervals[0]!.id, embedding: unit(1), frames: 16 }],
       failed: [],
     }));
-    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals });
+    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals });
     expect(result.embedded).toHaveLength(1);
     expect(result.failed).toEqual([
       { id: intervals[1]!.id, reason: expect.stringContaining('neither an embedding nor a failure') },
@@ -153,7 +157,7 @@ describe('embedVideoIntervals', () => {
       results: [{ id: intervals[0]!.id, embedding: unit(1), frames: 16 }],
       failed: [{ id: intervals[1]!.id, reason: 'no frames decoded for this range' }],
     }));
-    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals });
+    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals });
     expect(result.failed).toEqual([{ id: intervals[1]!.id, reason: 'no frames decoded for this range' }]);
     expect(result.embedded.some((row) => row.id === intervals[1]!.id)).toBe(false);
   });
@@ -164,7 +168,7 @@ describe('embedVideoIntervals', () => {
     invokeMock.mockResolvedValue(reply({
       results: [], failed: [{ id: '000900000-000910000', reason: 'x' }],
     }));
-    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals }))
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals }))
       .rejects.toThrow(/nobody asked for/);
   });
 
@@ -173,7 +177,7 @@ describe('embedVideoIntervals', () => {
       results: [],
       failed: [{ id: intervals[0]!.id, reason: 'a' }, { id: intervals[0]!.id, reason: 'b' }],
     }));
-    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals }))
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals }))
       .rejects.toThrow(/twice/);
   });
 
@@ -184,7 +188,7 @@ describe('embedVideoIntervals', () => {
       results: [{ id: intervals[0]!.id, embedding: unit(1), frames: 16 }],
       failed: [{ id: intervals[0]!.id, reason: 'could not decode' }],
     }));
-    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals }))
+    await expect(embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals }))
       .rejects.toThrow(/both answered and failed/);
   });
 
@@ -210,7 +214,7 @@ describe('embedVideoIntervals', () => {
   });
 
   it('does not call the GPU for an empty list', async () => {
-    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', intervals: [] });
+    const result = await embedVideoIntervals({ videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, intervals: [] });
     expect(invokeMock).not.toHaveBeenCalled();
     expect(result.embedded).toEqual([]);
   });
@@ -239,7 +243,7 @@ describe('rerankVideoIntervals', () => {
       ],
       failed: [], metrics: {},
     });
-    const result = await rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals });
+    const result = await rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals });
     expect(result.ranked.map((row) => row.id)).toEqual([intervals[1]!.id, intervals[0]!.id]);
   });
 
@@ -251,13 +255,13 @@ describe('rerankVideoIntervals', () => {
       model: 'Qwen/Qwen3-VL-Reranker-8B',
       results: [{ id: intervals[0]!.id, score: 0.9 }], failed: [], metrics: {},
     });
-    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals }))
       .rejects.toThrow(/Reranker-8B/);
   });
 
   it('refuses a ranking that names no model at all', async () => {
     invokeMock.mockResolvedValue({ results: [{ id: intervals[0]!.id, score: 0.9 }], failed: [], metrics: {} });
-    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals }))
       .rejects.toThrow(/none given/);
   });
 
@@ -265,7 +269,7 @@ describe('rerankVideoIntervals', () => {
     invokeMock.mockResolvedValue({
       model: RERANK_MODEL, results: [{ id: intervals[0]!.id, score: 'very relevant' }], failed: [], metrics: {},
     });
-    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals }))
       .rejects.toThrow(/non-numeric/);
   });
 
@@ -277,7 +281,7 @@ describe('rerankVideoIntervals', () => {
     invokeMock.mockResolvedValue({
       model: RERANK_MODEL, results: [{ id: intervals[0]!.id, score: 0.7 }], failed: [], metrics: {},
     });
-    const result = await rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals });
+    const result = await rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals });
     expect(result.ranked).toHaveLength(1);
     expect(result.failed).toEqual([
       { id: intervals[1]!.id, reason: expect.stringContaining('neither a score nor a failure') },
@@ -288,7 +292,7 @@ describe('rerankVideoIntervals', () => {
     invokeMock.mockResolvedValue({
       model: RERANK_MODEL, results: [{ id: '000900000-000910000', score: 0.9 }], failed: [], metrics: {},
     });
-    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals }))
       .rejects.toThrow(/nobody asked for/);
   });
 
@@ -296,7 +300,7 @@ describe('rerankVideoIntervals', () => {
     invokeMock.mockResolvedValue({
       model: RERANK_MODEL, results: [], failed: [{ id: 'not-ours', reason: 'x' }], metrics: {},
     });
-    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals }))
       .rejects.toThrow(/nobody asked for/);
   });
 
@@ -306,7 +310,7 @@ describe('rerankVideoIntervals', () => {
       results: [{ id: intervals[0]!.id, score: 0.7 }, { id: intervals[0]!.id, score: 0.2 }],
       failed: [], metrics: {},
     });
-    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals }))
       .rejects.toThrow(/twice/);
   });
 
@@ -319,7 +323,7 @@ describe('rerankVideoIntervals', () => {
       failed: [{ id: intervals[0]!.id, reason: 'could not decode' }],
       metrics: {},
     });
-    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals }))
+    await expect(rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals }))
       .rejects.toThrow(/both answered and failed/);
   });
 
@@ -332,7 +336,7 @@ describe('rerankVideoIntervals', () => {
       failed: [{ id: intervals[1]!.id, reason: 'no frames decoded for this range' }],
       metrics: {},
     });
-    const result = await rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', candidates: intervals });
+    const result = await rerankVideoIntervals({ query: 'q', videoUrl: 'u', videoKey: 'k', expectedBytes: 1000, candidates: intervals });
     expect(result.ranked).toHaveLength(1);
     expect(result.failed[0]!.id).toBe(intervals[1]!.id);
   });

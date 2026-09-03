@@ -62,7 +62,7 @@ import {
   rerankVideoIntervals,
   type EmbeddedInterval,
 } from '../services/mediaIndex/qwen.js';
-import { sourceIdentity } from '../services/mediaIndex/sourceIdentity.js';
+import { sourceIdentity, type SourceIdentity } from '../services/mediaIndex/sourceIdentity.js';
 
 // ---------------------------------------------------------------- arguments
 
@@ -251,8 +251,8 @@ function describe(window: IndexWindow): string {
  */
 async function embedAllWindows(input: {
   proxyKey: string;
-  /** Key plus content tag: see sourceIdentity. Never the signed URL. */
-  identity: string;
+  /** Key plus content tag, and the size it was read at. Never the signed URL. */
+  source: SourceIdentity;
   windows: IndexWindow[];
 }): Promise<{ vectors: Map<string, Float32Array>; failed: Array<{ id: string; reason: string }>; metrics: Array<Record<string, unknown>> }> {
   const vectors = new Map<string, Float32Array>();
@@ -267,7 +267,8 @@ async function embedAllWindows(input: {
     });
     const result = await embedVideoIntervals({
       videoUrl,
-      videoKey: input.identity,
+      videoKey: input.source.identity,
+      expectedBytes: input.source.sizeBytes,
       // The proxy IS the source timeline, so window seconds need no rebasing.
       intervals: batch.map((window) => ({
         id: windowKey(window), start: window.startSeconds, end: window.endSeconds,
@@ -293,10 +294,10 @@ async function embedAllWindows(input: {
   // the race rather than detect it; that needs to be tried against the real
   // store, which this environment cannot reach.)
   const after = await sourceIdentity(input.proxyKey);
-  if (after !== input.identity) {
+  if (after.identity !== input.source.identity) {
     throw new Error(
-      `The analysis proxy changed while it was being indexed (${input.identity.split('#')[1]} → ` +
-        `${after.split('#')[1]}). Some of these vectors describe footage that has been replaced, and ` +
+      `The analysis proxy changed while it was being indexed (${input.source.identity.split('#')[1]} → ` +
+        `${after.identity.split('#')[1]}). Some of these vectors describe footage that has been replaced, and ` +
         'nothing here can tell which. Re-run once the video has finished re-processing.',
     );
   }
@@ -444,8 +445,9 @@ async function main(): Promise<void> {
   // Resolved once, before any GPU work: the proxy key plus the store's tag for
   // its current bytes. A re-processed video overwrites the key, and a warm
   // container caching on the key alone would embed the previous footage.
-  const identity = await sourceIdentity(proxyKey);
-  console.log(`identity   ${identity.split('#')[1]}  (content tag — a re-processed video gets a new one)\n`);
+  const source = await sourceIdentity(proxyKey);
+  console.log(`identity   ${source.identity.split('#')[1]}  ` +
+    `(content tag, ${(source.sizeBytes / 1_000_000).toFixed(1)} MB — a re-processed video gets a new one)\n`);
 
   /**
    * Before anything else: is the question actually being phrased differently
@@ -507,7 +509,7 @@ async function main(): Promise<void> {
     assertDistractorsSeparable(probes, windows, label);
 
     const startedAt = performance.now();
-    const { vectors, failed, metrics } = await embedAllWindows({ proxyKey, identity, windows });
+    const { vectors, failed, metrics } = await embedAllWindows({ proxyKey, source, windows });
     const embedMs = Math.round(performance.now() - startedAt);
 
     const covered = windows.filter((window) => vectors.has(windowKey(window)));
@@ -659,7 +661,7 @@ async function main(): Promise<void> {
           expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
         });
         const reranked = await rerankVideoIntervals({
-          query: probe.query, videoUrl, videoKey: identity,
+          query: probe.query, videoUrl, videoKey: source.identity, expectedBytes: source.sizeBytes,
           candidates: shortlist.map((entry) => ({
             id: windowKey(entry.window), start: entry.window.startSeconds, end: entry.window.endSeconds,
           })),
