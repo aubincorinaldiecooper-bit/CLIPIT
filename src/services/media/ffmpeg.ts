@@ -342,6 +342,10 @@ export function watchClosedSegments(
       if (probed) return probed;
       if (stopped || attempt === probeAttempts) break;
       await new Promise((resolve) => setTimeout(resolve, probeRetryMs));
+      // The run can fail while we are waiting to try again. Without this the
+      // next probe launches anyway, and a stray ffprobe on a file that is
+      // about to be deleted can sit there until its own timeout.
+      if (stopped) break;
     }
     return { readable: false, seconds: Number.NaN };
   };
