@@ -58,6 +58,7 @@ import {
 import { orchestrateVerticalDeck, type OrchestratorCandidate } from '../../services/media/verticalOrchestrator.js';
 import { deckCompletion } from '../../services/media/deckAssembly.js';
 import { clearUnkeptMatchesForRequest } from '../../db/repositories/verticalMedia.js';
+import { verticalForRework } from '../../services/search/presentationTarget.js';
 import type {
   ChunkDegradation,
   ClipRequest,
@@ -1117,7 +1118,10 @@ async function attachSearchThumbnails(input: {
     videoId: video.id,
     proxyStorageKey: video.proxyStorageKey,
     playbackStorageKey: video.playbackStorageKey ?? null,
-    presentation: request?.presentationTarget === 'vertical' ? 'vertical' : 'original',
+    // Vertical whatever the stored row says. A request from before the
+        // always-vertical rule carries 'source', and re-cutting from it would
+        // hand back the landscape clip the rule exists to stop.
+        presentation: verticalForRework(),
     matches,
     workDir,
     log,

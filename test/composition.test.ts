@@ -176,20 +176,37 @@ describe('presentationTargetFor — what shape was actually asked for', () => {
     expect(presentationTargetFor('something for YouTube Shorts').target).toBe('vertical');
   });
 
-  it('does not invent a vertical request from an ordinary question', () => {
-    expect(presentationTargetFor('Find the part where they introduce themselves').target).toBe('source');
-    expect(presentationTargetFor('').target).toBe('source');
+  /**
+   * These three tests used to assert the opposite, and they were right to:
+   * the shape was read from the words, an ordinary question got the footage
+   * as shot, and "keep the original framing" beat a platform mention.
+   *
+   * The owner ended that on 2026-09-03 — every clip is 9:16, never
+   * landscape, ever. So they now pin the rule that replaced it, including
+   * the phrases that used to be the way out.
+   */
+  it('is vertical for an ordinary question, with no platform word anywhere', () => {
+    // The case that made the rule: a search worded like this produced a
+    // landscape clip, which the 9:16 review card showed as a wide band in a
+    // tall black box. Nothing had failed.
+    expect(presentationTargetFor('Find the part where they introduce themselves').target).toBe('vertical');
+    expect(presentationTargetFor('').target).toBe('vertical');
+    expect(presentationTargetFor(null).target).toBe('vertical');
+    expect(presentationTargetFor(undefined).target).toBe('vertical');
   });
 
-  it('lets an explicit keep-the-framing instruction beat a platform word', () => {
-    // "post the original framing to TikTok" is a coherent thing to want.
-    const intent = presentationTargetFor('post to tiktok but keep the original framing');
-    expect(intent.target).toBe('source');
-    expect(intent.matched).toBe('keep the original framing');
+  it('is vertical even when asked to keep the original framing', () => {
+    // The escape hatch is deliberately gone. "Never landscape, ever" has no
+    // phrase that returns landscape — that is the whole of the rule.
+    expect(presentationTargetFor('post to tiktok but keep the original framing').target).toBe('vertical');
+    expect(presentationTargetFor('keep the full frame').target).toBe('vertical');
+    expect(presentationTargetFor("tiktok clips but don't crop them").target).toBe('vertical');
+    expect(presentationTargetFor('preserve the original aspect ratio please').target).toBe('vertical');
   });
 
-  it("honours don't-crop phrasing", () => {
-    expect(presentationTargetFor("tiktok clips but don't crop them").target).toBe('source');
+  it('reports no deciding phrase, because nothing decides it', () => {
+    expect(presentationTargetFor('post to tiktok').matched).toBeNull();
+    expect(presentationTargetFor('keep the original framing').matched).toBeNull();
   });
 });
 

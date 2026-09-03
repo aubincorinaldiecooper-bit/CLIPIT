@@ -112,17 +112,29 @@ describe('what is filtered before anything is paid for', () => {
     expect(exceedsPlatformHardMax({ startSeconds: 10, endSeconds: 50 }, intent)).toBe(false);
   });
 
-  it('leaves non-platform requests entirely alone', () => {
+  /**
+   * Both of these used to expect `false`, and that was the design: a request
+   * with no platform, or one that asked for the original framing, owed no
+   * vertical derivative. The owner ended that on 2026-09-03 — every clip is
+   * 9:16, never landscape, ever.
+   *
+   * What the intent still decides is untouched, and these keep checking it:
+   * which platform's limits apply, and how long a clip may run.
+   */
+  it('owes a vertical derivative to a request that never mentions a platform', () => {
     const intent = resolvePlatformIntent('find the bit where the dog barks', 90);
-    expect(needsVerticalDerivative(intent)).toBe(false);
+    expect(needsVerticalDerivative(intent)).toBe(true);
+    // No platform means no platform LIMITS, which is a separate question and
+    // still answered the old way.
+    expect(intent.platform).toBeNull();
     expect(exceedsPlatformHardMax({ startSeconds: 0, endSeconds: 89 }, intent)).toBe(false);
   });
 
-  it('honours "keep the original framing" over the platform word', () => {
+  it('owes one even when the words ask to keep the original framing', () => {
     const intent = resolvePlatformIntent('post a 30 second clip to tiktok but keep the original framing', 90);
     expect(intent.platform).toBe('tiktok');
-    // Duration rules still apply; the crop does not.
-    expect(needsVerticalDerivative(intent)).toBe(false);
+    // The crop is no longer negotiable. The duration still is.
+    expect(needsVerticalDerivative(intent)).toBe(true);
     expect(intent.hardMaxSeconds).toBe(30);
   });
 });
