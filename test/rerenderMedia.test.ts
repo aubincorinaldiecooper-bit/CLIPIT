@@ -180,7 +180,16 @@ beforeEach(() => {
   pipeline.discardUploadedObjects.mockResolvedValue(undefined);
 });
 
-describe('a re-render of a moment cut on find, original framing', () => {
+/**
+ * This block was "original framing": a clip made landscape stayed landscape
+ * through a re-cut. The owner ended that on 2026-09-03 — every clip is 9:16,
+ * never landscape, ever — so a re-cut of an old clip now converts it, and the
+ * row is updated in the same write so it cannot disagree with the file.
+ *
+ * Found by Devin and Codex together: without this the rule had a hole exactly
+ * where somebody would press Re-clip.
+ */
+describe('a re-render of a moment made before the always-vertical rule', () => {
   it('stores the new cut and its poster at fresh keys, takes both in one row write, then lets the old objects go', async () => {
     await handleClipGeneration(job({ reclip: reclipPayload }));
 
@@ -191,9 +200,11 @@ describe('a re-render of a moment cut on find, original framing', () => {
     const render = freshCanonical.slice('clips/video-1/clip-1-'.length, -'.mp4'.length);
 
     // The poster first, sharing the render's name, then the cut.
-    const posterCall = pipeline.runOriginalPipeline.mock.calls[0]![0] as Record<string, unknown>;
-    expect(posterCall).toMatchObject({ canonicalPath: '/tmp/clipit-test/clip-1.mp4', render, snapshotPosterKey: OLD_POSTER });
-    expect(orderOf(pipeline.runOriginalPipeline)).toBeLessThan(storage.uploadFile.mock.invocationCallOrder[storage.uploadFile.mock.calls.indexOf(upload)]!);
+    // The vertical pipeline, not the original one: converting the clip.
+    const posterCall = pipeline.runVerticalPipeline.mock.calls[0]![0] as Record<string, unknown>;
+    expect(posterCall).toMatchObject({ canonicalPath: '/tmp/clipit-test/clip-1.mp4', render });
+    expect(pipeline.runOriginalPipeline).not.toHaveBeenCalled();
+    expect(orderOf(pipeline.runVerticalPipeline)).toBeLessThan(storage.uploadFile.mock.invocationCallOrder[storage.uploadFile.mock.calls.indexOf(upload)]!);
 
     // One write, both keys — inside the same transaction as the Re-clip's
     // version and cleared pending state, and the stale variants.
@@ -206,7 +217,15 @@ describe('a re-render of a moment cut on find, original framing', () => {
       storageKey: freshCanonical,
       durationSeconds: 23,
       sizeBytes: 500,
-      media: { kind: 'original', poster: { posterStorageKey: `posters/video-1/clip-1-${render}.jpg`, sourceWidth: 1920 } },
+      media: {
+        kind: 'vertical',
+        media: {
+          derivativeStorageKey: `clips/video-1/clip-1-${render}-vertical.mp4`,
+          posterStorageKey: `posters/video-1/clip-1-${render}.jpg`,
+          outputWidth: 1080,
+          outputHeight: 1920,
+        },
+      },
     });
     expect(committed()!.captions).toBeUndefined();
 
@@ -224,8 +243,10 @@ describe('a re-render of a moment cut on find, original framing', () => {
   it('does the same for a caption Replace, whose spec rides in the same write', async () => {
     await handleClipGeneration(job({ captions: [] }));
     expect(canonicalUpload()![0]).toMatch(FRESH_CANONICAL);
-    expect(pipeline.runOriginalPipeline).toHaveBeenCalledTimes(1);
-    expect(committed()).toMatchObject({ captions: [], media: { kind: 'original' } });
+    expect(pipeline.runVerticalPipeline).toHaveBeenCalledTimes(1);
+    expect(pipeline.runOriginalPipeline).not.toHaveBeenCalled();
+    // A caption Replace re-cuts the file, so it converts the clip too.
+    expect(committed()).toMatchObject({ captions: [], media: { kind: 'vertical' } });
     expect(enqueueObjectRelease.mock.calls[0]![0]).toEqual(expect.arrayContaining([OLD_CANONICAL]));
   });
 
@@ -250,7 +271,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
   });
 
   it('replaces nothing and rolls the Re-clip back when the new poster cannot be made', async () => {
-    pipeline.runOriginalPipeline.mockRejectedValueOnce(new Error('poster frame extracted to nothing'));
+    pipeline.runVerticalPipeline.mockRejectedValueOnce(new Error('poster frame extracted to nothing'));
 
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('poster frame');
 
@@ -269,10 +290,15 @@ describe('a re-render of a moment cut on find, original framing', () => {
 
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('bucket refused');
 
+    // Three now, not two: converting the clip makes a 9:16 derivative
+    // alongside the cut and its poster, and a rollback takes back all of it.
     const [keys, context] = pipeline.discardUploadedObjects.mock.calls[0]!;
-    expect(keys).toHaveLength(2);
+    expect(keys).toHaveLength(3);
     expect(keys[0]).toMatch(FRESH_CANONICAL);
-    expect(keys[1]).toMatch(/^posters\/video-1\/clip-1-[0-9a-f]{8}\.jpg$/);
+    expect(keys).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^clips\/video-1\/clip-1-[0-9a-f]{8}-vertical\.mp4$/),
+      expect.stringMatching(/^posters\/video-1\/clip-1-[0-9a-f]{8}\.jpg$/),
+    ]));
     expect(context).toMatchObject({ clipId: 'clip-1', reason: 'render_commit_failed' });
     expect(commitRender).not.toHaveBeenCalled();
     expect(enqueueObjectRelease).not.toHaveBeenCalled();
@@ -285,7 +311,7 @@ describe('a re-render of a moment cut on find, original framing', () => {
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('database refused');
 
     const [keys] = pipeline.discardUploadedObjects.mock.calls[0]!;
-    expect(keys).toHaveLength(2);
+    expect(keys).toHaveLength(3);
     // The previous cut and poster are still what the row names, so they stay.
     expect(enqueueObjectRelease).not.toHaveBeenCalled();
     // A failed render like any other: rolled back, no version, the failure on record.

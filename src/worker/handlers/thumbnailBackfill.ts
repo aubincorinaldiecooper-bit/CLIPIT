@@ -10,7 +10,6 @@ import {
 import { getVideo } from '../../db/repositories/videos.js';
 import { attachThumbnails } from '../../services/media/thumbnails.js';
 import type { ThumbnailBackfillJob } from '../../queues/index.js';
-import { verticalForRework } from '../../services/search/presentationTarget.js';
 
 /**
  * Gives stills to matches that were found before stills existed.
@@ -69,10 +68,13 @@ export async function handleThumbnailBackfill(job: Job<ThumbnailBackfillJob>): P
           videoId: video.videoId,
           proxyStorageKey: video.proxyStorageKey,
           playbackStorageKey,
-          // Vertical whatever the stored row says. A request from before the
-        // always-vertical rule carries 'source', and re-cutting from it would
-        // hand back the landscape clip the rule exists to stop.
-        presentation: verticalForRework(),
+          // The REQUEST's own target, not the rule. This backfill only draws a
+        // still for a clip that already exists, and a still must match the
+        // file it stands for. Forcing 9:16 here would centre-crop a preview
+        // of a clip that is still served, and still played, landscape —
+        // promising a framing the file does not deliver. The rule governs
+        // what is made; this makes nothing.
+        presentation: request?.presentationTarget === 'vertical' ? 'vertical' : 'original',
           matches: group,
           workDir: dir,
           log,
