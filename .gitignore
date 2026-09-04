@@ -17,3 +17,9 @@ tmp/
 
 # Redis dump from a locally started redis-server
 dump.rdb
+
+# Python bytecode. modal/ holds real Python — the two standalone test suites
+# are run with plain python3 — so running them leaves .pyc files behind, and
+# two of them were committed with #93 before this rule existed.
+__pycache__/
+*.py[cod]
