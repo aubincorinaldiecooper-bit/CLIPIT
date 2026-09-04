@@ -220,6 +220,66 @@ const envSchema = z.object({
       const parsed = Number(value);
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
     }),
+  // --- Media Index: Qwen embeddings and reranking on Modal ---------------
+  /**
+   * The two deployed Qwen services. Separate apps from the video model, so
+   * each has its own name here rather than sharing MODAL_APP_NAME — one
+   * setting for three deployments is how the wrong class gets invoked.
+   */
+  MEDIA_INDEX_EMBED_APP: z.string().trim().default('clipit-embedding'),
+  MEDIA_INDEX_EMBED_CLASS: z.string().trim().default('QwenEmbeddingService'),
+  MEDIA_INDEX_RERANK_APP: z.string().trim().default('clipit-reranker'),
+  MEDIA_INDEX_RERANK_CLASS: z.string().trim().default('QwenRerankerService'),
+  /**
+   * Frozen onto every row. A vector is only comparable with another made by
+   * the same model at the same dimension, and a stored embedding that cannot
+   * say which model produced it is a vector nobody can ever safely use again.
+   */
+  MEDIA_INDEX_EMBED_MODEL: z.string().trim().default('Qwen/Qwen3-VL-Embedding-2B'),
+  MEDIA_INDEX_EMBED_DIMS: int(2048, 8, 16_000),
+  /** Same rule for the reranker: a misrouted deployment ranks confidently. */
+  MEDIA_INDEX_RERANK_MODEL: z.string().trim().default('Qwen/Qwen3-VL-Reranker-2B'),
+  /**
+   * Bumped by hand whenever anything that changes the MEANING of a vector
+   * changes: the model, the pooling, the frame sampling, the window grid.
+   * Retrieval only ever compares within one version, so an index built under
+   * the old rules is retired rather than quietly mixed with the new — which
+   * would look exactly like working search and would not be.
+   */
+  MEDIA_INDEX_VERSION: z.string().trim().default('v1'),
+  /**
+   * The exact weights, when they are known. A model NAME is not an identity:
+   * the same name can serve different weights after a republish, and vectors
+   * from two sets of weights are no more comparable than vectors from two
+   * models. Left empty the revision is recorded on every reply but not
+   * demanded — the experiment has to run before anyone knows what to pin.
+   * Set it before the index becomes durable.
+   */
+  MEDIA_INDEX_EMBED_REVISION: z.string().trim().default(''),
+  /**
+   * The timeline grid. Experiment variables until the measurement settles
+   * them — but not independent ones: the three are checked against each other
+   * below, because two combinations inside these ranges leave parts of a
+   * video with no embedding at all.
+   */
+  MEDIA_INDEX_WINDOW_SECONDS: num(10, 1, 120),
+  MEDIA_INDEX_STRIDE_SECONDS: num(5, 0.5, 120),
+  MEDIA_INDEX_MIN_WINDOW_SECONDS: num(3, 0.5, 120),
+  /** How the model is shown a window. Part of a vector's identity. */
+  MEDIA_INDEX_SAMPLE_FPS: num(2, 0.1, 30),
+  MEDIA_INDEX_MAX_FRAMES: int(16, 1, 128),
+  MEDIA_INDEX_FRAME_SHORT_SIDE: int(256, 64, 1080),
+  /** How many windows ride in one Modal call. One fetch, many vectors. */
+  MEDIA_INDEX_BATCH_WINDOWS: int(32, 1, 512),
+  /**
+   * In-flight Modal calls. Every one can hold its own L4 and the bill is per
+   * GPU-second, so this stays low until measured — the same reasoning that
+   * keeps MINICPM_VIDEO_CONCURRENCY at one.
+   */
+  MEDIA_INDEX_CONCURRENCY: int(1, 1, 8),
+  MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
+  MEDIA_INDEX_MAX_RETRIES: int(2, 0, 5),
+
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
   OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
   /**
@@ -500,6 +560,21 @@ function loadEnv(): Env {
 
   if (value.MAX_CLIP_SECONDS < value.MIN_CLIP_SECONDS) {
     problems.push('MAX_CLIP_SECONDS must be >= MIN_CLIP_SECONDS');
+  }
+  // The Media Index grid has to be able to cover a timeline. Two combinations
+  // inside the individual ranges cannot: a stride longer than a window leaves
+  // a hole between every pair, and a minimum longer than a window disqualifies
+  // all of them. Caught at startup rather than at the first video, and again
+  // in planWindows for anything that builds a plan by hand.
+  if (value.MEDIA_INDEX_STRIDE_SECONDS > value.MEDIA_INDEX_WINDOW_SECONDS) {
+    problems.push(
+      'MEDIA_INDEX_STRIDE_SECONDS must be <= MEDIA_INDEX_WINDOW_SECONDS, or parts of every video go unindexed',
+    );
+  }
+  if (value.MEDIA_INDEX_MIN_WINDOW_SECONDS > value.MEDIA_INDEX_WINDOW_SECONDS) {
+    problems.push(
+      'MEDIA_INDEX_MIN_WINDOW_SECONDS must be <= MEDIA_INDEX_WINDOW_SECONDS, or no window ever qualifies',
+    );
   }
   if (value.TRANSCRIPTION_ENABLED && !value.OPENROUTER_API_KEY) {
     problems.push(
