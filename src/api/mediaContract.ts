@@ -42,6 +42,12 @@ export interface ClipMediaContract {
   composition: ClipComposition;
   /** What to play. The 9:16 derivative for a vertical moment; otherwise the canonical clip. */
   url: string | null;
+  /**
+   * The same file as `url`, served to be saved rather than played. Null while
+   * there is nothing to save: a vertical moment whose 9:16 file has not
+   * landed has no download, not a landscape one.
+   */
+  downloadUrl: string | null;
   /** Always the original-framing excerpt. Never replaced by a derivative. */
   canonicalUrl: string | null;
   posterUrl: string | null;
@@ -54,7 +60,11 @@ export interface ClipMediaContract {
 
 export interface ClipMediaRow {
   canonicalUrl: string | null;
+  /** The canonical excerpt, signed to be saved (attachment disposition). */
+  canonicalDownloadUrl?: string | null;
   derivativeUrl: string | null;
+  /** The 9:16 file, signed to be saved. */
+  derivativeDownloadUrl?: string | null;
   derivativeStorageKey: string | null;
   derivativeStatus: DerivativeStatus | null;
   posterUrl: string | null;
@@ -143,6 +153,12 @@ export function clipMediaContract(row: ClipMediaRow, wantsVertical: boolean): Cl
   const url = wantsVertical
     ? (derivativeReady ? row.derivativeUrl : null)
     : row.canonicalUrl;
+  // Saving follows the same rule as playing: the file offered for download
+  // is the one on screen, and a vertical moment without its 9:16 file offers
+  // nothing rather than the landscape cut.
+  const downloadUrl = wantsVertical
+    ? (derivativeReady ? row.derivativeDownloadUrl ?? null : null)
+    : row.canonicalDownloadUrl ?? null;
 
   const outputAspectRatio = wantsVertical && derivativeReady
     ? aspectRatioLabel(row.outputWidth, row.outputHeight) ?? '9:16'
@@ -151,6 +167,7 @@ export function clipMediaContract(row: ClipMediaRow, wantsVertical: boolean): Cl
   return {
     composition: clipComposition(row, wantsVertical, derivativeReady),
     url,
+    downloadUrl,
     canonicalUrl: row.canonicalUrl,
     posterUrl: row.posterUrl,
     posterTimestampSeconds: row.posterTimestampSeconds,

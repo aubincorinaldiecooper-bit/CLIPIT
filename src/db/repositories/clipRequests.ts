@@ -709,6 +709,33 @@ export async function listMatches(requestId: string): Promise<ClipMatch[]> {
   return rows.map(mapMatch);
 }
 
+/**
+ * The question a moment was found for, and the words that were searched.
+ *
+ * A render made on Keep needs both: the request, to attribute the framing
+ * call's cost where the search's own cost went; and the words, to apply the
+ * platform or duration limit the question named. The two differ for a
+ * correction. "Are you sure?" is stored as its own request, but the search
+ * looked for the PREVIOUS question's words (see handleClipSearch), so its
+ * moments must be cut to that question's limits — read through
+ * corrected_request_id, exactly one hop, which is what the search itself
+ * read. Devin's finding on #95. Null when the moment is gone.
+ */
+export async function getClipRequestForMatch(
+  matchId: string,
+): Promise<{ request: ClipRequest; instruction: string } | null> {
+  const row = await queryOne<ClipRequestRow & { effective_instruction: string | null }>(
+    `SELECT r.*, corrected.instruction AS effective_instruction
+       FROM clip_matches m
+       JOIN clip_requests r ON r.id = m.clip_request_id
+       LEFT JOIN clip_requests corrected ON corrected.id = r.corrected_request_id
+      WHERE m.id = $1`,
+    [matchId],
+  );
+  if (!row) return null;
+  return { request: mapRequest(row), instruction: row.effective_instruction ?? row.instruction };
+}
+
 export async function listMatchesByIds(requestId: string, matchIds: string[]): Promise<ClipMatch[]> {
   if (matchIds.length === 0) return [];
   const rows = await queryRows<ClipMatchRow>(

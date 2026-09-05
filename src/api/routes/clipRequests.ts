@@ -11,19 +11,20 @@ import {
   setMatchFeedback,
 } from '../../db/repositories/clipRequests.js';
 import { getRootClipByMatchId, listClipsForRequest, upsertClipForMatch } from '../../db/repositories/clips.js';
-import { approveClip } from '../../db/repositories/verticalMedia.js';
-import { keepAction, retentionClassFor } from '../../services/media/keepApproval.js';
+import { approveClip, approveClipOnKeep, undoKeepNotQueued } from '../../db/repositories/verticalMedia.js';
+import { KeepNotQueuedError, approveAndQueue } from '../../services/media/keepProduction.js';
+import { keepAction, keepTargetFromClip, retentionClassFor } from '../../services/media/keepApproval.js';
 import { claimReclip, clearReclipPending, latestVersionsForMatches } from '../../db/repositories/reclips.js';
 import { getVideo } from '../../db/repositories/videos.js';
 import { enqueueClipGeneration, enqueueReclip } from '../../queues/index.js';
 import { assertOwnership, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import {
-  creatorVisibleDeck,
   searchCoverage,
   serializeClip,
   serializeClipRequest,
   serializeMatch,
+  visibleMatches,
   type SearchCoverage,
 } from '../serializers.js';
 import { parse } from '../validation.js';
@@ -89,19 +90,15 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
     const [allMatches, allClips] = await Promise.all([listMatches(requestId), listClipsForRequest(requestId)]);
     const clipsByMatchId = new Map<string, Clip>(allClips.map((clip) => [clip.clipMatchId, clip]));
 
-    // A post-ready request renders more candidates than it shows, so the
-    // answer is the finished set — not everything the search happened to
-    // store. Requests that never pre-rendered anything are untouched.
-    const visible = creatorVisibleDeck(clipRequest, allMatches, clipsByMatchId);
-    if (visible.withheld > 0) {
-      logger.info('withheld unfinished moments from a creator response', {
-        requestId, shown: visible.matches.length, withheld: visible.withheld,
-      });
-    }
+    // Every moment, once the search has finished; until then the count of
+    // what has been stored so far, so the chat can speak from something real.
+    const matches = visibleMatches(clipRequest, allMatches);
+    const shown = new Set(matches.map((match) => match.id));
+    const clips = allClips.filter((clip) => shown.has(clip.clipMatchId));
 
     return reply.send({
-      clipRequest: await serializeClipRequest(clipRequest, visible.matches, clipsByMatchId),
-      clips: await Promise.all(visible.clips.map((clip: Clip) => serializeClip(clip))),
+      clipRequest: await serializeClipRequest(clipRequest, matches, clipsByMatchId, { candidatesFound: allMatches.length }),
+      clips: await Promise.all(clips.map((clip: Clip) => serializeClip(clip))),
     });
   });
 
@@ -211,8 +208,13 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
   });
 
   /**
-   * Turns matches into real MP4s. Generation happens in the worker; this
-   * returns immediately with clip records to poll.
+   * Keep. Approves the moments named and makes their files.
+   *
+   * This is where production starts — the cut, the framing call, the 9:16
+   * encode and the poster all follow from this press and from nothing
+   * earlier. The moment was shown from the source video it was found in; its
+   * file is made because a person chose it. The render runs in the worker;
+   * this returns at once with clip records to poll.
    */
   app.post('/api/clip-requests/:requestId/generate', { preHandler: requireSession }, async (request, reply) => {
     await enforceRateLimits(request, [
@@ -251,20 +253,9 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       ? await listMatchesByIds(requestId, body.matchIds)
       : await listMatches(requestId);
 
-    // "Everything" means everything the creator was actually SHOWN.
-    //
-    // A post-ready request over-fetches on purpose, so the stored matches
-    // include candidates that were withheld: ones whose render failed, and
-    // ones the deck never needed. Keeping "all" of a three-moment deck would
-    // walk into one of those, be refused as an unfinished moment, and leave
-    // the creator unable to keep the three finished ones at all — while the
-    // moments it had already approved stayed approved. Scoping to the deck
-    // removes both the refusal and the half-applied state.
-    const existingClips = await listClipsForRequest(requestId);
-    const existingByMatchId = new Map<string, Clip>(existingClips.map((clip) => [clip.clipMatchId, clip]));
-    const candidates = body.matchIds?.length
-      ? all
-      : creatorVisibleDeck(clipRequest, all, existingByMatchId).matches;
+    // "Everything" means everything the creator was actually shown — which,
+    // for a completed request, is every moment it found.
+    const candidates = body.matchIds?.length ? all : visibleMatches(clipRequest, all);
 
     // An explicit list is taken at its word — asking for a match by id is a
     // deliberate act, even one previously waved off. Generating "everything",
@@ -273,37 +264,6 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
     const matches = body.matchIds?.length
       ? candidates
       : candidates.filter((match) => match.feedback !== 'rejected');
-
-    // The deck withheld everything. That is not the creator waving everything
-    // away, and it is not one situation either — it is three, and each wants
-    // a different sentence.
-    //
-    // My first attempt at this fix collapsed them into one message and so
-    // swapped a false statement for a different false statement: a request
-    // where nothing ever fit the platform's limits was told its moments were
-    // "no longer available" and to ask again — inviting a retry that could
-    // only produce the same answer, for media that never existed.
-    if (!body.matchIds?.length && candidates.length === 0 && all.length > 0) {
-      if (clipRequest.effectiveDeckTarget === 0) {
-        // Nothing the search found could be posted here — every moment was
-        // too long for the platform. A real answer about their video, and a
-        // retry cannot change it.
-        throw HttpError.unprocessable(
-          'None of the moments found fit that platform\'s length limits.',
-        );
-      }
-      if (clipRequest.deckCompletedAt) {
-        // A deck really was delivered; its unkept media has since expired,
-        // which is by design. Rebuilding is the right suggestion here.
-        throw HttpError.unprocessable(
-          'Those moments are no longer available to keep. Ask again to rebuild them.',
-        );
-      }
-      // Never completed — the deck failed or is still being made.
-      throw HttpError.unprocessable(
-        'Those moments are not ready to keep yet. Ask again to rebuild them.',
-      );
-    }
 
     // Telling someone to rephrase when the search worked and they simply waved
     // every result away would send them to fix the one thing that was fine.
@@ -333,34 +293,6 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
     // where the moment stands now.
     const currentBounds = await latestVersionsForMatches(matches.map((match) => match.id));
 
-    // Decide everything BEFORE changing anything.
-    //
-    // The loop below mutates as it goes — a clip row per match, an approval,
-    // a queued render. Discovering a moment is unkeepable halfway through
-    // used to throw with the earlier ones already approved, leaving the
-    // creator's request half-applied and no way to tell which half. An
-    // explicit id can still name a withheld moment, so the refusal stays;
-    // it just happens before the first write rather than after several.
-    const unkeepable = candidates.find((match) => {
-      const existing = existingByMatchId.get(match.id);
-      if (!existing?.preRendered) return false;
-      return keepAction({
-        preRendered: true,
-        presentation: existing.presentation,
-        storageKey: existing.storageKey,
-        derivativeStatus: existing.derivativeStatus,
-        derivativeStorageKey: existing.derivativeStorageKey,
-        posterStorageKey: existing.posterStorageKey,
-        clipStatus: existing.status,
-      }).kind === 'reject';
-    });
-    if (unkeepable) {
-      logger.error('keep refused on an unfinished pre-rendered moment', {
-        requestId, matchId: unkeepable.id,
-      });
-      throw HttpError.unprocessable('That moment is not finished yet. Ask again to rebuild it.');
-    }
-
     const clips: Clip[] = [];
     let approved = 0;
     let queued = 0;
@@ -376,61 +308,60 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
         endSeconds: bounds?.endSeconds ?? match.globalEndSeconds,
       });
 
-      // What Keep means depends on whether the media already exists.
+      // What Keep means depends on whether the file already exists.
       //
-      // Every moment is now cut when it is found, so the file was made before
-      // the card was ever shown and Keep is an APPROVAL: it files the clip in
-      // the library. Re-rendering would spend a second GPU call re-deciding
-      // framing that was already decided, and could hand back a
-      // differently-cropped clip from the one the person just chose: they
-      // would have kept one clip and received another.
+      // Usually it does not: the moment was shown from the source video, and
+      // this press is what makes its file. The moment is approved NOW, before
+      // the render, so a retried search cannot sweep it away with its render
+      // still queued — and then the cut, the framing call and the 9:16 encode
+      // follow in the worker.
       //
-      // Only a moment from before that rule — nothing cut behind it — is
-      // still cut here.
-      const action = keepAction({
-        preRendered: clip.preRendered,
-        presentation: clip.presentation,
-        storageKey: clip.storageKey,
-        derivativeStatus: clip.derivativeStatus,
-        derivativeStorageKey: clip.derivativeStorageKey,
-        posterStorageKey: clip.posterStorageKey,
-        clipStatus: clip.status,
-      });
-
-      if (action.kind === 'reject') {
-        // A pre-rendered card should never have reached anyone in this state.
-        // Refusing surfaces the invariant violation; regenerating would
-        // quietly paper over it.
-        logger.error('keep refused on an unfinished pre-rendered moment', {
-          requestId, clipId: clip.id, reason: action.reason,
-        });
-        throw HttpError.unprocessable('That moment is not finished yet. Ask again to rebuild it.');
-      }
+      // A moment whose file already stands — kept before, or made in the
+      // months when every moment was rendered before review — is approved and
+      // left alone. Re-rendering would re-decide framing that was already
+      // decided and could hand back a differently-cropped clip from the one on
+      // screen: they would have kept one clip and received another.
+      const action = keepAction(keepTargetFromClip(clip));
 
       if (action.kind === 'approve') {
-        // retentionClassFor's decision, applied. Approval is what promotes a
-        // file from temporary to owned, and is the reason the retention
-        // sweep will leave it alone.
+        // Conditional on the media really being there — a card can outlive
+        // its files (the sweep collects unkept pre-rendered media), and
+        // approving one would mint an owned row pointing at nothing. Refused
+        // here, it is produced afresh below instead.
         const took = await approveClip(clip.id);
-        if (!took) {
-          logger.error('approval did not take', { requestId, clipId: clip.id });
-          throw HttpError.unprocessable('That moment is not finished yet. Ask again to rebuild it.');
+        if (took) {
+          approved += 1;
+          clips.push({
+            ...clip,
+            approvedAt: clip.approvedAt ?? new Date(),
+            retentionClass: retentionClassFor({ approved: true, preRendered: clip.preRendered }),
+          });
+          continue;
         }
-        approved += 1;
-        clips.push({
-          ...clip,
-          approvedAt: clip.approvedAt ?? new Date(),
-          retentionClass: retentionClassFor({ approved: true, preRendered: true }),
-        });
-        continue;
+        logger.warn('a finished moment could not be approved; producing it again', { requestId, clipId: clip.id });
       }
 
-      clips.push(clip);
-      // A clip that is already rendered does not need to be cut again.
-      if (clip.status !== 'ready') {
-        await enqueueClipGeneration({ clipId: clip.id });
-        queued += 1;
+      // Produce. The approval is recorded first — the person has chosen this
+      // moment — and taken back if the render cannot be queued, so no press
+      // can leave an approved clip that nothing will ever cut.
+      try {
+        await approveAndQueue({
+          clipId: clip.id,
+          approve: approveClipOnKeep,
+          enqueue: (clipId) => enqueueClipGeneration({ clipId }),
+          undo: undoKeepNotQueued,
+        });
+      } catch (cause) {
+        if (cause instanceof KeepNotQueuedError) {
+          logger.error('keep unwound: the render could not be queued', {
+            requestId, clipId: clip.id, alreadyQueued: queued, err: cause.cause,
+          });
+          throw HttpError.serviceUnavailable(cause.message);
+        }
+        throw cause;
       }
+      clips.push({ ...clip, approvedAt: clip.approvedAt ?? new Date(), retentionClass: 'owned' });
+      queued += 1;
     }
 
     logger.info('keep handled', { requestId, clips: clips.length, approved, queued });

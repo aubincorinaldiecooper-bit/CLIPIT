@@ -1,9 +1,9 @@
 import { env } from '../config/env.js';
 import { getStorage } from '../services/storage/s3.js';
 import { formatTimecode } from '../services/timestamps.js';
+import { acceptsQuestions } from '../services/search/readiness.js';
 import { latestVersionsForMatches } from '../db/repositories/reclips.js';
 import { clipMediaContract } from './mediaContract.js';
-import { isCreatorVisible, type DeckPresentation } from '../services/media/verticalVisibility.js';
 import type { CompositionMode } from '../services/media/composition.js';
 import type {
   ChunkDegradation,
@@ -78,6 +78,13 @@ export function serializeVideo(video: Video, chunks?: VideoChunk[]) {
     chunkSeconds: video.chunkSeconds,
     chunkCount: video.chunkCount,
     readyForSearch: video.status === 'ready',
+    /**
+     * Whether a question may be sent now. True from the moment the bytes have
+     * landed: the answer waits, inside the search, for whatever it needs —
+     * see services/search/readiness.ts. `readyForSearch` above still says
+     * whether the preparation itself has finished.
+     */
+    acceptsQuestions: acceptsQuestions(video.status),
     transcript: {
       status: video.transcriptStatus,
       source: video.transcriptSource,
@@ -172,6 +179,14 @@ export interface ClipRequestProgress {
   chunksTotal: number;
   chunksCompleted: number;
   chunksFailed: number;
+  /**
+   * Moments stored for this question so far. Real while the search is still
+   * running — rows the model returned and validation accepted — so a client
+   * can say "a few possible moments so far" from something that exists. They
+   * are not handed out as moments until the request completes (see
+   * visibleMatches), because the search may still fold two of them together.
+   */
+  candidatesFound: number;
   message: string;
 }
 
@@ -255,7 +270,7 @@ export function searchCoverage(request: ClipRequest): SearchCoverage {
   };
 }
 
-function clipRequestProgress(request: ClipRequest): ClipRequestProgress {
+function clipRequestProgress(request: ClipRequest, candidatesFound: number): ClipRequestProgress {
   const total = request.chunksTotal;
   const done = request.chunksCompleted + request.chunksFailed;
   const percent = total > 0 ? Math.min(100, Math.round((100 * done) / total)) : request.status === 'completed' ? 100 : 0;
@@ -288,6 +303,7 @@ function clipRequestProgress(request: ClipRequest): ClipRequestProgress {
     chunksTotal: total,
     chunksCompleted: request.chunksCompleted,
     chunksFailed: request.chunksFailed,
+    candidatesFound,
     message,
   };
 }
@@ -296,6 +312,10 @@ export async function serializeClipRequest(
   request: ClipRequest,
   matches?: ClipMatch[],
   clipsByMatchId?: Map<string, Clip>,
+  options: {
+    /** Moments stored so far, shown or not. Defaults to the shown ones. */
+    candidatesFound?: number;
+  } = {},
 ) {
   return {
     id: request.id,
@@ -328,21 +348,15 @@ export async function serializeClipRequest(
         description: match.description,
       }))
       .sort((a, b) => a.startSeconds - b.startSeconds),
-    progress: clipRequestProgress(request),
+    progress: clipRequestProgress(request, options.candidatesFound ?? matches?.length ?? 0),
     /**
-     * What was asked for, what the video had, and what came back.
+     * What was asked for and what the video had.
      *
-     * Present for every request that owes a finished deck — which, since
-     * moments are cut when they are found, is every request planned after
-     * that rule, whatever framing it asked for. `available` below
+     * Kept under its old name for clients that read it. `available` below
      * `requested` is a fact about the footage, not a failure — a creator who
-     * asks for three and is offered two should be told their video had two,
-     * and this is what lets the interface say that instead of implying we
-     * dropped one.
-     *
-     * `complete` is the same gate the matches above passed through, restated
-     * so a client can tell "still assembling" from "assembled, and this is
-     * all of it" without inferring anything from the array length.
+     * asks for three and is shown two should be told their video had two.
+     * `complete` now simply restates that the search finished: nothing is
+     * assembled behind an answer any more.
      */
     ...(request.presentationTarget !== null
       ? {
@@ -351,7 +365,7 @@ export async function serializeClipRequest(
             availableCandidateCount: request.availableCandidateCount,
             effectiveDeckTarget: request.effectiveDeckTarget,
             readyResultCount: matches?.length ?? 0,
-            complete: request.deckCompletedAt !== null,
+            complete: request.status === 'completed',
           },
         }
       : {}),
@@ -450,133 +464,43 @@ export async function serializeLibraryClip(entry: {
 }
 
 /**
- * The gate between what the pipeline made and what a creator is shown.
+ * Which of a request's moments a creator may see.
  *
- * SET-level, not card-level, and that distinction is the entire point.
+ * All of them, once the search has finished — and none before. That second
+ * half is not a reveal rule; it is about identity. A search that reads the
+ * footage stores what each part found as it goes, then folds duplicates
+ * together at the end, which rewrites the rows and their ids. A card handed
+ * out before that fold would be a card whose moment can vanish under it.
+ * Once the request says completed the ids are final, and every moment is
+ * shown — with whatever file has since been made for it attached, and with
+ * none if nobody has kept it yet.
  *
- * Filtering finished clips one at a time still lets a polling client watch the
- * deck build itself: one card, then two, then three. The rule is that a
- * creator who asks for three postable moments sees NOTHING until all three
- * are finished, and then sees them together. So the question asked here is
- * not "is this clip ready?" but "does this request's whole deck stand?".
- *
- * The answer comes from the REQUEST ROW, never from inspecting clips. Three
- * reasons it has to:
- *
- *  - It must survive process boundaries. The worker that assembled the deck
- *    may be gone; a different API instance answers the poll.
- *  - "Some clip has preRendered = true" cannot distinguish a deck mid-assembly
- *    from a finished one, which is exactly the distinction that matters.
- *  - A correction ("are you sure?") stores those three words as its own
- *    instruction while the deck belongs to the question before it, so
- *    re-reading the text would be wrong precisely when it matters most.
- *
- * A request that owes no deck passes through untouched — every non-platform
- * flow behaves exactly as it did before any of this existed.
+ * What this replaced, so nobody puts it back: a gate that hid every moment
+ * until every one of them had been cut, framed and encoded. The session that
+ * ended it found four moments in fifteen seconds and showed them after four
+ * and a half minutes. The moment is the evidence; the file is production, and
+ * production waits for a person.
  */
-/** Does this moment have real, finished media behind it, for what the deck delivers? */
-function clipIsShowable(match: ClipMatch, clip: Clip, presentation: DeckPresentation): boolean {
-  return isCreatorVisible({
-    matchId: match.id,
-    derivativeStatus: clip.derivativeStatus,
-    derivativeStorageKey: clip.derivativeStorageKey,
-    posterStorageKey: clip.posterStorageKey,
-    // The canonical file counts only once its row says the cut finished.
-    canonicalStorageKey: clip.status === 'ready' ? clip.storageKey : null,
-    confidence: match.confidence,
-  }, presentation);
-}
-
-export function creatorVisibleDeck(
-  request: Pick<ClipRequest, 'presentationTarget' | 'deckCompletedAt' | 'effectiveDeckTarget' | 'status'>,
+export function visibleMatches(
+  request: Pick<ClipRequest, 'status' | 'requestedResultCount'>,
   matches: ClipMatch[],
-  clipsByMatchId: Map<string, Clip>,
-): { matches: ClipMatch[]; clips: Clip[]; withheld: number } {
-  // A request from BEFORE set-level tracking existed.
-  //
-  // Migration 030 adds these columns nullable and does not backfill, so every
-  // vertical request created while 028/029 were live — media already rendered,
-  // overfetch candidates and failures among it — carries a null target. Read
-  // as "owes no deck", those rows would hand back every match and clip,
-  // including cards that play nothing. That is a regression against the gate
-  // this replaced, and it lands on real rows the moment 030 ships.
-  //
-  // So a null target falls back to the rule those rows were BUILT under:
-  // card-level readiness, from the clips themselves. It is weaker than the
-  // set-level guarantee and deliberately not dressed up as it — the
-  // set-level truth was never recorded for them and cannot be invented now.
-  if (request.presentationTarget === null) {
-    const preRendered = [...clipsByMatchId.values()].some((clip) => clip.preRendered);
-    if (!preRendered) return { matches, clips: [...clipsByMatchId.values()], withheld: 0 };
-    const legacyVisible = matches.filter((match) => {
-      const clip = clipsByMatchId.get(match.id);
-      // Every pre-rendered row from before the column was a vertical one.
-      return clip ? clipIsShowable(match, clip, 'vertical') : false;
-    });
-    return {
-      matches: legacyVisible,
-      clips: legacyVisible.map((match) => clipsByMatchId.get(match.id)!),
-      withheld: matches.length - legacyVisible.length,
-    };
-  }
+): ClipMatch[] {
+  if (request.status !== 'completed') return [];
 
-  // An original-framing request answered BEFORE every moment was cut on find.
-  //
-  // Those requests completed through the plain status write and never had a
-  // deck to release, so their gate never opened — and every one of their
-  // moments was shown at the time, with nothing cut behind it. Reading them
-  // through the gate would take finished answers off the screen; reading them
-  // as they were built keeps them exactly as the person last saw them. A
-  // request still searching, or failed, is not this case and falls through.
-  if (
-    request.presentationTarget === 'original'
-    && !request.deckCompletedAt
-    && request.status === 'completed'
-  ) {
-    return { matches, clips: [...clipsByMatchId.values()], withheld: 0 };
-  }
-
-  // Assembling, or failed. Both are "there is no finished set", and a creator
-  // sees the same thing in both cases: nothing yet. This now holds for every
-  // framing: a moment is cut when it is found, and the review shows finished
-  // clips or nothing.
-  if (!request.deckCompletedAt) {
-    return { matches: [], clips: [], withheld: matches.length };
-  }
-
-  // The deck stands. Release it whole — still checking each clip's FILES
-  // rather than trusting the flag alone, because a released deck whose media
-  // went missing underneath must not hand out a card that plays nothing.
-  // Narrowed to a local: the null case returned above, and a closure cannot
-  // carry that narrowing on a property.
-  const presentation: DeckPresentation = request.presentationTarget;
-  const visible = matches.filter((match) => {
-    const clip = clipsByMatchId.get(match.id);
-    return clip ? clipIsShowable(match, clip, presentation) : false;
-  });
-
-  // Deliberately NOT re-checked against effectiveDeckTarget.
-  //
-  // An earlier version refused to serve a released deck whose visible count
-  // had fallen below its original target, on the theory that a shortfall
-  // meant something had deleted media out from under a finished request. But
-  // the commonest cause of that shortfall is the system working exactly as
-  // designed: the creator Keeps one moment, and a day later the retention
-  // sweep collects the ones they did not keep — which is the whole point of
-  // rendering before Keep being affordable. Comparing against the original
-  // target then hid the entire conversation, including the moment they chose
-  // and which still plays perfectly well from their library.
-  //
-  // The atomic promise is about the REVEAL, and it is already kept above:
-  // deck_completed_at is written only when every moment in the effective deck
-  // is finished and stored, so a polling client sees nothing and then sees
-  // all of them. What survives afterwards is a question about the passage of
-  // time, and answering it with what still exists is the truthful answer.
-  return {
-    matches: visible,
-    clips: visible.map((match) => clipsByMatchId.get(match.id)!),
-    withheld: matches.length - visible.length,
-  };
+  // No product cap — but a number the person wrote is a limit (owner,
+  // 2026-09-05): "give me 3" shows the best three of whatever qualified, and
+  // "find every time" shows every one. Never padded: three asked for and two
+  // found is two. Ranked by the model's confidence, ties broken by id so the
+  // same request always shows the same three; returned in the stored order.
+  const cap = request.requestedResultCount;
+  if (cap === null || cap <= 0 || matches.length <= cap) return matches;
+  const kept = new Set(
+    [...matches]
+      .sort((a, b) => b.confidence - a.confidence || a.id.localeCompare(b.id))
+      .slice(0, cap)
+      .map((match) => match.id),
+  );
+  return matches.filter((match) => kept.has(match.id));
 }
 
 /** Does this clip's playback slot belong to a 9:16 derivative? */
@@ -590,13 +514,18 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
   let downloadUrl: string | null = null;
   let urlExpiresAt: string | null = null;
   let derivativeUrl: string | null = null;
+  let derivativeDownloadUrl: string | null = null;
   let posterUrl: string | null = null;
+  const downloadFilename = `clipit-${formatTimecode(clip.startSeconds)}-${formatTimecode(clip.endSeconds)}.mp4`;
 
   // The 9:16 file and its still, signed only when they really exist. Asking
   // for a URL to a key that is null would sign a path to nothing, and the
   // client would get a link that 404s instead of an honest absence.
   if (includeUrl && clip.derivativeStatus === 'ready' && clip.derivativeStorageKey) {
-    derivativeUrl = await getStorage().createDownloadUrl(clip.derivativeStorageKey);
+    [derivativeUrl, derivativeDownloadUrl] = await Promise.all([
+      getStorage().createDownloadUrl(clip.derivativeStorageKey),
+      getStorage().createDownloadUrl(clip.derivativeStorageKey, { downloadFilename }),
+    ]);
   }
   if (includeUrl && clip.posterStorageKey) {
     posterUrl = await getStorage().createDownloadUrl(clip.posterStorageKey);
@@ -609,9 +538,7 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
     // <video> element playing it.
     const [inline, attachment] = await Promise.all([
       getStorage().createDownloadUrl(clip.storageKey),
-      getStorage().createDownloadUrl(clip.storageKey, {
-        downloadFilename: `clipit-${formatTimecode(clip.startSeconds)}-${formatTimecode(clip.endSeconds)}.mp4`,
-      }),
+      getStorage().createDownloadUrl(clip.storageKey, { downloadFilename }),
     ]);
     url = inline;
     downloadUrl = attachment;
@@ -655,7 +582,9 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
     media: clipMediaContract(
       {
         canonicalUrl: url,
+        canonicalDownloadUrl: downloadUrl,
         derivativeUrl,
+        derivativeDownloadUrl,
         derivativeStorageKey: clip.derivativeStorageKey,
         derivativeStatus: clip.derivativeStatus,
         posterUrl,

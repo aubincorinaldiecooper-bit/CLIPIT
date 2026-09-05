@@ -10,12 +10,17 @@ import { clipKey } from '../../services/storage/types.js';
 import { cutClip, ffprobe } from '../../services/media/ffmpeg.js';
 import { appendReclipVersion, clearReclipPending, markReclipFailed } from '../../db/repositories/reclips.js';
 import { captionsSchema, prepareCaptionFilters } from '../../services/media/captions.js';
-import { applyClipPadding } from '../../services/timestamps.js';
+import { limitedRange } from '../../services/timestamps.js';
 import { withTransaction } from '../../db/pool.js';
 import { getClip, markClipGenerating, setClipStatus, restoreClipBoundaries } from '../../db/repositories/clips.js';
 import { commitRender } from '../../db/repositories/verticalMedia.js';
-import { discardUploadedObjects } from '../../services/media/verticalPipeline.js';
+import { markAttemptsRecovered } from '../../db/repositories/verticalRenders.js';
+import { getClipRequestForMatch } from '../../db/repositories/clipRequests.js';
+import { recordVerticalRenderAttempt } from '../../db/repositories/verticalRenders.js';
+import { VerticalPipelineFailure, discardUploadedObjects, shouldDiscardOnUploadFailure } from '../../services/media/verticalPipeline.js';
 import { releaseObjects, renderDeliveredMedia } from '../../services/media/rerender.js';
+import { deliverableStands, keepTargetFromClip } from '../../services/media/keepApproval.js';
+import { resolvePlatformIntent } from '../../services/search/platformIntent.js';
 import { RECLIP_FAILED_MESSAGE } from '../../services/media/unknownRender.js';
 import { discardVariants } from '../../db/repositories/clipVariants.js';
 import { recordObjectRelease } from '../../db/repositories/objectReleases.js';
@@ -138,8 +143,15 @@ function earlierAttemptLanded(clip: Clip, data: ClipGenerationJob): boolean {
 }
 
 /**
- * Cuts a match out of the ORIGINAL source (never the analysis proxy) and stores
- * the result as MP4 / H.264 / AAC.
+ * Makes a moment's file: cuts it out of the ORIGINAL source (never the
+ * analysis proxy), frames it, encodes the 9:16 deliverable and its poster,
+ * and stores all of it as one committed row.
+ *
+ * This is the one production path. It runs when a person keeps a moment —
+ * that is what Keep means now — and again for every re-render after that (a
+ * Re-clip's new boundaries, a caption Replace). Nothing renders speculatively
+ * any more: a moment is shown from the source it was found in, and paid for
+ * only once somebody has chosen it.
  */
 export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise<void> {
   const { clipId } = job.data;
@@ -171,9 +183,11 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
   }
   // Re-render jobs (a Replace, or a Re-clip applying new boundaries) carry
   // their intent in the job and must run even against a finished clip; only
-  // a plain generation of an already-finished clip is a duplicate worth
-  // skipping.
-  if (clip.status === 'ready' && clip.storageKey && job.data.captions === undefined && job.data.reclip === undefined) {
+  // a plain generation of a moment whose file already stands is a duplicate
+  // worth skipping. "Stands" is the same question Keep asks — a canonical
+  // cut whose 9:16 file never landed is not finished, and a Keep pressed on
+  // it is a request to finish it.
+  if (job.data.captions === undefined && job.data.reclip === undefined && deliverableStands(keepTargetFromClip(clip))) {
     log.info('clip already generated, skipping');
     return;
   }
@@ -194,22 +208,108 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
     return;
   }
 
+  // The question this moment was found for: its WORDS name the platform or
+  // duration whose limit applies (for a correction, the words of the question
+  // being looked at again — not "are you sure"), and the request itself is
+  // what the framing call's cost is charged to. Gone (a match deleted
+  // underneath a queued render) means the global limit and an unattributed
+  // cost, not a refusal — the file is still owed.
+  const found = await getClipRequestForMatch(clip.clipMatchId);
+  const request = found?.request ?? null;
+  const intent = resolvePlatformIntent(found?.instruction ?? null, env.MAX_CLIP_SECONDS);
+
   // The row's version as set here is the mark an unknown outcome is settled
   // against; nothing of this render's writes the row again before the commit.
   const rowVersion = await markClipGenerating(clipId);
   await job.updateProgress({ stage: 'generating', percent: 10 });
+  log.info('render picked up', {
+    // How long the moment waited between Keep and this worker starting.
+    queueWaitMs: Math.max(0, (job.processedOn ?? Date.now()) - job.timestamp),
+    attempt: job.attemptsMade + 1,
+    firstRender: clip.storageKey === null,
+  });
+
+  /** The record of this attempt, whichever way it ends. Best-effort: telemetry never fails a render. */
+  const recordAttempt = (
+    outcome: 'succeeded' | 'failed',
+    detail: {
+      failureStage?: VerticalPipelineFailure['stage'] | null;
+      failureCode?: string | null;
+      failureMessage?: string | null;
+      provider?: string | null;
+      model?: string | null;
+      sourceAspect?: string | null;
+      sourceWidth?: number | null;
+      sourceHeight?: number | null;
+      outputWidth?: number | null;
+      outputHeight?: number | null;
+      compositionMode?: string | null;
+      canonicalGenerationMs?: number | null;
+      compositionDecisionMs?: number | null;
+      derivativeRenderMs?: number | null;
+      posterGenerationMs?: number | null;
+    } = {},
+  ) =>
+    recordVerticalRenderAttempt({
+      videoId: video.id,
+      clipRequestId: request?.id ?? null,
+      matchId: clip.clipMatchId,
+      clipId,
+      workspaceId: clip.workspaceId,
+      sessionId: clip.sessionId,
+      requestedPlatform: intent.platform,
+      presentationTarget: 'vertical',
+      sourceWidth: detail.sourceWidth ?? null,
+      sourceHeight: detail.sourceHeight ?? null,
+      sourceAspect: detail.sourceAspect ?? null,
+      targetAspect: '9:16',
+      targetWidth: detail.outputWidth ?? null,
+      targetHeight: detail.outputHeight ?? null,
+      compositionMode: detail.compositionMode ?? null,
+      provider: detail.provider ?? null,
+      model: detail.model ?? null,
+      outcome,
+      failureStage: detail.failureStage ?? null,
+      failureCode: detail.failureCode ?? null,
+      // Truncated by the repository, and never a URL or credential: what
+      // reaches here is an ffmpeg stderr tail or a provider message.
+      failureMessage: detail.failureMessage ?? null,
+      attemptNumber: job.attemptsMade + 1,
+      totalAttempts: job.opts.attempts ?? null,
+      canonicalGenerationMs: detail.canonicalGenerationMs ?? null,
+      compositionDecisionMs: detail.compositionDecisionMs ?? null,
+      derivativeRenderMs: detail.derivativeRenderMs ?? null,
+      posterGenerationMs: detail.posterGenerationMs ?? null,
+    });
+
+  let canonicalGenerationMs: number | null = null;
 
   try {
     // Widen the match slightly so the moment is not clipped off at either edge.
-    const padded = applyClipPadding(
+    const cut = limitedRange(
       { startSeconds: clip.startSeconds, endSeconds: clip.endSeconds },
       {
         paddingSeconds: env.CLIP_PADDING_SECONDS,
         videoDurationSeconds: video.durationSeconds ?? Number.POSITIVE_INFINITY,
         minDurationSeconds: env.MIN_CLIP_SECONDS,
-        maxDurationSeconds: env.MAX_CLIP_SECONDS,
+        // A duration the person WROTE ("a 30 second clip") is honoured, as it
+        // always was. A platform's own limit is not applied here: a moment
+        // longer than TikTok would take is still the moment that was found
+        // and shown, and cutting it to its first sixty seconds would hand
+        // back a file the card never previewed (Codex's finding on #95). What
+        // a platform will accept is that platform's answer at publish time.
+        maxDurationSeconds: intent.explicitDurationSeconds !== null
+          ? Math.min(intent.explicitDurationSeconds, env.MAX_CLIP_SECONDS)
+          : env.MAX_CLIP_SECONDS,
       },
     );
+    // A limit that changed the range is written back to the row with the
+    // cut, so the row never describes seconds the file does not have — the
+    // API would report them and a Re-clip would start from them (Devin's
+    // findings on #95). A range padding only widened is not written back:
+    // written, it would widen again on every re-render.
+    const padded = cut.range;
+    const shortened = cut.limited;
 
     await withWorkDir(`clip-${clipId}`, async (dir) => {
       const sourcePath = path.join(dir, `source${path.extname(video.originalStorageKey!) || '.mp4'}`);
@@ -232,6 +332,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       }
 
       const outputPath = path.join(dir, `${clipId}.mp4`);
+      const cutStartedAt = performance.now();
       const result = await cutClip({
         inputPath: sourcePath,
         outputPath,
@@ -240,6 +341,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         hasAudio: video.hasAudio ?? true,
         ...(videoFilters ? { videoFilters } : {}),
       });
+      canonicalGenerationMs = Math.round(performance.now() - cutStartedAt);
 
       // A re-render puts a different file under the same clip id. Its bytes
       // go to a FRESH key beside the old ones, so the working clip is never
@@ -247,37 +349,91 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       // the plain key it always had.
       const rerender = clip.storageKey !== null && (job.data.captions !== undefined || job.data.reclip !== undefined);
       const render = rerender ? randomUUID().slice(0, 8) : undefined;
+      const key = clipKey(video.id, clipId, render);
+      const context = { videoId: video.id, clipId };
 
-      // The card's picture — and for a vertical moment the 9:16 file — were
-      // made from the cut, so they are made again from THIS one, first, at
-      // fresh keys too. If any of it fails, nothing has been replaced yet and
-      // the failure below rolls this render back like any other.
-      const delivered = await renderDeliveredMedia({
-        clip,
-        videoId: video.id,
-        canonicalPath: outputPath,
-        workDir: dir,
-        hasAudio: video.hasAudio ?? true,
-        cut: result,
-        render,
-        log,
+      // The cut's object, taken back out of storage when this render cannot
+      // go on — under the same ownership rule as every other cleanup here:
+      // only what this attempt could itself have written, never an object
+      // the row already named when it began (a retry re-uploading over an
+      // earlier attempt's good cut).
+      const discardCanonicalIfOurs = async (reason: string) => {
+        let currentKey: string | null | undefined;
+        let readFailed = false;
+        try {
+          currentKey = (await getClip(clipId))?.storageKey ?? null;
+        } catch {
+          readFailed = true;
+        }
+        if (shouldDiscardOnUploadFailure({ key, snapshotKey: clip.storageKey, currentKey, readFailed })) {
+          await discardUploadedObjects([key], { ...context, reason });
+        }
+      };
+
+      // The cut goes to storage BEFORE it is framed. The MiniCPM lane frames
+      // from a signed URL to the cut's key, so the object has to exist by
+      // the time the model is asked; the OpenRouter lane does not care. The
+      // row still names nothing new until the commit below, so a failure
+      // anywhere from here to that commit takes this upload back out. A PUT
+      // that rejected may still have landed, so a rejected upload is cleaned
+      // up like a successful one.
+      const uploadStartedAt = performance.now();
+      try {
+        await getStorage().uploadFile(key, outputPath, 'video/mp4');
+      } catch (error) {
+        await discardCanonicalIfOurs('canonical_upload_failed');
+        // Named as the storage failure it is, so the stage metrics do not
+        // blame the cut for an outage in storage (Devin's finding on #95).
+        throw new VerticalPipelineFailure('storage_upload', 'canonical_upload_failed', errorMessage(error), error);
+      }
+      log.info('cut uploaded', {
+        key,
+        bytes: result.sizeBytes,
+        cutMs: canonicalGenerationMs,
+        uploadMs: Math.round(performance.now() - uploadStartedAt),
+      });
+
+      // The card's picture and the 9:16 file are made from the cut, so they
+      // are made from THIS one, at fresh keys too. If any of it fails,
+      // nothing has been replaced yet and the failure rolls this render back
+      // like any other — the pipeline takes its own objects back out, and
+      // the cut goes with them.
+      let delivered;
+      try {
+        delivered = await renderDeliveredMedia({
+          clip,
+          videoId: video.id,
+          clipRequestId: request?.id ?? null,
+          canonicalPath: outputPath,
+          canonicalKey: key,
+          workDir: dir,
+          hasAudio: video.hasAudio ?? true,
+          cut: result,
+          render,
+          log,
+        });
+      } catch (error) {
+        await discardCanonicalIfOurs('delivered_media_failed');
+        throw error;
+      }
+      log.info('delivered media made', {
+        framingMs: delivered.framing.compositionDecisionMs,
+        framedBy: delivered.framing.provider,
+        encodeMs: delivered.framing.derivativeGenerationMs,
+        posterMs: delivered.framing.posterGenerationMs,
       });
 
       await job.updateProgress({ stage: 'uploading', percent: 80 });
 
-      const key = clipKey(video.id, clipId, render);
       // Everything this render uploaded: on a failure, whatever the row does
       // not name goes, and the previous cut and media stay exactly as they
       // were. A first render's plain key is in the list too — a cut whose
       // row never came to name it would otherwise sit in storage for good.
-      const fresh = [key, ...(delivered?.freshKeys ?? [])];
-      const context = { videoId: video.id, clipId };
+      const fresh = [key, ...delivered.freshKeys];
       // Platform shapes cut from the master this render replaces. Their rows
       // go inside the transaction; their files, after it.
       let staleVariantKeys: string[] = [];
       try {
-        await getStorage().uploadFile(key, outputPath, 'video/mp4');
-
         // ONE transaction. The row takes the new cut and the media made
         // from it — a Replace's spec included — the platform shapes cut from
         // the OLD master go (posting one would send footage the person just
@@ -287,11 +443,12 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         // history still said the re-cut had failed.
         await withTransaction(async (client) => {
           const wrote = await commitRender(clipId, {
+            ...(shortened ? { boundaries: { startSeconds: padded.startSeconds, endSeconds: padded.endSeconds } } : {}),
             storageKey: key,
             durationSeconds: Number(result.durationSeconds.toFixed(3)),
             sizeBytes: result.sizeBytes,
             captions: job.data.captions,
-            media: delivered?.media ?? { kind: 'none' },
+            media: delivered.media,
           }, client);
           if (!wrote) {
             throw new Error(`Clip ${clipId} no longer exists — its render has nowhere to be recorded`);
@@ -317,7 +474,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
           // to the release, which asks the rows again when it acts and keeps
           // whichever they name — the previous cut and media if the write
           // did not land, this render's if it did.
-          const unresolved = [render ? clip.storageKey : null, ...(delivered?.oldKeys ?? []), ...staleVariantKeys, ...fresh]
+          const unresolved = [render ? clip.storageKey : null, ...delivered.oldKeys, ...staleVariantKeys, ...fresh]
             .filter((unresolvedKey): unresolvedKey is string => typeof unresolvedKey === 'string' && unresolvedKey.length > 0);
           log.error('the render\'s outcome is unknown; its objects and the previous ones are queued for a release that will ask the row', {
             ...context, keys: unresolved, err: error,
@@ -367,8 +524,8 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       // could still fail has succeeded — so a failure anywhere above leaves
       // the old cut and its media where the row can still name them.
       await releaseObjects(
-        [render ? clip.storageKey : null, ...(delivered?.oldKeys ?? []), ...staleVariantKeys],
-        [key, ...(delivered?.freshKeys ?? [])],
+        [render ? clip.storageKey : null, ...delivered.oldKeys, ...staleVariantKeys],
+        [key, ...delivered.freshKeys],
         context,
         log,
       );
@@ -393,6 +550,34 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         sizeBytes: result.sizeBytes,
       });
       await job.updateProgress({ stage: 'ready', percent: 100 });
+
+      // The operational record: written on success too, so a pipeline that
+      // fails a third of the time can be told apart from one that never runs.
+      const written = delivered.media.kind === 'vertical' ? delivered.media.media : null;
+      await recordAttempt('succeeded', {
+        provider: delivered.framing.provider,
+        model: delivered.framing.model,
+        sourceAspect: delivered.framing.sourceAspectRatio,
+        sourceWidth: written?.sourceWidth ?? null,
+        sourceHeight: written?.sourceHeight ?? null,
+        outputWidth: written?.outputWidth ?? null,
+        outputHeight: written?.outputHeight ?? null,
+        compositionMode: written?.compositionMode ?? null,
+        canonicalGenerationMs,
+        compositionDecisionMs: delivered.framing.compositionDecisionMs,
+        derivativeRenderMs: delivered.framing.derivativeGenerationMs,
+        posterGenerationMs: delivered.framing.posterGenerationMs,
+      });
+      // This attempt succeeded after an earlier one failed: the earlier
+      // failure rows are marked recovered, or retryRecoveryRate reads zero
+      // forever while retries are helping (the orchestrator did this; Devin's
+      // finding on #95). Best-effort — a metrics write cannot fail a render
+      // that is done.
+      if (job.attemptsMade > 0) {
+        await markAttemptsRecovered(clip.clipMatchId).catch((recoveryError: unknown) => {
+          log.error('could not mark earlier attempts recovered', { matchId: clip.clipMatchId, err: recoveryError });
+        });
+      }
     });
   } catch (error) {
     // Not a failure: the write may have landed. Marking anything failed here
@@ -427,6 +612,15 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
 
     const message = errorMessage(error);
     log.error('clip generation failed', { err: error });
+
+    // Named by stage when the framing, the encode or the poster gave way;
+    // 'canonical_generation' for everything before them.
+    await recordAttempt('failed', {
+      failureStage: error instanceof VerticalPipelineFailure ? error.stage : 'canonical_generation',
+      failureCode: error instanceof VerticalPipelineFailure ? error.code : 'unexpected',
+      failureMessage: message,
+      canonicalGenerationMs,
+    });
 
     // A Re-clip render that has spent its last attempt rolls the WHOLE
     // re-evaluation back: the clip returns to exactly the boundaries, edit

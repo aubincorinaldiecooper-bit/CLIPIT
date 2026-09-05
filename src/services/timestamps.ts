@@ -161,6 +161,27 @@ export function applyClipPadding(range: TimeRange, options: PaddingOptions): Tim
   return { startSeconds: round(start), endSeconds: round(end) };
 }
 
+/**
+ * The range a cut will cover, and whether a length limit changed it.
+ *
+ * Padding alone is not a change worth writing back to a row — written, it
+ * would widen again on every re-render — but a limit is: the file then
+ * covers different footage from the moment, and the row has to say so.
+ * Compared as endpoints, not lengths: a moment already at the limit,
+ * padded at both ends and then capped from its earlier start, keeps its
+ * length and still moves (Devin's finding on #95).
+ */
+export function limitedRange(range: TimeRange, options: PaddingOptions): { range: TimeRange; limited: boolean } {
+  const padded = applyClipPadding(range, options);
+  if (options.maxDurationSeconds === undefined) return { range: padded, limited: false };
+  const { maxDurationSeconds: _unused, ...unlimitedOptions } = options;
+  const unlimited = applyClipPadding(range, unlimitedOptions);
+  return {
+    range: padded,
+    limited: padded.startSeconds !== unlimited.startSeconds || padded.endSeconds !== unlimited.endSeconds,
+  };
+}
+
 export interface MergeableRange extends TimeRange {
   confidence?: number;
 }
