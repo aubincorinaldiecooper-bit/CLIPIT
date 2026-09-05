@@ -175,9 +175,17 @@ export function formatIssue(report: PlatformReport): { title: string; body: stri
 }
 
 /**
+ * How long the hand-off may take. The report is already saved when this
+ * runs, and the person is waiting on the response; a GitHub that stalls
+ * must not hold them, or the request, for good (Devin's finding on #95).
+ */
+export const HANDOFF_TIMEOUT_MS = 10_000;
+
+/**
  * Files the report as an issue where it can be fixed. Returns where it
  * went, or null when no repository is configured. Throws when GitHub
- * refused — the caller logs and the report stays in the database.
+ * refused or did not answer in time — the caller logs and the report
+ * stays in the database.
  */
 export async function handOffToGitHub(report: PlatformReport): Promise<string | null> {
   const repo = env.GITHUB_REPORTS_REPO;
@@ -193,6 +201,7 @@ export async function handOffToGitHub(report: PlatformReport): Promise<string | 
       'User-Agent': 'clipit-reports',
     },
     body: JSON.stringify({ title: issue.title, body: issue.body, labels: ['platform-report'] }),
+    signal: AbortSignal.timeout(HANDOFF_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`GitHub answered ${response.status} when filing the report`);
   const created = (await response.json()) as { number: number };

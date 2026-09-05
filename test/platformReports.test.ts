@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest';
-import { formatIssue, reportSchema, snapshotContext } from '../src/services/reports/platformReports.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { HANDOFF_TIMEOUT_MS, formatIssue, handOffToGitHub, reportSchema, snapshotContext } from '../src/services/reports/platformReports.js';
 import type { PlatformReport } from '../src/db/repositories/platformReports.js';
+
+vi.mock('../src/config/env.js', () => ({ env: { GITHUB_REPORTS_REPO: 'owner/repo', GITHUB_REPORTS_TOKEN: 'token' } }));
 
 /**
  * A report made from the page carries the context a fix needs — and only
@@ -56,6 +58,42 @@ describe('snapshotContext', () => {
 
   it('is honest about nothing on screen', () => {
     expect(snapshotContext({ viewport: '', video: null, clipRequest: null, clips: [] })).toEqual({ viewport: '', video: null, clipRequest: null, clips: [] });
+  });
+});
+
+describe('handOffToGitHub', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('files the issue with a bounded wait, and says where it went', async () => {
+    const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      return new Response(JSON.stringify({ number: 12 }), { status: 201 });
+    });
+    vi.stubGlobal('fetch', fetch);
+    await expect(handOffToGitHub(report())).resolves.toBe('github:owner/repo#12');
+    expect(fetch).toHaveBeenCalledWith('https://api.github.com/repos/owner/repo/issues', expect.objectContaining({ method: 'POST' }));
+    expect(HANDOFF_TIMEOUT_MS).toBeLessThanOrEqual(15_000);
+  });
+
+  it('does not hold the report when GitHub stalls: the wait ends and the caller hears why', async () => {
+    // Devin's finding on #95: a fetch with no timeout kept the person, and
+    // the request, waiting for good. The signal is what ends it.
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+      init.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? new Error('aborted')));
+      // Nothing else ever happens.
+    })));
+    const stalled = handOffToGitHub(report());
+    // Stand in for the clock: the same signal, fired now.
+    const call = (globalThis.fetch as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]!;
+    const signal = call[1].signal as AbortSignal;
+    expect(signal.aborted).toBe(false);
+    // The signal is a timeout: it aborts on its own. Prove it does within the bound.
+    await expect(Promise.race([stalled, new Promise((resolve) => setTimeout(() => resolve('still waiting'), HANDOFF_TIMEOUT_MS + 2_000))])).rejects.toThrow();
+  }, HANDOFF_TIMEOUT_MS + 5_000);
+
+  it('refuses in words when GitHub answers with an error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
+    await expect(handOffToGitHub(report())).rejects.toThrow('GitHub answered 401');
   });
 });
 
