@@ -58,7 +58,7 @@ vi.mock('../src/services/media/verticalPipeline.js', async (importOriginal) => {
     discardUploadedObjects: pipeline.discardUploadedObjects,
   };
 });
-const getClipRequestForMatch = vi.fn(async () => ({ id: 'request-1', instruction: 'find the harbour' }));
+const getClipRequestForMatch = vi.fn(async () => ({ request: { id: 'request-1', instruction: 'find the harbour' }, instruction: 'find the harbour' }));
 vi.mock('../src/db/repositories/clipRequests.js', () => ({ getClipRequestForMatch }));
 const recordVerticalRenderAttempt = vi.fn(async () => undefined);
 vi.mock('../src/db/repositories/verticalRenders.js', () => ({ recordVerticalRenderAttempt }));
@@ -154,7 +154,7 @@ beforeEach(() => {
   ]) {
     mock.mockReset();
   }
-  getClipRequestForMatch.mockResolvedValue({ id: 'request-1', instruction: 'find the harbour' });
+  getClipRequestForMatch.mockResolvedValue({ request: { id: 'request-1', instruction: 'find the harbour' }, instruction: 'find the harbour' });
   recordVerticalRenderAttempt.mockResolvedValue(undefined);
   askVideoModel.mockResolvedValue({
     content: JSON.stringify({ composition_mode: 'smart_crop', focal_x: 0.5, focal_y: 0.4, crop_safe: true }),
@@ -706,6 +706,25 @@ describe('a first render — the one Keep starts', () => {
     expect(enqueueObjectRelease).not.toHaveBeenCalled();
     // The production record survives the move from the orchestrator.
     expect(recordVerticalRenderAttempt).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'succeeded', clipRequestId: 'request-1', matchId: 'match-1' }));
+  });
+
+  it('cuts to the limit the question named — for a correction too, whose own stored words are "are you sure"', async () => {
+    // Devin's finding on #95: the moment lives on the correction request, but
+    // the words that were searched — and whose limits apply — are the
+    // previous question's. The cost still goes to the correction request.
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
+    getClipRequestForMatch.mockResolvedValue({
+      request: { id: 'request-2', instruction: 'are you sure?' },
+      instruction: 'find a 10 second moment for TikTok',
+    });
+
+    await handleClipGeneration(job({}));
+
+    // 128 → 151 is 23 s; the question asked for 10.
+    expect(media.cutClip).toHaveBeenCalledWith(expect.objectContaining({ startSeconds: 128, endSeconds: 138 }));
+    expect(recordVerticalRenderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ clipRequestId: 'request-2', requestedPlatform: 'tiktok' }),
+    );
   });
 
   it('takes its own cut and media back out when the row write fails and the row never came to name them', async () => {

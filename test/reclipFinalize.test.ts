@@ -69,7 +69,7 @@ vi.mock('../src/services/media/verticalPipeline.js', async (importOriginal) => {
   };
 });
 vi.mock('../src/db/repositories/clipRequests.js', () => ({
-  getClipRequestForMatch: vi.fn(async () => ({ id: 'request-1', instruction: 'find the harbour' })),
+  getClipRequestForMatch: vi.fn(async () => ({ request: { id: 'request-1', instruction: 'find the harbour' }, instruction: 'find the harbour' })),
 }));
 vi.mock('../src/db/repositories/verticalRenders.js', () => ({
   recordVerticalRenderAttempt: vi.fn(async () => undefined),

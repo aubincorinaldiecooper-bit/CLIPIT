@@ -207,12 +207,15 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
     return;
   }
 
-  // The question this moment was found for: it names the platform whose
-  // length limit applies, and it is what the framing call's cost is charged
-  // to. Gone (a match deleted underneath a queued render) means the global
-  // limit and an unattributed cost, not a refusal — the file is still owed.
-  const request = await getClipRequestForMatch(clip.clipMatchId);
-  const intent = resolvePlatformIntent(request?.instruction ?? null, env.MAX_CLIP_SECONDS);
+  // The question this moment was found for: its WORDS name the platform or
+  // duration whose limit applies (for a correction, the words of the question
+  // being looked at again — not "are you sure"), and the request itself is
+  // what the framing call's cost is charged to. Gone (a match deleted
+  // underneath a queued render) means the global limit and an unattributed
+  // cost, not a refusal — the file is still owed.
+  const found = await getClipRequestForMatch(clip.clipMatchId);
+  const request = found?.request ?? null;
+  const intent = resolvePlatformIntent(found?.instruction ?? null, env.MAX_CLIP_SECONDS);
 
   // The row's version as set here is the mark an unknown outcome is settled
   // against; nothing of this render's writes the row again before the commit.

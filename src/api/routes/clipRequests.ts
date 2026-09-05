@@ -11,7 +11,8 @@ import {
   setMatchFeedback,
 } from '../../db/repositories/clipRequests.js';
 import { getRootClipByMatchId, listClipsForRequest, upsertClipForMatch } from '../../db/repositories/clips.js';
-import { approveClip, approveClipOnKeep } from '../../db/repositories/verticalMedia.js';
+import { approveClip, approveClipOnKeep, undoKeepNotQueued } from '../../db/repositories/verticalMedia.js';
+import { KeepNotQueuedError, approveAndQueue } from '../../services/media/keepProduction.js';
 import { keepAction, keepTargetFromClip, retentionClassFor } from '../../services/media/keepApproval.js';
 import { claimReclip, clearReclipPending, latestVersionsForMatches } from '../../db/repositories/reclips.js';
 import { getVideo } from '../../db/repositories/videos.js';
@@ -340,11 +341,26 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
         logger.warn('a finished moment could not be approved; producing it again', { requestId, clipId: clip.id });
       }
 
-      // Produce. The approval is recorded first and unconditionally: the
-      // person has chosen this moment, and the file follows.
-      await approveClipOnKeep(clip.id);
+      // Produce. The approval is recorded first — the person has chosen this
+      // moment — and taken back if the render cannot be queued, so no press
+      // can leave an approved clip that nothing will ever cut.
+      try {
+        await approveAndQueue({
+          clipId: clip.id,
+          approve: approveClipOnKeep,
+          enqueue: (clipId) => enqueueClipGeneration({ clipId }),
+          undo: undoKeepNotQueued,
+        });
+      } catch (cause) {
+        if (cause instanceof KeepNotQueuedError) {
+          logger.error('keep unwound: the render could not be queued', {
+            requestId, clipId: clip.id, alreadyQueued: queued, err: cause.cause,
+          });
+          throw HttpError.serviceUnavailable(cause.message);
+        }
+        throw cause;
+      }
       clips.push({ ...clip, approvedAt: clip.approvedAt ?? new Date(), retentionClass: 'owned' });
-      await enqueueClipGeneration({ clipId: clip.id });
       queued += 1;
     }
 

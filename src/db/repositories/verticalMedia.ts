@@ -412,17 +412,49 @@ export async function approveClip(clipId: string): Promise<boolean> {
  * Owned from the first byte: a file made because somebody asked for it is
  * never temporary.
  */
-export async function approveClipOnKeep(clipId: string): Promise<boolean> {
-  const row = await queryOne<{ id: string }>(
+export async function approveClipOnKeep(clipId: string): Promise<{ newlyApproved: boolean } | null> {
+  // Whether THIS press approved it: now() is fixed for the statement, so an
+  // approval written here equals it and an earlier one does not. The undo
+  // below must not take back an approval an earlier Keep made.
+  const row = await queryOne<{ newly_approved: boolean }>(
     `UPDATE clips
         SET approved_at     = COALESCE(approved_at, now()),
             retention_class = 'owned',
             updated_at      = now()
       WHERE id = $1
-      RETURNING id`,
+      RETURNING (approved_at = now()) AS newly_approved`,
     [clipId],
   );
-  return row !== null;
+  return row ? { newlyApproved: row.newly_approved } : null;
+}
+
+/**
+ * Keep pressed, approval recorded, and then the render could not be queued.
+ *
+ * Left as it was, the row is an owned, approved clip with no job that will
+ * ever make its file (Devin's finding on #95). So the press is unwound: the
+ * approval this press made is taken back (never one an earlier Keep made),
+ * and a clip still waiting to be cut is marked failed with the reason, so
+ * nothing polls it as if a render were coming and the next Keep starts it
+ * afresh. A clip mid-render or already finished is left exactly as it is.
+ *
+ * Whether the queue really refused, or took the job and lost the reply, is
+ * not knowable here. Either way the next Keep is correct: the queue
+ * de-duplicates by clip id, so a job that did land carries on, and the
+ * approval is simply recorded again.
+ */
+export async function undoKeepNotQueued(clipId: string, input: { newlyApproved: boolean; reason: string }): Promise<void> {
+  await query(
+    `UPDATE clips
+        SET status          = CASE WHEN status = 'pending' THEN 'failed' ELSE status END,
+            error_message   = CASE WHEN status = 'pending' THEN $2 ELSE error_message END,
+            approved_at     = CASE WHEN $3 THEN NULL ELSE approved_at END,
+            retention_class = CASE WHEN $3 AND pre_rendered THEN 'temporary' ELSE retention_class END,
+            row_version     = row_version + 1,
+            updated_at      = now()
+      WHERE id = $1`,
+    [clipId, input.reason.slice(0, 500), input.newlyApproved],
+  );
 }
 
 export interface ExpiredMediaRow {
