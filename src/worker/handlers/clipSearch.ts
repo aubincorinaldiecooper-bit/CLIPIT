@@ -56,6 +56,7 @@ import {
 } from '../../services/search/platformIntent.js';
 import { clearUnkeptMatchesForRequest } from '../../db/repositories/verticalMedia.js';
 import { verticalForRework } from '../../services/search/presentationTarget.js';
+import { PREPARATION_TIMED_OUT_MESSAGE, preparationWait } from '../../services/search/readiness.js';
 import type {
   ChunkDegradation,
   ClipRequest,
@@ -144,11 +145,33 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   let intent = resolvePlatformIntent(request.instruction, env.MAX_CLIP_SECONDS, {
     maxCount: env.VERTICAL_CANDIDATE_CEILING,
   });
+  /** Milliseconds this question has already spent parked, across every re-queue. */
+  const waitedMs = job.data.waitedMs ?? 0;
 
   try {
+    // A question is accepted the moment the video's bytes have landed; the
+    // answer waits here for the video to be prepared — its analysis segments
+    // — the same way it waits for the notes and the transcript further down.
+    // Bounded, so a preparation that never finishes still ends in an answer:
+    // a refusal, said plainly, rather than a question parked for good.
+    const preparation = preparationWait(video.status, waitedMs, env.PREPARATION_WAIT_TIMEOUT_MS);
+    if (preparation === 'wait') {
+      log.info('waiting for the video to be prepared', { waitedMs, videoStatus: video.status });
+      await enqueueClipSearch(
+        { clipRequestId, waitedMs: waitedMs + env.PREPARATION_WAIT_POLL_MS },
+        { delay: env.PREPARATION_WAIT_POLL_MS },
+      );
+      outcome = 'completed';
+      return;
+    }
+    if (preparation === 'timed_out') throw new Error(PREPARATION_TIMED_OUT_MESSAGE);
     if (video.status !== 'ready') {
-      // The API blocks this, but a request can still race preprocessing.
-      throw new Error(`Video is not ready for search (status: ${video.status})`);
+      // Failed, or a status this handler does not know.
+      throw new Error(
+        video.status === 'failed'
+          ? `Video processing failed: ${video.errorMessage ?? 'unknown error'}`
+          : `Video is not ready for search (status: ${video.status})`,
+      );
     }
 
     const chunks = await listChunks(video.id);
@@ -251,8 +274,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       transcriptAvailable: transcriptReady || transcriptPending,
     });
 
-    const waitedMs = job.data.waitedMs ?? 0;
-
     /**
      * Waiting for the video to finish being read.
      *
@@ -287,6 +308,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         const answered = await answerFromNotes({
           clipRequestId,
           deckAttemptId,
+          requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
           video,
           chunks,
           instruction,
@@ -355,6 +377,10 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       rationale: resolved.rationale,
       chunks: chunks.length,
       instruction,
+      // How long the question sat before this delivery began (the queue), and
+      // how long it has been parked waiting for the video across re-queues.
+      queueWaitMs: Math.max(0, (job.processedOn ?? Date.now()) - job.timestamp),
+      waitedMs,
       ...(correcting ? { correctionOf: request.instruction } : {}),
     });
 
@@ -381,6 +407,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       const answered = await answerFromNotes({
         clipRequestId,
         deckAttemptId,
+        requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
         video,
         chunks,
         instruction,
@@ -525,7 +552,10 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // The moments are the answer. They are released the moment they have
       // their pictures — nothing is cut, framed or encoded until somebody
       // keeps one.
-      const released = await completeRequest({ clipRequestId, answeredFrom: 'footage', deckAttemptId, log });
+      const released = await completeRequest({
+        clipRequestId, answeredFrom: 'footage', deckAttemptId, log,
+        requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
+      });
       if (!released) {
         // Another delivery owns the answer now; this one stands down.
         outcome = 'completed';
@@ -780,18 +810,27 @@ export async function completeRequest(input: {
   answeredFrom: 'notes' | 'footage';
   /** The token from recordDeckPlan — the release is fenced to it. */
   deckAttemptId: string | null;
+  /** A number the person wrote, or null: the only cap there is. */
+  requestedResultCount: number | null;
   log: Logger;
 }): Promise<boolean> {
   const { clipRequestId, log } = input;
 
-  // What the search found — every moment, whatever number the question
-  // named. The answer is what the evidence supports (owner, 2026-09-05):
-  // asking for three and finding five shows five, and finding none is a
-  // finished answer too, never padded and never hidden.
+  // What the search found, and how many will be shown. No product cap: the
+  // answer is what the evidence supports (owner, 2026-09-05), and finding
+  // none is a finished answer too, never padded and never hidden. A number
+  // the person WROTE is the one limit — "give me 3" shows the best three of
+  // whatever qualified (visibleMatches), and three asked for with two found
+  // is two. A moment longer than a platform would take is still a moment:
+  // whether it exists and whether it already suits TikTok are different
+  // questions, and discovery answers only the first.
   const found = await listMatches(clipRequestId);
+  const shown = input.requestedResultCount !== null && input.requestedResultCount > 0
+    ? Math.min(found.length, input.requestedResultCount)
+    : found.length;
   await recordDeckAvailability(clipRequestId, {
     availableCandidateCount: found.length,
-    effectiveDeckTarget: found.length,
+    effectiveDeckTarget: shown,
   }, input.deckAttemptId);
 
   // Released and completed together, in one statement, so there is no
@@ -810,7 +849,8 @@ export async function completeRequest(input: {
   log.info('moments released', {
     clipRequestId,
     answeredFrom: input.answeredFrom,
-    moments: found.length,
+    found: found.length,
+    shown,
   });
   return true;
 }
@@ -895,6 +935,8 @@ async function answerFromNotes(input: {
   clipRequestId: string;
   /** The planning token, so the release stays fenced on this path too. */
   deckAttemptId: string | null;
+  /** A number the person wrote, or null. */
+  requestedResultCount: number | null;
   video: Video;
   chunks: VideoChunk[];
   instruction: string;
@@ -1081,6 +1123,7 @@ async function answerFromNotes(input: {
   // never drift apart on what a creator is owed.
   const released = await completeRequest({
     clipRequestId, answeredFrom: 'notes', deckAttemptId: input.deckAttemptId, log,
+    requestedResultCount: input.requestedResultCount,
   });
 
   const answerLog = {

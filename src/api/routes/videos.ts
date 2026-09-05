@@ -25,6 +25,7 @@ import { listClipsForRequest } from '../../db/repositories/clips.js';
 import { enqueueClipSearch, enqueueIngestion } from '../../queues/index.js';
 import { warmMiniCpm } from '../../services/search/minicpmVideo.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
+import { questionAcceptance } from '../../services/search/readiness.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import {
   visibleMatches,
@@ -550,12 +551,17 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
     if (!video) throw HttpError.notFound('Video not found');
     assertOwnership(request, video, 'Video');
 
-    if (video.status !== 'ready') {
-      throw HttpError.conflict(
-        video.status === 'failed'
-          ? `Video processing failed: ${video.errorMessage ?? 'unknown error'}`
-          : `Video is not ready for search yet (status: ${video.status})`,
-      );
+    // A question is accepted the moment there is a video to ask about. The
+    // answer waits, inside the search, for whatever it genuinely needs —
+    // the preparation, the notes, the transcript — and says so as it does.
+    // Refusing here until the whole preparation had finished was a minute
+    // of dead send button in the observed session (services/search/readiness).
+    const acceptance = questionAcceptance(video.status);
+    if (acceptance === 'failed') {
+      throw HttpError.conflict(`Video processing failed: ${video.errorMessage ?? 'unknown error'}`);
+    }
+    if (acceptance === 'uploading') {
+      throw HttpError.conflict('The video is still uploading — ask once it has landed.');
     }
 
     const clipRequest = await createClipRequest({

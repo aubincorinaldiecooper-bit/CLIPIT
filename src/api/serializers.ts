@@ -1,6 +1,7 @@
 import { env } from '../config/env.js';
 import { getStorage } from '../services/storage/s3.js';
 import { formatTimecode } from '../services/timestamps.js';
+import { acceptsQuestions } from '../services/search/readiness.js';
 import { latestVersionsForMatches } from '../db/repositories/reclips.js';
 import { clipMediaContract } from './mediaContract.js';
 import type { CompositionMode } from '../services/media/composition.js';
@@ -77,6 +78,13 @@ export function serializeVideo(video: Video, chunks?: VideoChunk[]) {
     chunkSeconds: video.chunkSeconds,
     chunkCount: video.chunkCount,
     readyForSearch: video.status === 'ready',
+    /**
+     * Whether a question may be sent now. True from the moment the bytes have
+     * landed: the answer waits, inside the search, for whatever it needs —
+     * see services/search/readiness.ts. `readyForSearch` above still says
+     * whether the preparation itself has finished.
+     */
+    acceptsQuestions: acceptsQuestions(video.status),
     transcript: {
       status: video.transcriptStatus,
       source: video.transcriptSource,
@@ -473,8 +481,26 @@ export async function serializeLibraryClip(entry: {
  * and a half minutes. The moment is the evidence; the file is production, and
  * production waits for a person.
  */
-export function visibleMatches(request: Pick<ClipRequest, 'status'>, matches: ClipMatch[]): ClipMatch[] {
-  return request.status === 'completed' ? matches : [];
+export function visibleMatches(
+  request: Pick<ClipRequest, 'status' | 'requestedResultCount'>,
+  matches: ClipMatch[],
+): ClipMatch[] {
+  if (request.status !== 'completed') return [];
+
+  // No product cap — but a number the person wrote is a limit (owner,
+  // 2026-09-05): "give me 3" shows the best three of whatever qualified, and
+  // "find every time" shows every one. Never padded: three asked for and two
+  // found is two. Ranked by the model's confidence, ties broken by id so the
+  // same request always shows the same three; returned in the stored order.
+  const cap = request.requestedResultCount;
+  if (cap === null || cap <= 0 || matches.length <= cap) return matches;
+  const kept = new Set(
+    [...matches]
+      .sort((a, b) => b.confidence - a.confidence || a.id.localeCompare(b.id))
+      .slice(0, cap)
+      .map((match) => match.id),
+  );
+  return matches.filter((match) => kept.has(match.id));
 }
 
 /** Does this clip's playback slot belong to a 9:16 derivative? */

@@ -346,6 +346,15 @@ const envSchema = z.object({
   INDEX_WAIT_TIMEOUT_MS: int(240_000, 0, 900_000),
   INDEX_WAIT_POLL_MS: int(4_000, 500, 60_000),
   /**
+   * A question is accepted the moment the video's bytes have landed; the
+   * answer waits here for the video to be prepared (its analysis segments),
+   * polling at this rate, before it goes on to wait for the notes above.
+   * Past the timeout the question fails with a plain message rather than
+   * sitting forever on a preparation that will not finish.
+   */
+  PREPARATION_WAIT_TIMEOUT_MS: int(600_000, 0, 3_600_000),
+  PREPARATION_WAIT_POLL_MS: int(3_000, 500, 60_000),
+  /**
    * Room for a description of everything in one chunk, which runs far longer
    * than a list of matching moments. An answer cut off mid-scene leaves a hole
    * in the notes that nothing downstream can see.

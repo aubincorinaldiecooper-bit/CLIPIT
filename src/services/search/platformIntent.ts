@@ -80,9 +80,6 @@ const COUNTED = new RegExp(
   'i',
 );
 
-/** Every mention of the noun, so singular can be told from plural. */
-const BARE_NOUN = new RegExp(String.raw`\b(?:${MOMENT_WORDS})(s?)\b`, 'gi');
-
 /** A number that is really a duration: "30 second clips" is ONE clip. */
 const DURATION_NUMBER = /\b\d+\s*(?:seconds?|secs?|minutes?|mins?)\b/i;
 
@@ -99,8 +96,12 @@ const DURATION_NUMBER = /\b\d+\s*(?:seconds?|secs?|minutes?|mins?)\b/i;
  *
  *  - "a 30 second clip for TikTok" is ONE clip, not thirty. A number attached
  *    to a duration unit belongs to parseExplicitDurationSeconds, never here.
- *  - "the best moment", singular, is one — even with no number in it. Reading
- *    that as the default three would render two clips nobody asked for.
+ *  - "the best moment", singular, is NOT a count. It used to be read as one,
+ *    which mattered when every moment found was rendered before review: the
+ *    default of three would have cut two clips nobody asked for. Nothing is
+ *    rendered before review now, and the owner's rule (2026-09-05) is that a
+ *    number the person WROTE is a limit and nothing else is — "the moment
+ *    where the cigar is smoked" found two, and both were the answer.
  */
 export function parseRequestedMomentCount(instruction: string): number | null {
   const counted = instruction.match(COUNTED);
@@ -109,22 +110,6 @@ export function parseRequestedMomentCount(instruction: string): number | null {
     const value = WORD_NUMBERS[token] ?? Number(token);
     if (Number.isFinite(value) && value >= 1) return Math.floor(value);
   }
-
-  // No number, but the noun itself can be singular or plural.
-  //
-  // Skipped when the word OPENS the instruction, because there it is a verb,
-  // not a thing being counted. "post the 5 best bits to tiktok" was read as a
-  // request for one moment — the leading "post" taken as a singular noun —
-  // and the whole deck was built for a single card when five were asked for.
-  for (const bare of instruction.matchAll(BARE_NOUN)) {
-    // A word that OPENS the instruction is a verb, not a thing being counted:
-    // "post the best bits", "clip this for tiktok". Skipping to the next
-    // mention rather than giving up keeps the noun further along — "clip this
-    // for tiktok" is still one moment, read off "tiktok".
-    if (bare.index === 0) continue;
-    return bare[1] ? null : 1;
-  }
-
   return null;
 }
 

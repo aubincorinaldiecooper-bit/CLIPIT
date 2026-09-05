@@ -727,6 +727,23 @@ describe('a first render — the one Keep starts', () => {
     );
   });
 
+  it('cuts a moment longer than a platform would take in full — production does not shorten what discovery showed', async () => {
+    // Codex's finding on #95: the platform ceiling used to move the end
+    // timestamp, so an 85-second moment became its first 60 seconds while
+    // the row still described the whole moment. A platform's limit is that
+    // platform's answer at publish time; a number the person WROTE is the
+    // only duration applied here.
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending', startSeconds: 100, endSeconds: 185 });
+    getClipRequestForMatch.mockResolvedValue({
+      request: { id: 'request-1', instruction: 'find moments for TikTok' },
+      instruction: 'find moments for TikTok',
+    });
+
+    await handleClipGeneration(job({}));
+
+    expect(media.cutClip).toHaveBeenCalledWith(expect.objectContaining({ startSeconds: 100, endSeconds: 185 }));
+  });
+
   it('takes its own cut and media back out when the row write fails and the row never came to name them', async () => {
     clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
     commitRender.mockRejectedValueOnce(new Error('database refused'));

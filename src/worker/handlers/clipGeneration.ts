@@ -221,6 +221,12 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
   // against; nothing of this render's writes the row again before the commit.
   const rowVersion = await markClipGenerating(clipId);
   await job.updateProgress({ stage: 'generating', percent: 10 });
+  log.info('render picked up', {
+    // How long the moment waited between Keep and this worker starting.
+    queueWaitMs: Math.max(0, (job.processedOn ?? Date.now()) - job.timestamp),
+    attempt: job.attemptsMade + 1,
+    firstRender: clip.storageKey === null,
+  });
 
   /** The record of this attempt, whichever way it ends. Best-effort: telemetry never fails a render. */
   const recordAttempt = (
@@ -285,10 +291,15 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         paddingSeconds: env.CLIP_PADDING_SECONDS,
         videoDurationSeconds: video.durationSeconds ?? Number.POSITIVE_INFINITY,
         minDurationSeconds: env.MIN_CLIP_SECONDS,
-        // The PLATFORM's ceiling when the question named one, never the
-        // global one alone: padding is the one thing that could push a
-        // 58-second moment past a 60-second limit.
-        maxDurationSeconds: intent.hardMaxSeconds,
+        // A duration the person WROTE ("a 30 second clip") is honoured, as it
+        // always was. A platform's own limit is not applied here: a moment
+        // longer than TikTok would take is still the moment that was found
+        // and shown, and cutting it to its first sixty seconds would hand
+        // back a file the card never previewed (Codex's finding on #95). What
+        // a platform will accept is that platform's answer at publish time.
+        maxDurationSeconds: intent.explicitDurationSeconds !== null
+          ? Math.min(intent.explicitDurationSeconds, env.MAX_CLIP_SECONDS)
+          : env.MAX_CLIP_SECONDS,
       },
     );
 
@@ -358,12 +369,19 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
       // anywhere from here to that commit takes this upload back out. A PUT
       // that rejected may still have landed, so a rejected upload is cleaned
       // up like a successful one.
+      const uploadStartedAt = performance.now();
       try {
         await getStorage().uploadFile(key, outputPath, 'video/mp4');
       } catch (error) {
         await discardCanonicalIfOurs('canonical_upload_failed');
         throw error;
       }
+      log.info('cut uploaded', {
+        key,
+        bytes: result.sizeBytes,
+        cutMs: canonicalGenerationMs,
+        uploadMs: Math.round(performance.now() - uploadStartedAt),
+      });
 
       // The card's picture and the 9:16 file are made from the cut, so they
       // are made from THIS one, at fresh keys too. If any of it fails,
@@ -388,6 +406,12 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         await discardCanonicalIfOurs('delivered_media_failed');
         throw error;
       }
+      log.info('delivered media made', {
+        framingMs: delivered.framing.compositionDecisionMs,
+        framedBy: delivered.framing.provider,
+        encodeMs: delivered.framing.derivativeGenerationMs,
+        posterMs: delivered.framing.posterGenerationMs,
+      });
 
       await job.updateProgress({ stage: 'uploading', percent: 80 });
 

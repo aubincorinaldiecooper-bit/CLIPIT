@@ -46,18 +46,24 @@ vi.mock('../src/queues/index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/queues/index.js')>();
   return { ...actual, enqueueClipGeneration };
 });
+// Nor the framing call: no moment is framed until somebody keeps it.
+const askModelForFraming = vi.fn();
+vi.mock('../src/services/media/framing.js', () => ({ askModelForFraming }));
 
 const { completeRequest } = await import('../src/worker/handlers/clipSearch.js');
 
 const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
 
-const moments = (count: number) =>
+const moments = (count: number, durationSeconds = 20) =>
   Array.from({ length: count }, (_, index) => ({
     id: `match-${index + 1}`,
     confidence: 0.9 - index * 0.1,
     globalStartSeconds: index * 30,
-    globalEndSeconds: index * 30 + 20,
+    globalEndSeconds: index * 30 + durationSeconds,
   }));
+
+const complete = (over: Partial<Parameters<typeof completeRequest>[0]> = {}) =>
+  completeRequest({ clipRequestId: 'request-1', answeredFrom: 'notes', deckAttemptId: 'attempt-1', requestedResultCount: null, log, ...over });
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -68,7 +74,7 @@ describe('a search completes on find', () => {
   it('releases every moment it found, and renders nothing', async () => {
     listMatches.mockResolvedValue(moments(4));
 
-    const released = await completeRequest({ clipRequestId: 'request-1', answeredFrom: 'notes', deckAttemptId: 'attempt-1', log });
+    const released = await complete();
 
     expect(released).toBe(true);
     expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'notes');
@@ -78,22 +84,60 @@ describe('a search completes on find', () => {
       { availableCandidateCount: 4, effectiveDeckTarget: 4 },
       'attempt-1',
     );
-    // Not a single byte of the source, and not a single render.
+    // Not a single byte of the source, not a single frame judged, not a
+    // single render.
     expect(downloadToFile).not.toHaveBeenCalled();
     expect(uploadFile).not.toHaveBeenCalled();
+    expect(askModelForFraming).not.toHaveBeenCalled();
     expect(enqueueClipGeneration).not.toHaveBeenCalled();
     expect(finishClipRequest).not.toHaveBeenCalled();
   });
 
-  it('does not cap what is shown to the number the question named', async () => {
+  it('shows everything when the question wrote no number — a singular "the moment" included', async () => {
     // "the moment where the cigar is smoked" found two; both are the answer.
     listMatches.mockResolvedValue(moments(2));
 
-    await completeRequest({ clipRequestId: 'request-1', answeredFrom: 'notes', deckAttemptId: 'attempt-1', log });
+    await complete({ requestedResultCount: null });
 
     expect(recordDeckAvailability).toHaveBeenCalledWith(
       'request-1',
-      expect.objectContaining({ effectiveDeckTarget: 2 }),
+      { availableCandidateCount: 2, effectiveDeckTarget: 2 },
+      'attempt-1',
+    );
+  });
+
+  it('respects a number the person wrote: "give me 3" of five found shows three, and records both facts', async () => {
+    listMatches.mockResolvedValue(moments(5));
+
+    await complete({ requestedResultCount: 3 });
+
+    expect(recordDeckAvailability).toHaveBeenCalledWith(
+      'request-1',
+      { availableCandidateCount: 5, effectiveDeckTarget: 3 },
+      'attempt-1',
+    );
+  });
+
+  it('never pads a written number: three asked for and two found is two', async () => {
+    listMatches.mockResolvedValue(moments(2));
+
+    await complete({ requestedResultCount: 3 });
+
+    expect(recordDeckAvailability).toHaveBeenCalledWith(
+      'request-1',
+      { availableCandidateCount: 2, effectiveDeckTarget: 2 },
+      'attempt-1',
+    );
+  });
+
+  it('keeps a moment longer than any platform would take — whether it exists is a different question from whether it suits TikTok', async () => {
+    listMatches.mockResolvedValue(moments(1, 200));
+
+    await complete({ answeredFrom: 'footage' });
+
+    expect(recordDeckAvailability).toHaveBeenCalledWith(
+      'request-1',
+      { availableCandidateCount: 1, effectiveDeckTarget: 1 },
       'attempt-1',
     );
   });
@@ -101,7 +145,7 @@ describe('a search completes on find', () => {
   it('completes truthfully with zero moments, and never fails the request for it', async () => {
     listMatches.mockResolvedValue([]);
 
-    const released = await completeRequest({ clipRequestId: 'request-1', answeredFrom: 'footage', deckAttemptId: 'attempt-1', log });
+    const released = await complete({ answeredFrom: 'footage' });
 
     expect(released).toBe(true);
     expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'footage');
@@ -116,7 +160,7 @@ describe('a search completes on find', () => {
   it('needs no source footage to complete — the moments are coordinates, not files', async () => {
     listMatches.mockResolvedValue(moments(1));
 
-    const released = await completeRequest({ clipRequestId: 'request-1', answeredFrom: 'notes', deckAttemptId: 'attempt-1', log });
+    const released = await complete();
 
     expect(released).toBe(true);
     expect(downloadToFile).not.toHaveBeenCalled();
@@ -128,7 +172,7 @@ describe('a superseded attempt stands down', () => {
     listMatches.mockResolvedValue(moments(3));
     releaseDeckAndComplete.mockResolvedValue(false);
 
-    const released = await completeRequest({ clipRequestId: 'request-1', answeredFrom: 'notes', deckAttemptId: 'stale', log });
+    const released = await complete({ deckAttemptId: 'stale' });
 
     expect(released).toBe(false);
     expect(finishClipRequest).not.toHaveBeenCalled();
@@ -141,7 +185,7 @@ describe('a superseded attempt stands down', () => {
   it('holds no claim, releases nothing', async () => {
     listMatches.mockResolvedValue(moments(3));
 
-    const released = await completeRequest({ clipRequestId: 'request-1', answeredFrom: 'notes', deckAttemptId: null, log });
+    const released = await complete({ deckAttemptId: null });
 
     expect(released).toBe(false);
     expect(releaseDeckAndComplete).not.toHaveBeenCalled();
