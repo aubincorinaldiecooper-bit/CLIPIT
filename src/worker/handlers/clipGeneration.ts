@@ -10,7 +10,7 @@ import { clipKey } from '../../services/storage/types.js';
 import { cutClip, ffprobe } from '../../services/media/ffmpeg.js';
 import { appendReclipVersion, clearReclipPending, markReclipFailed } from '../../db/repositories/reclips.js';
 import { captionsSchema, prepareCaptionFilters } from '../../services/media/captions.js';
-import { applyClipPadding } from '../../services/timestamps.js';
+import { limitedRange } from '../../services/timestamps.js';
 import { withTransaction } from '../../db/pool.js';
 import { getClip, markClipGenerating, setClipStatus, restoreClipBoundaries } from '../../db/repositories/clips.js';
 import { commitRender } from '../../db/repositories/verticalMedia.js';
@@ -286,7 +286,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
 
   try {
     // Widen the match slightly so the moment is not clipped off at either edge.
-    const padded = applyClipPadding(
+    const cut = limitedRange(
       { startSeconds: clip.startSeconds, endSeconds: clip.endSeconds },
       {
         paddingSeconds: env.CLIP_PADDING_SECONDS,
@@ -303,12 +303,13 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
           : env.MAX_CLIP_SECONDS,
       },
     );
-    // A limit that shortened the moment is written back to the row with the
+    // A limit that changed the range is written back to the row with the
     // cut, so the row never describes seconds the file does not have — the
     // API would report them and a Re-clip would start from them (Devin's
-    // finding on #95). A range padding only widened is not written back:
+    // findings on #95). A range padding only widened is not written back:
     // written, it would widen again on every re-render.
-    const shortened = padded.endSeconds - padded.startSeconds < clip.endSeconds - clip.startSeconds - 0.001;
+    const padded = cut.range;
+    const shortened = cut.limited;
 
     await withWorkDir(`clip-${clipId}`, async (dir) => {
       const sourcePath = path.join(dir, `source${path.extname(video.originalStorageKey!) || '.mp4'}`);
