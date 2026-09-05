@@ -17,8 +17,33 @@ import type { PlatformReport } from '../../db/repositories/platformReports.js';
  * listing shows it.
  */
 
+/** The most a report may say, counted the way a person counts. */
+export const MAX_MESSAGE_CHARACTERS = 2000;
+
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/**
+ * Characters as a person counts them: an emoji, a flag or an accented
+ * letter is one. The product's report box shows this count beside its
+ * limit, so the server has to count the same way — measured in storage
+ * units instead, "1,998 of 2,000" on the box could be refused here as over.
+ */
+export function charactersIn(text: string): number {
+  let count = 0;
+  for (const _ of graphemes.segment(text)) count += 1;
+  return count;
+}
+
 export const reportSchema = z.object({
-  message: z.string().trim().min(1, 'Say what went wrong.').max(2000),
+  // The outer bound is storage: one perceived character can carry many
+  // units (a joined emoji is eleven), and a string of combining marks is
+  // one character of any length. The inner bound is the one the person sees.
+  message: z
+    .string()
+    .trim()
+    .min(1, 'Say what went wrong.')
+    .max(20_000)
+    .refine((text) => charactersIn(text) <= MAX_MESSAGE_CHARACTERS, `Say it in ${MAX_MESSAGE_CHARACTERS} characters or fewer.`),
   page: z.string().trim().max(500).default(''),
   videoId: z.string().uuid().nullish(),
   clipRequestId: z.string().uuid().nullish(),

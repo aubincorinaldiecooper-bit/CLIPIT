@@ -30,6 +30,11 @@ describe('reportSchema', () => {
   it('needs words, trims them, and caps them', () => {
     expect(reportSchema.safeParse({ message: '   ' }).success).toBe(false);
     expect(reportSchema.safeParse({ message: 'x'.repeat(2001) }).success).toBe(false);
+    // Counted as a person counts: the box in the product shows an emoji as one character.
+    expect(reportSchema.safeParse({ message: `${'x'.repeat(1999)}👍` }).success).toBe(true);
+    expect(reportSchema.safeParse({ message: '👍'.repeat(2001) }).success).toBe(false);
+    // But never without an outer bound on what is stored.
+    expect(reportSchema.safeParse({ message: `a${'\u0301'.repeat(20_000)}` }).success).toBe(false);
     const parsed = reportSchema.parse({ message: '  the clip never cut  ', page: '/start' });
     expect(parsed.message).toBe('the clip never cut');
     expect(parsed.videoId).toBeUndefined();
