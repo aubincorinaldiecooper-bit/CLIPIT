@@ -252,6 +252,12 @@ export interface RenderCommit {
   sizeBytes: number;
   /** Written only when provided — a caption Replace's spec becomes the row's truth here. */
   captions?: unknown;
+  /**
+   * The range the file actually covers, given only when a limit shortened
+   * the moment. Written with the cut so the row never describes seconds the
+   * file does not have.
+   */
+  boundaries?: { startSeconds: number; endSeconds: number };
   media: RenderedMedia;
 }
 
@@ -295,6 +301,11 @@ export async function commitRender(clipId: string, input: RenderCommit, client?:
     params.push(value);
     sets.push(`${column} = $${params.length}`);
   };
+
+  if (input.boundaries) {
+    set('start_seconds', input.boundaries.startSeconds);
+    set('end_seconds', input.boundaries.endSeconds);
+  }
 
   if (input.media.kind === 'original') {
     const poster = input.media.poster;

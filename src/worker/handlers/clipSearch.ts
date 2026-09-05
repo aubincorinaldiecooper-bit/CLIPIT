@@ -145,8 +145,17 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   let intent = resolvePlatformIntent(request.instruction, env.MAX_CLIP_SECONDS, {
     maxCount: env.VERTICAL_CANDIDATE_CEILING,
   });
-  /** Milliseconds this question has already spent parked, across every re-queue. */
+  /** Milliseconds this question has already spent parked for the notes or the transcript, across every re-queue. */
   const waitedMs = job.data.waitedMs ?? 0;
+  /**
+   * Milliseconds spent parked for the video's preparation, counted apart
+   * from the notes' and the transcript's allowances. A six-minute
+   * preparation (a 4 GB file, 2026-09-04) must not use up the four minutes
+   * the notes are allowed afterwards, or a slow file would be sent to the
+   * footage — fifty times the cost — for an answer the notes were about to
+   * give (Devin's finding on #95).
+   */
+  const preparationWaitedMs = job.data.preparationWaitedMs ?? 0;
 
   try {
     // A question is accepted the moment the video's bytes have landed; the
@@ -154,11 +163,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // — the same way it waits for the notes and the transcript further down.
     // Bounded, so a preparation that never finishes still ends in an answer:
     // a refusal, said plainly, rather than a question parked for good.
-    const preparation = preparationWait(video.status, waitedMs, env.PREPARATION_WAIT_TIMEOUT_MS);
+    const preparation = preparationWait(video.status, preparationWaitedMs, env.PREPARATION_WAIT_TIMEOUT_MS);
     if (preparation === 'wait') {
-      log.info('waiting for the video to be prepared', { waitedMs, videoStatus: video.status });
+      log.info('waiting for the video to be prepared', { preparationWaitedMs, videoStatus: video.status });
       await enqueueClipSearch(
-        { clipRequestId, waitedMs: waitedMs + env.PREPARATION_WAIT_POLL_MS },
+        { clipRequestId, waitedMs, preparationWaitedMs: preparationWaitedMs + env.PREPARATION_WAIT_POLL_MS },
         { delay: env.PREPARATION_WAIT_POLL_MS },
       );
       outcome = 'completed';
@@ -381,6 +390,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // how long it has been parked waiting for the video across re-queues.
       queueWaitMs: Math.max(0, (job.processedOn ?? Date.now()) - job.timestamp),
       waitedMs,
+      preparationWaitedMs,
       ...(correcting ? { correctionOf: request.instruction } : {}),
     });
 

@@ -76,8 +76,13 @@ describe('a superseded attempt must not release an answer', () => {
 
 describe('a question may be sent before the video is prepared', () => {
   it('the search parks the question and looks again, rather than refusing it', () => {
-    expect(handler).toContain('preparationWait(video.status, waitedMs, env.PREPARATION_WAIT_TIMEOUT_MS)');
-    expect(handler).toContain('waitedMs: waitedMs + env.PREPARATION_WAIT_POLL_MS');
+    expect(handler).toContain('preparationWait(video.status, preparationWaitedMs, env.PREPARATION_WAIT_TIMEOUT_MS)');
+    // Its own allowance: the wait for preparation is re-queued with the
+    // notes' and transcript's counter untouched, so a slow preparation
+    // cannot spend the allowance those get once the video is ready
+    // (Devin's finding on #95).
+    expect(handler).toContain('{ clipRequestId, waitedMs, preparationWaitedMs: preparationWaitedMs + env.PREPARATION_WAIT_POLL_MS }');
+    expect(handler).toContain('indexPending && waitedMs < env.INDEX_WAIT_TIMEOUT_MS');
     // The wait comes BEFORE the segment list is read — there is nothing to
     // read until the video is prepared.
     expect(handler.indexOf('preparationWait(video.status')).toBeLessThan(handler.indexOf('const chunks = await listChunks(video.id)'));

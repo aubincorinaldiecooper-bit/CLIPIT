@@ -61,7 +61,8 @@ vi.mock('../src/services/media/verticalPipeline.js', async (importOriginal) => {
 const getClipRequestForMatch = vi.fn(async () => ({ request: { id: 'request-1', instruction: 'find the harbour' }, instruction: 'find the harbour' }));
 vi.mock('../src/db/repositories/clipRequests.js', () => ({ getClipRequestForMatch }));
 const recordVerticalRenderAttempt = vi.fn(async () => undefined);
-vi.mock('../src/db/repositories/verticalRenders.js', () => ({ recordVerticalRenderAttempt }));
+const markAttemptsRecovered = vi.fn(async () => undefined);
+vi.mock('../src/db/repositories/verticalRenders.js', () => ({ recordVerticalRenderAttempt, markAttemptsRecovered }));
 const askVideoModel = vi.fn(async () => ({
   content: JSON.stringify({ composition_mode: 'smart_crop', focal_x: 0.5, focal_y: 0.4, crop_safe: true }),
   provider: 'openrouter', model: 'qwen/qwen3.6-flash',
@@ -156,6 +157,8 @@ beforeEach(() => {
   }
   getClipRequestForMatch.mockResolvedValue({ request: { id: 'request-1', instruction: 'find the harbour' }, instruction: 'find the harbour' });
   recordVerticalRenderAttempt.mockResolvedValue(undefined);
+  markAttemptsRecovered.mockReset();
+  markAttemptsRecovered.mockResolvedValue(undefined);
   askVideoModel.mockResolvedValue({
     content: JSON.stringify({ composition_mode: 'smart_crop', focal_x: 0.5, focal_y: 0.4, crop_safe: true }),
     provider: 'openrouter', model: 'qwen/qwen3.6-flash',
@@ -326,6 +329,10 @@ describe('a re-render of a moment made before the always-vertical rule', () => {
     expect(keys).toHaveLength(1);
     expect(keys[0]).toMatch(FRESH_CANONICAL);
     expect(context).toMatchObject({ clipId: 'clip-1', reason: 'canonical_upload_failed' });
+    // Recorded as the storage failure it is, not as a failed cut (Devin's finding on #95).
+    expect(recordVerticalRenderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'failed', failureStage: 'storage_upload', failureCode: 'canonical_upload_failed' }),
+    );
     expect(pipeline.runVerticalPipeline).not.toHaveBeenCalled();
     expect(commitRender).not.toHaveBeenCalled();
     expect(enqueueObjectRelease).not.toHaveBeenCalled();
@@ -725,6 +732,29 @@ describe('a first render — the one Keep starts', () => {
     expect(recordVerticalRenderAttempt).toHaveBeenCalledWith(
       expect.objectContaining({ clipRequestId: 'request-2', requestedPlatform: 'tiktok' }),
     );
+    // The row is told, with the cut: it must not go on describing 23 seconds
+    // the file does not have (Devin's finding on #95).
+    expect(commitRender.mock.calls.at(-1)![1]).toMatchObject({ boundaries: { startSeconds: 128, endSeconds: 138 } });
+  });
+
+  it('marks the earlier failed attempts recovered when a retry succeeds — and only then', async () => {
+    // Devin's finding on #95: the orchestrator marked them; without it
+    // retryRecoveryRate reads zero forever while retries are helping.
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
+    await handleClipGeneration(job({}, { attemptsMade: 1, attempts: 3 }));
+    expect(markAttemptsRecovered).toHaveBeenCalledWith('match-1');
+
+    markAttemptsRecovered.mockClear();
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
+    await handleClipGeneration(job({}));
+    expect(markAttemptsRecovered).not.toHaveBeenCalled();
+  });
+
+  it('a metrics write that fails does not fail a render that is done', async () => {
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
+    markAttemptsRecovered.mockRejectedValueOnce(new Error('metrics down'));
+    await expect(handleClipGeneration(job({}, { attemptsMade: 1, attempts: 3 }))).resolves.toBeUndefined();
+    expect(commitRender).toHaveBeenCalled();
   });
 
   it('cuts a moment longer than a platform would take in full — production does not shorten what discovery showed', async () => {
@@ -742,6 +772,8 @@ describe('a first render — the one Keep starts', () => {
     await handleClipGeneration(job({}));
 
     expect(media.cutClip).toHaveBeenCalledWith(expect.objectContaining({ startSeconds: 100, endSeconds: 185 }));
+    // Nothing shortened it, so the row's range is left alone.
+    expect(commitRender.mock.calls.at(-1)![1]).not.toHaveProperty('boundaries');
   });
 
   it('takes its own cut and media back out when the row write fails and the row never came to name them', async () => {

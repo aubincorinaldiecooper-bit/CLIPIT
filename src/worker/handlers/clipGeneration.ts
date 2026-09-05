@@ -14,6 +14,7 @@ import { applyClipPadding } from '../../services/timestamps.js';
 import { withTransaction } from '../../db/pool.js';
 import { getClip, markClipGenerating, setClipStatus, restoreClipBoundaries } from '../../db/repositories/clips.js';
 import { commitRender } from '../../db/repositories/verticalMedia.js';
+import { markAttemptsRecovered } from '../../db/repositories/verticalRenders.js';
 import { getClipRequestForMatch } from '../../db/repositories/clipRequests.js';
 import { recordVerticalRenderAttempt } from '../../db/repositories/verticalRenders.js';
 import { VerticalPipelineFailure, discardUploadedObjects, shouldDiscardOnUploadFailure } from '../../services/media/verticalPipeline.js';
@@ -302,6 +303,12 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
           : env.MAX_CLIP_SECONDS,
       },
     );
+    // A limit that shortened the moment is written back to the row with the
+    // cut, so the row never describes seconds the file does not have — the
+    // API would report them and a Re-clip would start from them (Devin's
+    // finding on #95). A range padding only widened is not written back:
+    // written, it would widen again on every re-render.
+    const shortened = padded.endSeconds - padded.startSeconds < clip.endSeconds - clip.startSeconds - 0.001;
 
     await withWorkDir(`clip-${clipId}`, async (dir) => {
       const sourcePath = path.join(dir, `source${path.extname(video.originalStorageKey!) || '.mp4'}`);
@@ -374,7 +381,9 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         await getStorage().uploadFile(key, outputPath, 'video/mp4');
       } catch (error) {
         await discardCanonicalIfOurs('canonical_upload_failed');
-        throw error;
+        // Named as the storage failure it is, so the stage metrics do not
+        // blame the cut for an outage in storage (Devin's finding on #95).
+        throw new VerticalPipelineFailure('storage_upload', 'canonical_upload_failed', errorMessage(error), error);
       }
       log.info('cut uploaded', {
         key,
@@ -433,6 +442,7 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         // history still said the re-cut had failed.
         await withTransaction(async (client) => {
           const wrote = await commitRender(clipId, {
+            ...(shortened ? { boundaries: { startSeconds: padded.startSeconds, endSeconds: padded.endSeconds } } : {}),
             storageKey: key,
             durationSeconds: Number(result.durationSeconds.toFixed(3)),
             sizeBytes: result.sizeBytes,
@@ -557,6 +567,16 @@ export async function handleClipGeneration(job: Job<ClipGenerationJob>): Promise
         derivativeRenderMs: delivered.framing.derivativeGenerationMs,
         posterGenerationMs: delivered.framing.posterGenerationMs,
       });
+      // This attempt succeeded after an earlier one failed: the earlier
+      // failure rows are marked recovered, or retryRecoveryRate reads zero
+      // forever while retries are helping (the orchestrator did this; Devin's
+      // finding on #95). Best-effort — a metrics write cannot fail a render
+      // that is done.
+      if (job.attemptsMade > 0) {
+        await markAttemptsRecovered(clip.clipMatchId).catch((recoveryError: unknown) => {
+          log.error('could not mark earlier attempts recovered', { matchId: clip.clipMatchId, err: recoveryError });
+        });
+      }
     });
   } catch (error) {
     // Not a failure: the write may have landed. Marking anything failed here
