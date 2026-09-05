@@ -709,6 +709,23 @@ export async function listMatches(requestId: string): Promise<ClipMatch[]> {
   return rows.map(mapMatch);
 }
 
+/**
+ * The question a moment was found for.
+ *
+ * A render made on Keep needs it twice: to attribute the framing call's
+ * cost to the request that found the moment, and to apply the platform's
+ * length limit the question named. Null when the moment is gone.
+ */
+export async function getClipRequestForMatch(matchId: string): Promise<ClipRequest | null> {
+  const row = await queryOne<ClipRequestRow>(
+    `SELECT r.* FROM clip_requests r
+       JOIN clip_matches m ON m.clip_request_id = r.id
+      WHERE m.id = $1`,
+    [matchId],
+  );
+  return row ? mapRequest(row) : null;
+}
+
 export async function listMatchesByIds(requestId: string, matchIds: string[]): Promise<ClipMatch[]> {
   if (matchIds.length === 0) return [];
   const rows = await queryRows<ClipMatchRow>(

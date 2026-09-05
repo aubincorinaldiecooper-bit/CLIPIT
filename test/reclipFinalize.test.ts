@@ -41,6 +41,39 @@ vi.mock('../src/services/media/ffmpeg.js', () => ({
   cutClip: media.cutClip,
   ffprobe: media.ffprobe,
 }));
+// Every render makes the 9:16 file now; this test is about what a Re-clip's
+// SUCCESS or FAILURE writes, so the media pipeline is answered, not run.
+vi.mock('../src/services/media/verticalPipeline.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/media/verticalPipeline.js')>();
+  return {
+    ...actual,
+    runVerticalPipeline: vi.fn(async (input: { render?: string }) => ({
+      compositionMode: 'blurred_background',
+      focalX: null,
+      focalY: null,
+      derivativeStorageKey: `clips/video-1/clip-1${input.render ? `-${input.render}` : ''}-vertical.mp4`,
+      posterStorageKey: `posters/video-1/clip-1${input.render ? `-${input.render}` : ''}.jpg`,
+      posterTimestampSeconds: 5,
+      sourceWidth: 640,
+      sourceHeight: 360,
+      sourceAspectRatio: '16:9',
+      outputWidth: 1080,
+      outputHeight: 1920,
+      compositionDecisionMs: 1,
+      derivativeGenerationMs: 1,
+      posterGenerationMs: 1,
+      provider: 'stored',
+      model: 'first-render',
+    })),
+    discardUploadedObjects: vi.fn(async () => undefined),
+  };
+});
+vi.mock('../src/db/repositories/clipRequests.js', () => ({
+  getClipRequestForMatch: vi.fn(async () => ({ id: 'request-1', instruction: 'find the harbour' })),
+}));
+vi.mock('../src/db/repositories/verticalRenders.js', () => ({
+  recordVerticalRenderAttempt: vi.fn(async () => undefined),
+}));
 vi.mock('../src/lib/workdir.js', () => ({
   withWorkDir: (_name: string, fn: (dir: string) => Promise<void>) => fn('/tmp/clipit-test'),
 }));

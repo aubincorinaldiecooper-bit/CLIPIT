@@ -398,6 +398,33 @@ export async function approveClip(clipId: string): Promise<boolean> {
   return row !== null;
 }
 
+/**
+ * Keep, on a moment whose file is about to be made.
+ *
+ * Unconditional where approveClip is conditional, and on purpose: the person
+ * has chosen this moment and its file does not exist yet, so there is nothing
+ * to check the approval against. Recording it NOW rather than when the render
+ * lands is what keeps the moment safe in the meantime — a retried search
+ * clears every match whose clip nobody approved (clearUnkeptMatchesForRequest),
+ * and a moment kept but not yet cut would otherwise be swept away with its
+ * render still queued.
+ *
+ * Owned from the first byte: a file made because somebody asked for it is
+ * never temporary.
+ */
+export async function approveClipOnKeep(clipId: string): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
+    `UPDATE clips
+        SET approved_at     = COALESCE(approved_at, now()),
+            retention_class = 'owned',
+            updated_at      = now()
+      WHERE id = $1
+      RETURNING id`,
+    [clipId],
+  );
+  return row !== null;
+}
+
 export interface ExpiredMediaRow {
   clipId: string;
   videoId: string;

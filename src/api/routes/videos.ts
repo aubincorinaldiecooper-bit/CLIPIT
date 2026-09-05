@@ -27,7 +27,7 @@ import { warmMiniCpm } from '../../services/search/minicpmVideo.js';
 import { assertOwnership, ownerScope, requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR, MINUTE } from '../rateLimit.js';
 import {
-  creatorVisibleDeck,
+  visibleMatches,
   serializeClipRequest,
   serializeVideo,
   serializeVideoWithPlayback,
@@ -520,11 +520,9 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
           listClipsForRequest(clipRequest.id),
         ]);
         const clipsByMatchId = new Map<string, Clip>(allClips.map((clip) => [clip.clipMatchId, clip]));
-        // Same gate as the request route. History is still a creator-facing
-        // view, and an unfinished moment must not reappear in it just
-        // because it is being read from a different page.
-        const { matches } = creatorVisibleDeck(clipRequest, allMatches, clipsByMatchId);
-        return serializeClipRequest(clipRequest, matches, clipsByMatchId);
+        // Same rule as the request route: every moment of a finished search.
+        const matches = visibleMatches(clipRequest, allMatches);
+        return serializeClipRequest(clipRequest, matches, clipsByMatchId, { candidatesFound: allMatches.length });
       }),
     );
 
