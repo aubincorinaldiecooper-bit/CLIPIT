@@ -514,13 +514,18 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
   let downloadUrl: string | null = null;
   let urlExpiresAt: string | null = null;
   let derivativeUrl: string | null = null;
+  let derivativeDownloadUrl: string | null = null;
   let posterUrl: string | null = null;
+  const downloadFilename = `clipit-${formatTimecode(clip.startSeconds)}-${formatTimecode(clip.endSeconds)}.mp4`;
 
   // The 9:16 file and its still, signed only when they really exist. Asking
   // for a URL to a key that is null would sign a path to nothing, and the
   // client would get a link that 404s instead of an honest absence.
   if (includeUrl && clip.derivativeStatus === 'ready' && clip.derivativeStorageKey) {
-    derivativeUrl = await getStorage().createDownloadUrl(clip.derivativeStorageKey);
+    [derivativeUrl, derivativeDownloadUrl] = await Promise.all([
+      getStorage().createDownloadUrl(clip.derivativeStorageKey),
+      getStorage().createDownloadUrl(clip.derivativeStorageKey, { downloadFilename }),
+    ]);
   }
   if (includeUrl && clip.posterStorageKey) {
     posterUrl = await getStorage().createDownloadUrl(clip.posterStorageKey);
@@ -533,9 +538,7 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
     // <video> element playing it.
     const [inline, attachment] = await Promise.all([
       getStorage().createDownloadUrl(clip.storageKey),
-      getStorage().createDownloadUrl(clip.storageKey, {
-        downloadFilename: `clipit-${formatTimecode(clip.startSeconds)}-${formatTimecode(clip.endSeconds)}.mp4`,
-      }),
+      getStorage().createDownloadUrl(clip.storageKey, { downloadFilename }),
     ]);
     url = inline;
     downloadUrl = attachment;
@@ -579,7 +582,9 @@ export async function serializeClip(clip: Clip, includeUrl = true) {
     media: clipMediaContract(
       {
         canonicalUrl: url,
+        canonicalDownloadUrl: downloadUrl,
         derivativeUrl,
+        derivativeDownloadUrl,
         derivativeStorageKey: clip.derivativeStorageKey,
         derivativeStatus: clip.derivativeStatus,
         posterUrl,
