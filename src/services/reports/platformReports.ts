@@ -20,6 +20,17 @@ import type { PlatformReport } from '../../db/repositories/platformReports.js';
 /** The most a report may say, counted the way a person counts. */
 export const MAX_MESSAGE_CHARACTERS = 2000;
 
+/**
+ * The most storage the words may take, in UTF-16 units. Sixteen per
+ * character is more than the longest standard emoji sequence needs (a kiss
+ * with two skin tones is fifteen; a family of four, eleven; a subdivision
+ * flag, fourteen), so no report the box calls two thousand characters is
+ * refused here for its size. Only a run of combining marks — one
+ * "character" of any length — can reach it, and the box holds the same
+ * line with its own words for it.
+ */
+export const MAX_MESSAGE_UNITS = MAX_MESSAGE_CHARACTERS * 16;
+
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
 /**
@@ -35,14 +46,14 @@ export function charactersIn(text: string): number {
 }
 
 export const reportSchema = z.object({
-  // The outer bound is storage: one perceived character can carry many
-  // units (a joined emoji is eleven), and a string of combining marks is
-  // one character of any length. The inner bound is the one the person sees.
+  // Two lines, and the box in the product holds both: the count a person
+  // sees, and an outer bound on storage that only a run of combining marks
+  // can reach.
   message: z
     .string()
     .trim()
     .min(1, 'Say what went wrong.')
-    .max(20_000)
+    .max(MAX_MESSAGE_UNITS, 'That is more than one report can carry.')
     .refine((text) => charactersIn(text) <= MAX_MESSAGE_CHARACTERS, `Say it in ${MAX_MESSAGE_CHARACTERS} characters or fewer.`),
   page: z.string().trim().max(500).default(''),
   videoId: z.string().uuid().nullish(),

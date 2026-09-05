@@ -33,8 +33,13 @@ describe('reportSchema', () => {
     // Counted as a person counts: the box in the product shows an emoji as one character.
     expect(reportSchema.safeParse({ message: `${'x'.repeat(1999)}👍` }).success).toBe(true);
     expect(reportSchema.safeParse({ message: '👍'.repeat(2001) }).success).toBe(false);
-    // But never without an outer bound on what is stored.
-    expect(reportSchema.safeParse({ message: `a${'\u0301'.repeat(20_000)}` }).success).toBe(false);
+    // Two thousand of the longest common sequence — a family, eleven units
+    // each — is two thousand characters and passes (Devin's finding on #95).
+    expect(reportSchema.safeParse({ message: '👨‍👩‍👧‍👦'.repeat(2000) }).success).toBe(true);
+    expect(reportSchema.safeParse({ message: '👨‍👩‍👧‍👦'.repeat(2001) }).success).toBe(false);
+    // But never without an outer bound on what is stored: one letter under a
+    // run of combining marks is one "character" of any length.
+    expect(reportSchema.safeParse({ message: `a${'\u0301'.repeat(32_000)}` }).success).toBe(false);
     const parsed = reportSchema.parse({ message: '  the clip never cut  ', page: '/start' });
     expect(parsed.message).toBe('the clip never cut');
     expect(parsed.videoId).toBeUndefined();
