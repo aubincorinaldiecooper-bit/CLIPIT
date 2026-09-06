@@ -1,4 +1,4 @@
-import type { Job } from 'bullmq';
+import { DelayedError, type Job } from 'bullmq';
 import { logger } from '../../lib/logger.js';
 import type { ScheduledPublishJob } from '../../queues/index.js';
 import {
@@ -23,7 +23,7 @@ import { zernioConfigured } from '../../services/zernio/client.js';
  * on purpose (a blind retry could double-post to a real audience) and the
  * row, not the job, is the record the person will read.
  */
-export async function handleScheduledPublish(job: Job<ScheduledPublishJob>): Promise<void> {
+export async function handleScheduledPublish(job: Job<ScheduledPublishJob>, token?: string): Promise<void> {
   const { scheduledPostId } = job.data;
 
   // The claim is the gate: a canceled promise, one already kept, or one
@@ -35,19 +35,26 @@ export async function handleScheduledPublish(job: Job<ScheduledPublishJob>): Pro
     // job well before the quarantine expires (its lock is minutes, the
     // quarantine is ten), so THIS run is the retry — and if it just
     // returned, no later run would exist and a promise whose worker died
-    // mid-fire would sit in 'firing' forever. Re-arm the alarm for when
-    // the quarantine lifts, and the claim will succeed then.
+    // mid-fire would sit in 'firing' forever. Push the same job back into
+    // the delayed set and throw DelayedError so the worker does not also
+    // try to complete it; the claim will succeed once the quarantine lifts.
     const existing = await getScheduledPost(scheduledPostId);
     if (existing?.status === 'firing') {
       const readyAt = new Date((existing.claimed_at?.getTime() ?? Date.now()) + CLAIM_QUARANTINE_MS + 1000);
-      await enqueueScheduledPublish({ scheduledPostId }, readyAt).catch((cause) =>
-        logger.error('could not re-arm a quarantined scheduled publish', { scheduledPostId, err: cause }),
-      );
+      if (token) {
+        await job.moveToDelayed(readyAt.getTime(), token);
+      } else {
+        // Fallback for tests or manual invocation where the worker token is
+        // unavailable; the worker path always provides a token.
+        await enqueueScheduledPublish({ scheduledPostId }, readyAt).catch((cause) =>
+          logger.error('could not re-arm a quarantined scheduled publish', { scheduledPostId, err: cause }),
+        );
+      }
       logger.info('scheduled publish re-armed past quarantine', {
         scheduledPostId,
         readyAt: readyAt.toISOString(),
       });
-      return;
+      throw new DelayedError('Scheduled publish is quarantined');
     }
     logger.info('scheduled publish skipped — not claimable', { scheduledPostId, status: existing?.status });
     return;
