@@ -211,15 +211,26 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
         await setTranscriptStatus(videoId, 'unavailable', { error: 'Source has no audio track' });
       } else {
         const fresh = await getVideo(videoId);
-        const transcriptStatus = fresh?.transcriptStatus ?? 'pending';
+        if (!fresh) {
+          throw new Error(`Video ${videoId} disappeared while starting transcription`);
+        }
+        const { transcriptStatus, updatedAt } = fresh;
 
         if (transcriptStatus === 'running' || transcriptStatus === 'ready' || transcriptStatus === 'unavailable') {
           log.info('transcription already in flight or finished', { transcriptStatus });
         } else {
           try {
+            // Enqueue first, then write the marker. If we crash after the queue
+            // add, the job is real; if we wrote 'queued' first, a crash before
+            // enqueue would leave an orphan marker that blocks spoken searches.
             await enqueueTranscription({ videoId, captionsStorageKey: video.captionsStorageKey });
+
+            // Compare-and-set on updated_at so a transcription worker that starts
+            // the moment the job lands cannot have its running/ready/failed state
+            // overwritten by this stale preprocessor.
             const written = await setTranscriptStatus(videoId, 'queued', {
               ifIn: ['pending', 'queued', 'failed'],
+              ifUpdatedAt: updatedAt,
             });
             log.info(written ? 'transcription queued' : 'transcription finished before status could be written', {
               transcriptStatus,
@@ -230,6 +241,7 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
             await setTranscriptStatus(videoId, 'failed', {
               error: `Could not queue transcription: ${errorMessage(error)}`,
               ifNotIn: ['running', 'ready', 'unavailable'],
+              ifUpdatedAt: updatedAt,
             });
           }
         }

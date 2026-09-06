@@ -279,6 +279,13 @@ export async function setTranscriptStatus(
     ifIn?: TranscriptStatus[];
     /** Never overwrite these statuses. */
     ifNotIn?: TranscriptStatus[];
+    /**
+     * Only overwrite the row if its `updated_at` matches this value.
+     * Used as an optimistic compare-and-set: a transcription worker that
+     * started after our read will have touched `updated_at`, so a stale
+     * preprocessor cannot overwrite its running/ready/failed state.
+     */
+    ifUpdatedAt?: Date;
   } = {},
 ): Promise<boolean> {
   const params: unknown[] = [
@@ -295,6 +302,11 @@ export async function setTranscriptStatus(
   } else if (options.ifNotIn) {
     params.push(options.ifNotIn);
     where += ` AND transcript_status <> ALL($${params.length}::text[])`;
+  }
+  if (options.ifUpdatedAt) {
+    params.push(options.ifUpdatedAt);
+    // Compare at millisecond precision so JS Date round-trip does not miss.
+    where += ` AND updated_at::timestamptz(3) = $${params.length}::timestamptz(3)`;
   }
 
   const row = await queryOne<{ id: string }>(
