@@ -271,18 +271,58 @@ export async function updateVideoMedia(videoId: string, update: VideoMediaUpdate
 export async function setTranscriptStatus(
   videoId: string,
   status: TranscriptStatus,
-  options: { source?: TranscriptSource | null; error?: string | null; segmentCount?: number } = {},
-): Promise<void> {
-  await queryOne(
+  options: {
+    source?: TranscriptSource | null;
+    error?: string | null;
+    segmentCount?: number;
+    /** Only overwrite these statuses. */
+    ifIn?: TranscriptStatus[];
+    /** Never overwrite these statuses. */
+    ifNotIn?: TranscriptStatus[];
+    /**
+     * Only overwrite the row if its `updated_at` matches this value.
+     * Used as an optimistic compare-and-set: a transcription worker that
+     * started after our read will have touched `updated_at`, so a stale
+     * preprocessor cannot overwrite its running/ready/failed state.
+     */
+    ifUpdatedAt?: Date;
+  } = {},
+): Promise<boolean> {
+  const params: unknown[] = [
+    videoId,
+    status,
+    options.source ?? null,
+    options.error ?? null,
+    options.segmentCount ?? null,
+  ];
+  let where = 'WHERE id = $1';
+  if (options.ifIn) {
+    params.push(options.ifIn);
+    where += ` AND transcript_status = ANY($${params.length}::text[])`;
+  } else if (options.ifNotIn) {
+    params.push(options.ifNotIn);
+    where += ` AND transcript_status <> ALL($${params.length}::text[])`;
+  }
+  if (options.ifUpdatedAt) {
+    params.push(options.ifUpdatedAt);
+    // JS Dates are only millisecond-precise; Postgres stores microseconds.
+    // Truncate both sides to milliseconds so an unchanged row is not rejected
+    // because of extra fractional seconds.
+    where += ` AND date_trunc('milliseconds', updated_at) = $${params.length}::timestamptz`;
+  }
+
+  const row = await queryOne<{ id: string }>(
     `UPDATE videos
         SET transcript_status = $2,
             transcript_source = COALESCE($3, transcript_source),
             transcript_error = $4,
             transcript_segment_count = COALESCE($5, transcript_segment_count),
             updated_at = now()
-      WHERE id = $1`,
-    [videoId, status, options.source ?? null, options.error ?? null, options.segmentCount ?? null],
+      ${where}
+      RETURNING id`,
+    params,
   );
+  return row !== null;
 }
 
 /**

@@ -13,7 +13,7 @@ vi.mock('../src/services/storage/s3.js', () => ({ getStorage: () => ({ remove })
 vi.mock('../src/db/repositories/objectOwnership.js', () => ({ storageKeysInUse }));
 const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 vi.mock('../src/lib/logger.js', () => ({ logger: { ...log, child: () => log } }));
-vi.mock('../src/db/repositories/verticalMedia.js', () => ({ claimUnkeptPreRenderedMedia: vi.fn() }));
+vi.mock('../src/db/repositories/verticalMedia.js', () => ({ claimUnkeptPreRenderedMedia: vi.fn(async () => []) }));
 vi.mock('../src/db/repositories/videos.js', () => ({ listVideosWithUnreachableFootage: vi.fn(async () => []) }));
 vi.mock('../src/services/retention.js', () => ({ expireVideoFootage: vi.fn() }));
 const enqueueObjectRelease = vi.fn();

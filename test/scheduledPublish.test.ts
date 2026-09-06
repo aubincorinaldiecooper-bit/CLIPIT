@@ -1,3 +1,4 @@
+import { DelayedError } from 'bullmq';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -48,7 +49,10 @@ const claimedRow = {
 };
 
 function job() {
-  return { data: { scheduledPostId: 'sched-1' } } as never;
+  return {
+    data: { scheduledPostId: 'sched-1' },
+    moveToDelayed: vi.fn(),
+  } as never;
 }
 
 beforeEach(() => {
@@ -79,12 +83,12 @@ describe('handleScheduledPublish', () => {
     rows.claimScheduledPost.mockResolvedValue(null);
     rows.getScheduledPost.mockResolvedValue({ ...claimedRow, status: 'firing', claimed_at: claimedAt });
 
-    await handleScheduledPublish(job());
+    const j = job();
+    await expect(handleScheduledPublish(j, 'token')).rejects.toBeInstanceOf(DelayedError);
 
-    expect(enqueueScheduledPublish).toHaveBeenCalledTimes(1);
-    const [data, readyAt] = enqueueScheduledPublish.mock.calls[0]!;
-    expect(data).toEqual({ scheduledPostId: 'sched-1' });
-    expect((readyAt as Date).getTime()).toBeGreaterThan(claimedAt.getTime() + 10 * 60 * 1000);
+    expect(j.moveToDelayed).toHaveBeenCalledTimes(1);
+    const [readyAtMs] = j.moveToDelayed.mock.calls[0]!;
+    expect(readyAtMs as number).toBeGreaterThan(claimedAt.getTime() + 10 * 60 * 1000);
     expect(executeClipPublish).not.toHaveBeenCalled();
   });
 

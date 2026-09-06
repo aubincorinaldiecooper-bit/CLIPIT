@@ -83,6 +83,9 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
   // must wait on there being footage to sweep.
   await handOverRecordedReleases(log);
   await settleUnknownRenders(log);
+  // Pre-rendered, unkept clips are swept regardless of whether any guest
+  // footage has expired; the early return below must not skip them.
+  await sweepUnkeptPreRenderedMedia(log);
 
   const videos = await listVideosWithUnreachableFootage(env.FOOTAGE_IDLE_SECONDS, limit + 1);
   if (videos.length === 0) {
@@ -125,8 +128,6 @@ export async function handleRetention(job: Job<RetentionJob>): Promise<void> {
     elapsedMs: Math.round(performance.now() - startedAt),
     ...(remaining > 0 ? { videosLeftForNextSweep: remaining } : {}),
   });
-
-  await sweepUnkeptPreRenderedMedia(log);
 }
 
 /**

@@ -1,5 +1,5 @@
 import type pg from 'pg';
-import { query, queryOne, queryRows } from '../pool.js';
+import { query, queryOne, queryRows, withTransaction } from '../pool.js';
 import type { CompositionMode } from '../../services/media/composition.js';
 
 /**
@@ -376,26 +376,42 @@ export async function markOriginalFailed(clipId: string, message: string): Promi
  * it is for a vertical one.
  */
 export async function approveClip(clipId: string): Promise<boolean> {
-  const row = await queryOne<{ id: string }>(
-    `UPDATE clips
-        SET approved_at     = COALESCE(approved_at, now()),
-            retention_class = 'owned',
-            updated_at      = now()
-      WHERE id = $1
-        AND status = 'ready'
-        AND storage_key IS NOT NULL
-        -- A pre-rendered moment is finished when its poster and its
-        -- deliverable both exist: the canonical file for an original-framing
-        -- deck, the 9:16 derivative as well for a vertical one.
-        AND (pre_rendered = FALSE
-             OR (poster_storage_key IS NOT NULL
-                 AND (presentation = 'original'
-                      OR (derivative_status = 'ready'
-                          AND derivative_storage_key IS NOT NULL))))
-      RETURNING id`,
-    [clipId],
-  );
-  return row !== null;
+  return withTransaction(async (client) => {
+    // Lock the request this clip belongs to so a concurrent sweep cannot see
+    // the clip as unkept, delete its match, and cascade away the row while we
+    // are still writing the approval.
+    const request = await client.query<{ id: string }>(
+      `SELECT r.id
+         FROM clip_requests r
+         JOIN clip_matches m ON m.clip_request_id = r.id
+         JOIN clips c ON c.clip_match_id = m.id
+        WHERE c.id = $1
+        FOR UPDATE`,
+      [clipId],
+    );
+    if (request.rows.length === 0) return false;
+
+    const { rows } = await client.query<{ id: string }>(
+      `UPDATE clips
+          SET approved_at     = COALESCE(approved_at, now()),
+              retention_class = 'owned',
+              updated_at      = now()
+        WHERE id = $1
+          AND status = 'ready'
+          AND storage_key IS NOT NULL
+          -- A pre-rendered moment is finished when its poster and its
+          -- deliverable both exist: the canonical file for an original-framing
+          -- deck, the 9:16 derivative as well for a vertical one.
+          AND (pre_rendered = FALSE
+               OR (poster_storage_key IS NOT NULL
+                   AND (presentation = 'original'
+                        OR (derivative_status = 'ready'
+                            AND derivative_storage_key IS NOT NULL))))
+        RETURNING id`,
+      [clipId],
+    );
+    return rows.length > 0;
+  });
 }
 
 export interface ExpiredMediaRow {
@@ -517,36 +533,47 @@ export async function clearUnkeptMatchesForRequest(
    */
   attemptId: string | null,
 ): Promise<string[]> {
-  const rows = await queryRows<{
-    storage_key: string | null;
-    derivative_storage_key: string | null;
-    poster_storage_key: string | null;
-  }>(
-    `WITH doomed AS (
-       SELECT m.id AS match_id
-         FROM clip_matches m
-        WHERE m.clip_request_id = $1
-          -- Only the attempt that currently owns this request may clear it.
-          AND ($2::uuid IS NULL OR EXISTS (
-            SELECT 1 FROM clip_requests r
-             WHERE r.id = $1 AND r.deck_attempt_id = $2::uuid
-          ))
-          AND NOT EXISTS (
-            SELECT 1 FROM clips k
-             WHERE k.clip_match_id = m.id AND k.approved_at IS NOT NULL
-          )
-     ), files AS (
-       SELECT c.storage_key, c.derivative_storage_key, c.poster_storage_key
-         FROM clips c
-         JOIN doomed d ON d.match_id = c.clip_match_id
-     ), removed AS (
-       DELETE FROM clip_matches WHERE id IN (SELECT match_id FROM doomed)
-     )
-     SELECT storage_key, derivative_storage_key, poster_storage_key FROM files`,
-    [clipRequestId, attemptId],
-  );
-  return rows.flatMap((row) =>
-    [row.storage_key, row.derivative_storage_key, row.poster_storage_key]
-      .filter((key): key is string => typeof key === 'string' && key.length > 0),
-  );
+  return withTransaction(async (client) => {
+    // Lock the request row before reading the matches so a concurrent Keep
+    // cannot approve a clip after we have decided its match is unkept. The
+    // fence check lives here too: if the attempt no longer owns the request,
+    // there is nothing to clear.
+    const fence = await client.query<{ id: string }>(
+      `SELECT id
+         FROM clip_requests
+        WHERE id = $1
+          AND ($2::uuid IS NULL OR deck_attempt_id = $2::uuid)
+        FOR UPDATE`,
+      [clipRequestId, attemptId],
+    );
+    if (fence.rows.length === 0) return [];
+
+    const rows = await client.query<{
+      storage_key: string | null;
+      derivative_storage_key: string | null;
+      poster_storage_key: string | null;
+    }>(
+      `WITH doomed AS (
+         SELECT m.id AS match_id
+           FROM clip_matches m
+          WHERE m.clip_request_id = $1
+            AND NOT EXISTS (
+              SELECT 1 FROM clips k
+               WHERE k.clip_match_id = m.id AND k.approved_at IS NOT NULL
+            )
+       ), files AS (
+         SELECT c.storage_key, c.derivative_storage_key, c.poster_storage_key
+           FROM clips c
+           JOIN doomed d ON d.match_id = c.clip_match_id
+       ), removed AS (
+         DELETE FROM clip_matches WHERE id IN (SELECT match_id FROM doomed)
+       )
+       SELECT storage_key, derivative_storage_key, poster_storage_key FROM files`,
+      [clipRequestId],
+    );
+    return rows.rows.flatMap((row) =>
+      [row.storage_key, row.derivative_storage_key, row.poster_storage_key]
+        .filter((key): key is string => typeof key === 'string' && key.length > 0),
+    );
+  });
 }

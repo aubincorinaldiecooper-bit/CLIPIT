@@ -452,7 +452,6 @@ export async function registerSocialRoutes(app: FastifyInstance): Promise<void> 
    */
   app.get('/api/scheduled-posts', { preHandler: requireSession }, async (request, reply) => {
     const userId = requireUserId(request.principal);
-    if (!zernioConfigured()) return reply.send({ scheduled: [] });
     const rows = await listScheduledPostsForUser(userId);
     return reply.send({
       scheduled: rows.map((row: ScheduledPostView) => ({

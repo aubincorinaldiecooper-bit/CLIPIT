@@ -192,7 +192,62 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       });
       await job.updateProgress({ stage: 'probed', percent: 40 });
 
-      // 2. Derive the analysis proxy, its chunks and the playback proxy.
+      // 2. Start transcription as soon as the source is understood.
+      //
+      //    The long encode below is the bottleneck; the transcript can be built
+      //    in parallel from the original file (and any YouTube captions). If it
+      //    is disabled or there is no audio, mark it unavailable so searches can
+      //    fall back cleanly.
+      //
+      //    The snapshot from the start of this job can be stale: a transcription
+      //    attempt can be retried by BullMQ while we are still probing or
+      //    downloading. We re-read the row and use atomic status guards so a
+      //    running or ready transcript is never overwritten, and we enqueue
+      //    before writing 'queued' so a crash between the two does not leave a
+      //    queued marker with no job behind it.
+      if (!env.TRANSCRIPTION_ENABLED) {
+        await setTranscriptStatus(videoId, 'unavailable', { error: 'Transcription is disabled' });
+      } else if (!probe.hasAudio) {
+        await setTranscriptStatus(videoId, 'unavailable', { error: 'Source has no audio track' });
+      } else {
+        const fresh = await getVideo(videoId);
+        if (!fresh) {
+          throw new Error(`Video ${videoId} disappeared while starting transcription`);
+        }
+        const { transcriptStatus, updatedAt } = fresh;
+
+        if (transcriptStatus === 'running' || transcriptStatus === 'ready' || transcriptStatus === 'unavailable') {
+          log.info('transcription already in flight or finished', { transcriptStatus });
+        } else {
+          try {
+            // Enqueue first, then write the marker. If we crash after the queue
+            // add, the job is real; if we wrote 'queued' first, a crash before
+            // enqueue would leave an orphan marker that blocks spoken searches.
+            await enqueueTranscription({ videoId, captionsStorageKey: video.captionsStorageKey });
+
+            // Compare-and-set on updated_at so a transcription worker that starts
+            // the moment the job lands cannot have its running/ready/failed state
+            // overwritten by this stale preprocessor.
+            const written = await setTranscriptStatus(videoId, 'queued', {
+              ifIn: ['pending', 'queued', 'failed'],
+              ifUpdatedAt: updatedAt,
+            });
+            log.info(written ? 'transcription queued' : 'transcription finished before status could be written', {
+              transcriptStatus,
+              captionsStorageKey: video.captionsStorageKey,
+            });
+          } catch (error) {
+            log.error('could not queue transcription', { err: error });
+            await setTranscriptStatus(videoId, 'failed', {
+              error: `Could not queue transcription: ${errorMessage(error)}`,
+              ifNotIn: ['running', 'ready', 'unavailable'],
+              ifUpdatedAt: updatedAt,
+            });
+          }
+        }
+      }
+
+      // 3. Derive the analysis proxy, its chunks and the playback proxy.
       //
       // One decode of the source feeds all three. Before this, the original
       // was decoded once for the analysis proxy and again for the playback
@@ -379,29 +434,7 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       await setVideoStatus(videoId, 'ready');
       await job.updateProgress({ stage: 'ready', percent: 100 });
 
-      // 5. Transcription runs after the video is searchable, so a spoken-word
-      //    search waits only for the transcript, not for the whole pipeline.
-      if (!env.TRANSCRIPTION_ENABLED) {
-        await setTranscriptStatus(videoId, 'unavailable', { error: 'Transcription is disabled' });
-      } else if (!probe.hasAudio) {
-        await setTranscriptStatus(videoId, 'unavailable', { error: 'Source has no audio track' });
-      } else {
-        // Both follow-ups run AFTER the video is already searchable, so a queue
-        // that is momentarily unreachable must not reach the catch below and
-        // mark a fully processed video failed. Each records its own failure and
-        // leaves the video exactly as usable as it already is.
-        try {
-          await setTranscriptStatus(videoId, 'queued');
-          await enqueueTranscription({ videoId, captionsStorageKey: video.captionsStorageKey });
-        } catch (error) {
-          log.error('could not queue transcription', { err: error });
-          await setTranscriptStatus(videoId, 'failed', {
-            error: `Could not queue transcription: ${errorMessage(error)}`,
-          });
-        }
-      }
-
-      // 6. Read the video into notes, once, so questions can be answered from
+      // 5. Read the video into notes, once, so questions can be answered from
       //    text instead of re-reading the whole video every time one is asked.
       //    Queued after the video is already searchable, so indexing never
       //    delays the first question — it only makes the later ones cheap.
