@@ -197,26 +197,42 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       //    The long encode below is the bottleneck; the transcript can be built
       //    in parallel from the original file (and any YouTube captions). If it
       //    is disabled or there is no audio, mark it unavailable so searches can
-      //    fall back cleanly. We only enqueue when the status is still pending or
-      //    has failed, so a retry does not overwrite an already-running/ready
-      //    transcript.
+      //    fall back cleanly.
+      //
+      //    The snapshot from the start of this job can be stale: a transcription
+      //    attempt can be retried by BullMQ while we are still probing or
+      //    downloading. We re-read the row and use atomic status guards so a
+      //    running or ready transcript is never overwritten, and we enqueue
+      //    before writing 'queued' so a crash between the two does not leave a
+      //    queued marker with no job behind it.
       if (!env.TRANSCRIPTION_ENABLED) {
         await setTranscriptStatus(videoId, 'unavailable', { error: 'Transcription is disabled' });
       } else if (!probe.hasAudio) {
         await setTranscriptStatus(videoId, 'unavailable', { error: 'Source has no audio track' });
-      } else if (video.transcriptStatus === 'pending' || video.transcriptStatus === 'failed') {
-        try {
-          await setTranscriptStatus(videoId, 'queued');
-          await enqueueTranscription({ videoId, captionsStorageKey: video.captionsStorageKey });
-          log.info('transcription queued', { captionsStorageKey: video.captionsStorageKey });
-        } catch (error) {
-          log.error('could not queue transcription', { err: error });
-          await setTranscriptStatus(videoId, 'failed', {
-            error: `Could not queue transcription: ${errorMessage(error)}`,
-          });
-        }
       } else {
-        log.info('transcription already in flight, skipping re-queue', { transcriptStatus: video.transcriptStatus });
+        const fresh = await getVideo(videoId);
+        const transcriptStatus = fresh?.transcriptStatus ?? 'pending';
+
+        if (transcriptStatus === 'running' || transcriptStatus === 'ready' || transcriptStatus === 'unavailable') {
+          log.info('transcription already in flight or finished', { transcriptStatus });
+        } else {
+          try {
+            await enqueueTranscription({ videoId, captionsStorageKey: video.captionsStorageKey });
+            const written = await setTranscriptStatus(videoId, 'queued', {
+              ifIn: ['pending', 'queued', 'failed'],
+            });
+            log.info(written ? 'transcription queued' : 'transcription finished before status could be written', {
+              transcriptStatus,
+              captionsStorageKey: video.captionsStorageKey,
+            });
+          } catch (error) {
+            log.error('could not queue transcription', { err: error });
+            await setTranscriptStatus(videoId, 'failed', {
+              error: `Could not queue transcription: ${errorMessage(error)}`,
+              ifNotIn: ['running', 'ready', 'unavailable'],
+            });
+          }
+        }
       }
 
       // 3. Derive the analysis proxy, its chunks and the playback proxy.

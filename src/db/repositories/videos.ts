@@ -271,18 +271,44 @@ export async function updateVideoMedia(videoId: string, update: VideoMediaUpdate
 export async function setTranscriptStatus(
   videoId: string,
   status: TranscriptStatus,
-  options: { source?: TranscriptSource | null; error?: string | null; segmentCount?: number } = {},
-): Promise<void> {
-  await queryOne(
+  options: {
+    source?: TranscriptSource | null;
+    error?: string | null;
+    segmentCount?: number;
+    /** Only overwrite these statuses. */
+    ifIn?: TranscriptStatus[];
+    /** Never overwrite these statuses. */
+    ifNotIn?: TranscriptStatus[];
+  } = {},
+): Promise<boolean> {
+  const params: unknown[] = [
+    videoId,
+    status,
+    options.source ?? null,
+    options.error ?? null,
+    options.segmentCount ?? null,
+  ];
+  let where = 'WHERE id = $1';
+  if (options.ifIn) {
+    params.push(options.ifIn);
+    where += ` AND transcript_status = ANY($${params.length}::text[])`;
+  } else if (options.ifNotIn) {
+    params.push(options.ifNotIn);
+    where += ` AND transcript_status <> ALL($${params.length}::text[])`;
+  }
+
+  const row = await queryOne<{ id: string }>(
     `UPDATE videos
         SET transcript_status = $2,
             transcript_source = COALESCE($3, transcript_source),
             transcript_error = $4,
             transcript_segment_count = COALESCE($5, transcript_segment_count),
             updated_at = now()
-      WHERE id = $1`,
-    [videoId, status, options.source ?? null, options.error ?? null, options.segmentCount ?? null],
+      ${where}
+      RETURNING id`,
+    params,
   );
+  return row !== null;
 }
 
 /**
