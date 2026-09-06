@@ -305,8 +305,10 @@ export async function setTranscriptStatus(
   }
   if (options.ifUpdatedAt) {
     params.push(options.ifUpdatedAt);
-    // Compare at millisecond precision so JS Date round-trip does not miss.
-    where += ` AND updated_at::timestamptz(3) = $${params.length}::timestamptz(3)`;
+    // JS Dates are only millisecond-precise; Postgres stores microseconds.
+    // Truncate both sides to milliseconds so an unchanged row is not rejected
+    // because of extra fractional seconds.
+    where += ` AND date_trunc('milliseconds', updated_at) = $${params.length}::timestamptz`;
   }
 
   const row = await queryOne<{ id: string }>(
