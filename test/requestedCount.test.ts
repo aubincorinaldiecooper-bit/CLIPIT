@@ -27,15 +27,22 @@ describe('parseRequestedMomentCount', () => {
    * that asked for one.
    */
   it('never mistakes a duration for a count', () => {
-    expect(parseRequestedMomentCount('make it a 30 second clip for tiktok')).toBe(1);
-    expect(parseRequestedMomentCount('make me a 45 second reel')).toBe(1);
+    // The number belongs to parseExplicitDurationSeconds; no count was written.
+    expect(parseRequestedMomentCount('make it a 30 second clip for tiktok')).toBeNull();
+    expect(parseRequestedMomentCount('make me a 45 second reel')).toBeNull();
     expect(parseRequestedMomentCount('find me 30 second clips for tiktok')).toBeNull();
   });
 
-  /** Singular is a count, even with no digit in it. */
-  it('reads a singular ask as one', () => {
-    expect(parseRequestedMomentCount('find the best moment')).toBe(1);
-    expect(parseRequestedMomentCount('give me a moment for reels')).toBe(1);
+  /** A singular noun is how people talk, not a count. */
+  it('does not read a singular ask as a limit — only a number the person wrote is one', () => {
+    // "the moment where the cigar is smoked" found two, and both were the
+    // answer (owner, 2026-09-05). A singular noun is how people talk, not a
+    // count; the old reading of it as one existed to stop the default of
+    // three from rendering two clips nobody asked for, and nothing renders
+    // before review any more.
+    expect(parseRequestedMomentCount('find the best moment')).toBeNull();
+    expect(parseRequestedMomentCount('give me a moment for reels')).toBeNull();
+    expect(parseRequestedMomentCount('what about the moment where we see a cigar being smoked?')).toBeNull();
   });
 
   it('says nothing when the creator did not', () => {
@@ -109,9 +116,11 @@ describe('phrasings that quietly produced the wrong deck', () => {
     expect(intent.requestedCount).toBe(5);
   });
 
-  /** A word further along is still a noun, so this stays one moment. */
-  it('still reads a noun that is not the first word', () => {
-    expect(resolvePlatformIntent('clip this for tiktok', 60).requestedCount).toBe(1);
+  /** No number anywhere: the default stands, and it is recorded as not the person's. */
+  it('reads no count at all from a sentence without a number in it', () => {
+    const intent = resolvePlatformIntent('clip this for tiktok', 60);
+    expect(intent.requestedCount).toBe(3);
+    expect(intent.countExplicit).toBe(false);
   });
 
   /**

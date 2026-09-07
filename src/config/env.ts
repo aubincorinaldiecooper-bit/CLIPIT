@@ -346,6 +346,15 @@ const envSchema = z.object({
   INDEX_WAIT_TIMEOUT_MS: int(240_000, 0, 900_000),
   INDEX_WAIT_POLL_MS: int(4_000, 500, 60_000),
   /**
+   * A question is accepted the moment the video's bytes have landed; the
+   * answer waits here for the video to be prepared (its analysis segments),
+   * polling at this rate, before it goes on to wait for the notes above.
+   * Past the timeout the question fails with a plain message rather than
+   * sitting forever on a preparation that will not finish.
+   */
+  PREPARATION_WAIT_TIMEOUT_MS: int(600_000, 0, 3_600_000),
+  PREPARATION_WAIT_POLL_MS: int(3_000, 500, 60_000),
+  /**
    * Room for a description of everything in one chunk, which runs far longer
    * than a list of matching moments. An answer cut off mid-scene leaves a hole
    * in the notes that nothing downstream can see.
@@ -400,6 +409,14 @@ const envSchema = z.object({
    * evaluation route answers 404 for everyone — absent, not merely locked.
    */
   EVAL_OWNER_EMAILS: z.string().trim().optional(),
+  /**
+   * Where a problem reported from the product goes to be fixed: a GitHub
+   * repository ("owner/name") and a token allowed to open issues in it.
+   * Unset, reports stay in the database and the log, and the owner's
+   * listing (GET /api/reports) shows them.
+   */
+  GITHUB_REPORTS_REPO: z.string().trim().regex(/^[\w.-]+\/[\w.-]+$/).optional(),
+  GITHUB_REPORTS_TOKEN: z.string().min(1).optional(),
   SESSION_TTL_SECONDS: int(2_592_000, 3_600, 31_536_000),
   /** When false, /api routes accept unauthenticated requests (local dev only). */
   REQUIRE_SESSION: bool(true),
@@ -411,6 +428,7 @@ const envSchema = z.object({
   RATE_LIMIT_SEARCH_PER_IP_HOURLY: int(60, 1, 10_000),
   RATE_LIMIT_GENERATE_PER_SESSION_HOURLY: int(60, 1, 10_000),
   RATE_LIMIT_GENERATE_PER_IP_HOURLY: int(180, 1, 10_000),
+  RATE_LIMIT_REPORTS_PER_SESSION_HOURLY: int(20, 1, 10_000),
   RATE_LIMIT_READ_PER_SESSION_MINUTE: int(240, 1, 100_000),
 
   // --- Media pipeline -----------------------------------------------------

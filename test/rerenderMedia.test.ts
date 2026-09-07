@@ -49,10 +49,26 @@ const recordUnknownRender = vi.fn();
 vi.mock('../src/db/repositories/unknownRenders.js', () => ({ recordUnknownRender }));
 const txClient = { query: vi.fn() };
 vi.mock('../src/db/pool.js', () => ({ withTransaction: (fn: (client: unknown) => Promise<unknown>) => fn(txClient) }));
-vi.mock('../src/services/media/verticalPipeline.js', () => ({
-  runOriginalPipeline: pipeline.runOriginalPipeline,
-  runVerticalPipeline: pipeline.runVerticalPipeline,
-  discardUploadedObjects: pipeline.discardUploadedObjects,
+vi.mock('../src/services/media/verticalPipeline.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/media/verticalPipeline.js')>();
+  return {
+    ...actual,
+    runOriginalPipeline: pipeline.runOriginalPipeline,
+    runVerticalPipeline: pipeline.runVerticalPipeline,
+    discardUploadedObjects: pipeline.discardUploadedObjects,
+  };
+});
+const getClipRequestForMatch = vi.fn(async () => ({ request: { id: 'request-1', instruction: 'find the harbour' }, instruction: 'find the harbour' }));
+vi.mock('../src/db/repositories/clipRequests.js', () => ({ getClipRequestForMatch }));
+const recordVerticalRenderAttempt = vi.fn(async () => undefined);
+const markAttemptsRecovered = vi.fn(async () => undefined);
+vi.mock('../src/db/repositories/verticalRenders.js', () => ({ recordVerticalRenderAttempt, markAttemptsRecovered }));
+const askVideoModel = vi.fn(async () => ({
+  content: JSON.stringify({ composition_mode: 'smart_crop', focal_x: 0.5, focal_y: 0.4, crop_safe: true }),
+  provider: 'openrouter', model: 'qwen/qwen3.6-flash',
+}));
+vi.mock('../src/services/media/framing.js', () => ({
+  askModelForFraming: () => askVideoModel,
 }));
 vi.mock('../src/services/storage/s3.js', () => ({ getStorage: () => storage }));
 vi.mock('../src/services/media/ffmpeg.js', () => ({
@@ -97,6 +113,9 @@ function job(data: Record<string, unknown>, overrides: { attemptsMade?: number; 
 const original = {
   id: 'clip-1',
   videoId: 'video-1',
+  clipMatchId: 'match-1',
+  workspaceId: null,
+  sessionId: null,
   startSeconds: 128,
   endSeconds: 151,
   status: 'pending',
@@ -132,9 +151,18 @@ beforeEach(() => {
   for (const mock of [
     ...Object.values(clips), ...Object.values(reclips), ...Object.values(storage), ...Object.values(media),
     ...Object.values(pipeline), ...Object.values(log), discardVariants, getVideo, commitRender, enqueueObjectRelease, recordObjectRelease, recordUnknownRender,
+    getClipRequestForMatch, recordVerticalRenderAttempt, askVideoModel,
   ]) {
     mock.mockReset();
   }
+  getClipRequestForMatch.mockResolvedValue({ request: { id: 'request-1', instruction: 'find the harbour' }, instruction: 'find the harbour' });
+  recordVerticalRenderAttempt.mockResolvedValue(undefined);
+  markAttemptsRecovered.mockReset();
+  markAttemptsRecovered.mockResolvedValue(undefined);
+  askVideoModel.mockResolvedValue({
+    content: JSON.stringify({ composition_mode: 'smart_crop', focal_x: 0.5, focal_y: 0.4, crop_safe: true }),
+    provider: 'openrouter', model: 'qwen/qwen3.6-flash',
+  });
   enqueueObjectRelease.mockResolvedValue(undefined);
   recordObjectRelease.mockResolvedValue(undefined);
   recordUnknownRender.mockResolvedValue(undefined);
@@ -199,12 +227,13 @@ describe('a re-render of a moment made before the always-vertical rule', () => {
     expect(freshCanonical).not.toBe(OLD_CANONICAL);
     const render = freshCanonical.slice('clips/video-1/clip-1-'.length, -'.mp4'.length);
 
-    // The poster first, sharing the render's name, then the cut.
-    // The vertical pipeline, not the original one: converting the clip.
+    // The cut first — stored so a framing call can be pointed at it — then
+    // the media made from it, sharing the render's name. The vertical
+    // pipeline, not the original one: converting the clip.
     const posterCall = pipeline.runVerticalPipeline.mock.calls[0]![0] as Record<string, unknown>;
     expect(posterCall).toMatchObject({ canonicalPath: '/tmp/clipit-test/clip-1.mp4', render });
     expect(pipeline.runOriginalPipeline).not.toHaveBeenCalled();
-    expect(orderOf(pipeline.runVerticalPipeline)).toBeLessThan(storage.uploadFile.mock.invocationCallOrder[storage.uploadFile.mock.calls.indexOf(upload)]!);
+    expect(storage.uploadFile.mock.invocationCallOrder[storage.uploadFile.mock.calls.indexOf(upload)]!).toBeLessThan(orderOf(pipeline.runVerticalPipeline));
 
     // One write, both keys — inside the same transaction as the Re-clip's
     // version and cleared pending state, and the stale variants.
@@ -275,7 +304,11 @@ describe('a re-render of a moment made before the always-vertical rule', () => {
 
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('poster frame');
 
-    expect(canonicalUpload()).toBeUndefined();
+    // The fresh cut had already been stored, so it is taken back out; the
+    // row never named it, and the previous cut is untouched.
+    const freshCanonical = canonicalUpload()![0] as string;
+    expect(freshCanonical).toMatch(FRESH_CANONICAL);
+    expect(pipeline.discardUploadedObjects).toHaveBeenCalledWith([freshCanonical], expect.objectContaining({ clipId: 'clip-1', reason: 'delivered_media_failed' }));
     expect(commitRender).not.toHaveBeenCalled();
     expect(storage.remove).not.toHaveBeenCalled();
     expect(clips.restoreClipBoundaries).toHaveBeenCalledWith('clip-1', expect.objectContaining({ startSeconds: 130, endSeconds: 150 }));
@@ -283,23 +316,24 @@ describe('a re-render of a moment made before the always-vertical rule', () => {
     expect(reclips.appendReclipVersion).not.toHaveBeenCalled();
   });
 
-  it('takes the fresh cut and poster back out when the new cut cannot be stored', async () => {
+  it('takes the fresh cut back out when it cannot be stored — a PUT that rejected may still have landed', async () => {
     storage.uploadFile.mockImplementation(async (key: string) => {
       if (key.startsWith('clips/')) throw new Error('bucket refused');
     });
 
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('bucket refused');
 
-    // Three now, not two: converting the clip makes a 9:16 derivative
-    // alongside the cut and its poster, and a rollback takes back all of it.
+    // The cut is stored before any media is made from it, so nothing else
+    // exists yet to take back: one key, the fresh canonical.
     const [keys, context] = pipeline.discardUploadedObjects.mock.calls[0]!;
-    expect(keys).toHaveLength(3);
+    expect(keys).toHaveLength(1);
     expect(keys[0]).toMatch(FRESH_CANONICAL);
-    expect(keys).toEqual(expect.arrayContaining([
-      expect.stringMatching(/^clips\/video-1\/clip-1-[0-9a-f]{8}-vertical\.mp4$/),
-      expect.stringMatching(/^posters\/video-1\/clip-1-[0-9a-f]{8}\.jpg$/),
-    ]));
-    expect(context).toMatchObject({ clipId: 'clip-1', reason: 'render_commit_failed' });
+    expect(context).toMatchObject({ clipId: 'clip-1', reason: 'canonical_upload_failed' });
+    // Recorded as the storage failure it is, not as a failed cut (Devin's finding on #95).
+    expect(recordVerticalRenderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'failed', failureStage: 'storage_upload', failureCode: 'canonical_upload_failed' }),
+    );
+    expect(pipeline.runVerticalPipeline).not.toHaveBeenCalled();
     expect(commitRender).not.toHaveBeenCalled();
     expect(enqueueObjectRelease).not.toHaveBeenCalled();
     expect(reclips.appendReclipVersion).not.toHaveBeenCalled();
@@ -622,54 +656,139 @@ describe('a re-render of a moment cut on find, vertical', () => {
     expect(pipeline.runOriginalPipeline).not.toHaveBeenCalled();
   });
 
-  it('takes all three fresh objects back out when the new cut cannot be stored', async () => {
+  it('takes the fresh cut back out when it cannot be stored, before any media is made from it', async () => {
     storage.uploadFile.mockImplementation(async (key: string) => {
       if (key.startsWith('clips/') && !key.endsWith('-vertical.mp4')) throw new Error('bucket refused');
     });
 
     await expect(handleClipGeneration(job({ reclip: reclipPayload }))).rejects.toThrow('bucket refused');
 
-    const [keys] = pipeline.discardUploadedObjects.mock.calls[0]!;
-    expect(keys).toHaveLength(3);
+    const [keys, context] = pipeline.discardUploadedObjects.mock.calls[0]!;
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatch(FRESH_CANONICAL);
+    expect(context).toMatchObject({ reason: 'canonical_upload_failed' });
+    expect(pipeline.runVerticalPipeline).not.toHaveBeenCalled();
     expect(commitRender).not.toHaveBeenCalled();
     expect(enqueueObjectRelease).not.toHaveBeenCalled();
   });
 });
 
-describe('a re-render of a moment cut on demand', () => {
-  it('remakes no media, but still stores the new cut beside the old and swaps them in one write', async () => {
+describe('a re-render of a moment cut on demand before the always-vertical rule', () => {
+  it('converts it: the whole frame on a blurred background, with no model call, and swaps the files in one write', async () => {
     clips.getClip.mockResolvedValue(onDemand);
 
     await handleClipGeneration(job({ reclip: reclipPayload }));
 
     expect(pipeline.runOriginalPipeline).not.toHaveBeenCalled();
-    expect(pipeline.runVerticalPipeline).not.toHaveBeenCalled();
+    expect(pipeline.runVerticalPipeline).toHaveBeenCalledTimes(1);
+    // Never framed, so nothing to reuse and nothing worth paying to decide:
+    // the stored fallback keeps every pixel.
+    const call = pipeline.runVerticalPipeline.mock.calls[0]![0] as { askComposition: (path: string) => Promise<{ content: string; provider: string }> };
+    const answer = await call.askComposition('/tmp/clipit-test/clip-1.mp4');
+    expect(JSON.parse(answer.content).composition_mode).toBe('blurred_background');
+    expect(answer.provider).toBe('stored');
+    expect(askVideoModel).not.toHaveBeenCalled();
     expect(canonicalUpload()![0]).toMatch(FRESH_CANONICAL);
-    expect(committed()).toMatchObject({ media: { kind: 'none' } });
-    expect(enqueueObjectRelease.mock.calls[0]![0]).toEqual([OLD_CANONICAL]);
+    expect(committed()).toMatchObject({ media: { kind: 'vertical' } });
+    expect(enqueueObjectRelease.mock.calls[0]![0]).toEqual(expect.arrayContaining([OLD_CANONICAL]));
   });
 });
 
-describe('a first render', () => {
-  it('keeps the plain key it always had, and removes nothing', async () => {
+describe('a first render — the one Keep starts', () => {
+  it('asks the model how to frame the moment, makes the 9:16 file, and keeps the plain key', async () => {
     clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
 
     await handleClipGeneration(job({}));
 
+    // The cut is stored, THEN the model is asked: the MiniCPM lane frames
+    // from a signed URL to the stored cut.
     expect(canonicalUpload()![0]).toBe(OLD_CANONICAL);
-    expect(committed()).toMatchObject({ storageKey: OLD_CANONICAL, media: { kind: 'none' } });
+    expect(storage.uploadFile.mock.invocationCallOrder[storage.uploadFile.mock.calls.indexOf(canonicalUpload()!)]!)
+      .toBeLessThan(orderOf(pipeline.runVerticalPipeline));
+    const call = pipeline.runVerticalPipeline.mock.calls[0]![0] as { askComposition: (path: string) => Promise<{ content: string; provider: string }> };
+    const answer = await call.askComposition('/tmp/clipit-test/clip-1.mp4');
+    expect(askVideoModel).toHaveBeenCalledTimes(1);
+    expect(answer.provider).toBe('openrouter');
+    expect(committed()).toMatchObject({ storageKey: OLD_CANONICAL, media: { kind: 'vertical' } });
     expect(enqueueObjectRelease).not.toHaveBeenCalled();
+    // The production record survives the move from the orchestrator.
+    expect(recordVerticalRenderAttempt).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'succeeded', clipRequestId: 'request-1', matchId: 'match-1' }));
   });
 
-  it('takes its own cut back out when the row write fails and the row never came to name it', async () => {
+  it('cuts to the limit the question named — for a correction too, whose own stored words are "are you sure"', async () => {
+    // Devin's finding on #95: the moment lives on the correction request, but
+    // the words that were searched — and whose limits apply — are the
+    // previous question's. The cost still goes to the correction request.
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
+    getClipRequestForMatch.mockResolvedValue({
+      request: { id: 'request-2', instruction: 'are you sure?' },
+      instruction: 'find a 10 second moment for TikTok',
+    });
+
+    await handleClipGeneration(job({}));
+
+    // 128 → 151 is 23 s; the question asked for 10.
+    expect(media.cutClip).toHaveBeenCalledWith(expect.objectContaining({ startSeconds: 128, endSeconds: 138 }));
+    expect(recordVerticalRenderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ clipRequestId: 'request-2', requestedPlatform: 'tiktok' }),
+    );
+    // The row is told, with the cut: it must not go on describing 23 seconds
+    // the file does not have (Devin's finding on #95).
+    expect(commitRender.mock.calls.at(-1)![1]).toMatchObject({ boundaries: { startSeconds: 128, endSeconds: 138 } });
+  });
+
+  it('marks the earlier failed attempts recovered when a retry succeeds — and only then', async () => {
+    // Devin's finding on #95: the orchestrator marked them; without it
+    // retryRecoveryRate reads zero forever while retries are helping.
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
+    await handleClipGeneration(job({}, { attemptsMade: 1, attempts: 3 }));
+    expect(markAttemptsRecovered).toHaveBeenCalledWith('match-1');
+
+    markAttemptsRecovered.mockClear();
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
+    await handleClipGeneration(job({}));
+    expect(markAttemptsRecovered).not.toHaveBeenCalled();
+  });
+
+  it('a metrics write that fails does not fail a render that is done', async () => {
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
+    markAttemptsRecovered.mockRejectedValueOnce(new Error('metrics down'));
+    await expect(handleClipGeneration(job({}, { attemptsMade: 1, attempts: 3 }))).resolves.toBeUndefined();
+    expect(commitRender).toHaveBeenCalled();
+  });
+
+  it('cuts a moment longer than a platform would take in full — production does not shorten what discovery showed', async () => {
+    // Codex's finding on #95: the platform ceiling used to move the end
+    // timestamp, so an 85-second moment became its first 60 seconds while
+    // the row still described the whole moment. A platform's limit is that
+    // platform's answer at publish time; a number the person WROTE is the
+    // only duration applied here.
+    clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending', startSeconds: 100, endSeconds: 185 });
+    getClipRequestForMatch.mockResolvedValue({
+      request: { id: 'request-1', instruction: 'find moments for TikTok' },
+      instruction: 'find moments for TikTok',
+    });
+
+    await handleClipGeneration(job({}));
+
+    expect(media.cutClip).toHaveBeenCalledWith(expect.objectContaining({ startSeconds: 100, endSeconds: 185 }));
+    // Nothing shortened it, so the row's range is left alone.
+    expect(commitRender.mock.calls.at(-1)![1]).not.toHaveProperty('boundaries');
+  });
+
+  it('takes its own cut and media back out when the row write fails and the row never came to name them', async () => {
     clips.getClip.mockResolvedValue({ ...onDemand, storageKey: null, status: 'pending' });
     commitRender.mockRejectedValueOnce(new Error('database refused'));
 
     await expect(handleClipGeneration(job({}))).rejects.toThrow('database refused');
 
-    // A cut no row names would sit in storage for good; a retry uploads again.
-    expect(pipeline.discardUploadedObjects).toHaveBeenCalledWith([OLD_CANONICAL], expect.objectContaining({ reason: 'render_commit_failed' }));
+    // Objects no row names would sit in storage for good; a retry uploads again.
+    const [keys, context] = pipeline.discardUploadedObjects.mock.calls[0]!;
+    expect(keys).toHaveLength(3);
+    expect(keys).toEqual(expect.arrayContaining([OLD_CANONICAL]));
+    expect(context).toMatchObject({ reason: 'render_commit_failed' });
     expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'failed', expect.objectContaining({ errorMessage: 'database refused' }));
+    expect(recordVerticalRenderAttempt).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed' }));
   });
 
   it('keeps a plain-key cut the row already named, and does not mistake that for a landed write', async () => {
@@ -681,7 +800,8 @@ describe('a first render', () => {
 
     await expect(handleClipGeneration(job({}))).rejects.toThrow('database refused');
 
-    for (const [keys] of pipeline.discardUploadedObjects.mock.calls) expect(keys).toEqual([]);
+    // The fresh media goes; the cut the row already named stays.
+    for (const [keys] of pipeline.discardUploadedObjects.mock.calls) expect(keys).not.toContain(OLD_CANONICAL);
     expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining('carrying on as committed'), expect.anything());
     expect(clips.setClipStatus).toHaveBeenCalledWith('clip-1', 'ready', expect.objectContaining({ errorMessage: 'database refused' }));
   });

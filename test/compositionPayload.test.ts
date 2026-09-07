@@ -10,12 +10,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * nothing that had watched them. These tests pin the rule rather than that
  * single symptom: whatever the framing call sends, it is not the file the
  * creator downloads.
+ *
+ * The call now happens on Keep, from the render job, rather than for every
+ * moment a search finds. The rule is the same.
  */
 
 const removedFiles: string[] = [];
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
-  return { ...actual, rm: vi.fn(async (target: string) => { removedFiles.push(target); }) };
+  return {
+    ...actual,
+    rm: vi.fn(async (target: string) => { removedFiles.push(target); }),
+    stat: vi.fn(async () => ({ size: 20_000_000 })),
+  };
 });
 
 const uploadFile = vi.fn(async () => {});
@@ -27,29 +34,16 @@ const renderVerticalDerivative = vi.fn(async () => ({
 }));
 const extractFrameAt = vi.fn(async () => true);
 const ffprobe = vi.fn(async () => ({ width: 1920, height: 1080, durationSeconds: 20 }));
-const cutClip = vi.fn(async () => ({ durationSeconds: 20, sizeBytes: 20_000_000 }));
 const createAnalysisProxy = vi.fn(async () => {});
 vi.mock('../src/services/media/ffmpeg.js', () => ({
-  renderVerticalDerivative, extractFrameAt, ffprobe, cutClip, createAnalysisProxy,
+  renderVerticalDerivative, extractFrameAt, ffprobe, createAnalysisProxy,
 }));
 
 vi.mock('../src/db/repositories/clips.js', () => ({
-  upsertClipForMatch: vi.fn(async () => ({ id: 'clip-1', derivativeStorageKey: null, posterStorageKey: null })),
   getClip: vi.fn(async () => ({ id: 'clip-1', derivativeStorageKey: null, posterStorageKey: null })),
-  setClipStatus: vi.fn(async () => true),
-}));
-const setVerticalMedia = vi.fn(async () => undefined);
-vi.mock('../src/db/repositories/verticalMedia.js', () => ({
-  setVerticalMedia,
-  markVerticalFailed: vi.fn(async () => undefined),
-  setOriginalMedia: vi.fn(async () => undefined),
-  markOriginalFailed: vi.fn(async () => undefined),
-}));
-vi.mock('../src/db/repositories/verticalRenders.js', () => ({
-  markAttemptsRecovered: vi.fn(async () => undefined),
-  recordVerticalRenderAttempt: vi.fn(async () => undefined),
 }));
 vi.mock('../src/db/repositories/usage.js', () => ({ recordModelUsage: vi.fn(async () => undefined) }));
+vi.mock('../src/queues/index.js', () => ({ enqueueObjectRelease: vi.fn(async () => undefined) }));
 
 const askVideoModel = vi.fn(async () => ({
   content: JSON.stringify({ composition_mode: 'smart_crop', focal_x: 0.5, focal_y: 0.4, crop_safe: true }),
@@ -67,34 +61,41 @@ vi.mock('../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }) },
 }));
 
-const { orchestrateVerticalDeck } = await import('../src/services/media/verticalOrchestrator.js');
-const { resolvePlatformIntent } = await import('../src/services/search/platformIntent.js');
-const { UsageTally } = await import('../src/services/usageTally.js');
+const { renderDeliveredMedia } = await import('../src/services/media/rerender.js');
 
-const WORK_DIR = '/tmp/deck-work';
-/** What the orchestrator names the delivery clip: <workDir>/<clipId>.mp4 */
+const WORK_DIR = '/tmp/render-work';
+/** What the render job names the delivery clip: <workDir>/<clipId>.mp4 */
 const DELIVERY_PATH = `${WORK_DIR}/clip-1.mp4`;
+const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any;
 
-async function runOneCandidate() {
-  return orchestrateVerticalDeck({
+/** A moment being rendered for the first time: nothing has been cut for it before. */
+const firstRender = {
+  id: 'clip-1',
+  videoId: 'video-1',
+  clipMatchId: 'match-1',
+  storageKey: null,
+  derivativeStorageKey: null,
+  posterStorageKey: null,
+  compositionMode: null,
+  focalX: null,
+  focalY: null,
+  preRendered: false,
+  presentation: null,
+  retentionClass: 'owned',
+} as any;
+
+async function renderOnce(clip = firstRender) {
+  return renderDeliveredMedia({
+    clip,
     videoId: 'video-1',
     clipRequestId: 'request-1',
-    sessionId: null, userId: null, workspaceId: null,
-    sourcePath: '/tmp/source.mp4',
+    canonicalPath: DELIVERY_PATH,
+    canonicalKey: 'clips/video-1/clip-1.mp4',
     workDir: WORK_DIR,
     hasAudio: true,
-    videoDurationSeconds: 20,
-    intent: resolvePlatformIntent('find a moment to post on TikTok', 90),
-    presentation: 'vertical' as const,
-    requestedResultCount: 1,
-    effectiveDeckTarget: 1,
-    candidates: [{
-      matchId: 'match-1', confidence: 0.9, startSeconds: 0, endSeconds: 20,
-      derivativeStatus: 'pending', derivativeStorageKey: null, posterStorageKey: null,
-    }],
-    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as any,
-    startedAtMs: Date.now(),
-    tally: new UsageTally(),
+    cut: { durationSeconds: 20, width: 1920, height: 1080 },
+    render: undefined,
+    log,
   });
 }
 
@@ -102,7 +103,7 @@ beforeEach(() => { vi.clearAllMocks(); removedFiles.length = 0; });
 
 describe('what the framing call is allowed to send', () => {
   it('sends a downscaled proxy, never the delivery clip', async () => {
-    await runOneCandidate();
+    await renderOnce();
 
     expect(createAnalysisProxy).toHaveBeenCalledTimes(1);
     const [source, proxyPath] = createAnalysisProxy.mock.calls[0] as unknown as [string, string];
@@ -116,7 +117,7 @@ describe('what the framing call is allowed to send', () => {
   });
 
   it('keeps the payload under what a provider will accept', async () => {
-    await runOneCandidate();
+    await renderOnce();
 
     const sent = askVideoModel.mock.calls[0]?.[0] as unknown as { videoBytes: number };
     // The 413 came back at ~11.7MB of payload. 10MB is the limit this must
@@ -125,25 +126,37 @@ describe('what the framing call is allowed to send', () => {
     expect(sent.videoBytes).toBeLessThan(20_000_000);
   });
 
-  it('still asks the model rather than falling back to the safe composition', async () => {
-    const result = await runOneCandidate();
+  it('asks the model on a first render, and the decision reaches the row', async () => {
+    const delivered = await renderOnce();
 
     expect(askVideoModel).toHaveBeenCalledTimes(1);
-    expect(result.outcome.deck).toHaveLength(1);
+    expect(delivered.media.kind).toBe('vertical');
+    if (delivered.media.kind !== 'vertical') throw new Error('unreachable');
+    // The crop is the model's and not the fallback the 413s were producing.
+    expect(delivered.media.media.compositionMode).toBe('smart_crop');
+    expect(delivered.media.media.focalX).toBe(0.5);
+    expect(delivered.framing.provider).toBe('openrouter');
+  });
 
-    // The decision reaches the row, so the crop is the model's and not the
-    // fallback the 413s were producing.
-    const persisted = setVerticalMedia.mock.calls[0]?.[1] as unknown as {
-      compositionMode: string; focalX: number | null;
-    };
-    expect(persisted.compositionMode).toBe('smart_crop');
-    expect(persisted.focalX).toBe(0.5);
+  it('does not ask again on a re-render — the first render\'s decision is reused', async () => {
+    const delivered = await renderOnce({
+      ...firstRender,
+      storageKey: 'clips/video-1/clip-1.mp4',
+      compositionMode: 'smart_crop',
+      focalX: 0.7,
+      focalY: 0.3,
+    });
+
+    expect(askVideoModel).not.toHaveBeenCalled();
+    expect(createAnalysisProxy).not.toHaveBeenCalled();
+    if (delivered.media.kind !== 'vertical') throw new Error('unreachable');
+    expect(delivered.media.media.focalX).toBe(0.7);
   });
 });
 
 describe('the proxy never outlives the call that needed it', () => {
   it('deletes it after a successful framing call', async () => {
-    await runOneCandidate();
+    await renderOnce();
 
     const [, proxyPath] = createAnalysisProxy.mock.calls[0] as unknown as [string, string];
     expect(removedFiles).toContain(proxyPath);
@@ -152,9 +165,9 @@ describe('the proxy never outlives the call that needed it', () => {
   it('deletes it when the encode fails', async () => {
     videoPartFromFile.mockRejectedValueOnce(new Error('could not read the proxy'));
 
-    // The framing failure is caught upstream and the deck carries on, so
+    // The framing failure is caught by the pipeline (safe composition), so
     // nothing else would ever come back for this file.
-    await runOneCandidate();
+    await renderOnce();
 
     const [, proxyPath] = createAnalysisProxy.mock.calls[0] as unknown as [string, string];
     expect(removedFiles).toContain(proxyPath);
@@ -163,7 +176,7 @@ describe('the proxy never outlives the call that needed it', () => {
   it('deletes the half-written file when ffmpeg fails', async () => {
     createAnalysisProxy.mockRejectedValueOnce(new Error('ffmpeg died mid-write'));
 
-    await runOneCandidate();
+    await renderOnce();
 
     // Named before ffmpeg ran, so whatever it managed to write is still
     // removed by name.

@@ -14,6 +14,7 @@ import { registerEvaluationRoutes } from './routes/evaluation.js';
 import { registerSocialRoutes } from './routes/social.js';
 import { registerZernioWebhookRoutes } from './routes/zernioWebhook.js';
 import { registerWorkspaceRoutes } from './routes/workspace.js';
+import { registerReportRoutes } from './routes/reports.js';
 
 export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -95,6 +96,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await registerSocialRoutes(app);
   await registerZernioWebhookRoutes(app);
   await registerWorkspaceRoutes(app);
+  await registerReportRoutes(app);
 
   return app;
 }

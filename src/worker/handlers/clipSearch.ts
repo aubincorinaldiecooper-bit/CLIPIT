@@ -50,15 +50,13 @@ import {
 } from '../../db/repositories/clipRequests.js';
 import { enqueueClipSearch, type ClipSearchJob } from '../../queues/index.js';
 import {
-  exceedsPlatformHardMax,
   needsVerticalDerivative,
   resolvePlatformIntent,
   type PlatformIntent,
 } from '../../services/search/platformIntent.js';
-import { orchestrateVerticalDeck, type OrchestratorCandidate } from '../../services/media/verticalOrchestrator.js';
-import { deckCompletion } from '../../services/media/deckAssembly.js';
 import { clearUnkeptMatchesForRequest } from '../../db/repositories/verticalMedia.js';
 import { verticalForRework } from '../../services/search/presentationTarget.js';
+import { PREPARATION_TIMED_OUT_MESSAGE, preparationWait } from '../../services/search/readiness.js';
 import type {
   ChunkDegradation,
   ClipRequest,
@@ -147,12 +145,42 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   let intent = resolvePlatformIntent(request.instruction, env.MAX_CLIP_SECONDS, {
     maxCount: env.VERTICAL_CANDIDATE_CEILING,
   });
-  let deck: VerticalDeckResult | null = null;
+  /** Milliseconds this question has already spent parked for the notes or the transcript, across every re-queue. */
+  const waitedMs = job.data.waitedMs ?? 0;
+  /**
+   * Milliseconds spent parked for the video's preparation, counted apart
+   * from the notes' and the transcript's allowances. A six-minute
+   * preparation (a 4 GB file, 2026-09-04) must not use up the four minutes
+   * the notes are allowed afterwards, or a slow file would be sent to the
+   * footage — fifty times the cost — for an answer the notes were about to
+   * give (Devin's finding on #95).
+   */
+  const preparationWaitedMs = job.data.preparationWaitedMs ?? 0;
 
   try {
+    // A question is accepted the moment the video's bytes have landed; the
+    // answer waits here for the video to be prepared — its analysis segments
+    // — the same way it waits for the notes and the transcript further down.
+    // Bounded, so a preparation that never finishes still ends in an answer:
+    // a refusal, said plainly, rather than a question parked for good.
+    const preparation = preparationWait(video.status, preparationWaitedMs, env.PREPARATION_WAIT_TIMEOUT_MS);
+    if (preparation === 'wait') {
+      log.info('waiting for the video to be prepared', { preparationWaitedMs, videoStatus: video.status });
+      await enqueueClipSearch(
+        { clipRequestId, waitedMs, preparationWaitedMs: preparationWaitedMs + env.PREPARATION_WAIT_POLL_MS },
+        { delay: env.PREPARATION_WAIT_POLL_MS },
+      );
+      outcome = 'completed';
+      return;
+    }
+    if (preparation === 'timed_out') throw new Error(PREPARATION_TIMED_OUT_MESSAGE);
     if (video.status !== 'ready') {
-      // The API blocks this, but a request can still race preprocessing.
-      throw new Error(`Video is not ready for search (status: ${video.status})`);
+      // Failed, or a status this handler does not know.
+      throw new Error(
+        video.status === 'failed'
+          ? `Video processing failed: ${video.errorMessage ?? 'unknown error'}`
+          : `Video is not ready for search (status: ${video.status})`,
+      );
     }
 
     const chunks = await listChunks(video.id);
@@ -255,8 +283,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       transcriptAvailable: transcriptReady || transcriptPending,
     });
 
-    const waitedMs = job.data.waitedMs ?? 0;
-
     /**
      * Waiting for the video to finish being read.
      *
@@ -290,9 +316,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       if (readSoFar.count > 0) {
         const answered = await answerFromNotes({
           clipRequestId,
-          request,
-          intent,
           deckAttemptId,
+          requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
           video,
           chunks,
           instruction,
@@ -303,14 +328,14 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         });
 
         if (answered.matchCount > 0) {
-          if (answered.deckCompleted) {
+          if (answered.released) {
             log.info('answered from the part read so far', {
               matches: answered.matchCount,
               readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
               ofSeconds: Math.round(video.durationSeconds ?? 0),
             });
           } else {
-            log.error('notes answered but the deck could not be finished', {
+            log.warn('answered from the part read so far, but the answer was superseded', {
               matches: answered.matchCount,
               readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
               ofSeconds: Math.round(video.durationSeconds ?? 0),
@@ -361,6 +386,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       rationale: resolved.rationale,
       chunks: chunks.length,
       instruction,
+      // How long the question sat before this delivery began (the queue), and
+      // how long it has been parked waiting for the video across re-queues.
+      queueWaitMs: Math.max(0, (job.processedOn ?? Date.now()) - job.timestamp),
+      waitedMs,
+      preparationWaitedMs,
       ...(correcting ? { correctionOf: request.instruction } : {}),
     });
 
@@ -386,9 +416,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     if (notesAvailable) {
       const answered = await answerFromNotes({
         clipRequestId,
-        request,
-        intent,
         deckAttemptId,
+        requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
         video,
         chunks,
         instruction,
@@ -530,26 +559,15 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       // After aggregation, because merging rewrites match rows and their ids.
       await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
 
-      // A request that named a platform is not answered by a list of
-      // timestamps. It is answered by finished, postable files — so the deck
-      // is BUILT here, before the request is reported complete, and the
-      // creator sees the whole set or nothing.
-      //
-      // Not thrown on failure: throwing re-runs the whole search, and the
-      // search half worked. Every retry worth making has already been made,
-      // per candidate, inside the deck assembly where it costs one render
-      // rather than a re-reading of the entire video.
-      const finished = await completeRequestWithDeck({
-        clipRequestId, request, video, intent, workDir: dir, log, tally,
-        answeredFrom: 'footage', deckAttemptId,
-        // The creator has been waiting since the search finished, not since
-        // the source finished downloading.
-        deckStartedAtMs: performance.now(),
+      // The moments are the answer. They are released the moment they have
+      // their pictures — nothing is cut, framed or encoded until somebody
+      // keeps one.
+      const released = await completeRequest({
+        clipRequestId, answeredFrom: 'footage', deckAttemptId, log,
+        requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
       });
-      deck = finished.deck;
-      if (!finished.completed) {
-        // The job did what it was asked; the request carries the bad news.
-        // Marking the job failed too would double-count it.
+      if (!released) {
+        // Another delivery owns the answer now; this one stands down.
         outcome = 'completed';
         return;
       }
@@ -559,22 +577,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         matches: finalCount,
         mergedFrom: totalMatches,
         failedChunks: failed,
-        // What the creator was actually given. A search that "completed" with
-        // three matches and no finished media is a different event from one
-        // that handed over three postable files, and the log must tell them
-        // apart.
-        ...(deck
-          ? {
-              platform: intent.platform,
-              requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
-              availableCandidateCount: deck.availableCandidateCount,
-              effectiveDeckTarget: deck.effectiveDeckTarget,
-              readyResultCount: deck.readyCount,
-              failedCandidateCount: deck.failedCandidateCount,
-              renderedButSkippedCount: deck.renderedButSkippedCount,
-              timeToCompleteDeckMs: deck.timeToCompleteDeckMs,
-            }
-          : {}),
+        platform: intent.platform,
+        requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
         // Coverage, not just outcome: how much of the video was actually
         // examined, and how much of it with less than the intended evidence.
         chunksSearchedWithoutTranscript: degradations.length,
@@ -791,313 +795,74 @@ async function clearPreviousAttempt(
  * Finish a request the same way whichever path answered it.
  *
  * Two paths reach a completed request: the notes, and the footage. Both owe
- * the creator the same thing. Before this existed only the footage path built
- * a deck, so a TikTok question that the notes could answer returned a list of
- * timestamps and no media at all — the fast path quietly opting out of the
- * product rule, and only for the videos we had already read.
+ * the creator the same thing: the moments they found, with their pictures,
+ * as soon as they exist. Exported for focused tests of the boundary.
  *
- * Reading from memory is still the right architecture and is untouched: the
- * notes decide WHICH moments, exactly as before, and the deck is built from
- * whatever they found. What changed is only that answering fast no longer
- * means answering with less. Exported for focused tests of the request/deck
- * boundary.
+ * Nothing is rendered here. That is the change this function carries, and it
+ * is worth stating plainly because the previous version of it did the
+ * opposite: every moment a search found was cut, framed and encoded — one
+ * after another, a model call and an encode each — before a single one was
+ * shown. In the session that prompted this, four moments were found in
+ * fifteen seconds and shown after four and a half minutes, and three of the
+ * four were then thrown away. A moment is evidence: a stretch of the source
+ * video, a description and a still. It is shown from the source it was found
+ * in, and its file is made when a person keeps it (the /generate route and
+ * handleClipGeneration).
+ *
+ * What is recorded is what was found: `available_candidate_count` and
+ * `effective_deck_target` both carry the count of moments released, and
+ * `deck_completed_at` — kept under its old name so no migration is needed —
+ * now marks the instant the answer was released. The fence is unchanged: a
+ * superseded delivery finds the token changed and releases nothing.
  */
-export async function completeRequestWithDeck(input: {
+export async function completeRequest(input: {
   clipRequestId: string;
-  request: ClipRequest;
-  video: Video;
-  intent: PlatformIntent;
-  workDir: string;
-  log: Logger;
-  tally: UsageTally;
   answeredFrom: 'notes' | 'footage';
-  /** The token from recordDeckPlan — the gate is fenced to it. */
+  /** The token from recordDeckPlan — the release is fenced to it. */
   deckAttemptId: string | null;
-  /** When the creator's wait for this deck actually began. */
-  deckStartedAtMs: number;
-}): Promise<{ completed: boolean; deck: VerticalDeckResult | null }> {
-  const { clipRequestId, intent, log } = input;
+  /** A number the person wrote, or null: the only cap there is. */
+  requestedResultCount: number | null;
+  log: Logger;
+}): Promise<boolean> {
+  const { clipRequestId, log } = input;
 
-  // Every request owes a deck now, whatever framing it asked for. The owner's
-  // rule (2026-09-02): a moment is cut the moment it is found, and the review
-  // shows finished clips — Keep files one in the library, Skip lets it go.
-  // Only what the deck DELIVERS differs: the canonical cut itself, or a 9:16
-  // derivative of it. Nothing completes through the plain status write any
-  // more; the gate below is the one door.
-  const deck = await buildDeck({
-    clipRequestId,
-    request: input.request,
-    video: input.video,
-    intent,
-    workDir: input.workDir,
-    log,
-    tally: input.tally,
-    deckAttemptId: input.deckAttemptId,
-    // Passed in rather than started inside: the whole original source is
-    // downloaded before a single candidate renders, and a clock started after
-    // it reported a wait that no creator ever had. A 2GB source is a minute
-    // of that wait on its own.
-    startedAtMs: input.deckStartedAtMs,
-  });
+  // What the search found, and how many will be shown. No product cap: the
+  // answer is what the evidence supports (owner, 2026-09-05), and finding
+  // none is a finished answer too, never padded and never hidden. A number
+  // the person WROTE is the one limit — "give me 3" shows the best three of
+  // whatever qualified (visibleMatches), and three asked for with two found
+  // is two. A moment longer than a platform would take is still a moment:
+  // whether it exists and whether it already suits TikTok are different
+  // questions, and discovery answers only the first.
+  const found = await listMatches(clipRequestId);
+  const shown = input.requestedResultCount !== null && input.requestedResultCount > 0
+    ? Math.min(found.length, input.requestedResultCount)
+    : found.length;
+  await recordDeckAvailability(clipRequestId, {
+    availableCandidateCount: found.length,
+    effectiveDeckTarget: shown,
+  }, input.deckAttemptId);
 
-  const completion = deckCompletion(deck);
-  // What the creator is told is written for what they asked for: a platform
-  // question was about posting, a plain question was about clips.
-  const owesVertical = needsVerticalDerivative(intent);
-
-  // The footage is gone. The moments are real and we cannot cut them, so the
-  // creator is told that — not that their video had nothing in it.
-  if (completion.kind === 'source_unavailable') {
-    await finishClipRequest(
-      clipRequestId,
-      'failed',
-      owesVertical
-        ? 'The original video is no longer available, so these moments could not be made ready to post.'
-        : 'The original video is no longer available, so these moments could not be cut.',
-      null,
-      input.deckAttemptId,
-    );
-    log.error('vertical deck abandoned: the source footage is gone', {
-      answeredFrom: input.answeredFrom,
-      videoId: input.video.id,
-    });
-    return { completed: false, deck };
-  }
-
-  // Candidates existed and we could not finish them. That is OUR failure and
-  // it is reported as one. Completing with an empty deck would tell someone
-  // their video has no postable moments when the truth is that our pipeline
-  // fell over on moments we found.
-  if (completion.kind === 'render_failed') {
-    await finishClipRequest(
-      clipRequestId,
-      'failed',
-      owesVertical
-        ? 'We found the moments but could not finish making them ready to post. Please try again.'
-        : 'We found the moments but could not finish cutting them. Please try again.',
-      null,
-      input.deckAttemptId,
-    );
-    log.error('vertical deck incomplete', {
-      answeredFrom: input.answeredFrom,
-      requested: intent.requestedCount,
-      available: deck.availableCandidateCount,
-      effectiveDeckTarget: deck.effectiveDeckTarget,
-      ready: deck.readyCount,
-      failed: deck.failedCandidateCount,
-    });
-    return { completed: false, deck };
-  }
-
-  // The gate opens. Every moment in the effective deck is finished and its row
-  // written, so the set can be released — all of it, at once. Before this line
-  // a poll sees nothing; after it, everything.
-  //
-  // It also opens on a legitimately EMPTY deck (nothing this platform could
-  // take). That is a finished answer too, and leaving the gate shut would
-  // leave a completed request looking forever like one still assembling.
-  // A superseded run finds the token changed and opens nothing. It must not
-  // then report the request complete either — the run that replaced it owns
-  // that, and saying so here would finish a request over someone else's
-  // half-built deck.
-  // Released and completed together. As two writes there was an instant in
-  // which the deck was on the creator's screen while the request still said
-  // 'searching', and a stale delivery could claim it there and rebuild it
-  // underneath them.
+  // Released and completed together, in one statement, so there is no
+  // instant in which the moments are on the creator's screen while the
+  // request still says 'searching' and a stale delivery could claim it.
   const released = input.deckAttemptId
     ? await releaseDeckAndComplete(clipRequestId, input.deckAttemptId, input.answeredFrom)
     : false;
   if (!released) {
-    log.warn('deck attempt was superseded before it could be released', {
+    log.warn('answer was superseded before it could be released', {
       clipRequestId, answeredFrom: input.answeredFrom,
     });
-    return { completed: false, deck };
+    return false;
   }
 
-  return { completed: true, deck };
-}
-
-/** What the deck build produced, for the caller's log line and its decision. */
-interface VerticalDeckResult {
-  complete: boolean;
-  readyCount: number;
-  /** Eligible moments the search found for this platform. */
-  availableCandidateCount: number;
-  /** min(requested, available) — the deck actually attempted. */
-  effectiveDeckTarget: number;
-  failedCandidateCount: number;
-  renderedButSkippedCount: number;
-  /** Null when the deck never completed — there is no time-to-complete for it. */
-  timeToCompleteDeckMs: number | null;
-  /**
-   * The source footage was gone before a single candidate could be considered.
-   *
-   * Kept apart from an empty candidate pool, because the two say opposite
-   * things about the creator's video. An empty pool means we looked and this
-   * platform could take none of what we found. This means we never looked at
-   * all — and reporting it as the former tells someone their video has no
-   * postable moments on the strength of an examination that never happened.
-   */
-  sourceUnavailable: boolean;
-}
-
-/**
- * Turn the moments the search found into finished, postable files.
- *
- * Runs inside the search job, before the request is reported complete, and
- * that ordering is the product rule: the creator sees the whole deck at once
- * or they see nothing, so there must be no window where the request says
- * "done" and the media is still being made.
- *
- * Candidates are ranked by the model's own confidence and taken in that
- * order. Anything longer than the platform will accept is dropped BEFORE it
- * costs anything — rendering an 85-second clip only to discover TikTok
- * refuses it spends a GPU call and an encode on something that was never
- * eligible.
- */
-async function buildDeck(input: {
-  clipRequestId: string;
-  request: ClipRequest;
-  video: Video;
-  intent: PlatformIntent;
-  workDir: string;
-  log: Logger;
-  tally: UsageTally;
-  /** When the creator's wait began — before the source download, not after. */
-  startedAtMs: number;
-  /** Fenced: a superseded run must not rewrite this request's deck facts. */
-  deckAttemptId: string | null;
-}): Promise<VerticalDeckResult> {
-  const { clipRequestId, request, video, intent, log } = input;
-  // What each finished moment must have. Decided once, here, and handed to
-  // the orchestrator and the reveal alike — the same fact recordDeckPlan
-  // wrote on the request row.
-  const presentation = needsVerticalDerivative(intent) ? 'vertical' as const : 'original' as const;
-  const empty: VerticalDeckResult = {
-    complete: false, readyCount: 0, availableCandidateCount: 0, effectiveDeckTarget: 0,
-    failedCandidateCount: 0, renderedButSkippedCount: 0, timeToCompleteDeckMs: null,
-    sourceUnavailable: false,
-  };
-
-  if (!video.originalStorageKey) {
-    // Nothing can be cut, so nothing can be judged eligible. Reported as its
-    // own outcome rather than as an empty deck: the moments the search found
-    // are real, and answering "your video has none" because the footage
-    // expired would be an absence we never verified.
-    log.warn('cannot build a vertical deck without the original source');
-    return { ...empty, sourceUnavailable: true };
-  }
-
-  const stored = await listMatches(clipRequestId);
-  const candidates: OrchestratorCandidate[] = stored
-    .filter((match) => !exceedsPlatformHardMax(
-      { startSeconds: match.globalStartSeconds, endSeconds: match.globalEndSeconds },
-      intent,
-    ))
-    // Best first. The deck stops as soon as enough are ready, so rank order
-    // decides which moments are paid for at all.
-    .sort((a, b) => b.confidence - a.confidence)
-    .map((match) => ({
-      matchId: match.id,
-      confidence: match.confidence,
-      startSeconds: match.globalStartSeconds,
-      endSeconds: match.globalEndSeconds,
-      // A derivative is owed only for a vertical deck; 'pending' about work
-      // that will never happen would be a lie in the data.
-      derivativeStatus: presentation === 'vertical' ? 'pending' as const : null,
-      derivativeStorageKey: null,
-      posterStorageKey: null,
-    }));
-
-  if (candidates.length === 0) {
-    log.info('no eligible candidates for a deck', {
-      storedMatches: stored.length,
-      hardMaxSeconds: intent.hardMaxSeconds,
-    });
-    await recordDeckAvailability(clipRequestId, {
-      availableCandidateCount: 0,
-      effectiveDeckTarget: 0,
-    }, input.deckAttemptId);
-    return empty;
-  }
-
-  // One download for the whole deck. Every candidate is cut from the ORIGINAL
-  // source, never the analysis proxy — the proxy is small on purpose and
-  // posting a clip cut from it would send someone a downscaled video.
-  const sourcePath = path.join(
-    input.workDir,
-    `original${path.extname(video.originalStorageKey) || '.mp4'}`,
-  );
-  await getStorage().downloadToFile(video.originalStorageKey, sourcePath);
-
-  // The EFFECTIVE deck: what this video can actually supply.
-  //
-  // A video with two moments matching the question is not a pipeline failure
-  // and must never be reported as one. Uncapped, a three-moment request
-  // against a two-candidate pool renders both successfully, reports the deck
-  // incomplete, and tells the creator we could not make their moments ready
-  // to post — inviting a retry that would do exactly the same thing.
-  //
-  // Capping splits the two questions cleanly. "Fewer moments existed" is
-  // answered by availableCandidateCount; "we could not finish the ones that
-  // did" is answered by an incomplete deck against this target. Atomicity
-  // still applies to the effective deck: two moments appear together or not
-  // at all, never one then two.
-  // Three separate limits, and each is recorded as itself: what they asked
-  // for, what the video had, and what we are willing to render.
-  //
-  // What counts as "asked for" depends on the question. A number in it
-  // ("give me 5") is the target. Without one, the footage decides: every
-  // eligible moment the search found is cut, up to the ceiling — a
-  // two-minute clip can only hold so many moments, and a default of three
-  // would be a guess standing in for that fact (owner, 2026-09-02). This
-  // holds for a platform question and a plain one alike.
-  const wanted = intent.countExplicit ? intent.requestedCount : candidates.length;
-  const effectiveDeckTarget = Math.min(wanted, candidates.length, intent.renderCeiling);
-  await recordDeckAvailability(clipRequestId, {
-    availableCandidateCount: candidates.length,
-    effectiveDeckTarget,
-  }, input.deckAttemptId);
-  if (effectiveDeckTarget < wanted) {
-    log.info('fewer moments will be cut than were asked for', {
-      requested: wanted,
-      available: candidates.length,
-      renderCeiling: intent.renderCeiling,
-      effectiveDeckTarget,
-    });
-  }
-
-  const { outcome, metrics } = await orchestrateVerticalDeck({
-    videoId: video.id,
+  log.info('moments released', {
     clipRequestId,
-    sessionId: request.sessionId,
-    userId: request.userId,
-    workspaceId: request.workspaceId,
-    sourcePath,
-    workDir: input.workDir,
-    hasAudio: video.hasAudio ?? true,
-    videoDurationSeconds: video.durationSeconds ?? null,
-    intent,
-    presentation,
-    requestedResultCount: wanted,
-    effectiveDeckTarget,
-    candidates,
-    log,
-    tally: input.tally,
-    startedAtMs: input.startedAtMs,
+    answeredFrom: input.answeredFrom,
+    found: found.length,
+    shown,
   });
-
-  return {
-    complete: outcome.complete,
-    readyCount: outcome.deck.length,
-    availableCandidateCount: candidates.length,
-    effectiveDeckTarget,
-    failedCandidateCount: metrics.failedCandidateCount,
-    renderedButSkippedCount: metrics.renderedButSkippedCount,
-    timeToCompleteDeckMs: metrics.timeToCompleteDeckMs,
-    // The source was there — whatever else happened, it was not this.
-    sourceUnavailable: false,
-  };
+  return true;
 }
 
 async function attachSearchThumbnails(input: {
@@ -1178,10 +943,10 @@ const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
  */
 async function answerFromNotes(input: {
   clipRequestId: string;
-  request: ClipRequest;
-  intent: PlatformIntent;
-  /** The deck-planning token, so the gate stays fenced on this path too. */
+  /** The planning token, so the release stays fenced on this path too. */
   deckAttemptId: string | null;
+  /** A number the person wrote, or null. */
+  requestedResultCount: number | null;
   video: Video;
   chunks: VideoChunk[];
   instruction: string;
@@ -1194,8 +959,8 @@ async function answerFromNotes(input: {
    * must not be reported in the same words.
    */
   readComplete: boolean;
-}): Promise<{ matchCount: number; deckCompleted: boolean }> {
-  const { clipRequestId, request, intent, video, chunks, instruction, mode, tally, log, readComplete } = input;
+}): Promise<{ matchCount: number; released: boolean }> {
+  const { clipRequestId, video, chunks, instruction, mode, tally, log, readComplete } = input;
   const startedAt = performance.now();
 
   // Memory is both halves: what was seen, and what was said. A spoken question
@@ -1220,7 +985,7 @@ async function answerFromNotes(input: {
     })),
   ].sort((a, b) => a.startSeconds - b.startSeconds);
 
-  if (notes.length === 0) return { matchCount: 0, deckCompleted: false };
+  if (notes.length === 0) return { matchCount: 0, released: false };
 
   await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
   await clearPreviousAttempt(clipRequestId, log, input.deckAttemptId);
@@ -1306,7 +1071,7 @@ async function answerFromNotes(input: {
   // Nothing remembered. Left unfinished on purpose: the caller reads the video
   // itself before anyone is told this video does not contain what they asked
   // for.
-  if (found.length === 0) return { matchCount: 0, deckCompleted: false };
+  if (found.length === 0) return { matchCount: 0, released: false };
 
   /**
    * Name the stretches the notes never covered.
@@ -1359,35 +1124,31 @@ async function answerFromNotes(input: {
   await insertMatches(clipRequestId, found);
   const finalCount = await aggregateStoredMatches(clipRequestId, chunks, input.deckAttemptId);
 
-  let deckCompleted = false;
   await withWorkDir(`notes-${clipRequestId}`, async (dir) => {
     await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
+  });
 
-    // Answering fast must not mean answering with less. The notes decided
-    // WHICH moments, exactly as they always have; the deck is built from what
-    // they found, and the request is completed by the same helper the footage
-    // path uses so the two can never drift apart on what a creator is owed.
-    const completed = await completeRequestWithDeck({
-      clipRequestId, request, video, intent, workDir: dir, log, tally,
-      answeredFrom: 'notes', deckAttemptId: input.deckAttemptId,
-      deckStartedAtMs: performance.now(),
-    });
-    deckCompleted = completed.completed;
+  // The notes decided WHICH moments, exactly as they always have; the request
+  // is completed by the same helper the footage path uses so the two can
+  // never drift apart on what a creator is owed.
+  const released = await completeRequest({
+    clipRequestId, answeredFrom: 'notes', deckAttemptId: input.deckAttemptId, log,
+    requestedResultCount: input.requestedResultCount,
   });
 
   const answerLog = {
     matches: finalCount,
-    deckCompleted,
+    released,
     elapsedMs: Math.round(performance.now() - startedAt),
     ...tally.summary(),
   };
-  if (deckCompleted) {
+  if (released) {
     log.info('answered from memory', answerLog);
   } else {
-    log.error('answered from memory but could not finish the deck', answerLog);
+    log.warn('answered from memory but the answer was superseded before release', answerLog);
   }
 
-  return { matchCount: finalCount, deckCompleted };
+  return { matchCount: finalCount, released };
 }
 
 async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClipMatch[]> {

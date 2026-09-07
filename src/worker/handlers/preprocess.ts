@@ -151,12 +151,28 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
   await setVideoStatus(videoId, 'preprocessing');
   await job.updateProgress({ stage: 'preprocessing', percent: 35 });
 
+  // The three stages between "uploaded" and "prepared", timed apart, so the
+  // next session can say which one the person was waiting for: the queue,
+  // the download of the source into this worker, and the decode. In the
+  // observed session those were one unexplained thirteen seconds followed by
+  // forty-six.
+  const pickedUpAt = performance.now();
+  log.info('preprocessing picked up', {
+    queueWaitMs: Math.max(0, (job.processedOn ?? Date.now()) - job.timestamp),
+    sizeBytes: video.sizeBytes,
+  });
+
   try {
     const storage = getStorage();
 
     await withWorkDir(`preprocess-${videoId}`, async (dir) => {
       const sourcePath = path.join(dir, `source${path.extname(video.originalStorageKey!) || '.mp4'}`);
+      const downloadStartedAt = performance.now();
       await storage.downloadToFile(video.originalStorageKey!, sourcePath);
+      log.info('source downloaded', {
+        sizeBytes: video.sizeBytes,
+        elapsedMs: Math.round(performance.now() - downloadStartedAt),
+      });
 
       // 1. Probe the source and persist its real metadata.
       const probe = await ffprobe(sourcePath);
@@ -433,6 +449,14 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       // 4. The video can now be searched.
       await setVideoStatus(videoId, 'ready');
       await job.updateProgress({ stage: 'ready', percent: 100 });
+      // The number a person actually waited: from the row being made (the
+      // upload being reserved) to the video being answerable. A question
+      // may be SENT before this — it is parked until here (readiness.ts).
+      log.info('video ready for questions', {
+        sinceCreatedMs: Math.max(0, Date.now() - video.createdAt.getTime()),
+        sincePickupMs: Math.round(performance.now() - pickedUpAt),
+        firstChunkReadyMs: derived.firstChunkReadyMs,
+      });
 
       // 5. Read the video into notes, once, so questions can be answered from
       //    text instead of re-reading the whole video every time one is asked.

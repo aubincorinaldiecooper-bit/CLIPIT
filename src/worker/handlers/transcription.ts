@@ -47,6 +47,9 @@ export async function handleTranscription(job: Job<TranscriptionJob>): Promise<v
 
   await setTranscriptStatus(videoId, 'running');
   await job.updateProgress({ stage: 'transcribing', percent: 5 });
+  log.info('transcription picked up', {
+    queueWaitMs: Math.max(0, (job.processedOn ?? Date.now()) - job.timestamp),
+  });
 
   // Paid once per video, unlike search. Logged separately so the one-time
   // ingestion cost is never mistaken for the recurring per-query cost.

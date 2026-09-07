@@ -40,6 +40,12 @@ export interface ClipSearchJob {
   clipRequestId: string;
   /** Milliseconds already spent waiting for an in-flight transcript or index. */
   waitedMs?: number;
+  /**
+   * Milliseconds already spent waiting for the video to be prepared. Kept
+   * apart from `waitedMs`: the notes and the transcript get their whole
+   * allowance once the video is ready, however long preparation took.
+   */
+  preparationWaitedMs?: number;
 }
 
 export interface ClipGenerationJob {
@@ -264,7 +270,7 @@ export async function enqueueClipSearch(data: ClipSearchJob, options: JobsOption
     getQueues().clipSearch,
     'search',
     data,
-    `search-${data.clipRequestId}-${data.waitedMs ?? 0}`,
+    `search-${data.clipRequestId}-${data.waitedMs ?? 0}${data.preparationWaitedMs ? `-prepared-${data.preparationWaitedMs}` : ''}`,
     options,
   );
 }

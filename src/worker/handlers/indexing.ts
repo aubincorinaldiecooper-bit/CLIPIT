@@ -46,6 +46,10 @@ export async function handleIndexing(job: Job<IndexingJob>): Promise<void> {
     await setIndexStatus(videoId, 'failed', { error: 'Video has no analysis chunks to read' });
     return;
   }
+  log.info('indexing picked up', {
+    queueWaitMs: Math.max(0, (job.processedOn ?? Date.now()) - job.timestamp),
+    chunks: chunks.length,
+  });
 
   const tally = new UsageTally();
   const startedAt = performance.now();

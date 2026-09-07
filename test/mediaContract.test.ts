@@ -11,7 +11,9 @@ import { clipMediaContract, creatorVisibleVerticalRows, type ClipMediaRow } from
 
 const row = (over: Partial<ClipMediaRow> = {}): ClipMediaRow => ({
   canonicalUrl: 'https://cdn/canonical.mp4',
+  canonicalDownloadUrl: 'https://cdn/canonical.mp4?download=1',
   derivativeUrl: 'https://cdn/vertical.mp4',
+  derivativeDownloadUrl: 'https://cdn/vertical.mp4?download=1',
   derivativeStorageKey: 'clips/v/c-vertical.mp4',
   derivativeStatus: 'ready',
   posterUrl: 'https://cdn/poster.jpg',
@@ -36,6 +38,16 @@ describe('clipMediaContract — vertical', () => {
     expect(media.outputAspectRatio).toBe('9:16');
     expect(media.compositionMode).toBe('smart_crop');
     expect(media.derivativeStatus).toBe('ready');
+  });
+
+  it('offers the same file to save as it offers to play', () => {
+    expect(clipMediaContract(row(), true).downloadUrl).toBe('https://cdn/vertical.mp4?download=1');
+    expect(clipMediaContract(row(), false).downloadUrl).toBe('https://cdn/canonical.mp4?download=1');
+    // A vertical moment whose 9:16 file has not landed has nothing to save —
+    // not the landscape cut, which is not what was kept.
+    expect(
+      clipMediaContract(row({ derivativeStatus: 'pending', derivativeStorageKey: null, derivativeUrl: null, derivativeDownloadUrl: null }), true).downloadUrl,
+    ).toBeNull();
   });
 
   it('keeps canonicalUrl as the original excerpt, never overwritten', () => {

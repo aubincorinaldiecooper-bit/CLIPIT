@@ -256,6 +256,16 @@ export async function runVerticalPipeline(input: VerticalPipelineInput): Promise
   }
 
   const composition = await decideComposition(input, { width: sourceWidth, height: sourceHeight });
+  logger.info('framing decided', {
+    clipId: input.clipId,
+    mode: composition.decision.mode,
+    // Skipped: the source was already 9:16, so nothing was asked. Fell
+    // back: the call failed and the whole frame was kept.
+    skipped: composition.skipped,
+    fellBack: composition.decision.fellBack,
+    provider: composition.provider,
+    elapsedMs: composition.elapsedMs,
+  });
   let mode: CompositionMode = composition.decision.mode;
   let cropFilter: string | null = null;
 
