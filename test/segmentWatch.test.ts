@@ -112,6 +112,12 @@ describe.skipIf(!ffmpegAvailable)('watching chunks close', () => {
       // The run fails while the watcher is working through the backlog.
       if (seen.length === 2) watcher.stop();
     });
+    // Wait for the two announcements rather than sleeping a guessed interval:
+    // under full-suite load a probe takes longer than the poll it is racing,
+    // and a fixed wait sees only the first one.
+    await until(() => seen.length >= 2, 'the first two chunks to be announced');
+    // THEN a fixed wait, because the rest of the claim is an absence — nothing
+    // further arrives after the stop — and an absence cannot be waited for.
     await settle();
     // Without the check after each probe it would announce all five closed
     // chunks regardless.

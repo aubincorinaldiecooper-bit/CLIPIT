@@ -8,7 +8,17 @@ import { logger } from '../../lib/logger.js';
 // what it costs to decide how a moment should be FRAMED is a different
 // question from what it costs to FIND it, and the answer only exists if the
 // rows keep them apart.
-export type UsageStage = 'transcription' | 'indexing' | 'search' | 'reclip' | 'composition';
+export type UsageStage =
+  | 'transcription'
+  | 'indexing'
+  | 'search'
+  | 'reclip'
+  | 'composition'
+  // The Media Index's two halves, costed apart: making the vectors, and
+  // ranking the shortlist they produce. Rolled together they would hide
+  // which half the money goes to.
+  | 'embedding'
+  | 'rerank';
 
 export interface ModelTokenUsage {
   promptTokens: number;
@@ -118,7 +128,12 @@ function mapTotals(rows: TotalsRow[]): UsageTotals[] {
  * someone searches, and cost-per-video silently becomes a function of how
  * popular the video is.
  */
-const INGESTION_STAGES: UsageStage[] = ['transcription', 'indexing'];
+// What it costs to make one video searchable. 'embedding' belongs here:
+// making the vectors IS part of reading the video, and leaving it out
+// would report a per-video ingestion cost that quietly excludes a stage
+// we pay for — the same shape of error migration 027 was written about.
+// 'rerank' is deliberately absent: it runs per question, not per video.
+const INGESTION_STAGES: UsageStage[] = ['transcription', 'indexing', 'embedding'];
 
 /** Cost of making one video searchable. Excludes searches run against it. */
 export async function usageForVideo(videoId: string): Promise<UsageTotals[]> {

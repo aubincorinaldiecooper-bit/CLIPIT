@@ -42,6 +42,7 @@ import {
   recordChunkFailure,
   recordDeckAvailability,
   recordDeckPlan,
+  recordRetrievalOutcome,
   recordSearchApproach,
   recordUncertainMatches,
   releaseDeckAndComplete,
@@ -62,6 +63,7 @@ import type {
   ClipRequest,
   ChunkFailureCode,
   MatchSource,
+  AnsweredFrom,
   ResolvedSearchMode,
   UncertainMatch,
   Video,
@@ -93,6 +95,19 @@ function classifyChunkFailure(reason: unknown): ChunkFailureCode {
  * categories. Each chunk is searched independently, and a chunk that fails is
  * recorded and skipped rather than failing the whole request.
  */
+import { getMediaIndexStatus, listIndexedWindows } from '../../db/repositories/mediaIndex.js';
+import {
+  decideIndexAnswer,
+  IndexProvenanceChanged,
+  searchMediaIndex,
+  type IndexFallbackReason,
+  type IndexSearchCall,
+} from '../../services/mediaIndex/search.js';
+import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
+import { unreadRanges } from '../../services/mediaIndex/coverage.js';
+import { planWindows, windowKey } from '../../services/mediaIndex/windows.js';
+import { estimateGpuCostUsd } from '../../services/mediaIndex/cost.js';
+
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   const { clipRequestId } = job.data;
   const log = logger.child({ job: 'clip-search', clipRequestId });
@@ -410,6 +425,60 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // answer different questions later: notes read and silent says reading at
     // upload is not covering what people ask, while no notes at all says
     // nothing about the reading and everything about the video's age.
+    /**
+     * The vectors first, when there are any.
+     *
+     * Another memory, asked before the notes because it holds a different
+     * thing: the notes say what a model thought worth writing down, and the
+     * vectors are what the pictures look like. Anything but a confident hit
+     * hands the question straight on to the notes below, with the reason
+     * recorded — the index is never allowed to end a search by finding
+     * nothing.
+     */
+    const fromIndex = await answerFromMediaIndex({
+      clipRequestId,
+      deckAttemptId,
+      requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
+      video,
+      chunks,
+      instruction,
+      mode: resolved.mode,
+      correcting,
+      log,
+    });
+    if (fromIndex.matchCount > 0) {
+      await recordRetrievalOutcome(clipRequestId, {
+        primary: 'media_index',
+        system: 'media_index',
+        fallbackReason: null,
+        primaryOutcome: fromIndex.outcome,
+      });
+      outcome = 'completed';
+      searchMode = resolved.mode;
+      chunkCount = 0;
+      return;
+    }
+    // Written to the row, not only the log. Every claim made for this design
+    // — how often the index answers, why it hands a question on, whether the
+    // fallback did better — can only be checked if the reason is durable. A
+    // reason that lives in a log line is not a record.
+    if (env.MEDIA_INDEX_ENABLED) {
+      // The reason and what the index produced, but NOT a claim about who
+      // answered: the fallback has not run yet, and it can still fail. A row
+      // saying Clipit answered a question nothing answered is worse than a
+      // row that says nothing. completeRequest fills the system in when a
+      // path actually succeeds.
+      await recordRetrievalOutcome(clipRequestId, {
+        primary: 'media_index',
+        system: null,
+        fallbackReason: fromIndex.fallback,
+        primaryOutcome: fromIndex.outcome,
+      });
+      if (fromIndex.fallback && fromIndex.fallback !== 'disabled') {
+        log.info('the media index handed the question on', { reason: fromIndex.fallback });
+      }
+    }
+
     const notesAvailable = !correcting && video.indexStatus === 'ready';
     if (!correcting) await recordSearchApproach(clipRequestId, { notesConsulted: notesAvailable });
 
@@ -817,7 +886,7 @@ async function clearPreviousAttempt(
  */
 export async function completeRequest(input: {
   clipRequestId: string;
-  answeredFrom: 'notes' | 'footage';
+  answeredFrom: AnsweredFrom;
   /** The token from recordDeckPlan — the release is fenced to it. */
   deckAttemptId: string | null;
   /** A number the person wrote, or null: the only cap there is. */
@@ -846,8 +915,17 @@ export async function completeRequest(input: {
   // Released and completed together, in one statement, so there is no
   // instant in which the moments are on the creator's screen while the
   // request still says 'searching' and a stale delivery could claim it.
+  // Which system answered goes in with the release itself: one fenced
+  // statement, so it cannot name an answer that was superseded and cannot be
+  // lost if this process stops. Notes and footage are both Clipit's own
+  // search; only the vectors are the other thing.
   const released = input.deckAttemptId
-    ? await releaseDeckAndComplete(clipRequestId, input.deckAttemptId, input.answeredFrom)
+    ? await releaseDeckAndComplete(
+        clipRequestId,
+        input.deckAttemptId,
+        input.answeredFrom,
+        input.answeredFrom === 'media_index' ? 'media_index' : 'clipit',
+      )
     : false;
   if (!released) {
     log.warn('answer was superseded before it could be released', {
@@ -855,6 +933,7 @@ export async function completeRequest(input: {
     });
     return false;
   }
+
 
   log.info('moments released', {
     clipRequestId,
@@ -941,6 +1020,293 @@ const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
  * — NOT that the video lacks it — and the caller must go to the footage before
  * telling anyone otherwise.
  */
+/**
+ * Answering from the vectors, before the notes are asked.
+ *
+ * This is memory too, and a different kind from the notes: the notes are a
+ * model's summary of what it thought worth writing down, and these are what
+ * the pictures actually look like. That is why they go first for a question
+ * about something SEEN — a summary drops the sign on the wall, and a dropped
+ * sentence cannot be matched against.
+ *
+ * Finding nothing here is NOT an answer, exactly as finding nothing in the
+ * notes is not. The question falls through to the notes and then to the
+ * footage, and the reason it fell through is recorded so the two systems can
+ * be compared from rows later.
+ */
+async function answerFromMediaIndex(input: {
+  clipRequestId: string;
+  deckAttemptId: string | null;
+  requestedResultCount: number | null;
+  video: Video;
+  chunks: VideoChunk[];
+  instruction: string;
+  mode: ResolvedSearchMode;
+  correcting: boolean;
+  log: Logger;
+}): Promise<{
+  matchCount: number;
+  released: boolean;
+  fallback: IndexFallbackReason | null;
+  /** What the index actually produced, kept even when the fallback answered. */
+  outcome: Record<string, unknown> | null;
+}> {
+  const { clipRequestId, video, chunks, instruction, mode, correcting, log } = input;
+  const startedAt = performance.now();
+
+  // Checked before anything is read. Switched off, this path must cost
+  // nothing at all — not a query, not a round trip — because every search in
+  // the product goes through it.
+  if (!env.MEDIA_INDEX_ENABLED) {
+    return { matchCount: 0, released: false, fallback: 'disabled', outcome: null };
+  }
+
+  const status = await getMediaIndexStatus(video.id);
+  const before = decideIndexAnswer({ enabled: true, correcting, mode, status });
+  if (before.use === 'fallback') {
+    return { matchCount: 0, released: false, fallback: before.reason, outcome: null };
+  }
+
+  // decideIndexAnswer has already refused a null status as `index_missing`,
+  // so this cannot fire — it is here so the reads below are not resting on a
+  // non-null assertion that a later edit could quietly invalidate.
+  if (!status || status.dims === null) {
+    return { matchCount: 0, released: false, fallback: 'index_missing', outcome: null };
+  }
+
+  // Marked as searching before any remote call. Embedding the question and
+  // reranking the shortlist can take a while, and the request would otherwise
+  // read as "Queued" throughout — the serializer shows the right words for a
+  // memory answer when no segments are counted.
+  await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
+
+  // Collected as each call completes, so a later failure cannot erase the
+  // record of an earlier one that already ran and already cost money.
+  const paidCalls: IndexSearchCall[] = [];
+  const recordCalls = async () => {
+    for (const call of paidCalls.splice(0)) {
+      await recordModelUsage({
+        videoId: video.id,
+        clipRequestId,
+        provider: 'modal',
+        model: call.model,
+        stage: call.stage,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        costUsd: estimateGpuCostUsd(call.gpuMs),
+        latencyMs: call.latencyMs,
+        metrics: { gpuMs: call.gpuMs, ...call.metrics },
+        startedAt: call.startedAt,
+      }).catch(() => undefined);
+    }
+  };
+
+  let result;
+  let windowsSearched = 0;
+  /** Exactly which windows were searched, so the gaps between them are known. */
+  let searchedWindowKeys: string[] = [];
+  try {
+    const snapshot = await listIndexedWindows(video.id);
+    // Coverage came back with the windows, from one read. A re-index starting
+    // between two separate reads would pair one run's windows with another
+    // run's coverage, and partly-read replacement footage would be reported
+    // as fully read. If the run moved since the decision above, this
+    // question is about an index that no longer exists.
+    if (snapshot.runStartedAt?.getTime() !== status.startedAt?.getTime()) {
+      log.info('the index was replaced while this question was being answered; handing it on');
+      await recordCalls();
+      return { matchCount: 0, released: false, fallback: 'index_not_ready', outcome: null };
+    }
+    const windows = snapshot.windows;
+    windowsSearched = windows.length;
+    searchedWindowKeys = windows.map((window) => window.windowKey);
+    const source = video.proxyStorageKey ? await sourceIdentity(video.proxyStorageKey) : null;
+    const videoUrl = video.proxyStorageKey
+      ? await getStorage().createDownloadUrl(video.proxyStorageKey, {
+          expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
+        })
+      : null;
+
+    result = await searchMediaIndex({
+      instruction,
+      windows,
+      coveredThroughSeconds: snapshot.coveredThroughSeconds,
+      onCall: (call) => paidCalls.push(call),
+      storedBy: { model: status.model, revision: status.revision, dims: status.dims },
+      // Without the proxy there is no footage to rerank against, so the raw
+      // vector order stands rather than the search failing.
+      rerank: source && videoUrl
+        ? { videoUrl, videoKey: source.identity, expectedBytes: source.sizeBytes }
+        : undefined,
+    });
+  } catch (error) {
+    // A model change since this video was indexed is not a failure to report
+    // as one: the index is simply stale, and the question goes to the notes
+    // while the video waits to be re-read.
+    await recordCalls();
+    if (error instanceof IndexProvenanceChanged) {
+      log.warn('the index was made by different weights than the question; handing the question on', {
+        reason: error.message,
+      });
+      return { matchCount: 0, released: false, fallback: 'provenance_changed', outcome: null };
+    }
+    log.warn('the media index could not answer; handing the question on', { err: error });
+    return { matchCount: 0, released: false, fallback: 'index_failed', outcome: null };
+  }
+
+  // Kept whether or not this answer is used. "The index found nothing" and
+  // "the index found three moments and the fallback still did better" are
+  // different facts, and only one of them is visible without this.
+  const outcome: Record<string, unknown> = {
+    windows: windowsSearched,
+    moments: result.moments.length,
+    topScore: result.moments[0]?.score ?? null,
+    reranked: result.reranked,
+    coveredThroughSeconds: result.coveredThroughSeconds,
+    model: result.model,
+    revision: result.revision,
+    elapsedMs: Math.round(performance.now() - startedAt),
+  };
+
+  // Recorded here, before the decision below can take an early exit. A
+  // consultation that found nothing still embedded the question and may still
+  // have reranked — a search that costs money and reports none is exactly the
+  // report that makes the comparison worthless.
+  await recordCalls();
+
+  const after = decideIndexAnswer({
+    enabled: true, correcting, mode, status, candidateCount: result.moments.length,
+  });
+  if (after.use === 'fallback') {
+    return { matchCount: 0, released: false, fallback: after.reason, outcome };
+  }
+
+  // Every moment that survived the relevance test, unless the person asked
+  // for a number. The filter is what limits results here; an arbitrary cap on
+  // top of it would silently drop hits the other search paths would return.
+  // Every paid call this question made, recorded before anything else can
+  // fail. A per-question cost that omits the calls the question actually made
+  // is the exact shape of error migration 027 was written about — and this
+  // path is the only writer of the `rerank` stage that migration 044 added.
+  await recordCalls();
+
+  const wanted = input.requestedResultCount ?? result.moments.length;
+  const found: NewClipMatch[] = [];
+  for (const moment of result.moments.slice(0, wanted)) {
+    const chunk = chunks.find(
+      (candidate) =>
+        moment.startSeconds >= candidate.globalStartSeconds && moment.startSeconds < candidate.globalEndSeconds,
+    ) ?? chunks.at(-1);
+    if (!chunk) continue;
+    const local = mapGlobalRangeToChunk(chunk, { startSeconds: moment.startSeconds, endSeconds: moment.endSeconds });
+    if (!local) continue;
+
+    found.push({
+      chunkId: chunk.id,
+      localStartSeconds: local.localStartSeconds,
+      localEndSeconds: local.localEndSeconds,
+      globalStartSeconds: moment.startSeconds,
+      globalEndSeconds: moment.endSeconds,
+      description: `A moment matching "${instruction}"`,
+      // The score a similarity or a reranker produced. NOT on the same scale
+      // as the confidences a language model writes, and deliberately not
+      // rescaled to look as though it were: inventing a calibration would
+      // make two incomparable numbers look comparable.
+      confidence: Math.max(0, Math.min(1, moment.score)),
+      source: 'visual',
+      provider: 'modal',
+      model: result.model,
+    });
+  }
+
+  if (found.length === 0) {
+    return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
+  }
+
+  // Everything past the unbroken read has not been examined, and says so
+  // through the same coverage channel a failed chunk uses — so it appears on
+  // screen as an unexamined stretch, and "look again" escalates to the
+  // footage rather than the person being told the video holds nothing there.
+  const duration = video.durationSeconds ?? chunks.at(-1)?.globalEndSeconds ?? 0;
+
+  /**
+   * Every stretch the index did not read — each one, not just the tail.
+   *
+   * Two wrong answers were tried before this one. Reporting everything past
+   * the contiguous prefix OVERSTATES it: windows past a hole are stored and
+   * were compared against the question. Reporting only past the furthest
+   * stored window UNDERSTATES it, and hides a hole in the middle entirely —
+   * which is worse, because an unexamined moment then reads as an absence.
+   *
+   * So the planned grid is rebuilt and diffed against what is actually
+   * stored. The grid is deterministic from the video's length and the index
+   * settings, which is what makes this possible without storing the gaps.
+   */
+  const storedKeys = new Set(searchedWindowKeys);
+  const plannedNow = planWindows(duration, {
+    windowSeconds: env.MEDIA_INDEX_WINDOW_SECONDS,
+    strideSeconds: env.MEDIA_INDEX_STRIDE_SECONDS,
+    minWindowSeconds: env.MEDIA_INDEX_MIN_WINDOW_SECONDS,
+  });
+  for (const gap of unreadRanges(plannedNow, storedKeys, windowKey)) {
+    const where = chunks.find(
+      (chunk) => gap.startSeconds >= chunk.globalStartSeconds && gap.startSeconds < chunk.globalEndSeconds,
+    ) ?? chunks.at(-1);
+    if (!where) continue;
+    await recordChunkFailure(clipRequestId, {
+      chunkIndex: where.chunkIndex,
+      chunkId: where.id,
+      message: 'This stretch had not been read into the index when the question was asked',
+      code: 'not_read_yet',
+      globalStartSeconds: gap.startSeconds,
+      globalEndSeconds: gap.endSeconds,
+    });
+  }
+
+  // Stretches the reranker could not read are named as unexamined, through
+  // the same channel a failed chunk uses. Left silent they would look like
+  // footage that was watched and found wanting.
+  for (const stretch of result.unread) {
+    const where = chunks.find(
+      (chunk) =>
+        stretch.startSeconds >= chunk.globalStartSeconds && stretch.startSeconds < chunk.globalEndSeconds,
+    ) ?? chunks.at(-1);
+    if (!where) continue;
+    await recordChunkFailure(clipRequestId, {
+      chunkIndex: where.chunkIndex,
+      chunkId: where.id,
+      message: `This stretch could not be examined: ${stretch.reason}`,
+      code: 'not_read_yet',
+      globalStartSeconds: stretch.startSeconds,
+      globalEndSeconds: stretch.endSeconds,
+    });
+  }
+
+  await insertMatches(clipRequestId, found);
+  const finalCount = await aggregateStoredMatches(clipRequestId, chunks, input.deckAttemptId);
+
+  await withWorkDir(`index-${clipRequestId}`, async (dir) => {
+    await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
+  });
+
+  const released = await completeRequest({
+    clipRequestId, answeredFrom: 'media_index', deckAttemptId: input.deckAttemptId, log,
+    requestedResultCount: input.requestedResultCount,
+  });
+
+  log.info('answered from the media index', {
+    matches: finalCount,
+    released,
+    reranked: result.reranked,
+    coveredThroughSeconds: Math.round(result.coveredThroughSeconds),
+    ofSeconds: Math.round(duration),
+    elapsedMs: Math.round(performance.now() - startedAt),
+  });
+
+  return { matchCount: finalCount, released, fallback: null, outcome };
+}
+
 async function answerFromNotes(input: {
   clipRequestId: string;
   /** The planning token, so the release stays fenced on this path too. */

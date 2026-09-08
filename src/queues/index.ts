@@ -7,6 +7,7 @@ export const QUEUE_NAMES = {
   preprocessing: 'video-preprocessing',
   transcription: 'video-transcription',
   indexing: 'video-indexing',
+  mediaIndexing: 'media-indexing',
   simplememIndexing: 'simplemem-indexing',
   clipSearch: 'clip-search',
   clipGeneration: 'clip-generation',
@@ -34,6 +35,11 @@ export interface TranscriptionJob {
 
 /** Read a video into notes, once, after preprocessing. */
 export interface IndexingJob {
+  videoId: string;
+}
+
+/** Read a video into vectors, once, after preprocessing. */
+export interface MediaIndexingJob {
   videoId: string;
 }
 
@@ -166,6 +172,7 @@ let queues: {
   preprocessing: Queue<PreprocessingJob>;
   transcription: Queue<TranscriptionJob>;
   indexing: Queue<IndexingJob>;
+  mediaIndexing: Queue<MediaIndexingJob>;
   simplememIndexing: Queue<SimpleMemIndexingJob>;
   clipSearch: Queue<ClipSearchJob>;
   clipGeneration: Queue<ClipGenerationJob>;
@@ -185,6 +192,7 @@ export function getQueues() {
       preprocessing: new Queue<PreprocessingJob>(QUEUE_NAMES.preprocessing, { connection, defaultJobOptions }),
       transcription: new Queue<TranscriptionJob>(QUEUE_NAMES.transcription, { connection, defaultJobOptions }),
       indexing: new Queue<IndexingJob>(QUEUE_NAMES.indexing, { connection, defaultJobOptions }),
+      mediaIndexing: new Queue<MediaIndexingJob>(QUEUE_NAMES.mediaIndexing, { connection, defaultJobOptions }),
       simplememIndexing: new Queue<SimpleMemIndexingJob>(QUEUE_NAMES.simplememIndexing, { connection, defaultJobOptions }),
       clipSearch: new Queue<ClipSearchJob>(QUEUE_NAMES.clipSearch, { connection, defaultJobOptions }),
       clipGeneration: new Queue<ClipGenerationJob>(QUEUE_NAMES.clipGeneration, { connection, defaultJobOptions }),
@@ -269,6 +277,10 @@ export async function enqueueTranscription(data: TranscriptionJob): Promise<void
 
 export async function enqueueIndexing(data: IndexingJob): Promise<void> {
   await addWithStableId(getQueues().indexing, 'index', data, `index-${data.videoId}`);
+}
+
+export async function enqueueMediaIndexing(data: MediaIndexingJob): Promise<void> {
+  await addWithStableId(getQueues().mediaIndexing, 'media-index', data, `media-index-${data.videoId}`);
 }
 
 export async function enqueueSimpleMemIndexing(data: SimpleMemIndexingJob): Promise<void> {

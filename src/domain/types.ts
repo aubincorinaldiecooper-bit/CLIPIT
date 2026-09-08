@@ -29,16 +29,29 @@ export type MatchSource = 'visual' | 'transcript' | 'multimodal';
  * mention it" is a weaker statement than "the video does not contain it", and
  * only one of the two paths can make the stronger claim.
  */
-export type AnsweredFrom = 'notes' | 'footage';
+// 'media_index' is the vectors: what the pictures look like, matched
+// against the question without watching the video again. A third kind of
+// memory, and named separately so a row can say which one answered.
+export type AnsweredFrom = 'notes' | 'footage' | 'media_index';
 
 /**
  * Which system found the moments: Clipit's own notes-then-footage search, or
  * Omni-SimpleMem, tried first when configured as the primary. One or the
  * other, never a blend — see migration 043 and services/retrieval/simplemem.
  */
-export type RetrievalSystem = 'clipit' | 'simplemem';
+// 'media_index' is the vectors. Named alongside the others so one row can
+// say which of the three found the moments, and which did not get to try.
+export type RetrievalSystem = 'clipit' | 'simplemem' | 'media_index';
 
-/** Why the primary did not answer; see services/retrieval/simplemem/candidates.ts. */
+/**
+ * Why the primary did not answer.
+ *
+ * Written to the row, not just the log: a reason that exists only in a log
+ * line cannot answer "how often, and why" — which is the whole point of
+ * recording which system answered at all.
+ *
+ * See services/mediaIndex/search.ts and services/retrieval/simplemem/candidates.ts.
+ */
 export type FallbackReason =
   | 'correction'
   | 'index_missing'
@@ -47,7 +60,13 @@ export type FallbackReason =
   | 'unsupported_mode'
   | 'no_candidates'
   | 'below_score'
-  | 'primary_failed';
+  | 'primary_failed'
+  // The Media Index's own reasons.
+  | 'disabled'
+  | 'not_visual'
+  | 'no_coverage'
+  | 'provenance_changed'
+  | 'index_failed';
 
 /**
  * What a person thought of a match.

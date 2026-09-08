@@ -246,6 +246,20 @@ const envSchema = z.object({
    * the old rules is retired rather than quietly mixed with the new — which
    * would look exactly like working search and would not be.
    */
+  /**
+   * Read every uploaded video into vectors.
+   *
+   * Off by default, and deliberately so: turning it on starts a GPU call per
+   * batch of windows for every upload, and the two Modal services must
+   * actually be deployed for it to do anything but fail. Neither is a thing
+   * this process can check for itself, and a deploy that silently begins
+   * spending — or silently begins failing on every video — is not something
+   * to inherit by accident.
+   *
+   * This is a real switch, unlike the one it replaces: with it on, videos are
+   * indexed and questions consult the index.
+   */
+  MEDIA_INDEX_ENABLED: bool(false),
   MEDIA_INDEX_VERSION: z.string().trim().default('v1'),
   /**
    * The exact weights, when they are known. A model NAME is not an identity:
@@ -276,6 +290,30 @@ const envSchema = z.object({
    * GPU-second, so this stays low until measured — the same reasoning that
    * keeps MINICPM_VIDEO_CONCURRENCY at one.
    */
+  /**
+   * Below this a window is not a moment, whatever else it outscores.
+   *
+   * These are cosine similarities in Qwen's space and they are NOT
+   * calibrated: there is no measurement behind this number yet, and the right
+   * value has to come from real footage rather than intuition. It is a floor
+   * against the obviously-wrong (a negative or near-zero similarity is not a
+   * match under any reading), and the separation test below is what actually
+   * carries the decision.
+   */
+  MEDIA_INDEX_MIN_SCORE: num(0.05, 0, 1),
+  /**
+   * How far the best window must stand clear of a typical one, as a fraction
+   * of the spread across the whole video.
+   *
+   * This needs no calibration, which is why it does the real work. If every
+   * window scores about the same, the question distinguishes nothing in this
+   * video — that is what "not in here" looks like from the vectors, whatever
+   * the absolute numbers are. Zero disables it, and disabling it means the
+   * index answers every question with its closest guess.
+   */
+  MEDIA_INDEX_MIN_SEPARATION: num(0.35, 0, 1),
+  /** Windows shortlisted from the vectors before the reranker watches them. */
+  MEDIA_INDEX_TOP_K: int(20, 1, 200),
   MEDIA_INDEX_CONCURRENCY: int(1, 1, 8),
   MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
   MEDIA_INDEX_MAX_RETRIES: int(2, 0, 5),
@@ -647,6 +685,12 @@ function loadEnv(): Env {
   }
   if (value.SIMPLEMEM_INDEX_ENABLED && !value.SIMPLEMEM_URL) {
     problems.push('SIMPLEMEM_INDEX_ENABLED=true requires SIMPLEMEM_URL');
+  }
+  if (value.MEDIA_INDEX_ENABLED && (!value.MODAL_TOKEN_ID || !value.MODAL_TOKEN_SECRET)) {
+    // Without these every upload is accepted and then its indexing job fails
+    // one at a time, which reads as a broken product rather than a missing
+    // setting. Failing once at startup says what is actually wrong.
+    problems.push('MEDIA_INDEX_ENABLED=true requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET');
   }
   if (value.TRANSCRIPTION_ENABLED && !value.OPENROUTER_API_KEY) {
     problems.push(

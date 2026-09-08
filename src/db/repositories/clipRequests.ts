@@ -240,11 +240,19 @@ export async function recordSearchApproach(
  * half of the comparison, and a row that only says "fell back" cannot say
  * whether falling back was right.
  */
+
 export async function recordRetrievalOutcome(
   requestId: string,
   input: {
     primary: RetrievalSystem;
-    system: RetrievalSystem;
+    /**
+     * Null until a system has actually answered.
+     *
+     * Naming one at the moment the primary stands aside would claim the
+     * fallback succeeded before it has run — and it can still fail, leaving a
+     * row that says a question was answered when nothing answered it.
+     */
+    system: RetrievalSystem | null;
     fallbackReason: FallbackReason | null;
     primaryOutcome: Record<string, unknown> | null;
   },
@@ -373,6 +381,19 @@ export async function releaseDeckAndComplete(
   requestId: string,
   attemptId: string,
   answeredFrom: AnsweredFrom,
+  /**
+   * Which retrieval system answered, written in the SAME statement.
+   *
+   * Not before, and not after. Written before, a superseded attempt names a
+   * system for an answer nobody ever saw; written after, a worker that stops
+   * in between loses the attribution for good, because a completed request
+   * cannot be claimed again to repair it. One fenced statement is the only
+   * place both are impossible.
+   *
+   * Only set on a request already part of a comparison, and only while still
+   * blank, so a completion cannot overwrite a decision already recorded.
+   */
+  retrievalSystem: RetrievalSystem | null = null,
 ): Promise<boolean> {
   const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
@@ -380,10 +401,17 @@ export async function releaseDeckAndComplete(
             status            = 'completed',
             error_message     = NULL,
             answered_from     = COALESCE($3, answered_from),
+            retrieval_system  = CASE
+                                  WHEN $4::text IS NOT NULL
+                                   AND retrieval_primary IS NOT NULL
+                                   AND retrieval_system IS NULL
+                                  THEN $4::text
+                                  ELSE retrieval_system
+                                END,
             updated_at        = now()
       WHERE id = $1 AND deck_attempt_id = $2
       RETURNING id`,
-    [requestId, attemptId, answeredFrom],
+    [requestId, attemptId, answeredFrom, retrievalSystem],
   );
   return row !== null;
 }

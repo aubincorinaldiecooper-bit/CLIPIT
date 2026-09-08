@@ -6,6 +6,7 @@ import {
 import { clearClipKeysForVideo, listClipKeysForVideo } from '../db/repositories/clips.js';
 import { clearVariantsForVideo, listVariantKeysForVideo } from '../db/repositories/clipVariants.js';
 import { deleteScenes } from '../db/repositories/scenes.js';
+import { deleteMediaIndex } from '../db/repositories/mediaIndex.js';
 import { deleteSimpleMemIndex } from '../db/repositories/simplememIndex.js';
 import { env } from '../config/env.js';
 import { simplememDeleteVideo } from './retrieval/simplemem/client.js';
@@ -143,7 +144,10 @@ async function removeClaimedFootage(
   // The database is updated even when some objects refused to go, because the
   // alternative is trying the same failing deletes forever while the rest of
   // the video stays half-removed. The count above is the record.
-  await Promise.all([deleteScenes(videoId), deleteTranscript(videoId)]);
+  // The Media Index describes footage that is about to stop existing. Its
+  // vectors go with it: an index of deleted footage would keep answering
+  // questions about seconds nobody can watch any more.
+  await Promise.all([deleteScenes(videoId), deleteTranscript(videoId), deleteMediaIndex(videoId)]);
   // SimpleMem's memory of the video is footage too — frames of it, stored on
   // the sidecar's disk — so it goes with the rest. Best-effort like the
   // objects above, and loud when it fails: a memory nobody can name is an

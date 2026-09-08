@@ -28,6 +28,7 @@ vi.mock('../src/db/repositories/clipRequests.js', () => ({
   recordChunkFailure: vi.fn(),
   recordDeckAvailability,
   recordDeckPlan: vi.fn(),
+  recordRetrievalOutcome: vi.fn(async () => undefined),
   recordSearchApproach: vi.fn(),
   recordUncertainMatches: vi.fn(),
   releaseDeckAndComplete,
@@ -77,7 +78,11 @@ describe('a search completes on find', () => {
     const released = await complete();
 
     expect(released).toBe(true);
-    expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'notes');
+    // Which system answered goes in with the release, in one fenced
+    // statement: written before it, a superseded attempt would name a system
+    // for an answer nobody saw; written after, a worker that stops in between
+    // loses it for good, because a completed request cannot be re-claimed.
+    expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'notes', 'clipit');
     // What was found is what is shown: four, not a deck target of three.
     expect(recordDeckAvailability).toHaveBeenCalledWith(
       'request-1',
@@ -148,7 +153,7 @@ describe('a search completes on find', () => {
     const released = await complete({ answeredFrom: 'footage' });
 
     expect(released).toBe(true);
-    expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'footage');
+    expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'footage', 'clipit');
     expect(recordDeckAvailability).toHaveBeenCalledWith(
       'request-1',
       { availableCandidateCount: 0, effectiveDeckTarget: 0 },
