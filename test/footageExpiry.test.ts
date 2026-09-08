@@ -21,6 +21,7 @@ const clears = {
   clearVariantsForVideo: vi.fn(),
   deleteScenes: vi.fn(),
   deleteTranscript: vi.fn(),
+  deleteMediaIndex: vi.fn(),
 };
 const order: string[] = [];
 const claimedAt = new Date('2026-09-02T20:30:00Z');
@@ -50,6 +51,9 @@ vi.mock('../src/db/repositories/clipVariants.js', () => ({
 vi.mock('../src/db/repositories/scenes.js', () => ({ deleteScenes: (...args: unknown[]) => clears.deleteScenes(...args) }));
 vi.mock('../src/db/repositories/transcripts.js', () => ({
   deleteTranscript: (...args: unknown[]) => clears.deleteTranscript(...args),
+}));
+vi.mock('../src/db/repositories/mediaIndex.js', () => ({
+  deleteMediaIndex: (...args: unknown[]) => clears.deleteMediaIndex(...args),
 }));
 vi.mock('../src/services/storage/s3.js', () => ({
   getStorage: () => ({
@@ -93,6 +97,11 @@ describe('expireVideoFootage', () => {
     expect(order.filter((step) => step === 'remove')).toHaveLength(3);
     expect(result).toEqual({ outcome: 'removed', objectsDeleted: 3, objectsFailed: 0 });
     expect(videos.markFootageExpired).toHaveBeenCalledWith('v1');
+    // Everything derived from the footage goes with it. An index left behind
+    // would keep answering questions about seconds nobody can watch any more.
+    expect(clears.deleteScenes).toHaveBeenCalledWith('v1');
+    expect(clears.deleteTranscript).toHaveBeenCalledWith('v1');
+    expect(clears.deleteMediaIndex).toHaveBeenCalledWith('v1');
   });
 
   it('lets an owner remove their own video whoever it belonged to before', async () => {
