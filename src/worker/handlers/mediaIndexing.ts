@@ -81,7 +81,7 @@ function samePlace(a: WindowProvenance, b: WindowProvenance): boolean {
  * is for, and a heartbeat that could crash the read it reports on would be
  * worse than no heartbeat at all.
  */
-function startHeartbeat(videoId: string, runStartedAt: Date): { stop: () => void } {
+function startHeartbeat(videoId: string, runId: string): { stop: () => void } {
   const intervalMs = env.MEDIA_INDEX_HEARTBEAT_SECONDS * 1000;
   // setTimeout after each write settles, NOT setInterval. An interval fires on
   // the clock whether or not the last write came back, so a slow database —
@@ -98,7 +98,7 @@ function startHeartbeat(videoId: string, runStartedAt: Date): { stop: () => void
   };
 
   const beat = (): void => {
-    void touchMediaIndexRun(videoId, runStartedAt)
+    void touchMediaIndexRun(videoId, runId)
       .then((stillOurs) => {
         // The row moved on without us — superseded by a newer run, or already
         // finished. Stop claiming it.
@@ -172,7 +172,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
   const stored = new Set<string>();
   const failures: Array<{ id: string; reason: string }> = [];
   let provenance: WindowProvenance | null = null;
-  let runStartedAt: Date | null = null;
+  let runId: string | null = null;
   /** Containers whose startup this run has already paid for. */
   const containersCharged = new Set<string>();
 
@@ -215,13 +215,13 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         // video never carries a dead copy of itself. Rows matching this exact
         // provenance survive, which is what makes a resumed run cheap.
         const opened = await beginIndexRun(videoId, provenance);
-        runStartedAt = opened.runStartedAt;
+        runId = opened.runId;
         // From here the run owns the row, so from here it says it is alive —
         // on its own timer, not when batches happen to finish. A batch may
         // wait a long time for a Modal permit that searches also use, and
         // then retry inside itself; none of that means nothing is reading
         // this video, and only this tick can tell the difference.
-        heartbeat = startHeartbeat(videoId, opened.runStartedAt);
+        heartbeat = startHeartbeat(videoId, opened.runId);
         if (opened.cleared > 0) {
           log.info('cleared windows that describe other weights or other footage', {
             videoId, cleared: opened.cleared, ...provenance,
@@ -238,7 +238,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
           windowsPlanned: planned.length,
           windowsStored: stored.size,
           coveredThroughSeconds: coveredThroughSeconds(planned, stored, windowKey),
-          ifRunStartedAt: opened.runStartedAt,
+          ifRunId: opened.runId,
         });
       } else if (!samePlace(provenance, here)) {
         // Mid-run the service began answering from different weights. Vectors
@@ -269,10 +269,10 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       });
 
       if (rows.length > 0) {
-        // provenance and runStartedAt are set together when the run opens,
+        // provenance and runId are set together when the run opens,
         // which happens on the first batch — before any row can be stored.
-        if (!runStartedAt) throw new Error('windows were ready before the run was opened');
-        const written = await storeIndexedWindows(videoId, rows, provenance, packVector, runStartedAt);
+        if (!runId) throw new Error('windows were ready before the run was opened');
+        const written = await storeIndexedWindows(videoId, rows, provenance, packVector, runId);
         // Nothing stored means this attempt has been superseded, or the
         // footage was claimed for deletion. Either way it must not go on
         // counting windows it did not write: an obsolete run that keeps
@@ -327,7 +327,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         windowsStored: stored.size,
         windowsFailed: failures.length,
         coveredThroughSeconds: coveredThroughSeconds(planned, stored, windowKey),
-        ifRunStartedAt: runStartedAt ?? undefined,
+        ifRunId: runId ?? undefined,
       });
     }
 
@@ -349,7 +349,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         coveredThroughSeconds: 0,
         finishedAt: new Date(),
         error: 'the analysis proxy was replaced while it was being indexed; these vectors describe two different videos',
-        ...(runStartedAt ? { ifRunStartedAt: runStartedAt } : { ifState: ['queued'] as const }),
+        ...(runId ? { ifRunId: runId } : { ifState: ['queued'] as const }),
       }).catch((writeError: unknown) => {
         // Swallowed so the handler still returns rather than throwing over a
         // condition it has already handled correctly — but never silently.
@@ -376,7 +376,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       // A resume that found every window already stored never opens a run and
       // so has no identity to be fenced on; it may then only report over a
       // still-`queued` row, never over a newer attempt.
-      ...(runStartedAt ? { ifRunStartedAt: runStartedAt } : { ifState: ['queued'] as const }),
+      ...(runId ? { ifRunId: runId } : { ifState: ['queued'] as const }),
       error: unread.length === 0
         ? null
         : `${unread.length} stretch(es) were not read: ${unread
@@ -409,7 +409,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       // so a delivery that died early cannot stamp `failed` over a newer
       // attempt that has since opened or even finished — which would send
       // every later question to the slow path for a video that is indexed.
-      ...(runStartedAt ? { ifRunStartedAt: runStartedAt } : { ifState: ['queued'] as const }),
+      ...(runId ? { ifRunId: runId } : { ifState: ['queued'] as const }),
       error: message,
     }).catch((writeError: unknown) => {
       // Deliberately swallowed: the original failure is what this job must

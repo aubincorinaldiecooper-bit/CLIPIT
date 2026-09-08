@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { query, queryOne, queryRows, withTransaction } from '../pool.js';
 import { unpackVector } from '../../services/mediaIndex/vectors.js';
 
@@ -128,7 +129,7 @@ export function buildWindowInsert(
   windows: readonly IndexedWindow[],
   provenance: WindowProvenance,
   packVector: (values: readonly number[]) => Buffer,
-  runStartedAt: Date,
+  runId: string,
 ): { text: string; values: unknown[] } {
   const PER_WINDOW = 8;
   const values: unknown[] = [];
@@ -150,12 +151,12 @@ export function buildWindowInsert(
       `$${base + 6}, $${base + 7}, $${base + 8}, $${shared + 1}, $${shared + 2}, $${shared + 3})`
     );
   });
-  values.push(provenance.indexVersion, provenance.sourceIdentity, runStartedAt);
+  values.push(provenance.indexVersion, provenance.sourceIdentity, runId);
 
   return {
     text:
       `INSERT INTO media_index
-         (video_id, window_key, start_seconds, end_seconds, embedding, dims, model, revision, index_version, source_identity, run_started_at)
+         (video_id, window_key, start_seconds, end_seconds, embedding, dims, model, revision, index_version, source_identity, run_id)
        VALUES ${tuples.join(', ')}
        ON CONFLICT (video_id, window_key) DO UPDATE SET
          start_seconds   = EXCLUDED.start_seconds,
@@ -166,7 +167,7 @@ export function buildWindowInsert(
          revision        = EXCLUDED.revision,
          index_version   = EXCLUDED.index_version,
          source_identity = EXCLUDED.source_identity,
-         run_started_at  = EXCLUDED.run_started_at,
+         run_id          = EXCLUDED.run_id,
          created_at      = now()`,
     values,
   };
@@ -189,7 +190,7 @@ export async function storeIndexedWindows(
   windows: readonly IndexedWindow[],
   provenance: WindowProvenance,
   packVector: (values: readonly number[]) => Buffer,
-  runStartedAt: Date,
+  runId: string,
 ): Promise<number> {
   if (windows.length === 0) return 0;
 
@@ -200,7 +201,7 @@ export async function storeIndexedWindows(
     );
   }
 
-  const statement = buildWindowInsert(videoId, windows, provenance, packVector, runStartedAt);
+  const statement = buildWindowInsert(videoId, windows, provenance, packVector, runId);
 
   return withTransaction(async (client) => {
     // Locks the video row for this transaction, so retention's claim blocks
@@ -218,8 +219,8 @@ export async function storeIndexedWindows(
     // overlapping attempt writes nothing rather than overwriting the newer
     // run's work with vectors that every read would then filter out.
     const current = await client.query(
-      `SELECT 1 FROM media_index_status WHERE video_id = $1 AND started_at = $2`,
-      [videoId, runStartedAt],
+      `SELECT 1 FROM media_index_status WHERE video_id = $1 AND run_id = $2`,
+      [videoId, runId],
     );
     if (current.rowCount === 0) return 0;
 
@@ -329,7 +330,7 @@ export interface StatusPatch {
    * coverage over the live run's, and a partial index would read as fully
    * ready. Progress and completion carry the run that produced them.
    */
-  ifRunStartedAt?: Date;
+  ifRunId?: string;
   /**
    * Write only while the row is in one of these states.
    *
@@ -414,14 +415,30 @@ export function statusWriteDecision(state: MediaIndexState, patch: StatusPatch):
  * superseded cannot keep a newer attempt's row looking alive, and one that
  * finished cannot revive a terminal state, because only `running` is touched.
  */
-export async function touchMediaIndexRun(videoId: string, runStartedAt: Date): Promise<boolean> {
-  const result = await query(
-    `UPDATE media_index_status
-        SET updated_at = now()
-      WHERE video_id = $1 AND started_at = $2 AND state = 'running'`,
-    [videoId, runStartedAt],
-  );
-  return (result.rowCount ?? 0) > 0;
+export async function touchMediaIndexRun(videoId: string, runId: string): Promise<boolean> {
+  // Bounded IN THE DATABASE, not merely awaited with a timer beside it.
+  //
+  // The caller schedules the next beat only once this one settles, so a write
+  // that never settles stops the heartbeat for good and lets the read path
+  // call a working run stopped — the exact lie the heartbeat exists to
+  // prevent. Abandoning the promise in the application would fix the stall and
+  // leave the query holding a pool connection, so a sick database would lose
+  // connections one beat at a time. A statement timeout ends it at the far
+  // end: the query is cancelled, the connection comes back, and the rejection
+  // reaches the caller, which logs a missed beat and schedules the next.
+  //
+  // SET LOCAL, so it lasts exactly this transaction and no pooled connection
+  // carries it to unrelated work.
+  return withTransaction(async (client) => {
+    await client.query("SET LOCAL statement_timeout = '10s'");
+    const result = await client.query(
+      `UPDATE media_index_status
+          SET updated_at = now()
+        WHERE video_id = $1 AND run_id = $2 AND state = 'running'`,
+      [videoId, runId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  });
 }
 
 export async function setMediaIndexStatus(
@@ -456,7 +473,7 @@ export async function setMediaIndexStatus(
        finished_at             = CASE WHEN $15 THEN NULL
                                       ELSE COALESCE($13, media_index_status.finished_at) END,
        updated_at              = now()
-     WHERE ($16::timestamptz IS NULL OR media_index_status.started_at = $16)
+     WHERE ($16::uuid IS NULL OR media_index_status.run_id = $16)
        AND ($17::text[] IS NULL OR media_index_status.state = ANY($17))`,
     [
       videoId,
@@ -474,7 +491,7 @@ export async function setMediaIndexStatus(
       patch.finishedAt ?? null,
       errorGiven,
       clearFinished,
-      patch.ifRunStartedAt ?? null,
+      patch.ifRunId ?? null,
       patch.ifState ? [...patch.ifState] : null,
     ] as never,
   );
@@ -495,7 +512,7 @@ export async function setMediaIndexStatus(
 export async function beginIndexRun(
   videoId: string,
   provenance: WindowProvenance,
-): Promise<{ cleared: number; retained: string[]; runStartedAt: Date }> {
+): Promise<{ cleared: number; retained: string[]; runId: string }> {
   // One transaction. Deleting the old index and recording the new run are a
   // single act: if the status write failed on its own, the previous index
   // would be gone while its status still read `ready`, and every search would
@@ -518,10 +535,19 @@ export async function beginIndexRun(
       [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity],
     );
 
-    const opened = await client.query<{ started_at: Date }>(
+    // Minted here rather than taken from the clock. Every write this run makes
+    // proves its identity by presenting this value back, and a timestamp could
+    // not do that job: it loses its microseconds crossing into JavaScript, and
+    // rounding it to survive the trip would let two runs that began in the same
+    // millisecond share one identity — the older then passing every fence
+    // belonging to the newer. A uuid has nothing to round and nothing to
+    // collide. See migration 050.
+    const runId = randomUUID();
+
+    const opened = await client.query<{ run_id: string }>(
       `INSERT INTO media_index_status
-         (video_id, state, model, revision, dims, index_version, source_identity, error, started_at, finished_at, updated_at)
-       VALUES ($1, 'running', $2, $3, $4, $5, $6, NULL, now(), NULL, now())
+         (video_id, state, model, revision, dims, index_version, source_identity, error, run_id, started_at, finished_at, updated_at)
+       VALUES ($1, 'running', $2, $3, $4, $5, $6, NULL, $7, now(), NULL, now())
        ON CONFLICT (video_id) DO UPDATE SET
          state           = 'running',
          model           = $2,
@@ -530,17 +556,21 @@ export async function beginIndexRun(
          index_version   = $5,
          source_identity = $6,
          error           = NULL,
+         run_id          = $7,
          started_at      = now(),
          finished_at     = NULL,
          updated_at      = now()
-       RETURNING started_at`,
-      [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity],
+       RETURNING run_id`,
+      [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity, runId],
     );
 
-    const runStartedAt = opened.rows[0]?.started_at;
-    if (!runStartedAt) throw new Error('the index run could not be opened');
+    // Read back rather than assumed: if the upsert wrote no row this run does
+    // not own the status, and going on to store windows under an identity
+    // nothing recognises would leave vectors no fence would ever accept.
+    const owned = opened.rows[0]?.run_id;
+    if (!owned) throw new Error('the index run could not be opened');
 
-    return { cleared: removed.rowCount ?? 0, retained: kept.rows.map((row) => row.window_key), runStartedAt };
+    return { cleared: removed.rowCount ?? 0, retained: kept.rows.map((row) => row.window_key), runId: owned };
   });
 }
 

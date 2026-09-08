@@ -30,7 +30,8 @@ const getVideo = vi.fn();
 vi.mock('../src/db/repositories/videos.js', () => ({ getVideo }));
 
 const setMediaIndexStatus = vi.fn(async () => true);
-const beginIndexRun = vi.fn(async () => ({ cleared: 0, retained: [], runStartedAt: new Date('2026-09-08T11:00:00Z') }));
+const RUN_ID = '3f2a6c1e-0b7d-4c8a-9e5f-1d2b3c4a5e6f';
+const beginIndexRun = vi.fn(async () => ({ cleared: 0, retained: [], runId: RUN_ID }));
 const storeIndexedWindows = vi.fn(async () => 0);
 const touchMediaIndexRun = vi.fn(async () => true);
 vi.mock('../src/db/repositories/mediaIndex.js', () => ({
@@ -64,7 +65,7 @@ beforeEach(() => {
     footageExpiredAt: null,
   });
   setMediaIndexStatus.mockResolvedValue(true);
-  beginIndexRun.mockResolvedValue({ cleared: 0, retained: [], runStartedAt: new Date('2026-09-08T11:00:00Z') });
+  beginIndexRun.mockResolvedValue({ cleared: 0, retained: [], runId: RUN_ID });
   sourceIdentity.mockResolvedValue({ identity: 'sha-original', bytes: 1_000 });
   touchMediaIndexRun.mockResolvedValue(true);
 });
@@ -79,7 +80,7 @@ describe('a run says it is alive for as long as it is working', () => {
    * system is, and starves a healthy run into looking dead. Only a tick that
    * keeps running while the batch waits can tell the two apart.
    */
-  const RUN_STARTED = new Date('2026-09-08T11:00:00Z');
+  // The identity a run proves itself with — a minted id, never a timestamp.
   const emptyBatch = {
     embedded: [], failed: [], model: 'Qwen/Qwen3-VL-Embedding-2B', revision: '', dims: 2048, metrics: {},
   };
@@ -115,7 +116,7 @@ describe('a run says it is alive for as long as it is working', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     await vi.advanceTimersByTimeAsync(30_000);
-    expect(touchMediaIndexRun).toHaveBeenCalledWith('video-1', RUN_STARTED);
+    expect(touchMediaIndexRun).toHaveBeenCalledWith('video-1', RUN_ID);
     const afterOne = touchMediaIndexRun.mock.calls.length;
     expect(afterOne).toBeGreaterThan(0);
 

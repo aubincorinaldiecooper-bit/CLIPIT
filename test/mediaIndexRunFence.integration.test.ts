@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 
 /**
@@ -10,19 +11,25 @@ import pg from 'pg';
  *
  * WHAT IT COVERS
  *
- * A run's identity is the moment it opened. beginIndexRun writes now() and
- * returns it; storing windows, writing a status and the liveness heartbeat all
- * re-present that value and require an exact match, so a superseded worker
- * cannot overwrite a newer run's work.
+ * Every write a run makes proves it is still the current run by presenting its
+ * identity back — storing windows, writing a status, and the heartbeat. The
+ * identity used to be `started_at`, the moment the run opened, and that failed
+ * twice over.
  *
- * PostgreSQL keeps microseconds. A JavaScript Date keeps milliseconds. The
- * round trip through node-postgres therefore threw away the microseconds and
- * the fence compared two values that were never equal — measured at 0 matches
- * in 20 runs before migration 050. Every window rejected, every status write
- * refused, every heartbeat lost, at full GPU price, for ever.
+ * It could never match: PostgreSQL keeps microseconds, a JavaScript Date keeps
+ * milliseconds, and node-postgres hands one back. Measured here before the fix
+ * at 0 matches in 20 runs — every window rejected, every status write refused,
+ * every heartbeat lost, at full GPU price.
  *
- * No mock can see this: it lives entirely in what the database and the driver
- * do to a value in transit. Hence a real connection, and hence this file.
+ * And rounding it to survive that trip would have made two runs beginning in
+ * the same millisecond share one identity, letting the older overwrite the
+ * newer. now() is transaction_timestamp, taken when the transaction BEGINS.
+ *
+ * So the identity is a minted uuid. These prove it round-trips, and that two
+ * runs opened back to back never collide however close together they are.
+ *
+ * No mock can see any of this: it lives in what the database and the driver do
+ * to a value in transit.
  */
 
 const CONNECTION = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
@@ -53,6 +60,7 @@ beforeAll(async () => {
   await client.query(`
     CREATE TABLE media_index_fence_probe (
       video_id   TEXT PRIMARY KEY,
+      run_id     UUID,
       started_at TIMESTAMPTZ(3) NOT NULL
     )`);
 });
@@ -63,61 +71,90 @@ afterAll(async () => {
   await client.end();
 });
 
+/** What beginIndexRun does: mint an id, write it, hand it back. */
+async function openRun(videoId: string): Promise<string> {
+  const runId = randomUUID();
+  const opened = await client.query<{ run_id: string }>(
+    `INSERT INTO media_index_fence_probe (video_id, run_id, started_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (video_id) DO UPDATE SET run_id = $2, started_at = now()
+     RETURNING run_id`,
+    [videoId, runId],
+  );
+  return opened.rows[0].run_id;
+}
+
+/** What storeIndexedWindows, setMediaIndexStatus and touchMediaIndexRun do. */
+async function fencePasses(videoId: string, runId: string): Promise<boolean> {
+  const found = await client.query(
+    'SELECT 1 FROM media_index_fence_probe WHERE video_id = $1 AND run_id = $2',
+    [videoId, runId],
+  );
+  return (found.rowCount ?? 0) > 0;
+}
+
 suite('a run can recognise its own identity', () => {
-  /** What beginIndexRun does: write now(), hand the value back. */
-  async function openRun(videoId: string): Promise<Date> {
-    const opened = await client.query<{ started_at: Date }>(
-      `INSERT INTO media_index_fence_probe (video_id, started_at)
-       VALUES ($1, now())
-       ON CONFLICT (video_id) DO UPDATE SET started_at = now()
-       RETURNING started_at`,
-      [videoId],
-    );
-    return opened.rows[0].started_at;
-  }
-
-  /** What storeIndexedWindows, setMediaIndexStatus and touchMediaIndexRun do. */
-  async function fencePasses(videoId: string, runStartedAt: Date): Promise<boolean> {
-    const found = await client.query(
-      'SELECT 1 FROM media_index_fence_probe WHERE video_id = $1 AND started_at = $2',
-      [videoId, runStartedAt],
-    );
-    return (found.rowCount ?? 0) > 0;
-  }
-
   it('matches the value it was just handed, every time', async () => {
-    // Twenty-five runs, because the failure was probabilistic in principle and
-    // total in practice: a match needed now() to land on an exact millisecond.
+    // Twenty-five runs. With a timestamp identity this needed now() to land on
+    // an exact millisecond and measured 0 in 20; an id has nothing to round.
     for (let i = 0; i < 25; i += 1) {
-      const runStartedAt = await openRun(`video-${i}`);
-      expect(await fencePasses(`video-${i}`, runStartedAt)).toBe(true);
+      const runId = await openRun(`video-${i}`);
+      expect(await fencePasses(`video-${i}`, runId)).toBe(true);
     }
   });
 
-  it('stores nothing finer than a millisecond, whatever the caller writes', async () => {
-    // The point of putting the precision on the column instead of rounding at
-    // the call site: a later `now()` written by anyone cannot reintroduce the
-    // microseconds that broke this.
+  it('refuses a run that has been superseded', async () => {
+    // The fence still doing its actual job: an older worker holding the
+    // previous identity writes nothing once a newer run has opened.
+    const first = await openRun('video-superseded');
+    const second = await openRun('video-superseded');
+
+    expect(second).not.toBe(first);
+    expect(await fencePasses('video-superseded', second)).toBe(true);
+    expect(await fencePasses('video-superseded', first)).toBe(false);
+  });
+
+  it('gives two runs opened in the same millisecond different identities', async () => {
+    // The reason a rounded timestamp was not good enough. now() is taken when
+    // the transaction BEGINS, so two deliveries of one video that start inside
+    // the same millisecond would have shared an identity — and the older would
+    // then have passed every fence belonging to the newer, overwriting its
+    // windows and its coverage with nothing to detect it.
+    const ids: string[] = [];
+    const stamps: string[] = [];
+    for (let i = 0; i < 40; i += 1) {
+      ids.push(await openRun('video-rapid'));
+      stamps.push(
+        (await client.query<{ text: string }>(
+          "SELECT to_char(started_at, 'YYYY-MM-DD HH24:MI:SS.MS') AS text FROM media_index_fence_probe WHERE video_id = 'video-rapid'",
+        )).rows[0].text,
+      );
+    }
+
+    // Every identity distinct, whatever the clock did.
+    expect(new Set(ids).size).toBe(ids.length);
+
+    // And this is not a vacuous check: the timestamps DID repeat, so a
+    // millisecond identity really would have collided here.
+    expect(new Set(stamps).size).toBeLessThan(stamps.length);
+
+    // Only the newest passes.
+    const newest = ids[ids.length - 1];
+    expect(await fencePasses('video-rapid', newest)).toBe(true);
+    for (const stale of ids.slice(0, -1)) {
+      expect(await fencePasses('video-rapid', stale)).toBe(false);
+    }
+  });
+
+  it('keeps started_at round-trippable, since it is still read into a Date', async () => {
+    // No longer the identity, but still handed to JavaScript for reporting. A
+    // stored value that cannot survive that trip is a trap either way.
     await openRun('video-precision');
     const stored = await client.query<{ text: string }>(
       'SELECT started_at::text AS text FROM media_index_fence_probe WHERE video_id = $1',
       ['video-precision'],
     );
-    const fraction = stored.rows[0].text.split('.')[1] ?? '';
-    // e.g. "248+00" — at most three digits before the timezone.
-    expect(fraction.replace(/\+.*$/, '').length).toBeLessThanOrEqual(3);
-  });
-
-  it('still refuses a run that has been superseded', async () => {
-    // The fence must keep doing its actual job. An older worker holding the
-    // previous identity writes nothing once a newer run has opened.
-    const first = await openRun('video-superseded');
-    const second = await openRun('video-superseded');
-
-    expect(second.getTime()).toBeGreaterThanOrEqual(first.getTime());
-    expect(await fencePasses('video-superseded', second)).toBe(true);
-    if (second.getTime() !== first.getTime()) {
-      expect(await fencePasses('video-superseded', first)).toBe(false);
-    }
+    const fraction = (stored.rows[0].text.split('.')[1] ?? '').replace(/\+.*$/, '');
+    expect(fraction.length).toBeLessThanOrEqual(3);
   });
 });

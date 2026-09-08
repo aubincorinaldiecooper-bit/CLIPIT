@@ -1,46 +1,58 @@
--- The run fence compared two timestamps that could never be equal.
+-- A run needs an identity. A timestamp was never one.
 --
--- A run's identity is the moment it opened: beginIndexRun writes now() and
--- returns it, and every later write is fenced on matching it exactly, so a
--- superseded worker cannot overwrite a newer run's work. Three places do that
--- comparison — storing windows, writing a status, and the liveness heartbeat.
+-- Every write a run makes is fenced on proving it is still the current run:
+-- storing windows, writing a status, and the liveness heartbeat all re-present
+-- the value beginIndexRun handed them and require an exact match, so a
+-- superseded worker cannot overwrite a newer run's work. Since 047 that value
+-- has been `started_at` — the moment the run opened. Two things were wrong
+-- with that, and only the first was obvious.
 --
--- PostgreSQL stores timestamptz to the MICROSECOND. JavaScript's Date holds
--- MILLISECONDS, and node-postgres hands one back, so the microseconds are
--- gone before the value ever reaches the application. Passing that Date into
--- `started_at = $2` compares 20:49:08.441 against 20:49:08.441526, which is
--- false — not sometimes, essentially always. Measured against a real
--- PostgreSQL 16 before this migration was written: 0 matches in 20 runs.
+-- IT COULD NEVER MATCH
 --
--- What that meant with the Media Index switched on: every window rejected by
--- its own fence, every status write refused, every heartbeat lost. A video
--- would be embedded at full GPU price, store nothing, and sit at `running`
--- for ever — the exact failure the fence and the heartbeat exist to prevent,
--- caused by the machinery meant to prevent it. It has been latent since 047
--- and harmless only because the feature was switched off.
+-- PostgreSQL keeps timestamptz to the microsecond. A JavaScript Date keeps
+-- milliseconds, and node-postgres hands one back, so the microseconds were
+-- gone before the value reached the application. `started_at = $2` compared
+-- 20:49:08.441 against 20:49:08.441526. Measured against a real PostgreSQL 16:
+-- 0 matches in 20 runs.
 --
--- WHY THE COLUMN TYPE, AND NOT A ROUNDED WRITE
+-- With the Media Index switched on that means every window rejected by its own
+-- fence, every status write refused, every heartbeat lost — a video embedded
+-- at full GPU price, storing nothing, sitting at `running` for ever. The exact
+-- failure the fence and the heartbeat exist to prevent, caused by the
+-- machinery meant to prevent it.
 --
--- date_trunc('milliseconds', now()) at the one call site also matches 20 of
--- 20, and would leave a landmine: any later code writing a plain now() here
--- silently breaks the fence again, with no test able to see it because the
--- damage is invisible until something is superseded. Declaring the precision
--- on the COLUMN makes it structural — PostgreSQL rounds every write, from any
--- caller, for ever. Same reasoning as 044's octet_length check: make the bad
--- value impossible to store rather than something discovered later.
+-- AND ROUNDING IT WOULD ONLY HAVE HIDDEN THE REST
 --
--- Rows already stored are rounded to the nearest millisecond in place, which
--- keeps any existing fence intact rather than shifting rows out from under it.
--- Verified against PostgreSQL 16: after the ALTER, an existing row's value
--- round-trips through a JavaScript Date and matches itself.
+-- Declaring the column TIMESTAMPTZ(3) makes the round trip lossless, and was
+-- the first fix here: measured at 25 of 25. But it buys that by making the
+-- identity coarser, and now() is transaction_timestamp — taken when the
+-- transaction BEGINS, not when it commits. Two deliveries of the same video
+-- that begin inside one millisecond would then be handed the same identity,
+-- and the older one would pass every fence belonging to the newer: silently
+-- overwriting its windows and its coverage. Unlikely is not the same as
+-- impossible, and this fence exists precisely for the case where two runs
+-- overlap.
 --
--- Millisecond resolution is ample for the job: this identifies which RUN
--- opened a row, and two runs for one video are serialised by the queue, not
--- microseconds apart.
+-- So the identity stops being a time. run_id is a UUID minted per run,
+-- compared as itself, with nothing to round and nothing to collide. A time is
+-- for saying when something happened; it was never a name.
+--
+-- started_at stays, and stays at millisecond precision: it is still read into
+-- a JavaScript Date for reporting, and a stored value that cannot survive that
+-- trip is a trap whether or not anything currently steps in it.
 ALTER TABLE media_index_status
     ALTER COLUMN started_at TYPE TIMESTAMPTZ(3);
 
--- Carried on each window so a row can say which run paid for it. Kept at the
--- same precision as the column it is copied from, so the two stay comparable.
 ALTER TABLE media_index
     ALTER COLUMN run_started_at TYPE TIMESTAMPTZ(3);
+
+-- Nullable, and deliberately so: rows written before this migration have no
+-- run id, and inventing one would claim they belonged to a run that never
+-- existed. A NULL simply loses to every fence, which is the safe direction —
+-- an old row cannot masquerade as the current run, and the next run over that
+-- video clears it by provenance anyway.
+ALTER TABLE media_index_status
+    ADD COLUMN IF NOT EXISTS run_id UUID;
+
+ALTER TABLE media_index
+    ADD COLUMN IF NOT EXISTS run_id UUID;

@@ -2,6 +2,7 @@ import { env } from '../config/env.js';
 import { ExternalServiceError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { assertMediaIndexDeploymentsAvailable } from '../services/mediaIndex/qwen.js';
+import { resetModalHandles } from '../services/modal/invoke.js';
 
 /**
  * Whether videos can actually be read into vectors — asked once, at startup.
@@ -57,6 +58,29 @@ async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
     // The losing timer is always cleared, so a slow-but-successful probe does
     // not leave a pending rejection behind it.
     if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * One probe, bounded, leaving nothing behind that would poison the next one.
+ *
+ * The deadline alone is not enough. The Modal client caches the promise for a
+ * deployment lookup so repeat calls share one handle — which is right for
+ * inference, and wrong here: abandoning the await on a timeout leaves that
+ * pending promise in the cache, so every later probe adopts the SAME hung
+ * lookup and times out again. Modal could come back and the watch would never
+ * notice, which would quietly defeat the recovery it exists to provide.
+ *
+ * So a timed-out probe drops the cached handles. The cache holds media-index
+ * targets only — MiniCPM keeps its own, in minicpmVideo.ts — so this costs one
+ * fresh lookup next time and nothing else.
+ */
+async function probeWithin(timeoutMs: number): Promise<void> {
+  try {
+    await withDeadline(assertMediaIndexDeploymentsAvailable(), timeoutMs);
+  } catch (error) {
+    resetModalHandles();
+    throw error;
   }
 }
 
@@ -160,7 +184,7 @@ export async function mediaIndexReadiness(
   const attempts = 3;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      await withDeadline(assertMediaIndexDeploymentsAvailable(), options.probeTimeoutMs ?? PROBE_TIMEOUT_MS);
+      await probeWithin(options.probeTimeoutMs ?? PROBE_TIMEOUT_MS);
       logger.info('media index deployments available', naming);
       return true;
     } catch (error) {
