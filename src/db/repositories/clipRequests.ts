@@ -240,29 +240,6 @@ export async function recordSearchApproach(
  * half of the comparison, and a row that only says "fell back" cannot say
  * whether falling back was right.
  */
-/**
- * Names the system that actually answered, once one has.
- *
- * Separate from recordRetrievalOutcome because the two are known at different
- * moments: the primary's reason is known when it stands aside, and who
- * answered is not known until something succeeds. Writing both at the handoff
- * would claim the fallback worked before it ran — and it can still fail,
- * leaving a row saying a question was answered when nothing answered it.
- *
- * Only fills a row that is already part of a comparison, and only while it is
- * still blank, so a completion cannot overwrite a decision already recorded.
- */
-export async function settleRetrievalSystem(requestId: string, system: RetrievalSystem): Promise<void> {
-  await queryOne(
-    `UPDATE clip_requests
-        SET retrieval_system = $2,
-            updated_at = now()
-      WHERE id = $1
-        AND retrieval_primary IS NOT NULL
-        AND retrieval_system IS NULL`,
-    [requestId, system],
-  );
-}
 
 export async function recordRetrievalOutcome(
   requestId: string,
@@ -404,6 +381,19 @@ export async function releaseDeckAndComplete(
   requestId: string,
   attemptId: string,
   answeredFrom: AnsweredFrom,
+  /**
+   * Which retrieval system answered, written in the SAME statement.
+   *
+   * Not before, and not after. Written before, a superseded attempt names a
+   * system for an answer nobody ever saw; written after, a worker that stops
+   * in between loses the attribution for good, because a completed request
+   * cannot be claimed again to repair it. One fenced statement is the only
+   * place both are impossible.
+   *
+   * Only set on a request already part of a comparison, and only while still
+   * blank, so a completion cannot overwrite a decision already recorded.
+   */
+  retrievalSystem: RetrievalSystem | null = null,
 ): Promise<boolean> {
   const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
@@ -411,10 +401,17 @@ export async function releaseDeckAndComplete(
             status            = 'completed',
             error_message     = NULL,
             answered_from     = COALESCE($3, answered_from),
+            retrieval_system  = CASE
+                                  WHEN $4::text IS NOT NULL
+                                   AND retrieval_primary IS NOT NULL
+                                   AND retrieval_system IS NULL
+                                  THEN $4::text
+                                  ELSE retrieval_system
+                                END,
             updated_at        = now()
       WHERE id = $1 AND deck_attempt_id = $2
       RETURNING id`,
-    [requestId, attemptId, answeredFrom],
+    [requestId, attemptId, answeredFrom, retrievalSystem],
   );
   return row !== null;
 }

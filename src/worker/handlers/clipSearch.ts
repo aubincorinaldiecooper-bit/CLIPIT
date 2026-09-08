@@ -44,7 +44,6 @@ import {
   recordDeckPlan,
   recordRetrievalOutcome,
   recordSearchApproach,
-  settleRetrievalSystem,
   recordUncertainMatches,
   releaseDeckAndComplete,
   startClipRequest,
@@ -916,8 +915,17 @@ export async function completeRequest(input: {
   // Released and completed together, in one statement, so there is no
   // instant in which the moments are on the creator's screen while the
   // request still says 'searching' and a stale delivery could claim it.
+  // Which system answered goes in with the release itself: one fenced
+  // statement, so it cannot name an answer that was superseded and cannot be
+  // lost if this process stops. Notes and footage are both Clipit's own
+  // search; only the vectors are the other thing.
   const released = input.deckAttemptId
-    ? await releaseDeckAndComplete(clipRequestId, input.deckAttemptId, input.answeredFrom)
+    ? await releaseDeckAndComplete(
+        clipRequestId,
+        input.deckAttemptId,
+        input.answeredFrom,
+        input.answeredFrom === 'media_index' ? 'media_index' : 'clipit',
+      )
     : false;
   if (!released) {
     log.warn('answer was superseded before it could be released', {
@@ -926,17 +934,6 @@ export async function completeRequest(input: {
     return false;
   }
 
-  // Which system answered — recorded only now that one demonstrably did.
-  //
-  // Written before the release, a superseded attempt would name a system for
-  // an answer that never reached anybody: the release is the fenced statement
-  // that decides whether this attempt owns the outcome at all, so nothing may
-  // claim an answer ahead of it. Notes and footage are both Clipit's own
-  // search; only the vectors are the other thing.
-  await settleRetrievalSystem(
-    clipRequestId,
-    input.answeredFrom === 'media_index' ? 'media_index' : 'clipit',
-  ).catch(() => undefined);
 
   log.info('moments released', {
     clipRequestId,
