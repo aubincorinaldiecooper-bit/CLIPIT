@@ -50,10 +50,16 @@ describe('vectors that describe footage the video no longer has', () => {
     expect(footageWasReplaced('sha-original', 'sha-original')).toBe(false);
   });
 
-  it('are used when nothing recorded what they were built from', () => {
-    // Rows written before identities were tracked. Refusing these would retire
-    // working indexes over a value nobody ever set.
-    expect(footageWasReplaced('', 'sha-anything')).toBe(false);
+  it('are refused when nothing recorded what they were built from', () => {
+    // This asserted the opposite when it was written, on the grounds that
+    // refusing would retire working legacy indexes. Checked since: only the
+    // indexing handler writes these rows, and it has never run in production,
+    // so there are no legacy indexes to retire.
+    //
+    // The two mistakes are also not the same size. Refusing a good index costs
+    // one slower answer; accepting a stale one costs an answer about a
+    // different video. Unknown provenance goes to refusing.
+    expect(footageWasReplaced('', 'sha-anything')).toBe(true);
   });
 
   it('are used when the video has no readable footage to compare against', () => {

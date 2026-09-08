@@ -98,13 +98,24 @@ export interface IndexDecisionInput {
  * changed pictures, and from the outside the two failures look the same —
  * confident, well-ordered, and about the wrong thing.
  *
- * An empty stored identity means "not recorded", from rows written before
- * identities were tracked. Refusing those would retire working indexes over a
- * value nobody ever set, so they are let through; a stored identity that
- * exists and disagrees is the case worth stopping.
+ * AN EMPTY STORED IDENTITY IS REFUSED TOO, and the first version of this let
+ * it through on the grounds that refusing would "retire working indexes over a
+ * value nobody ever set". That reason does not survive checking. Only
+ * storeIndexedWindows writes these rows, only the indexing handler calls it,
+ * and that handler has never run in production — the switch has been off on
+ * main since the table existed. There are no such indexes to retire.
+ *
+ * And even if there were, the two mistakes are not the same size. Refusing a
+ * good index costs one slower answer, from the notes and the footage that sit
+ * behind this. Accepting a stale one costs an answer about a different video,
+ * delivered with timestamps and full confidence. The doubt goes to refusing.
+ *
+ * A missing CURRENT identity is different: nothing to compare is not evidence
+ * of a mismatch, and the coverage rules already decide what an index with no
+ * readable footage behind it may say.
  */
 export function footageWasReplaced(indexedSourceIdentity: string, currentSourceIdentity: string | null): boolean {
-  if (indexedSourceIdentity === '' || currentSourceIdentity === null) return false;
+  if (currentSourceIdentity === null) return false;
   return indexedSourceIdentity !== currentSourceIdentity;
 }
 
