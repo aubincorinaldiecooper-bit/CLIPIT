@@ -1030,9 +1030,25 @@ async function answerFromMediaIndex(input: {
     return { matchCount: 0, released: false, fallback: 'index_missing' };
   }
 
+  // Marked as searching before any remote call. Embedding the question and
+  // reranking the shortlist can take a while, and the request would otherwise
+  // read as "Queued" throughout — the serializer shows the right words for a
+  // memory answer when no segments are counted.
+  await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
+
   let result;
   try {
-    const windows = await listIndexedWindows(video.id);
+    const snapshot = await listIndexedWindows(video.id);
+    // Coverage came back with the windows, from one read. A re-index starting
+    // between two separate reads would pair one run's windows with another
+    // run's coverage, and partly-read replacement footage would be reported
+    // as fully read. If the run moved since the decision above, this
+    // question is about an index that no longer exists.
+    if (snapshot.runStartedAt?.getTime() !== status.startedAt?.getTime()) {
+      log.info('the index was replaced while this question was being answered; handing it on');
+      return { matchCount: 0, released: false, fallback: 'index_not_ready' };
+    }
+    const windows = snapshot.windows;
     const source = video.proxyStorageKey ? await sourceIdentity(video.proxyStorageKey) : null;
     const videoUrl = video.proxyStorageKey
       ? await getStorage().createDownloadUrl(video.proxyStorageKey, {
@@ -1043,7 +1059,7 @@ async function answerFromMediaIndex(input: {
     result = await searchMediaIndex({
       instruction,
       windows,
-      coveredThroughSeconds: status.coveredThroughSeconds,
+      coveredThroughSeconds: snapshot.coveredThroughSeconds,
       storedBy: { model: status.model, revision: status.revision, dims: status.dims },
       // Without the proxy there is no footage to rerank against, so the raw
       // vector order stands rather than the search failing.

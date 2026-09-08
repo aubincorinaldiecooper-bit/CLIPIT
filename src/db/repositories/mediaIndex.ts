@@ -239,23 +239,42 @@ export async function storeIndexedWindows(
  * skipped. Silently dropping it would shrink the searched region without
  * saying so, which is the one thing coverage exists to prevent.
  */
-export async function listIndexedWindows(videoId: string): Promise<StoredWindow[]> {
-  // Joined to the status row so only windows from the CURRENT run are
-  // returned. A re-index under a different model, revision, dimension count
-  // or index version writes new rows for the keys it reaches and leaves the
-  // rest behind; without this filter those survivors would be searched
-  // alongside the new ones. Same-sized vectors from two different models do
-  // not throw — they score, plausibly and meaninglessly, which is worse than
-  // failing. No status row means nothing has been indexed under a known
-  // provenance, so nothing is returned.
+export interface IndexSnapshot {
+  windows: StoredWindow[];
+  /** The run these windows belong to, read in the SAME query as the windows. */
+  runStartedAt: Date | null;
+  /** Its coverage, likewise — so the two can never describe different runs. */
+  coveredThroughSeconds: number;
+}
+
+/**
+ * Every stored window for one video, with the run they belong to.
+ *
+ * Whole-video rather than top-k in SQL, because the similarity is computed in
+ * this process (migration 044 says why). A search is always about one video,
+ * so this is hundreds of rows, not the whole table.
+ *
+ * Coverage and the run identity come back from THIS query rather than from a
+ * separate read. A re-index starting between two reads would otherwise pair
+ * one run's windows with another run's coverage, and partly-read replacement
+ * footage would be reported as fully read.
+ *
+ * A row whose vector does not match its stated size throws rather than being
+ * skipped. Silently dropping it would shrink the searched region without
+ * saying so, which is the one thing coverage exists to prevent.
+ */
+export async function listIndexedWindows(videoId: string): Promise<IndexSnapshot> {
   const rows = await queryRows<{
     window_key: string;
     start_seconds: string | number;
     end_seconds: string | number;
     embedding: Buffer;
     dims: number;
+    run_started_at: Date | null;
+    covered_through_seconds: string | number;
   }>(
-    `SELECT m.window_key, m.start_seconds, m.end_seconds, m.embedding, m.dims
+    `SELECT m.window_key, m.start_seconds, m.end_seconds, m.embedding, m.dims,
+            s.started_at AS run_started_at, s.covered_through_seconds
        FROM media_index m
        JOIN media_index_status s ON s.video_id = m.video_id
       WHERE m.video_id = $1
@@ -268,12 +287,16 @@ export async function listIndexedWindows(videoId: string): Promise<StoredWindow[
     [videoId],
   );
 
-  return rows.map((row) => ({
-    windowKey: row.window_key,
-    startSeconds: Number(row.start_seconds),
-    endSeconds: Number(row.end_seconds),
-    embedding: unpackVector(row.embedding, row.dims),
-  }));
+  return {
+    windows: rows.map((row) => ({
+      windowKey: row.window_key,
+      startSeconds: Number(row.start_seconds),
+      endSeconds: Number(row.end_seconds),
+      embedding: unpackVector(row.embedding, row.dims),
+    })),
+    runStartedAt: rows[0]?.run_started_at ?? null,
+    coveredThroughSeconds: Number(rows[0]?.covered_through_seconds ?? 0),
+  };
 }
 
 export async function getMediaIndexStatus(videoId: string): Promise<MediaIndexStatus | null> {
