@@ -30,6 +30,43 @@ import { assertMediaIndexDeploymentsAvailable } from '../services/mediaIndex/qwe
  * Lives in its own module so it can be tested. The worker entrypoint runs on
  * import, so anything defined there is reachable only by starting a worker.
  */
+/**
+ * Keep asking, when Modal was down at boot.
+ *
+ * The startup check retries over a few seconds, which covers a blip during a
+ * deploy but not an outage lasting minutes. Without this, such an outage
+ * leaves indexing off for the process's whole lifetime while uploads keep
+ * queueing work nothing consumes — and recovery needs a human to notice and
+ * restart a worker that looks entirely healthy.
+ *
+ * Stops the moment it succeeds, so `onReady` runs exactly once and no consumer
+ * is ever started twice. Unref'd, so a worker shutting down is never held open
+ * by a probe for an optional feature.
+ */
+export function watchMediaIndexRecovery(
+  onReady: () => void,
+  options: { intervalMs?: number; check?: () => Promise<boolean> } = {},
+): NodeJS.Timeout {
+  const check = options.check ?? mediaIndexReadiness;
+  const timer = setInterval(() => {
+    void check()
+      .then((ready) => {
+        if (!ready) return;
+        // Cleared BEFORE onReady: if starting the consumer throws, the timer
+        // is already gone rather than firing again and starting a second one.
+        clearInterval(timer);
+        onReady();
+      })
+      .catch((error: unknown) => {
+        // Never let a rejected probe take the worker down. This is background
+        // work for an optional feature, and everything else here is working.
+        logger.warn('media index readiness re-check failed', { err: error });
+      });
+  }, options.intervalMs ?? env.MEDIA_INDEX_RECHECK_INTERVAL_MS);
+  timer.unref();
+  return timer;
+}
+
 export async function mediaIndexReadiness(): Promise<boolean> {
   if (!env.MEDIA_INDEX_ENABLED) return false;
 

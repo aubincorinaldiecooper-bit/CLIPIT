@@ -26,7 +26,7 @@ vi.mock('../src/services/mediaIndex/qwen.js', () => ({ assertMediaIndexDeploymen
 const envValues: Record<string, unknown> = {};
 vi.mock('../src/config/env.js', () => ({ env: new Proxy({}, { get: (_t, key: string) => envValues[key] }) }));
 
-const { mediaIndexReadiness } = await import('../src/worker/mediaIndexReadiness.js');
+const { mediaIndexReadiness, watchMediaIndexRecovery } = await import('../src/worker/mediaIndexReadiness.js');
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -112,6 +112,59 @@ describe('a blip at startup is not a verdict', () => {
       expect.stringContaining('could not be resolved'),
       expect.objectContaining({ attempts: 3 }),
     );
+  });
+
+  it('keeps asking after a startup outage, and starts the consumer when Modal comes back', async () => {
+    // The gap a bounded startup retry leaves. Six seconds of retries covers a
+    // blip; a Modal incident lasting minutes would otherwise leave indexing
+    // off for this process's whole life, while uploads keep queueing jobs
+    // nothing consumes — recoverable only by somebody noticing and restarting
+    // a worker that looks completely healthy.
+    vi.useFakeTimers();
+    const onReady = vi.fn();
+    const check = vi.fn<[], Promise<boolean>>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+
+    watchMediaIndexRecovery(onReady, { intervalMs: 1_000, check });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onReady).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onReady).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onReady).toHaveBeenCalledTimes(1);
+
+    // And then it stops: the queue now has a consumer, and a second one would
+    // read the same jobs twice.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(onReady).toHaveBeenCalledTimes(1);
+    expect(check).toHaveBeenCalledTimes(3);
+  });
+
+  it('survives a probe that rejects, and keeps trying', async () => {
+    // A thrown re-check must never take the worker down over an optional
+    // feature — and must not end the watch either, or one bad probe becomes
+    // the permanent outage this whole mechanism exists to prevent.
+    vi.useFakeTimers();
+    const onReady = vi.fn();
+    const check = vi.fn<[], Promise<boolean>>()
+      .mockRejectedValueOnce(new Error('modal client blew up'))
+      .mockResolvedValue(true);
+
+    watchMediaIndexRecovery(onReady, { intervalMs: 1_000, check });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onReady).not.toHaveBeenCalled();
+    expect(logWarn).toHaveBeenCalledWith(
+      'media index readiness re-check failed',
+      expect.objectContaining({ err: expect.any(Error) }),
+    );
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onReady).toHaveBeenCalledTimes(1);
   });
 
   it('does not retry a name that will never resolve', async () => {

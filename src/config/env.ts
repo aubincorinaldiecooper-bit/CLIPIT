@@ -348,6 +348,20 @@ const envSchema = z.object({
   MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
   MEDIA_INDEX_MAX_RETRIES: int(2, 0, 5),
   /**
+   * How often a worker that found Modal unreachable at startup asks again.
+   *
+   * The startup check retries over a few seconds, which covers a blip during a
+   * deploy but not an outage lasting minutes. Without this, such an outage
+   * leaves indexing off for the process's whole lifetime while uploads keep
+   * queueing work nothing consumes — and recovery needs a human to notice and
+   * restart a worker that looks entirely healthy.
+   *
+   * A minute: cheap enough to be invisible (resolving a deployment does not
+   * start a GPU) and short enough that recovery is measured in minutes rather
+   * than however long it takes somebody to look.
+   */
+  MEDIA_INDEX_RECHECK_INTERVAL_MS: int(60_000, 5_000, 3_600_000),
+  /**
    * How long a run may say nothing before it is presumed to have stopped.
    *
    * A live run writes its progress after every batch of windows, so silence is

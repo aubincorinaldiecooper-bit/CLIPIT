@@ -15,7 +15,7 @@ import {
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
 import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVideo.js';
-import { mediaIndexReadiness } from './mediaIndexReadiness.js';
+import { mediaIndexReadiness, watchMediaIndexRecovery } from './mediaIndexReadiness.js';
 import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
@@ -160,6 +160,32 @@ async function main(): Promise<void> {
   }
 
   const mediaIndexReady = await mediaIndexReadiness();
+
+  /**
+   * If Modal was down when this worker booted, keep asking.
+   *
+   * The startup check retries for a few seconds, which covers a blip but not
+   * an outage: a Modal incident lasting minutes would otherwise leave indexing
+   * off for this process's whole lifetime, while uploads keep queueing jobs
+   * nothing consumes. Recovery would then need somebody to notice and restart
+   * a worker that looks perfectly healthy.
+   *
+   * So the readiness question is asked again on a timer until it is answered
+   * yes, and the consumer starts then. Queued jobs are picked up at that
+   * point: delayed, not lost. The timer is unref'd so it never holds the
+   * process open, and it stops the moment the queue is being consumed.
+   *
+   * Only when the feature is switched ON: a deliberate MEDIA_INDEX_ENABLED
+   * =false must never start a consumer behind the operator's back.
+   */
+  if (env.MEDIA_INDEX_ENABLED && !mediaIndexReady) {
+    watchMediaIndexRecovery(() => {
+      startWorker(QUEUE_NAMES.mediaIndexing, handleMediaIndexing, env.MEDIA_INDEX_CONCURRENCY);
+      logger.info('media index recovered; reading videos into vectors again', {
+        queue: QUEUE_NAMES.mediaIndexing,
+      });
+    });
+  }
 
   startWorker(QUEUE_NAMES.ingestion, handleIngestion, env.INGESTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.preprocessing, handlePreprocessing, env.PREPROCESS_CONCURRENCY);
