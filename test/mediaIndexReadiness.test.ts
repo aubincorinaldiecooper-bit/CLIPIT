@@ -209,23 +209,19 @@ describe('a blip at startup is not a verdict', () => {
     expect(onReady).toHaveBeenCalledTimes(1);
   });
 
-  it('gives up on a probe that never answers, instead of holding every queue', async () => {
-    // This runs before ANY consumer starts, and resolving a Modal deployment
-    // awaits network calls with no deadline of their own. A stalled lookup
-    // would hold ingestion, transcription, search and rendering behind the
-    // health check of a feature none of them need — for as long as the socket
-    // stayed open. Non-fatal was not the same as non-blocking.
-    vi.useFakeTimers();
-    assertMediaIndexDeploymentsAvailable.mockImplementation(() => new Promise(() => {}));
+  it('hands each probe the deadline, rather than racing it from out here', async () => {
+    // Where the bound lives matters, and getting it wrong shipped a leak. A
+    // race out here abandons the WAIT and leaves the lookup running: the probe
+    // stays suspended, its cleanup never runs, and its client is never closed
+    // — one per retry, one per recovery cycle, for as long as the outage
+    // lasts. Only the probe holds the client whose closing actually ends the
+    // call, so the deadline goes with it. That the probe honours it is proven
+    // against a lookup that never settles in modalHandleReset.
+    assertMediaIndexDeploymentsAvailable.mockResolvedValue(undefined);
 
-    const readiness = mediaIndexReadiness({ probeTimeoutMs: 5_000 });
-    await vi.runAllTimersAsync();
+    await expect(mediaIndexReadiness({ probeTimeoutMs: 5_000 })).resolves.toBe(true);
 
-    await expect(readiness).resolves.toBe(false);
-    expect(logError).toHaveBeenCalledWith(
-      expect.stringContaining('could not be resolved'),
-      expect.objectContaining({ err: expect.any(Error) }),
-    );
+    expect(assertMediaIndexDeploymentsAvailable).toHaveBeenCalledWith(5_000);
   });
 
   it('does not retry a name that will never resolve', async () => {

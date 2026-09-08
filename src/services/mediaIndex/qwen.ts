@@ -51,12 +51,16 @@ const RERANK: ModalTarget = {
  * free — and it is the check whose supposed absence was once the argument for
  * shipping the whole feature switched off.
  */
-export async function assertMediaIndexDeploymentsAvailable(): Promise<void> {
+export async function assertMediaIndexDeploymentsAvailable(timeoutMs: number): Promise<void> {
   // Both, always, and the reranker is not optional to check: a working
   // embedder with a missing reranker indexes every video successfully and then
   // fails at the first question, which is the more expensive half to discover.
-  await probeModalTarget(EMBED_VIDEO);
-  await probeModalTarget(RERANK);
+  //
+  // The budget is per target rather than shared: each probe must own a
+  // deadline it can act on, because only the probe holds the client whose
+  // closing is what actually ends a hung lookup.
+  await probeModalTarget(EMBED_VIDEO, timeoutMs);
+  await probeModalTarget(RERANK, timeoutMs);
 }
 
 export interface IntervalRequest {

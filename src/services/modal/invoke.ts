@@ -106,7 +106,7 @@ export function resetModalHandles(): void {
  * notices. The cost is one connection set up and torn down per probe, which is
  * the right price for a check that runs once a minute at worst.
  */
-export async function probeModalTarget(target: ModalTarget): Promise<void> {
+export async function probeModalTarget(target: ModalTarget, timeoutMs: number): Promise<void> {
   if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
     throw new ExternalServiceError(target.label, `${target.label} is not configured`, { retryable: false });
   }
@@ -117,11 +117,50 @@ export async function probeModalTarget(target: ModalTarget): Promise<void> {
     environment: env.MODAL_ENVIRONMENT,
   });
 
+  /**
+   * The deadline lives HERE, holding the client, and not in a Promise.race
+   * around this call.
+   *
+   * A race abandons the wait; it does not touch the work. The await below
+   * stays suspended, so the `finally` never runs and the client is never
+   * closed — measured, not assumed: a finally after an await on a promise that
+   * never settles does not execute when the caller races out. Every startup
+   * retry and every recovery cycle would leave another client and another open
+   * call behind, which is the leak this whole design was meant to end.
+   *
+   * Closing the client is the cancellation. The pending lookup rejects
+   * (ClientClosedError), which unwinds this function normally and lets the
+   * cleanup run — so the deadline ends the work rather than merely giving up
+   * on hearing about it.
+   */
+  let timedOut = false;
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    try {
+      probe.close();
+    } catch {
+      // Nothing to do: the point was to end the call, and a client that
+      // refuses to close is already unusable.
+    }
+  }, timeoutMs);
+  deadline.unref();
+
   try {
     const cls = await probe.cls.fromName(target.app, target.className);
     const instance = await cls.instance();
     instance.method(target.method);
   } catch (error) {
+    // A close that ended the lookup surfaces as whatever the SDK throws for a
+    // closed client, which says nothing useful about the deployment. Report
+    // the timeout instead, and as retryable: a probe that ran out of time has
+    // not established that anything is wrong with the app.
+    if (timedOut) {
+      throw new ExternalServiceError(
+        target.label,
+        `Modal did not resolve ${target.app}/${target.className} within ${timeoutMs}ms`,
+        { retryable: true, cause: error },
+      );
+    }
     const failure = classify(target, error);
     if (!failure.retryable) {
       throw new ExternalServiceError(
@@ -133,9 +172,9 @@ export async function probeModalTarget(target: ModalTarget): Promise<void> {
     }
     throw failure;
   } finally {
-    // Ends this probe's own call, whether it answered, failed, or was
-    // abandoned by a deadline. Swallowed: a health check must not fail on its
-    // own cleanup.
+    clearTimeout(deadline);
+    // Ends this probe's own call whether it answered or failed. Already closed
+    // when the deadline fired; closing twice is why this is swallowed.
     try {
       probe.close();
     } catch {

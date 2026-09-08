@@ -194,6 +194,39 @@ suite('a run can recognise its own identity', () => {
     await client.query("DELETE FROM media_index_fence_probe WHERE video_id = 'video-retained'");
   });
 
+  it('queueing a replacement revokes the run that was in flight', async () => {
+    // Re-processing replaces the footage at the same key. Preprocessing writes
+    // `queued` for the new attempt, and until this the old run's id stayed on
+    // the row — so a handler still working on the REPLACED footage passed
+    // every fence and could store its windows and its coverage over the top,
+    // describing a video that no longer exists.
+    //
+    // Nulling run_id on the queued transition revokes the old run atomically
+    // with the queueing, before the replacement opens one of its own.
+    const inFlight = await openRun('video-replaced');
+    expect(await fencePasses('video-replaced', inFlight)).toBe(true);
+
+    // What preprocessing does when the footage is replaced.
+    await client.query(
+      "UPDATE media_index_fence_probe SET run_id = NULL WHERE video_id = 'video-replaced'",
+    );
+
+    // The old handler writes on. Nothing of its lands.
+    expect(await fencePasses('video-replaced', inFlight)).toBe(false);
+
+    // And a null id is not a wildcard: it must not match anything either.
+    const wildcard = await client.query(
+      'SELECT 1 FROM media_index_fence_probe WHERE video_id = $1 AND run_id IS NOT NULL AND run_id = $2',
+      ['video-replaced', inFlight],
+    );
+    expect(wildcard.rowCount).toBe(0);
+
+    // The replacement opens its own run and owns the row from there.
+    const replacement = await openRun('video-replaced');
+    expect(replacement).not.toBe(inFlight);
+    expect(await fencePasses('video-replaced', replacement)).toBe(true);
+  });
+
   it('keeps started_at round-trippable, since it is still read into a Date', async () => {
     // No longer the identity, but still handed to JavaScript for reporting. A
     // stored value that cannot survive that trip is a trap either way.

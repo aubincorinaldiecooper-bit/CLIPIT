@@ -42,36 +42,6 @@ import { assertMediaIndexDeploymentsAvailable } from '../services/mediaIndex/qwe
  */
 const PROBE_TIMEOUT_MS = 15_000;
 
-/** Resolves to the promise's value, or rejects once the deadline passes. */
-async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      work,
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
-        timer.unref();
-      }),
-    ]);
-  } finally {
-    // The losing timer is always cleared, so a slow-but-successful probe does
-    // not leave a pending rejection behind it.
-    if (timer) clearTimeout(timer);
-  }
-}
-
-/**
- * One probe, bounded.
- *
- * Nothing is cleaned up here, and that is the point: probeModalTarget builds a
- * client of its own and closes it in a finally, so an abandoned probe ends its
- * own call and leaves no cached handle behind for the next one to adopt. This
- * only has to stop the WAIT — the work is already accounted for.
- */
-async function probeWithin(timeoutMs: number): Promise<void> {
-  await withDeadline(assertMediaIndexDeploymentsAvailable(), timeoutMs);
-}
-
 /**
  * Keep asking, when Modal was down at boot.
  *
@@ -172,7 +142,7 @@ export async function mediaIndexReadiness(
   const attempts = 3;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      await probeWithin(options.probeTimeoutMs ?? PROBE_TIMEOUT_MS);
+      await assertMediaIndexDeploymentsAvailable(options.probeTimeoutMs ?? PROBE_TIMEOUT_MS);
       logger.info('media index deployments available', naming);
       return true;
     } catch (error) {

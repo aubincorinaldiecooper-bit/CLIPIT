@@ -220,7 +220,7 @@ export async function storeIndexedWindows(
     // overlapping attempt writes nothing rather than overwriting the newer
     // run's work with vectors that every read would then filter out.
     const current = await client.query(
-      `SELECT 1 FROM media_index_status WHERE video_id = $1 AND run_id = $2`,
+      `SELECT 1 FROM media_index_status WHERE video_id = $1 AND run_id IS NOT NULL AND run_id = $2`,
       [videoId, runId],
     );
     if (current.rowCount === 0) return 0;
@@ -435,7 +435,7 @@ export async function touchMediaIndexRun(videoId: string, runId: string): Promis
     const result = await client.query(
       `UPDATE media_index_status
           SET updated_at = now()
-        WHERE video_id = $1 AND run_id = $2 AND state = 'running'`,
+        WHERE video_id = $1 AND run_id IS NOT NULL AND run_id = $2 AND state = 'running'`,
       [videoId, runId],
     );
     return (result.rowCount ?? 0) > 0;
@@ -481,11 +481,18 @@ export async function setMediaIndexStatus(
        index_version           = COALESCE($10, media_index_status.index_version),
        error                   = CASE WHEN $14 THEN $11 ELSE media_index_status.error END,
        started_at              = COALESCE($12, media_index_status.started_at),
+       -- Queueing REVOKES the previous run. Without this the old run's id
+       -- stays on the row, so a handler still in flight over footage that has
+       -- since been replaced passes every fence and writes windows describing
+       -- a video that is gone. The queued state is written by preprocessing
+       -- alone and means exactly "a new attempt is coming", so nothing from
+       -- the old one may land after it.
+       run_id                  = CASE WHEN $2 = 'queued' THEN NULL ELSE media_index_status.run_id END,
        finished_at             = CASE WHEN $15 THEN NULL
                                       ELSE COALESCE($13, media_index_status.finished_at) END,
        updated_at              = now()`;
 
-  const fence = `($16::uuid IS NULL OR media_index_status.run_id = $16)
+  const fence = `($16::uuid IS NULL OR (media_index_status.run_id IS NOT NULL AND media_index_status.run_id = $16))
        AND ($17::text[] IS NULL OR media_index_status.state = ANY($17))`;
 
   const text = fenced
