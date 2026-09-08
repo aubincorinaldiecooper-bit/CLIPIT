@@ -33,17 +33,39 @@ export function coveredThroughSeconds(planned: readonly IndexWindow[], storedKey
  * act on. A bare covered-through figure hides which parts came back.
  */
 export function unreadRanges(planned: readonly IndexWindow[], storedKeys: ReadonlySet<string>, key: (window: IndexWindow) => string): IndexWindow[] {
-  const gaps: IndexWindow[] = [];
-  for (const window of planned) {
-    if (storedKeys.has(key(window))) continue;
-    const previous = gaps[gaps.length - 1];
-    // Windows overlap by design, so consecutive misses are one stretch of
-    // footage nobody looked at, not several.
+  // The seconds SOME stored window covers, merged into solid blocks.
+  //
+  // Not "the windows that are missing". The grid overlaps by design — ten
+  // second windows every five — so a window that failed is mostly covered by
+  // its neighbours, and reporting its whole span as unread invents a gap
+  // where the footage was in fact examined. That sends somebody looking again
+  // at seconds already searched, and makes every real gap less believable.
+  const examined = planned
+    .filter((window) => storedKeys.has(key(window)))
+    .sort((a, b) => a.startSeconds - b.startSeconds);
+
+  const blocks: IndexWindow[] = [];
+  for (const window of examined) {
+    const previous = blocks[blocks.length - 1];
     if (previous && window.startSeconds <= previous.endSeconds) {
       previous.endSeconds = Math.max(previous.endSeconds, window.endSeconds);
       continue;
     }
-    gaps.push({ startSeconds: window.startSeconds, endSeconds: window.endSeconds });
+    blocks.push({ startSeconds: window.startSeconds, endSeconds: window.endSeconds });
   }
+
+  // What is left is what nobody looked at: the complement of those blocks
+  // within the span the grid was planned over.
+  const spanStart = planned[0]?.startSeconds ?? 0;
+  const spanEnd = planned.reduce((furthest, window) => Math.max(furthest, window.endSeconds), spanStart);
+
+  const gaps: IndexWindow[] = [];
+  let cursor = spanStart;
+  for (const block of blocks) {
+    if (block.startSeconds > cursor) gaps.push({ startSeconds: cursor, endSeconds: block.startSeconds });
+    cursor = Math.max(cursor, block.endSeconds);
+  }
+  if (cursor < spanEnd) gaps.push({ startSeconds: cursor, endSeconds: spanEnd });
+
   return gaps;
 }

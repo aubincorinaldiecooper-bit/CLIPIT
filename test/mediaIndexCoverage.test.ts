@@ -68,16 +68,33 @@ describe('unreadRanges', () => {
     ]);
   });
 
-  it('merges overlapping windows, which the real plan always has', () => {
-    // The shipped plan overlaps: 10s windows every 5s. Two consecutive misses
-    // describe 15 seconds of footage, not two separate 10-second holes.
-    const overlapping = planWindows(60, { windowSeconds: 10, strideSeconds: 5, minWindowSeconds: 3 });
-    const missing = new Set(overlapping.map(windowKey));
-    const stored = new Set([...missing].filter((key) => key !== [...missing][2] && key !== [...missing][3]));
+  it('reports only the seconds no stored window covers, not the whole missing window', () => {
+    // Corrected: this test previously asserted the gap would be LONGER than a
+    // window. That encoded the wrong behaviour. The shipped plan overlaps —
+    // ten-second windows every five — so a window that failed is mostly
+    // covered by its neighbours, and calling its whole span unread invents a
+    // gap over footage that was examined.
+    //
+    // Windows 10–20 and 15–25 are missing from a 60-second video. 0–10 and
+    // 5–15 still cover up to 15, and 20–30 picks up at 20. Exactly five
+    // seconds — 15 to 20 — were covered by nothing else.
+    const plan = { windowSeconds: 10, strideSeconds: 5, minWindowSeconds: 3 };
+    const overlapping = planWindows(60, plan);
+    const stored = new Set(
+      overlapping.filter((_, index) => index !== 2 && index !== 3).map(windowKey),
+    );
 
-    const gaps = unreadRanges(overlapping, stored, windowKey);
-    expect(gaps).toHaveLength(1);
-    expect(gaps[0]!.endSeconds - gaps[0]!.startSeconds).toBeGreaterThan(10);
+    expect(unreadRanges(overlapping, stored, windowKey)).toEqual([{ startSeconds: 15, endSeconds: 20 }]);
+  });
+
+  it('reports nothing unread when a missing window is fully covered by its neighbours', () => {
+    // One window out of an overlapping grid leaves no uncovered second at
+    // all. Reporting a gap here would send somebody looking again at footage
+    // that was searched.
+    const overlapping = planWindows(60, { windowSeconds: 10, strideSeconds: 5, minWindowSeconds: 3 });
+    const stored = new Set(overlapping.filter((_, index) => index !== 3).map(windowKey));
+
+    expect(unreadRanges(overlapping, stored, windowKey)).toEqual([]);
   });
 
   it('treats a whole unread video as one stretch', () => {
