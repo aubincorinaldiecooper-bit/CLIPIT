@@ -215,6 +215,14 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         // video never carries a dead copy of itself. Rows matching this exact
         // provenance survive, which is what makes a resumed run cheap.
         const opened = await beginIndexRun(videoId, provenance);
+        if (!opened) {
+          // Retention claimed the footage while the first batch was in the
+          // air. Nothing to index and nothing to say: the status rows are
+          // already deleted, and writing one back would describe a video that
+          // has been removed as though it were being read.
+          log.info('the footage was claimed for deletion before the run could open', { videoId });
+          return;
+        }
         runId = opened.runId;
         // From here the run owns the row, so from here it says it is alive —
         // on its own timer, not when batches happen to finish. A batch may

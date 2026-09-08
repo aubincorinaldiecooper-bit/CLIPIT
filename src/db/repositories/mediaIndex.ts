@@ -247,6 +247,16 @@ export interface IndexSnapshot {
   runStartedAt: Date | null;
   /** Its coverage, likewise — so the two can never describe different runs. */
   coveredThroughSeconds: number;
+  /**
+   * WHICH FOOTAGE these vectors describe.
+   *
+   * Read in the same query for the same reason as the rest: so a caller can
+   * check the vectors against the video that exists NOW. The proxy key is
+   * mutable and re-processing overwrites it, so vectors can outlive the
+   * footage they were made from — and the model-identity check catches a
+   * changed model, not changed pictures.
+   */
+  sourceIdentity: string;
 }
 
 /**
@@ -274,9 +284,10 @@ export async function listIndexedWindows(videoId: string): Promise<IndexSnapshot
     dims: number;
     run_started_at: Date | null;
     covered_through_seconds: string | number;
+    source_identity: string;
   }>(
     `SELECT m.window_key, m.start_seconds, m.end_seconds, m.embedding, m.dims,
-            s.started_at AS run_started_at, s.covered_through_seconds
+            s.started_at AS run_started_at, s.covered_through_seconds, s.source_identity
        FROM media_index m
        JOIN media_index_status s ON s.video_id = m.video_id
       WHERE m.video_id = $1
@@ -298,6 +309,7 @@ export async function listIndexedWindows(videoId: string): Promise<IndexSnapshot
     })),
     runStartedAt: rows[0]?.run_started_at ?? null,
     coveredThroughSeconds: Number(rows[0]?.covered_through_seconds ?? 0),
+    sourceIdentity: rows[0]?.source_identity ?? '',
   };
 }
 
@@ -550,12 +562,29 @@ export async function setMediaIndexStatus(
 export async function beginIndexRun(
   videoId: string,
   provenance: WindowProvenance,
-): Promise<{ cleared: number; retained: string[]; runId: string }> {
+): Promise<{ cleared: number; retained: string[]; runId: string } | null> {
   // One transaction. Deleting the old index and recording the new run are a
   // single act: if the status write failed on its own, the previous index
   // would be gone while its status still read `ready`, and every search would
   // see a finished index with nothing in it until some later run repaired it.
   return withTransaction(async (client) => {
+    // Retention's claim comes first. storeIndexedWindows already locks this
+    // row before writing windows; opening a run did not, so retention could
+    // claim a video and delete both index tables while the first embedding
+    // call was still in flight, and this would then recreate a `running`
+    // status for footage that no longer exists — a deleted video reported as
+    // being indexed, for ever, with nothing to correct it.
+    //
+    // Same lock, same conditions: retention blocks until this commits, and a
+    // claim that got here first makes this find nothing and open nothing.
+    const claimable = await client.query(
+      `SELECT 1 FROM videos
+        WHERE id = $1 AND footage_expired_at IS NULL AND footage_claimed_at IS NULL
+        FOR UPDATE`,
+      [videoId],
+    );
+    if (claimable.rowCount === 0) return null;
+
     const removed = await client.query(
       `DELETE FROM media_index
         WHERE video_id = $1

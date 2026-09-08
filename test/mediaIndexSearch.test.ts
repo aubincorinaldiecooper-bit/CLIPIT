@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   decideIndexAnswer,
+  footageWasReplaced,
   foldIntoMoments,
   keepRelevant,
   rankWindows,
@@ -32,6 +33,35 @@ function status(over: Partial<MediaIndexStatus> = {}): MediaIndexStatus {
 }
 
 const base: IndexDecisionInput = { enabled: true, correcting: false, mode: 'visual', status: status() };
+
+describe('vectors that describe footage the video no longer has', () => {
+  /**
+   * The handler voids a run when it notices the proxy was swapped. That
+   * noticing is a database write, and when it fails the row keeps its old
+   * identity and every window stays searchable — so a question would come back
+   * with moments, and timestamps, from a video that is gone. Not a worse
+   * answer: an answer about something else.
+   */
+  it('are refused when the stored identity disagrees with the footage', () => {
+    expect(footageWasReplaced('sha-original', 'sha-replaced')).toBe(true);
+  });
+
+  it('are used when they match', () => {
+    expect(footageWasReplaced('sha-original', 'sha-original')).toBe(false);
+  });
+
+  it('are used when nothing recorded what they were built from', () => {
+    // Rows written before identities were tracked. Refusing these would retire
+    // working indexes over a value nobody ever set.
+    expect(footageWasReplaced('', 'sha-anything')).toBe(false);
+  });
+
+  it('are used when the video has no readable footage to compare against', () => {
+    // Nothing to compare is not evidence of a mismatch, and the coverage rules
+    // already decide what an index with no footage behind it may answer.
+    expect(footageWasReplaced('sha-original', null)).toBe(false);
+  });
+});
 
 describe('a read that stopped is never described as a read still going', () => {
   /**

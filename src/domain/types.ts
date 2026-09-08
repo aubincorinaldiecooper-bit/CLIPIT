@@ -68,7 +68,9 @@ export type FallbackReason =
   | 'provenance_changed'
   | 'index_failed'
   /** A read that opened, stopped, and never got to say why. */
-  | 'index_stopped';
+  | 'index_stopped'
+  /** The vectors describe footage the video no longer has. */
+  | 'index_footage_replaced';
 
 /**
  * What a person thought of a match.

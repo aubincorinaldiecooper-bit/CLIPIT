@@ -47,7 +47,18 @@ export type IndexFallbackReason =
    * that reading is still in progress, forever, for a video nothing is
    * touching.
    */
-  | 'index_stopped';
+  | 'index_stopped'
+  /**
+   * The vectors describe footage this video no longer has.
+   *
+   * The analysis proxy lives at a fixed key and re-processing overwrites it,
+   * so vectors can outlive the pictures they were made from. The handler voids
+   * a run when it notices — but that noticing is a database write, and when it
+   * fails the row keeps its old identity and every window stays searchable.
+   * Answering from those would return moments, with timestamps, from a video
+   * that is gone: not a worse answer, an answer about something else.
+   */
+  | 'index_footage_replaced';
 
 export type IndexDecision =
   | { use: 'index' }
@@ -71,6 +82,30 @@ export interface IndexDecisionInput {
    * silence for longer than this is not slowness.
    */
   staleAfterMs?: number;
+}
+
+/**
+ * Do these vectors still describe this video?
+ *
+ * The analysis proxy lives at a fixed key and re-processing overwrites it, so
+ * vectors can outlive the pictures they were made from. The handler voids a
+ * run when it notices the swap — but that noticing is a database write, and
+ * when it fails the row keeps its old identity and every window stays
+ * searchable. Answering from those returns moments, with timestamps, from a
+ * video that is gone: not a worse answer, an answer about something else.
+ *
+ * The model-provenance check catches a changed MODEL. Nothing else catches
+ * changed pictures, and from the outside the two failures look the same —
+ * confident, well-ordered, and about the wrong thing.
+ *
+ * An empty stored identity means "not recorded", from rows written before
+ * identities were tracked. Refusing those would retire working indexes over a
+ * value nobody ever set, so they are let through; a stored identity that
+ * exists and disagrees is the case worth stopping.
+ */
+export function footageWasReplaced(indexedSourceIdentity: string, currentSourceIdentity: string | null): boolean {
+  if (indexedSourceIdentity === '' || currentSourceIdentity === null) return false;
+  return indexedSourceIdentity !== currentSourceIdentity;
 }
 
 /**
