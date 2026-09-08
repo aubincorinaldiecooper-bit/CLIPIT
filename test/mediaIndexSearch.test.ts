@@ -80,16 +80,23 @@ describe('a read that stopped is never described as a read still going', () => {
     expect((decision as { detail: string }).detail).toContain('started and then stopped');
   });
 
-  it('treats a queued video that was never picked up the same way', () => {
-    // Queued and untouched for an hour is a job nothing consumed — the same
-    // lie by a different route.
+  it('never calls a long-queued video stopped — waiting in line is not failing', () => {
+    // This test asserted the opposite when it was written, and the assertion
+    // was wrong. A queued row is stamped once, when the job is enqueued, and
+    // then gets nothing until a worker picks it up. With indexing concurrency
+    // at 1, a healthy video sits behind a long one for as long as that one
+    // takes — so age measures the backlog, not whether anything broke.
+    //
+    // Calling that "started and stopped" would report a failure that never
+    // happened. "Not read yet" is the true answer for a video still in the
+    // queue, however long the queue is.
     const decision = decideIndexAnswer({
       ...base,
       ...stale,
       status: status({ state: 'queued', coveredThroughSeconds: 0, updatedAt: minutesAgo(90) }),
     });
 
-    expect(decision).toMatchObject({ reason: 'index_stopped' });
+    expect(decision).toMatchObject({ reason: 'index_not_ready' });
   });
 
   it('still answers from the part a stopped run did read', () => {

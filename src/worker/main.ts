@@ -15,7 +15,7 @@ import {
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
 import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVideo.js';
-import { assertMediaIndexDeploymentsAvailable } from '../services/mediaIndex/qwen.js';
+import { mediaIndexReadiness } from './mediaIndexReadiness.js';
 import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
@@ -95,14 +95,14 @@ function checkVideoProviderConfig(): void {
   if (env.VIDEO_PROVIDER === 'minicpm' && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
     throw new Error('VIDEO_PROVIDER=minicpm requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker');
   }
-  // Same rule, same reason: reading videos into vectors is Modal work, and
-  // this is the only process that does it. Checked here rather than in the
-  // shared config so a missing credential stops the indexing, not the API —
-  // an API that will not boot is an outage, and it would be an outage over a
-  // secret it is deliberately never given.
-  if (env.MEDIA_INDEX_ENABLED && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
-    throw new Error('MEDIA_INDEX_ENABLED=true requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker');
-  }
+  // The Media Index's own credential requirement is NOT checked here, and the
+  // reason is the one this function would otherwise get wrong twice over.
+  // Throwing here stops every worker before any of them start — ingestion,
+  // transcription, search, rendering — over a credential only the optional
+  // vector index needs. It is checked in mediaIndexReadiness() instead, which
+  // degrades that one feature and leaves the rest of the product running.
+  // MiniCPM stays fatal above because MiniCPM is how this product watches
+  // video; there is nothing left to degrade to.
 }
 
 async function checkBinaries(): Promise<void> {
@@ -159,49 +159,7 @@ async function main(): Promise<void> {
     });
   }
 
-  /**
-   * Are the two Qwen services actually deployed?
-   *
-   * Asked once here rather than discovered one upload at a time. Modal does
-   * not start a GPU to answer, so it costs nothing, and it turns "every video
-   * fails to index, hours apart, for reasons nobody reads" into one line at
-   * startup naming exactly what is missing.
-   *
-   * DELIBERATELY NOT FATAL, unlike the MiniCPM check above, and the difference
-   * is what each one is load-bearing for. MiniCPM is how this product watches
-   * video: without it there is no search worth running, so refusing to boot is
-   * honest. The Media Index only ADDS a way to answer — every question it
-   * cannot take still has the notes and the footage behind it. Killing the
-   * worker over it would stop ingestion, transcription, search and rendering
-   * for a feature none of them need, which trades a degraded extra for a total
-   * outage.
-   *
-   * So: loud, specific, and survivable. The queue is left unconsumed rather
-   * than consumed badly, because a job that fails on every attempt still burns
-   * retries and still writes a failure row per upload.
-   */
-  let mediaIndexReady = env.MEDIA_INDEX_ENABLED;
-  if (env.MEDIA_INDEX_ENABLED) {
-    try {
-      await assertMediaIndexDeploymentsAvailable();
-      logger.info('media index deployments available', {
-        environment: env.MODAL_ENVIRONMENT,
-        embedApp: env.MEDIA_INDEX_EMBED_APP,
-        rerankApp: env.MEDIA_INDEX_RERANK_APP,
-      });
-    } catch (error) {
-      mediaIndexReady = false;
-      // error, not warn: this is switched ON and not working. It must not read
-      // as routine, and it must name the remedy rather than the symptom.
-      logger.error('MEDIA_INDEX_ENABLED is on but its Modal services could not be resolved; videos will NOT be read into vectors', {
-        environment: env.MODAL_ENVIRONMENT,
-        embedApp: env.MEDIA_INDEX_EMBED_APP,
-        rerankApp: env.MEDIA_INDEX_RERANK_APP,
-        remedy: 'deploy both Modal apps, or set MEDIA_INDEX_ENABLED=false to stop asking for them',
-        err: error,
-      });
-    }
-  }
+  const mediaIndexReady = await mediaIndexReadiness();
 
   startWorker(QUEUE_NAMES.ingestion, handleIngestion, env.INGESTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.preprocessing, handlePreprocessing, env.PREPROCESS_CONCURRENCY);

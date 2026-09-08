@@ -76,11 +76,25 @@ export interface IndexDecisionInput {
 /**
  * A run that has gone quiet for longer than any batch could take.
  *
- * Only `queued` and `running` can go stale: every other state is terminal and
- * means somebody finished writing the truth down.
+ * ONLY `running`, and the exclusion of `queued` is the whole care of this
+ * function. A running row has a heartbeat: the handler writes its progress
+ * after every batch, so silence is evidence. A queued row has none — it is
+ * stamped once when the job is enqueued and then waits, and with indexing
+ * concurrency at 1 a perfectly healthy video can sit behind a long one for
+ * hours. Its age measures the size of the backlog, not whether anything is
+ * wrong, and calling that "stopped" would assert a failure that never
+ * happened — the exact move this file exists to prevent.
+ *
+ * The cost of that care is a job the queue genuinely dropped: it keeps saying
+ * "not read yet" rather than being noticed here. That is the right way round.
+ * Saying "not yet" about a video nobody got to is true but incomplete;
+ * saying "it stopped" about one waiting its turn is simply false, and telling
+ * the difference needs the queue itself, which this decision cannot see.
+ *
+ * Every other state is terminal: somebody finished writing the truth down.
  */
 function hasStopped(status: MediaIndexStatus, now: Date, staleAfterMs: number): boolean {
-  if (status.state !== 'queued' && status.state !== 'running') return false;
+  if (status.state !== 'running') return false;
   return now.getTime() - status.updatedAt.getTime() > staleAfterMs;
 }
 
