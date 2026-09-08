@@ -113,35 +113,27 @@ export interface WindowProvenance {
  * vectors of two different shapes in one video's index cannot be compared, and
  * would fail at search time as a bad answer instead of here as a bad write.
  */
-export async function storeIndexedWindows(
+/**
+ * The INSERT a batch of windows becomes, as text and bound values.
+ *
+ * Separated from the call so it can be checked without a database. It was
+ * shipped once with a placeholder that had no value behind it — every insert
+ * would have been rejected by Postgres for a parameter-count mismatch, and
+ * nothing caught it: TypeScript cannot see inside a SQL string, and no test
+ * here reaches a real server. The arithmetic is now something a test can hold
+ * to account.
+ */
+export function buildWindowInsert(
   videoId: string,
   windows: readonly IndexedWindow[],
   provenance: WindowProvenance,
   packVector: (values: readonly number[]) => Buffer,
-  /**
-   * The run these vectors belong to, as stamped when it opened.
-   *
-   * Two runs for one video can overlap — a stalled job redelivered while the
-   * original is still working. Both write the same window keys, and without
-   * this the older one overwrites rows the newer one already stored: the read
-   * filter then hides them, because they carry the older identity, while the
-   * newer run goes on reporting complete coverage. A video that reads as
-   * fully indexed and is not.
-   */
   runStartedAt: Date,
-): Promise<number> {
-  if (windows.length === 0) return 0;
-
-  const wrong = windows.find((window) => window.embedding.length !== provenance.dims);
-  if (wrong) {
-    throw new Error(
-      `window ${wrong.windowKey} has ${wrong.embedding.length} dimensions, not the ${provenance.dims} this index stores`,
-    );
-  }
-
+): { text: string; values: unknown[] } {
+  const PER_WINDOW = 8;
   const values: unknown[] = [];
   const tuples = windows.map((window, i) => {
-    const base = i * 8;
+    const base = i * PER_WINDOW;
     values.push(
       videoId,
       window.windowKey,
@@ -152,42 +144,16 @@ export async function storeIndexedWindows(
       provenance.model,
       provenance.revision,
     );
-    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${windows.length * 8 + 1}, $${windows.length * 8 + 2}, $${windows.length * 8 + 3})`;
+    const shared = windows.length * PER_WINDOW;
+    return (
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, ` +
+      `$${base + 6}, $${base + 7}, $${base + 8}, $${shared + 1}, $${shared + 2}, $${shared + 3})`
+    );
   });
-  values.push(provenance.indexVersion, provenance.sourceIdentity);
+  values.push(provenance.indexVersion, provenance.sourceIdentity, runStartedAt);
 
-  // Refused once retention has claimed or removed the footage.
-  //
-  // An indexing job in flight when someone deletes their video would
-  // otherwise recreate rows describing bytes that are already gone — and
-  // retention has run its delete by then, so the description outlives the
-  // video for good.
-  //
-  // SELECT ... FOR UPDATE rather than a check beforehand: it locks the video
-  // row for this transaction, so retention's claim blocks until these rows
-  // are committed, and a claim that got there first makes this write find
-  // nothing and store nothing. A plain check would leave exactly the gap
-  // that matters open.
-  return withTransaction(async (client) => {
-    const guard = await client.query(
-      `SELECT 1 FROM videos
-        WHERE id = $1 AND footage_expired_at IS NULL AND footage_claimed_at IS NULL
-        FOR UPDATE`,
-      [videoId],
-    );
-    if (guard.rowCount === 0) return 0;
-
-    // And the run that opened must still be the current one. An older,
-    // overlapping attempt finds its start time no longer stamped on the
-    // status row and writes nothing, rather than overwriting the newer run's
-    // work with vectors that will then be filtered out of every read.
-    const current = await client.query(
-      `SELECT 1 FROM media_index_status WHERE video_id = $1 AND started_at = $2`,
-      [videoId, runStartedAt],
-    );
-    if (current.rowCount === 0) return 0;
-
-    const result = await client.query(
+  return {
+    text:
       `INSERT INTO media_index
          (video_id, window_key, start_seconds, end_seconds, embedding, dims, model, revision, index_version, source_identity, run_started_at)
        VALUES ${tuples.join(', ')}
@@ -202,8 +168,62 @@ export async function storeIndexedWindows(
          source_identity = EXCLUDED.source_identity,
          run_started_at  = EXCLUDED.run_started_at,
          created_at      = now()`,
-      values,
+    values,
+  };
+}
+
+/**
+ * Stores a batch of embedded windows.
+ *
+ * An upsert on (video_id, window_key), because the window grid is
+ * deterministic: re-indexing rewrites the same windows rather than laying a
+ * second copy of the video beside the first.
+ *
+ * Returns 0 without storing anything when this attempt is no longer the
+ * current one, or when retention has claimed the footage. A caller that goes
+ * on counting windows it did not write would report coverage the index does
+ * not have.
+ */
+export async function storeIndexedWindows(
+  videoId: string,
+  windows: readonly IndexedWindow[],
+  provenance: WindowProvenance,
+  packVector: (values: readonly number[]) => Buffer,
+  runStartedAt: Date,
+): Promise<number> {
+  if (windows.length === 0) return 0;
+
+  const wrong = windows.find((window) => window.embedding.length !== provenance.dims);
+  if (wrong) {
+    throw new Error(
+      `window ${wrong.windowKey} has ${wrong.embedding.length} dimensions, not the ${provenance.dims} this index stores`,
     );
+  }
+
+  const statement = buildWindowInsert(videoId, windows, provenance, packVector, runStartedAt);
+
+  return withTransaction(async (client) => {
+    // Locks the video row for this transaction, so retention's claim blocks
+    // until these rows are committed, and a claim that got there first makes
+    // this write find nothing and store nothing.
+    const guard = await client.query(
+      `SELECT 1 FROM videos
+        WHERE id = $1 AND footage_expired_at IS NULL AND footage_claimed_at IS NULL
+        FOR UPDATE`,
+      [videoId],
+    );
+    if (guard.rowCount === 0) return 0;
+
+    // And the run that opened must still be the current one. An older,
+    // overlapping attempt writes nothing rather than overwriting the newer
+    // run's work with vectors that every read would then filter out.
+    const current = await client.query(
+      `SELECT 1 FROM media_index_status WHERE video_id = $1 AND started_at = $2`,
+      [videoId, runStartedAt],
+    );
+    if (current.rowCount === 0) return 0;
+
+    const result = await client.query(statement.text, statement.values);
     return result.rowCount ?? 0;
   });
 }
@@ -278,6 +298,15 @@ export interface StatusPatch {
   error?: string | null;
   startedAt?: Date;
   finishedAt?: Date;
+  /**
+   * Write only while this is still the run that owns the status row.
+   *
+   * The window fence stops an obsolete attempt storing vectors, but it wrote
+   * status regardless — so a superseded run could stamp its own counters and
+   * coverage over the live run's, and a partial index would read as fully
+   * ready. Progress and completion carry the run that produced them.
+   */
+  ifRunStartedAt?: Date;
 }
 
 /** States that mean the run is over, one way or another. */
@@ -363,7 +392,8 @@ export async function setMediaIndexStatus(
        started_at              = COALESCE($12, media_index_status.started_at),
        finished_at             = CASE WHEN $15 THEN NULL
                                       ELSE COALESCE($13, media_index_status.finished_at) END,
-       updated_at              = now()`,
+       updated_at              = now()
+     WHERE $16::timestamptz IS NULL OR media_index_status.started_at = $16`,
     [
       videoId,
       state,
@@ -380,6 +410,7 @@ export async function setMediaIndexStatus(
       patch.finishedAt ?? null,
       errorGiven,
       clearFinished,
+      patch.ifRunStartedAt ?? null,
     ] as never,
   );
 }

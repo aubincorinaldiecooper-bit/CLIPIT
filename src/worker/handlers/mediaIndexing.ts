@@ -200,7 +200,15 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         // provenance and runStartedAt are set together when the run opens,
         // which happens on the first batch — before any row can be stored.
         if (!runStartedAt) throw new Error('windows were ready before the run was opened');
-        await storeIndexedWindows(videoId, rows, provenance, packVector, runStartedAt);
+        const written = await storeIndexedWindows(videoId, rows, provenance, packVector, runStartedAt);
+        // Nothing stored means this attempt has been superseded, or the
+        // footage was claimed for deletion. Either way it must not go on
+        // counting windows it did not write: an obsolete run that keeps
+        // tallying would report coverage the index does not have.
+        if (written === 0) {
+          log.info('this indexing attempt is no longer the current one; stopping', { videoId });
+          return;
+        }
         for (const row of rows) stored.add(row.windowKey);
       }
       failures.push(...reply.failed);
@@ -225,6 +233,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         windowsStored: stored.size,
         windowsFailed: failures.length,
         coveredThroughSeconds: coveredThroughSeconds(planned, stored, windowKey),
+        ifRunStartedAt: runStartedAt ?? undefined,
       });
     }
 
@@ -234,7 +243,22 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
     // them are believed.
     const after = await sourceIdentity(proxyKey);
     if (after.identity !== source.identity) {
-      throw new Error('the analysis proxy was replaced while it was being indexed; these vectors describe two different videos');
+      // Recorded as unavailable with no coverage, NOT as a failure with a
+      // usable prefix. A failed run's prefix is searchable on purpose — those
+      // windows were read correctly, just not all of them. These were read
+      // from footage that has since been replaced, so every one of them
+      // describes a video that is gone. The next run clears them, because
+      // its source identity will not match.
+      await setMediaIndexStatus(videoId, 'unavailable', {
+        windowsStored: stored.size,
+        windowsFailed: failures.length,
+        coveredThroughSeconds: 0,
+        finishedAt: new Date(),
+        error: 'the analysis proxy was replaced while it was being indexed; these vectors describe two different videos',
+        ifRunStartedAt: runStartedAt ?? undefined,
+      }).catch(() => undefined);
+      log.warn('the footage was replaced mid-index; none of these vectors are believed', { videoId });
+      return;
     }
 
     const unread = unreadRanges(planned, stored, windowKey);
@@ -245,6 +269,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       windowsFailed: failures.length,
       coveredThroughSeconds: covered,
       finishedAt: new Date(),
+      ifRunStartedAt: runStartedAt ?? undefined,
       error: unread.length === 0
         ? null
         : `${unread.length} stretch(es) were not read: ${unread
@@ -272,6 +297,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       windowsFailed: failures.length,
       coveredThroughSeconds: coveredThroughSeconds(planned, stored, windowKey),
       finishedAt: new Date(),
+      ifRunStartedAt: runStartedAt ?? undefined,
       error: message,
     }).catch(() => undefined);
     log.error('media index failed', { videoId, err: error, stored: stored.size });
