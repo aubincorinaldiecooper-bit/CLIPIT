@@ -1,0 +1,243 @@
+import type { Job } from 'bullmq';
+import { env } from '../../config/env.js';
+import { logger } from '../../lib/logger.js';
+import { errorMessage } from '../../lib/errors.js';
+import { getStorage } from '../../services/storage/s3.js';
+import { getVideo } from '../../db/repositories/videos.js';
+import { recordModelUsage } from '../../db/repositories/usage.js';
+import {
+  beginIndexRun,
+  setMediaIndexStatus,
+  storeIndexedWindows,
+  type WindowProvenance,
+} from '../../db/repositories/mediaIndex.js';
+import { packVector } from '../../services/mediaIndex/vectors.js';
+import { coveredThroughSeconds, unreadRanges } from '../../services/mediaIndex/coverage.js';
+import { DEFAULT_WINDOW_PLAN, planWindows, windowKey, type IndexWindow } from '../../services/mediaIndex/windows.js';
+import { embedVideoIntervals } from '../../services/mediaIndex/qwen.js';
+import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
+import type { MediaIndexingJob } from '../../queues/index.js';
+
+/**
+ * Reading a video into vectors, once, at upload.
+ *
+ * The notes taken by the scene indexer are a model's summary of what it
+ * thought worth writing down. This is the other kind of memory: overlapping
+ * stretches of the timeline, each carrying a vector of what the pictures in
+ * it actually look like. A typed question can be compared against those
+ * without watching the video again, and — unlike the notes — their silence
+ * about a thing is not evidence the thing is absent, only that this stretch
+ * did not look like the question.
+ *
+ * Three promises this handler keeps, in order of how badly breaking them
+ * would hurt:
+ *
+ * It never claims to have read footage it did not read. Coverage is the
+ * contiguous prefix of stored windows, failures are counted rather than
+ * rounded away, and the stretches nobody looked at are named.
+ *
+ * It never mixes vectors from two runs. The provenance of the first batch
+ * becomes the run's identity; a later batch reporting different weights ends
+ * the run rather than storing a vector that is not comparable with the rest.
+ *
+ * It never indexes a video that has been replaced underneath it. The proxy
+ * key is mutable — re-processing overwrites the same object — so the source's
+ * content tag is read before and after, and a change voids the whole run.
+ */
+
+const log = logger.child({ handler: 'media-indexing' });
+
+/** How the run identifies itself and its rows. */
+function provenanceOf(reply: { model: string; revision: string; dims: number }): WindowProvenance {
+  return {
+    model: reply.model,
+    revision: reply.revision,
+    dims: reply.dims,
+    indexVersion: env.MEDIA_INDEX_VERSION,
+  };
+}
+
+function samePlace(a: WindowProvenance, b: WindowProvenance): boolean {
+  return a.model === b.model && a.revision === b.revision && a.dims === b.dims && a.indexVersion === b.indexVersion;
+}
+
+export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<void> {
+  const { videoId } = job.data;
+  const started = Date.now();
+
+  const video = await getVideo(videoId);
+  if (!video) {
+    log.warn('no such video; nothing to index', { videoId });
+    return;
+  }
+  // Footage already removed, or being removed. Indexing it would recreate a
+  // description of bytes that are going away, and retention has already run
+  // its delete — so the row would outlive the video it describes.
+  if (video.footageExpiredAt) {
+    await setMediaIndexStatus(videoId, 'unavailable', { error: 'the footage was removed before indexing began' });
+    return;
+  }
+  if (!video.proxyStorageKey || !video.durationSeconds) {
+    await setMediaIndexStatus(videoId, 'unavailable', {
+      error: !video.proxyStorageKey ? 'no analysis proxy to read' : 'the video has no known duration',
+    });
+    return;
+  }
+
+  const plan = {
+    windowSeconds: env.MEDIA_INDEX_WINDOW_SECONDS,
+    strideSeconds: env.MEDIA_INDEX_STRIDE_SECONDS,
+    minWindowSeconds: env.MEDIA_INDEX_MIN_WINDOW_SECONDS,
+  };
+  const planned = planWindows(video.durationSeconds, plan.windowSeconds ? plan : DEFAULT_WINDOW_PLAN);
+  if (planned.length === 0) {
+    await setMediaIndexStatus(videoId, 'unavailable', { error: 'the video is too short to plan a single window' });
+    return;
+  }
+
+  const proxyKey = video.proxyStorageKey;
+  const stored = new Set<string>();
+  const failures: Array<{ id: string; reason: string }> = [];
+  let provenance: WindowProvenance | null = null;
+
+  try {
+    // Read before the first signed URL is minted. The identity carries the
+    // store's tag for the CONTENT, so it changes when the bytes change.
+    const source = await sourceIdentity(proxyKey);
+    const batchSize = env.MEDIA_INDEX_BATCH_WINDOWS;
+
+    for (let offset = 0; offset < planned.length; offset += batchSize) {
+      const batch = planned.slice(offset, offset + batchSize);
+      // Re-signed per batch so a long run cannot expire halfway through.
+      const videoUrl = await getStorage().createDownloadUrl(proxyKey, {
+        expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
+      });
+      const batchStarted = Date.now();
+      const reply = await embedVideoIntervals({
+        videoUrl,
+        videoKey: source.identity,
+        expectedBytes: source.sizeBytes,
+        // The proxy IS the source timeline, so window seconds need no rebasing.
+        intervals: batch.map((window) => ({
+          id: windowKey(window),
+          start: window.startSeconds,
+          end: window.endSeconds,
+        })),
+      });
+
+      const here = provenanceOf(reply);
+      if (provenance === null) {
+        provenance = here;
+        // Opens the run and clears anything stored under other weights, so a
+        // video never carries a dead copy of itself. Rows matching this exact
+        // provenance survive, which is what makes a resumed run cheap.
+        const cleared = await beginIndexRun(videoId, provenance);
+        if (cleared > 0) log.info('cleared windows from an earlier run', { videoId, cleared, ...provenance });
+        await setMediaIndexStatus(videoId, 'running', { windowsPlanned: planned.length });
+      } else if (!samePlace(provenance, here)) {
+        // Mid-run the service began answering from different weights. Vectors
+        // from two sets of weights are no more comparable than vectors from
+        // two models, and there is no way to tell them apart afterwards.
+        throw new Error(
+          `the embedding service changed identity mid-run (${provenance.model}@${provenance.revision}/${provenance.dims} ` +
+            `→ ${here.model}@${here.revision}/${here.dims}); the vectors already stored are not comparable with the rest`,
+        );
+      }
+
+      const byKey = new Map(batch.map((window) => [windowKey(window), window]));
+      const rows = reply.embedded.flatMap((row) => {
+        const window = byKey.get(row.id);
+        // An id nobody asked for. The client already rejects unknown ids, so
+        // this is belt and braces; it is dropped and counted rather than
+        // stored against a window it might not describe.
+        if (!window) {
+          failures.push({ id: row.id, reason: 'the service answered about a window that was not asked for' });
+          return [];
+        }
+        return [{
+          windowKey: row.id,
+          startSeconds: window.startSeconds,
+          endSeconds: window.endSeconds,
+          embedding: Array.from(row.embedding),
+        }];
+      });
+
+      if (rows.length > 0) {
+        await storeIndexedWindows(videoId, rows, provenance, packVector);
+        for (const row of rows) stored.add(row.windowKey);
+      }
+      failures.push(...reply.failed);
+
+      await recordModelUsage({
+        videoId,
+        provider: 'modal',
+        model: reply.model,
+        stage: 'embedding',
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: Date.now() - batchStarted,
+        metrics: { windows: batch.length, embedded: rows.length, failed: reply.failed.length, ...reply.metrics },
+        startedAt: new Date(batchStarted),
+      });
+
+      // Written after every batch, not at the end, so a question asked while
+      // a long video is still being read can be answered from the part that
+      // has been read — with the unread part named.
+      await setMediaIndexStatus(videoId, 'running', {
+        windowsStored: stored.size,
+        windowsFailed: failures.length,
+        coveredThroughSeconds: coveredThroughSeconds(planned, stored, windowKey),
+      });
+    }
+
+    // The proxy key is mutable and re-processing overwrites it. If the bytes
+    // moved while this ran, some vectors describe one version of the video
+    // and some another, and nothing here can tell which is which — so none of
+    // them are believed.
+    const after = await sourceIdentity(proxyKey);
+    if (after.identity !== source.identity) {
+      throw new Error('the analysis proxy was replaced while it was being indexed; these vectors describe two different videos');
+    }
+
+    const unread = unreadRanges(planned, stored, windowKey);
+    const covered = coveredThroughSeconds(planned, stored, windowKey);
+    await setMediaIndexStatus(videoId, unread.length === 0 ? 'ready' : 'partial', {
+      windowsPlanned: planned.length,
+      windowsStored: stored.size,
+      windowsFailed: failures.length,
+      coveredThroughSeconds: covered,
+      finishedAt: new Date(),
+      error: unread.length === 0
+        ? null
+        : `${unread.length} stretch(es) were not read: ${unread
+            .slice(0, 5)
+            .map((gap) => `${gap.startSeconds.toFixed(1)}–${gap.endSeconds.toFixed(1)}s`)
+            .join(', ')}${unread.length > 5 ? ', …' : ''}`,
+    });
+
+    log.info('media index written', {
+      videoId,
+      planned: planned.length,
+      stored: stored.size,
+      failed: failures.length,
+      coveredThroughSeconds: covered,
+      ms: Date.now() - started,
+    });
+  } catch (error) {
+    const message = errorMessage(error);
+    // Whatever was stored before the failure stays stored and stays honest:
+    // coverage still says how far the unbroken read got, so a question about
+    // the early part of the video can still be answered from it.
+    await setMediaIndexStatus(videoId, 'failed', {
+      windowsPlanned: planned.length,
+      windowsStored: stored.size,
+      windowsFailed: failures.length,
+      coveredThroughSeconds: coveredThroughSeconds(planned, stored, windowKey),
+      finishedAt: new Date(),
+      error: message,
+    }).catch(() => undefined);
+    log.error('media index failed', { videoId, err: error, stored: stored.size });
+    throw error;
+  }
+}

@@ -19,6 +19,7 @@ import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
 import { handleIndexing } from './handlers/indexing.js';
+import { handleMediaIndexing } from './handlers/mediaIndexing.js';
 import { handleSimpleMemIndexing } from './handlers/simplememIndexing.js';
 import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
@@ -153,6 +154,13 @@ async function main(): Promise<void> {
   // second video indexing in parallel would only queue behind it while making
   // a search someone is waiting on wait longer.
   startWorker(QUEUE_NAMES.indexing, handleIndexing, 1);
+  // Reading a video into vectors is a GPU call per batch of windows, and the
+  // concurrency that matters is set on the Modal service, not here. One at a
+  // time locally keeps a long video from holding several signed URLs open and
+  // several downloads warm on the far side at once.
+  if (env.MEDIA_INDEX_ENABLED) {
+    startWorker(QUEUE_NAMES.mediaIndexing, handleMediaIndexing, env.MEDIA_INDEX_CONCURRENCY);
+  }
   // One at a time as well: a SimpleMem read is a captioning call per kept
   // frame, and the sidecar is one process on one box.
   startWorker(QUEUE_NAMES.simplememIndexing, handleSimpleMemIndexing, 1);

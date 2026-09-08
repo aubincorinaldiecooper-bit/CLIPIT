@@ -246,6 +246,20 @@ const envSchema = z.object({
    * the old rules is retired rather than quietly mixed with the new — which
    * would look exactly like working search and would not be.
    */
+  /**
+   * Read every uploaded video into vectors.
+   *
+   * Off by default, and deliberately so: turning it on starts a GPU call per
+   * batch of windows for every upload, and the two Modal services must
+   * actually be deployed for it to do anything but fail. Neither is a thing
+   * this process can check for itself, and a deploy that silently begins
+   * spending — or silently begins failing on every video — is not something
+   * to inherit by accident.
+   *
+   * This is a real switch, unlike the one it replaces: with it on, videos are
+   * indexed and questions consult the index.
+   */
+  MEDIA_INDEX_ENABLED: bool(false),
   MEDIA_INDEX_VERSION: z.string().trim().default('v1'),
   /**
    * The exact weights, when they are known. A model NAME is not an identity:
