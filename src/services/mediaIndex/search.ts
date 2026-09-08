@@ -65,11 +65,22 @@ export function decideIndexAnswer(input: IndexDecisionInput): IndexDecision {
   if (input.correcting) {
     return { use: 'fallback', reason: 'correction', detail: 'a correction re-reads the footage by rule' };
   }
-  // A question about what was SAID is not a question these vectors can
-  // answer. They describe pictures; the transcript is a different memory and
-  // already has its own path.
-  if (input.mode === 'transcript') {
-    return { use: 'fallback', reason: 'not_visual', detail: 'the question is about speech, and these vectors describe pictures' };
+  // These vectors describe pictures and nothing else.
+  //
+  // 'transcript' is obvious. 'both' is the one worth spelling out: a question
+  // that needs what was SEEN and what was SAID cannot be finished from half
+  // the evidence. Answering it from pictures alone would return a moment that
+  // satisfies one requirement while presenting it as satisfying both, and the
+  // spoken half would never be checked by anything. The existing multimodal
+  // search handles those.
+  if (input.mode !== 'visual') {
+    return {
+      use: 'fallback',
+      reason: 'not_visual',
+      detail: input.mode === 'transcript'
+        ? 'the question is about speech, and these vectors describe pictures'
+        : 'the question needs what was said as well as what was seen, and these vectors describe only pictures',
+    };
   }
   const status = input.status;
   if (!status) {
@@ -140,6 +151,57 @@ export function rankWindows(query: Float32Array, windows: readonly StoredWindow[
   return scored.slice(0, Math.max(0, topK));
 }
 
+export interface RelevanceRule {
+  /** Scores under this are not moments, whatever else they beat. */
+  minScore: number;
+  /**
+   * How far the best window must stand clear of a typical one, as a fraction
+   * of the spread. Zero disables the test.
+   */
+  minSeparation: number;
+}
+
+/**
+ * Which of the ranked windows are actually evidence.
+ *
+ * Without this the top of the list is always returned, so an indexed video
+ * answers EVERY visual question with its closest guess — however poor — and
+ * the notes and the footage are never reached. "There is no matching moment"
+ * becomes unreachable, which is the failure this product is built to avoid.
+ *
+ * Two tests, because neither alone is enough.
+ *
+ * An absolute floor, because a negative or near-zero similarity is not a
+ * match under any reading. It is a setting rather than a constant: these
+ * scores are not calibrated, and the right value has to come from measuring
+ * real footage rather than from anybody's intuition.
+ *
+ * And a separation test, which needs no calibration at all. If every window
+ * in the video scores about the same, the question does not distinguish
+ * anything in it — that is what "not in this video" looks like from here,
+ * whatever the absolute numbers happen to be. A question that IS answered by
+ * the footage produces a top score standing clear of the rest.
+ */
+export function keepRelevant(ranked: readonly ScoredWindow[], all: readonly ScoredWindow[], rule: RelevanceRule): ScoredWindow[] {
+  const above = ranked.filter((window) => window.score >= rule.minScore);
+  if (above.length === 0) return [];
+  if (rule.minSeparation <= 0) return [...above];
+
+  const scores = all.map((window) => window.score).sort((a, b) => a - b);
+  const lowest = scores[0] ?? 0;
+  const highest = scores[scores.length - 1] ?? 0;
+  const middle = scores[Math.floor(scores.length / 2)] ?? 0;
+  const spread = highest - lowest;
+  // Everything identical: nothing is distinguished, so nothing is evidence.
+  if (spread <= 0) return [];
+  if ((highest - middle) / spread < rule.minSeparation) return [];
+
+  // Keep only what stands clear of the middle, so low-scoring neighbours
+  // cannot later be folded into a hit and drag a moment across the video.
+  const floor = middle + (highest - middle) * rule.minSeparation;
+  return above.filter((window) => window.score >= floor);
+}
+
 /**
  * Neighbouring windows are one moment.
  *
@@ -147,12 +209,21 @@ export function rankWindows(query: Float32Array, windows: readonly StoredWindow[
  * several windows and a question that matches it matches all of them. Handing
  * a person the same moment three times is not three results.
  */
-export function foldIntoMoments(ranked: readonly ScoredWindow[]): ScoredWindow[] {
+export function foldIntoMoments(ranked: readonly ScoredWindow[], maxSeconds = Number.POSITIVE_INFINITY): ScoredWindow[] {
   const byTime = [...ranked].sort((a, b) => a.startSeconds - b.startSeconds);
   const moments: ScoredWindow[] = [];
   for (const window of byTime) {
     const previous = moments[moments.length - 1];
-    if (previous && window.startSeconds <= previous.endSeconds) {
+    // Merged only while the result stays a moment. The grid overlaps
+    // continuously, so without a ceiling a chain of adjacent windows folds
+    // into one result spanning the entire video — which is not a moment, it
+    // is the video, and handing that back is the same as finding nothing
+    // while looking like a hit.
+    if (
+      previous &&
+      window.startSeconds <= previous.endSeconds &&
+      Math.max(previous.endSeconds, window.endSeconds) - previous.startSeconds <= maxSeconds
+    ) {
       previous.endSeconds = Math.max(previous.endSeconds, window.endSeconds);
       previous.score = Math.max(previous.score, window.score);
       continue;
@@ -220,8 +291,15 @@ export async function searchMediaIndex(input: IndexSearchInput): Promise<IndexSe
     );
   }
 
-  const ranked = rankWindows(queryVector, input.windows, env.MEDIA_INDEX_TOP_K);
-  const moments = foldIntoMoments(ranked);
+  // Every window is scored so the separation test can see the whole
+  // distribution; only the shortlist is considered as evidence.
+  const all = rankWindows(queryVector, input.windows, input.windows.length);
+  const shortlist = all.slice(0, env.MEDIA_INDEX_TOP_K);
+  const relevant = keepRelevant(shortlist, all, {
+    minScore: env.MEDIA_INDEX_MIN_SCORE,
+    minSeparation: env.MEDIA_INDEX_MIN_SEPARATION,
+  });
+  const moments = foldIntoMoments(relevant, env.MAX_CLIP_SECONDS);
   if (moments.length === 0 || !input.rerank) {
     return {
       moments,

@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   decideIndexAnswer,
   foldIntoMoments,
+  keepRelevant,
   rankWindows,
   type IndexDecisionInput,
+  type ScoredWindow,
 } from '../src/services/mediaIndex/search.js';
 import type { MediaIndexStatus } from '../src/db/repositories/mediaIndex.js';
 import type { StoredWindow } from '../src/db/repositories/mediaIndex.js';
@@ -63,8 +65,16 @@ describe('decideIndexAnswer', () => {
     });
   });
 
-  it('takes a mixed question, because half of it is visual', () => {
-    expect(decideIndexAnswer({ ...base, mode: 'both', candidateCount: 2 })).toEqual({ use: 'index' });
+  it('will not finish a mixed question from pictures alone', () => {
+    // Corrected: this test previously asserted the opposite. A question that
+    // needs what was seen AND what was said cannot be answered from half the
+    // evidence — the moment would satisfy one requirement while being
+    // presented as satisfying both, and nothing would ever check the spoken
+    // half.
+    expect(decideIndexAnswer({ ...base, mode: 'both', candidateCount: 2 })).toMatchObject({
+      use: 'fallback',
+      reason: 'not_visual',
+    });
   });
 
   it('falls back when the video was never read', () => {
@@ -162,5 +172,77 @@ describe('foldIntoMoments', () => {
 
     expect(folded).toHaveLength(1);
     expect(folded[0]).toMatchObject({ startSeconds: 30, endSeconds: 50, score: 0.88 });
+  });
+});
+
+
+function scored(rows: Array<[string, number, number, number]>): ScoredWindow[] {
+  return rows.map(([windowKey, startSeconds, endSeconds, score]) => ({ windowKey, startSeconds, endSeconds, score }));
+}
+
+const rule = { minScore: 0.05, minSeparation: 0.35 };
+
+describe('keepRelevant', () => {
+  it('keeps a window that stands clear of the rest', () => {
+    const all = scored([['a', 0, 10, 0.82], ['b', 10, 20, 0.31], ['c', 20, 30, 0.28], ['d', 30, 40, 0.25]]);
+
+    expect(keepRelevant(all.slice(0, 3), all, rule).map((row) => row.windowKey)).toEqual(['a']);
+  });
+
+  it('keeps nothing when the question matches everything equally', () => {
+    // This is what "not in this video" looks like from the vectors: no window
+    // is distinguished, whatever the absolute numbers happen to be.
+    const all = scored([['a', 0, 10, 0.44], ['b', 10, 20, 0.43], ['c', 20, 30, 0.44], ['d', 30, 40, 0.43]]);
+
+    expect(keepRelevant(all, all, rule)).toEqual([]);
+  });
+
+  it('keeps nothing when every score is identical', () => {
+    const all = scored([['a', 0, 10, 0.5], ['b', 10, 20, 0.5]]);
+
+    expect(keepRelevant(all, all, rule)).toEqual([]);
+  });
+
+  it('refuses scores under the floor even when they stand out', () => {
+    const all = scored([['a', 0, 10, 0.02], ['b', 10, 20, -0.4], ['c', 20, 30, -0.5]]);
+
+    expect(keepRelevant(all, all, rule)).toEqual([]);
+  });
+
+  it('refuses a negative similarity, which is not a match under any reading', () => {
+    const all = scored([['a', 0, 10, -0.1], ['b', 10, 20, -0.8]]);
+
+    expect(keepRelevant(all, all, rule)).toEqual([]);
+  });
+
+  it('does not filter at all when separation is switched off', () => {
+    const all = scored([['a', 0, 10, 0.44], ['b', 10, 20, 0.43]]);
+
+    expect(keepRelevant(all, all, { minScore: 0.05, minSeparation: 0 })).toHaveLength(2);
+  });
+});
+
+describe('foldIntoMoments — the ceiling', () => {
+  it('does not turn a whole short video into one result', () => {
+    // Every window of a 60s video, overlapping continuously. Without a
+    // ceiling these fold into one 60-second "moment", which is the video
+    // rather than a moment — and looks like a hit while being none.
+    const everything = scored(
+      Array.from({ length: 11 }, (_, i) => [`w${i}`, i * 5, i * 5 + 10, 0.5] as [string, number, number, number]),
+    );
+
+    const capped = foldIntoMoments(everything, 30);
+
+    expect(capped.length).toBeGreaterThan(1);
+    for (const moment of capped) {
+      expect(moment.endSeconds - moment.startSeconds).toBeLessThanOrEqual(30);
+    }
+  });
+
+  it('still joins a genuinely short overlapping run', () => {
+    const folded = foldIntoMoments(scored([['a', 30, 40, 0.7], ['b', 35, 45, 0.9]]), 300);
+
+    expect(folded).toHaveLength(1);
+    expect(folded[0]).toMatchObject({ startSeconds: 30, endSeconds: 45 });
   });
 });

@@ -290,6 +290,28 @@ const envSchema = z.object({
    * GPU-second, so this stays low until measured — the same reasoning that
    * keeps MINICPM_VIDEO_CONCURRENCY at one.
    */
+  /**
+   * Below this a window is not a moment, whatever else it outscores.
+   *
+   * These are cosine similarities in Qwen's space and they are NOT
+   * calibrated: there is no measurement behind this number yet, and the right
+   * value has to come from real footage rather than intuition. It is a floor
+   * against the obviously-wrong (a negative or near-zero similarity is not a
+   * match under any reading), and the separation test below is what actually
+   * carries the decision.
+   */
+  MEDIA_INDEX_MIN_SCORE: num(0.05, 0, 1),
+  /**
+   * How far the best window must stand clear of a typical one, as a fraction
+   * of the spread across the whole video.
+   *
+   * This needs no calibration, which is why it does the real work. If every
+   * window scores about the same, the question distinguishes nothing in this
+   * video — that is what "not in here" looks like from the vectors, whatever
+   * the absolute numbers are. Zero disables it, and disabling it means the
+   * index answers every question with its closest guess.
+   */
+  MEDIA_INDEX_MIN_SEPARATION: num(0.35, 0, 1),
   /** Windows shortlisted from the vectors before the reranker watches them. */
   MEDIA_INDEX_TOP_K: int(20, 1, 200),
   MEDIA_INDEX_CONCURRENCY: int(1, 1, 8),
