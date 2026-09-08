@@ -32,6 +32,29 @@ const int = (defaultValue: number, min?: number, max?: number) =>
       })(),
     );
 
+/**
+ * An integer with NO default, left undefined when unset so the caller can
+ * derive one from another setting after parsing.
+ *
+ * For the case a static default cannot honestly serve: a value whose whole
+ * correctness is a relationship to a second setting the operator can move
+ * independently. A fixed number there is right only until somebody changes
+ * the other one, and then it is silently wrong.
+ */
+const optionalInt = (min?: number, max?: number) =>
+  z
+    .string()
+    .optional()
+    .transform((value) => (value === undefined || value === '' ? undefined : Number(value)))
+    .pipe(
+      (() => {
+        let schema = z.number().int();
+        if (min !== undefined) schema = schema.min(min);
+        if (max !== undefined) schema = schema.max(max);
+        return schema.optional();
+      })(),
+    );
+
 const num = (defaultValue: number, min?: number, max?: number) =>
   z
     .string()
@@ -328,9 +351,18 @@ const envSchema = z.object({
    * How long a run may say nothing before it is presumed to have stopped.
    *
    * A live run writes its progress after every batch of windows, so silence is
-   * not slowness — it means the process reading this video is gone. The
-   * default is three times the per-call timeout, which is longer than any
-   * single batch can legally take, so a working read can never trip it.
+   * not slowness — it means the process reading this video is gone.
+   *
+   * DERIVED, not fixed, and unset by default: it resolves to three times
+   * MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS (see loadEnv). The correctness of this
+   * number is entirely a relationship to that one — a single embedding call
+   * may legally run for the whole request timeout, and the heartbeat is only
+   * written once the batch it belongs to returns, so anything at or below the
+   * request timeout declares a healthy read dead. A fixed 2700 was right only
+   * while the timeout stayed at its own default of 900; raising the timeout to
+   * its permitted maximum of 3600 and leaving this alone would have had
+   * searches call a legally-running first call stopped. Derived, that cannot
+   * drift apart, and an explicit value is checked against the same rule.
    *
    * This exists because of the one failure the indexing handler cannot report
    * on its own: it records `failed` in its error path, but that record is
@@ -340,7 +372,7 @@ const envSchema = z.object({
    * every question about it quietly takes the slow, expensive path while the
    * system says something reassuring and false.
    */
-  MEDIA_INDEX_STALE_AFTER_SECONDS: int(2700, 60, 86_400),
+  MEDIA_INDEX_STALE_AFTER_SECONDS: optionalInt(60, 86_400),
 
   // --- Retrieval primary: Omni-SimpleMem tried first, Clipit's own search as the fallback
   /**
@@ -664,7 +696,36 @@ const envSchema = z.object({
   JOB_BACKOFF_MS: int(5_000, 100, 600_000),
 });
 
-export type Env = z.infer<typeof envSchema>;
+/**
+ * MEDIA_INDEX_STALE_AFTER_SECONDS is optional in the schema and always present
+ * here: loadEnv derives it from the request timeout when it is unset, so every
+ * consumer gets a number and none of them has to know where it came from.
+ */
+export type Env = Omit<z.infer<typeof envSchema>, 'MEDIA_INDEX_STALE_AFTER_SECONDS'> & {
+  MEDIA_INDEX_STALE_AFTER_SECONDS: number;
+};
+
+/**
+ * The longest a HEALTHY batch can legally go without reporting progress.
+ *
+ * Progress is written when a batch returns, and one batch is one invokeModal
+ * call — which retries inside itself. So the silence to beat is not one
+ * timeout but every attempt it is allowed, plus the waits between them:
+ *
+ *   (maxRetries + 1) attempts × the full request timeout
+ *   + the backoff after each failed attempt, min(30s, 2^attempt)
+ *
+ * Mirrors the retry loop in services/modal/invoke.ts. If that backoff changes,
+ * this changes with it — the two are one rule expressed twice, and the test in
+ * mediaIndexStaleThreshold pins the arithmetic.
+ */
+function longestHealthySilenceSeconds(requestTimeoutSeconds: number, maxRetries: number): number {
+  let backoffSeconds = 0;
+  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+    backoffSeconds += Math.min(30, 2 ** attempt);
+  }
+  return (maxRetries + 1) * requestTimeoutSeconds + backoffSeconds;
+}
 
 function loadEnv(): Env {
   const parsed = envSchema.safeParse(process.env);
@@ -724,11 +785,56 @@ function loadEnv(): Env {
     );
   }
 
+  // A read is judged dead by its silence, so the threshold has to outlast the
+  // longest silence a LIVE read can produce — and that is NOT one request
+  // timeout. Progress is written once a batch returns, and one batch is one
+  // invokeModal call, which retries internally: MEDIA_INDEX_MAX_RETRIES + 1
+  // attempts, each bounded by the full request timeout, with exponential
+  // backoff between them. A batch that times out twice and succeeds on the
+  // third attempt is a HEALTHY batch that said nothing for three timeouts.
+  //
+  // At defaults that worst case is 2703s, against a threshold that a plain
+  // "three times the timeout" would have put at 2700 — accusing a live read by
+  // three seconds. Raise MEDIA_INDEX_MAX_RETRIES to its permitted 5 and the
+  // same arithmetic gives 5431s against 2700, which accuses it comfortably.
+  const worstHealthySilenceSeconds = longestHealthySilenceSeconds(
+    value.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
+    value.MEDIA_INDEX_MAX_RETRIES,
+  );
+
+  // An explicit value may be tuned tighter than the derived default — an
+  // operator who knows their footage may want faster detection — but never
+  // into the range where a healthy batch is called dead.
+  if (value.MEDIA_INDEX_STALE_AFTER_SECONDS !== undefined
+      && value.MEDIA_INDEX_STALE_AFTER_SECONDS <= worstHealthySilenceSeconds) {
+    problems.push(
+      `MEDIA_INDEX_STALE_AFTER_SECONDS (${value.MEDIA_INDEX_STALE_AFTER_SECONDS}) must be greater than ` +
+        `${worstHealthySilenceSeconds}, the longest a healthy batch can legally go without reporting ` +
+        `(MEDIA_INDEX_MAX_RETRIES=${value.MEDIA_INDEX_MAX_RETRIES} retries of ` +
+        `MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS=${value.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS}s plus backoff), ` +
+        'or a read still working inside its own limits is reported as a read that stopped',
+    );
+  }
+
   if (problems.length > 0) {
     console.error(`\nInvalid environment configuration:\n${problems.map((p) => `  - ${p}`).join('\n')}\n`);
     process.exit(1);
   }
-  return value;
+  return {
+    ...value,
+    // Twice the worst healthy silence. The two errors are not symmetric:
+    // declaring a live read dead reports a failure that never happened, while
+    // being slow to notice a dead one only delays a fallback that already
+    // works. So the margin goes to never accusing.
+    //
+    // The doubling is also what covers the one delay the arithmetic above does
+    // NOT model: a batch waits on the shared Modal semaphore before its first
+    // attempt, and the search path draws on the same permits. Those calls are
+    // short next to an embedding batch, so contention is absorbed by the
+    // margin rather than proven impossible — the honest description of this
+    // number is "generously past any healthy silence", not "provably past".
+    MEDIA_INDEX_STALE_AFTER_SECONDS: value.MEDIA_INDEX_STALE_AFTER_SECONDS ?? worstHealthySilenceSeconds * 2,
+  };
 }
 
 export const env: Env = loadEnv();
