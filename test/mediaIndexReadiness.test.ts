@@ -209,6 +209,25 @@ describe('a blip at startup is not a verdict', () => {
     expect(onReady).toHaveBeenCalledTimes(1);
   });
 
+  it('gives up on a probe that never answers, instead of holding every queue', async () => {
+    // This runs before ANY consumer starts, and resolving a Modal deployment
+    // awaits network calls with no deadline of their own. A stalled lookup
+    // would hold ingestion, transcription, search and rendering behind the
+    // health check of a feature none of them need — for as long as the socket
+    // stayed open. Non-fatal was not the same as non-blocking.
+    vi.useFakeTimers();
+    assertMediaIndexDeploymentsAvailable.mockImplementation(() => new Promise(() => {}));
+
+    const readiness = mediaIndexReadiness({ probeTimeoutMs: 5_000 });
+    await vi.runAllTimersAsync();
+
+    await expect(readiness).resolves.toBe(false);
+    expect(logError).toHaveBeenCalledWith(
+      expect.stringContaining('could not be resolved'),
+      expect.objectContaining({ err: expect.any(Error) }),
+    );
+  });
+
   it('does not retry a name that will never resolve', async () => {
     // A wrong app name fails identically on the third try. Waiting on it only
     // delays the worker for no gain — and the error already says it is final.

@@ -31,6 +31,36 @@ import { assertMediaIndexDeploymentsAvailable } from '../services/mediaIndex/qwe
  * import, so anything defined there is reachable only by starting a worker.
  */
 /**
+ * How long one readiness probe may take before it counts as a no.
+ *
+ * This runs before any queue consumer starts, and resolving a Modal deployment
+ * awaits two network calls with no deadline of their own. A stalled lookup
+ * would therefore hold ingestion, transcription, search and rendering — every
+ * queue, none of which need the index — behind an optional feature's health
+ * check, for as long as the socket stayed open. Making the check non-fatal did
+ * not make it non-blocking; this does.
+ */
+const PROBE_TIMEOUT_MS = 15_000;
+
+/** Resolves to the promise's value, or rejects once the deadline passes. */
+async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    // The losing timer is always cleared, so a slow-but-successful probe does
+    // not leave a pending rejection behind it.
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * Keep asking, when Modal was down at boot.
  *
  * The startup check retries over a few seconds, which covers a blip during a
@@ -102,7 +132,9 @@ export function watchMediaIndexRecovery(
   };
 }
 
-export async function mediaIndexReadiness(): Promise<boolean> {
+export async function mediaIndexReadiness(
+  options: { probeTimeoutMs?: number } = {},
+): Promise<boolean> {
   if (!env.MEDIA_INDEX_ENABLED) return false;
 
   const naming = {
@@ -128,7 +160,7 @@ export async function mediaIndexReadiness(): Promise<boolean> {
   const attempts = 3;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      await assertMediaIndexDeploymentsAvailable();
+      await withDeadline(assertMediaIndexDeploymentsAvailable(), options.probeTimeoutMs ?? PROBE_TIMEOUT_MS);
       logger.info('media index deployments available', naming);
       return true;
     } catch (error) {

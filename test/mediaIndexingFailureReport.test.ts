@@ -126,6 +126,29 @@ describe('a run says it is alive for as long as it is working', () => {
     vi.useRealTimers();
   });
 
+  it('never has two beats in flight, however slow the database is', async () => {
+    // A plain interval fires on the clock whether or not the last write came
+    // back. On a struggling database that stacks writes up faster than they
+    // drain — adding load to the exact thing already in trouble, at the exact
+    // moment the heartbeat matters most.
+    vi.useFakeTimers();
+    longVideo();
+    embedVideoIntervals
+      .mockResolvedValueOnce(emptyBatch)
+      .mockImplementation(() => new Promise(() => {}));
+    // A touch that never comes back.
+    touchMediaIndexRun.mockImplementation(() => new Promise(() => {}));
+
+    void handleMediaIndexing(job);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Ten intervals pass with the first write still hanging.
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(touchMediaIndexRun).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+  });
+
   it('stops beating once the run is over, so a dead row never looks alive', async () => {
     vi.useFakeTimers();
     longVideo();

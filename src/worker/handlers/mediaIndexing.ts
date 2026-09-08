@@ -81,26 +81,55 @@ function samePlace(a: WindowProvenance, b: WindowProvenance): boolean {
  * is for, and a heartbeat that could crash the read it reports on would be
  * worse than no heartbeat at all.
  */
-function startHeartbeat(videoId: string, runStartedAt: Date): NodeJS.Timeout {
-  const timer = setInterval(() => {
+function startHeartbeat(videoId: string, runStartedAt: Date): { stop: () => void } {
+  const intervalMs = env.MEDIA_INDEX_HEARTBEAT_SECONDS * 1000;
+  // setTimeout after each write settles, NOT setInterval. An interval fires on
+  // the clock whether or not the last write came back, so a slow database —
+  // exactly when this matters most — would stack up writes faster than it
+  // drained them, adding pressure to the thing already struggling. Chained,
+  // there is never more than one beat in flight.
+  let stopped = false;
+  let timer: NodeJS.Timeout | null = null;
+
+  const scheduleNext = (): void => {
+    if (stopped) return;
+    timer = setTimeout(beat, intervalMs);
+    timer.unref();
+  };
+
+  const beat = (): void => {
     void touchMediaIndexRun(videoId, runStartedAt)
       .then((stillOurs) => {
         // The row moved on without us — superseded by a newer run, or already
         // finished. Stop claiming it.
-        if (!stillOurs) clearInterval(timer);
+        if (!stillOurs) {
+          stopped = true;
+          return;
+        }
+        scheduleNext();
       })
       .catch((error: unknown) => {
+        // A missed beat is what the threshold's margin is for. Keep going: a
+        // heartbeat that gave up on one failed write would report a healthy
+        // run as dead, which is the lie this exists to prevent.
         log.warn('could not record that this indexing run is still alive', { videoId, err: error });
+        scheduleNext();
       });
-  }, env.MEDIA_INDEX_HEARTBEAT_SECONDS * 1000);
-  timer.unref();
-  return timer;
+  };
+
+  scheduleNext();
+  return {
+    stop: () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    },
+  };
 }
 
 export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<void> {
   const { videoId } = job.data;
   const started = Date.now();
-  let heartbeat: NodeJS.Timeout | null = null;
+  let heartbeat: { stop: () => void } | null = null;
 
   const video = await getVideo(videoId);
   if (!video) {
@@ -404,6 +433,6 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
     // including a throw. A heartbeat outliving its run would keep a dead row
     // looking alive — the precise lie this whole mechanism exists to stop, and
     // it would be this code telling it.
-    if (heartbeat) clearInterval(heartbeat);
+    heartbeat?.stop();
   }
 }
