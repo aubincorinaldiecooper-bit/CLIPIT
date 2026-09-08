@@ -299,6 +299,16 @@ export interface IndexSearchInput {
   storedBy: { model: string; revision: string; dims: number };
   /** Signed URL and identity, for the reranker. Omit to skip reranking. */
   rerank?: { videoUrl: string; videoKey: string; expectedBytes: number };
+  /**
+   * Called as each remote call completes, before anything after it can fail.
+   *
+   * Returning the calls at the end was not enough: a reranker that throws
+   * took the record of the question's own embedding down with it — a call
+   * that had already run, and already cost money. Money spent is money spent
+   * whether or not the search it belonged to succeeded, and the understating
+   * is worst exactly when things are going wrong.
+   */
+  onCall?: (call: IndexSearchCall) => void;
 }
 
 /**
@@ -313,14 +323,19 @@ export async function searchMediaIndex(input: IndexSearchInput): Promise<IndexSe
   const embedStartedAt = new Date();
   const embedBegan = Date.now();
   const embedded = await embedTexts({ texts: [{ id: 'q', text: input.instruction }], isQuery: true });
-  const calls: IndexSearchCall[] = [{
+  const calls: IndexSearchCall[] = [];
+  const note = (call: IndexSearchCall) => {
+    calls.push(call);
+    input.onCall?.(call);
+  };
+  note({
     stage: 'search',
     model: embedded.model,
     gpuMs: gpuMsFrom([embedded.metrics]),
     metrics: embedded.metrics,
     startedAt: embedStartedAt,
     latencyMs: Date.now() - embedBegan,
-  }];
+  });
   const queryVector = embedded.embedded[0]?.embedding;
   if (!queryVector) {
     throw new Error('the embedding service returned no vector for the question');
@@ -380,7 +395,7 @@ export async function searchMediaIndex(input: IndexSearchInput): Promise<IndexSe
     })),
   });
 
-  calls.push({
+  note({
     stage: 'rerank',
     model: reranked.model,
     gpuMs: gpuMsFrom([reranked.metrics]),

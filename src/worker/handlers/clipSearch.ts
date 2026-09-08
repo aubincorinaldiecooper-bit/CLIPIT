@@ -101,6 +101,7 @@ import {
   IndexProvenanceChanged,
   searchMediaIndex,
   type IndexFallbackReason,
+  type IndexSearchCall,
 } from '../../services/mediaIndex/search.js';
 import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
 import { estimateGpuCostUsd } from '../../services/mediaIndex/cost.js';
@@ -1062,6 +1063,28 @@ async function answerFromMediaIndex(input: {
   // memory answer when no segments are counted.
   await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
 
+  // Collected as each call completes, so a later failure cannot erase the
+  // record of an earlier one that already ran and already cost money.
+  const paidCalls: IndexSearchCall[] = [];
+  const recordCalls = async () => {
+    for (const call of paidCalls.splice(0)) {
+      await recordModelUsage({
+        videoId: video.id,
+        clipRequestId,
+        provider: 'modal',
+        model: call.model,
+        stage: call.stage,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        costUsd: estimateGpuCostUsd(call.gpuMs),
+        latencyMs: call.latencyMs,
+        metrics: { gpuMs: call.gpuMs, ...call.metrics },
+        startedAt: call.startedAt,
+      }).catch(() => undefined);
+    }
+  };
+
   let result;
   let windowsSearched = 0;
   // The furthest second any stored window reaches. Past the contiguous
@@ -1076,6 +1099,7 @@ async function answerFromMediaIndex(input: {
     // question is about an index that no longer exists.
     if (snapshot.runStartedAt?.getTime() !== status.startedAt?.getTime()) {
       log.info('the index was replaced while this question was being answered; handing it on');
+      await recordCalls();
       return { matchCount: 0, released: false, fallback: 'index_not_ready', outcome: null };
     }
     const windows = snapshot.windows;
@@ -1092,6 +1116,7 @@ async function answerFromMediaIndex(input: {
       instruction,
       windows,
       coveredThroughSeconds: snapshot.coveredThroughSeconds,
+      onCall: (call) => paidCalls.push(call),
       storedBy: { model: status.model, revision: status.revision, dims: status.dims },
       // Without the proxy there is no footage to rerank against, so the raw
       // vector order stands rather than the search failing.
@@ -1103,6 +1128,7 @@ async function answerFromMediaIndex(input: {
     // A model change since this video was indexed is not a failure to report
     // as one: the index is simply stale, and the question goes to the notes
     // while the video waits to be re-read.
+    await recordCalls();
     if (error instanceof IndexProvenanceChanged) {
       log.warn('the index was made by different weights than the question; handing the question on', {
         reason: error.message,
@@ -1141,22 +1167,7 @@ async function answerFromMediaIndex(input: {
   // fail. A per-question cost that omits the calls the question actually made
   // is the exact shape of error migration 027 was written about — and this
   // path is the only writer of the `rerank` stage that migration 044 added.
-  for (const call of result.calls) {
-    await recordModelUsage({
-      videoId: video.id,
-      clipRequestId,
-      provider: 'modal',
-      model: call.model,
-      stage: call.stage,
-      promptTokens: 0,
-      completionTokens: 0,
-      totalTokens: 0,
-      costUsd: estimateGpuCostUsd(call.gpuMs),
-      latencyMs: call.latencyMs,
-      metrics: { gpuMs: call.gpuMs, ...call.metrics },
-      startedAt: call.startedAt,
-    });
-  }
+  await recordCalls();
 
   const wanted = input.requestedResultCount ?? result.moments.length;
   const found: NewClipMatch[] = [];
