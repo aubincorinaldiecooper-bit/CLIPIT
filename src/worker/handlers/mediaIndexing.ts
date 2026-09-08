@@ -109,6 +109,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
   const stored = new Set<string>();
   const failures: Array<{ id: string; reason: string }> = [];
   let provenance: WindowProvenance | null = null;
+  let runStartedAt: Date | null = null;
 
   try {
     // Read before the first signed URL is minted. The identity carries the
@@ -149,6 +150,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         // video never carries a dead copy of itself. Rows matching this exact
         // provenance survive, which is what makes a resumed run cheap.
         const opened = await beginIndexRun(videoId, provenance);
+        runStartedAt = opened.runStartedAt;
         if (opened.cleared > 0) {
           log.info('cleared windows that describe other weights or other footage', {
             videoId, cleared: opened.cleared, ...provenance,
@@ -195,7 +197,10 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       });
 
       if (rows.length > 0) {
-        await storeIndexedWindows(videoId, rows, provenance, packVector);
+        // provenance and runStartedAt are set together when the run opens,
+        // which happens on the first batch — before any row can be stored.
+        if (!runStartedAt) throw new Error('windows were ready before the run was opened');
+        await storeIndexedWindows(videoId, rows, provenance, packVector, runStartedAt);
         for (const row of rows) stored.add(row.windowKey);
       }
       failures.push(...reply.failed);

@@ -492,7 +492,19 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
       //    exactly as it is today.
       if (env.MEDIA_INDEX_ENABLED) {
         try {
-          await setMediaIndexStatus(videoId, 'queued');
+          // Coverage is reset here, not when the run opens. Re-processing
+          // replaces the footage at the same key, and until the first
+          // embedding reply arrives the status still describes the PREVIOUS
+          // video — so a question asked in that window would be answered
+          // with moments chosen from footage that no longer exists. Zero
+          // coverage makes the index unsearchable until the new run has
+          // actually read something. A retry of the same footage loses
+          // nothing: the run recounts from the windows it retains.
+          await setMediaIndexStatus(videoId, 'queued', {
+            coveredThroughSeconds: 0,
+            windowsStored: 0,
+            windowsFailed: 0,
+          });
           await enqueueMediaIndexing({ videoId });
         } catch (error) {
           log.error('could not queue media indexing', { err: error });

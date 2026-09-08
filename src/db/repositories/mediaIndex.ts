@@ -118,6 +118,17 @@ export async function storeIndexedWindows(
   windows: readonly IndexedWindow[],
   provenance: WindowProvenance,
   packVector: (values: readonly number[]) => Buffer,
+  /**
+   * The run these vectors belong to, as stamped when it opened.
+   *
+   * Two runs for one video can overlap — a stalled job redelivered while the
+   * original is still working. Both write the same window keys, and without
+   * this the older one overwrites rows the newer one already stored: the read
+   * filter then hides them, because they carry the older identity, while the
+   * newer run goes on reporting complete coverage. A video that reads as
+   * fully indexed and is not.
+   */
+  runStartedAt: Date,
 ): Promise<number> {
   if (windows.length === 0) return 0;
 
@@ -141,7 +152,7 @@ export async function storeIndexedWindows(
       provenance.model,
       provenance.revision,
     );
-    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${windows.length * 8 + 1}, $${windows.length * 8 + 2})`;
+    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${windows.length * 8 + 1}, $${windows.length * 8 + 2}, $${windows.length * 8 + 3})`;
   });
   values.push(provenance.indexVersion, provenance.sourceIdentity);
 
@@ -166,9 +177,19 @@ export async function storeIndexedWindows(
     );
     if (guard.rowCount === 0) return 0;
 
+    // And the run that opened must still be the current one. An older,
+    // overlapping attempt finds its start time no longer stamped on the
+    // status row and writes nothing, rather than overwriting the newer run's
+    // work with vectors that will then be filtered out of every read.
+    const current = await client.query(
+      `SELECT 1 FROM media_index_status WHERE video_id = $1 AND started_at = $2`,
+      [videoId, runStartedAt],
+    );
+    if (current.rowCount === 0) return 0;
+
     const result = await client.query(
       `INSERT INTO media_index
-         (video_id, window_key, start_seconds, end_seconds, embedding, dims, model, revision, index_version, source_identity)
+         (video_id, window_key, start_seconds, end_seconds, embedding, dims, model, revision, index_version, source_identity, run_started_at)
        VALUES ${tuples.join(', ')}
        ON CONFLICT (video_id, window_key) DO UPDATE SET
          start_seconds   = EXCLUDED.start_seconds,
@@ -179,6 +200,7 @@ export async function storeIndexedWindows(
          revision        = EXCLUDED.revision,
          index_version   = EXCLUDED.index_version,
          source_identity = EXCLUDED.source_identity,
+         run_started_at  = EXCLUDED.run_started_at,
          created_at      = now()`,
       values,
     );
@@ -377,7 +399,7 @@ export async function setMediaIndexStatus(
 export async function beginIndexRun(
   videoId: string,
   provenance: WindowProvenance,
-): Promise<{ cleared: number; retained: string[] }> {
+): Promise<{ cleared: number; retained: string[]; runStartedAt: Date }> {
   // One transaction. Deleting the old index and recording the new run are a
   // single act: if the status write failed on its own, the previous index
   // would be gone while its status still read `ready`, and every search would
@@ -400,7 +422,7 @@ export async function beginIndexRun(
       [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity],
     );
 
-    await client.query(
+    const opened = await client.query<{ started_at: Date }>(
       `INSERT INTO media_index_status
          (video_id, state, model, revision, dims, index_version, source_identity, error, started_at, finished_at, updated_at)
        VALUES ($1, 'running', $2, $3, $4, $5, $6, NULL, now(), NULL, now())
@@ -414,11 +436,15 @@ export async function beginIndexRun(
          error           = NULL,
          started_at      = now(),
          finished_at     = NULL,
-         updated_at      = now()`,
+         updated_at      = now()
+       RETURNING started_at`,
       [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity],
     );
 
-    return { cleared: removed.rowCount ?? 0, retained: kept.rows.map((row) => row.window_key) };
+    const runStartedAt = opened.rows[0]?.started_at;
+    if (!runStartedAt) throw new Error('the index run could not be opened');
+
+    return { cleared: removed.rowCount ?? 0, retained: kept.rows.map((row) => row.window_key), runStartedAt };
   });
 }
 

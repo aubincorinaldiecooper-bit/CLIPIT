@@ -103,9 +103,6 @@ import {
 } from '../../services/mediaIndex/search.js';
 import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
 
-/** Moments returned when the person did not write a number. */
-const DEFAULT_MEDIA_INDEX_RESULTS = 3;
-
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   const { clipRequestId } = job.data;
   const log = logger.child({ job: 'clip-search', clipRequestId });
@@ -1075,7 +1072,10 @@ async function answerFromMediaIndex(input: {
     return { matchCount: 0, released: false, fallback: after.reason };
   }
 
-  const wanted = input.requestedResultCount ?? DEFAULT_MEDIA_INDEX_RESULTS;
+  // Every moment that survived the relevance test, unless the person asked
+  // for a number. The filter is what limits results here; an arbitrary cap on
+  // top of it would silently drop hits the other search paths would return.
+  const wanted = input.requestedResultCount ?? result.moments.length;
   const found: NewClipMatch[] = [];
   for (const moment of result.moments.slice(0, wanted)) {
     const chunk = chunks.find(

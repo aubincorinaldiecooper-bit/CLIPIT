@@ -99,12 +99,31 @@ describe('decideIndexAnswer', () => {
     });
   });
 
-  it('carries the recorded reason when indexing failed', () => {
-    const broken = status({ state: 'failed', error: 'the GPU service refused every window' });
+  it('still answers from a run that failed after reading part of the video', () => {
+    // Corrected: this previously refused the whole index. A run that died at
+    // minute forty still read the first forty minutes, and those windows are
+    // kept on purpose — refusing them sends every later question to the
+    // expensive footage read for footage that was already read.
+    const partial = status({ state: 'failed', coveredThroughSeconds: 40, error: 'the GPU service dropped out' });
+
+    expect(decideIndexAnswer({ ...base, status: partial, candidateCount: 2 })).toEqual({ use: 'index' });
+  });
+
+  it('carries the recorded reason when indexing failed before storing anything', () => {
+    const broken = status({ state: 'failed', coveredThroughSeconds: 0, error: 'the GPU service refused every window' });
     const decision = decideIndexAnswer({ ...base, status: broken });
 
     expect(decision).toMatchObject({ use: 'fallback', reason: 'index_unavailable' });
     if (decision.use === 'fallback') expect(decision.detail).toBe('the GPU service refused every window');
+  });
+
+  it('refuses a video that could not be read at all, whatever coverage says', () => {
+    const gone = status({ state: 'unavailable', coveredThroughSeconds: 90, error: 'no analysis proxy to read' });
+
+    expect(decideIndexAnswer({ ...base, status: gone })).toMatchObject({
+      use: 'fallback',
+      reason: 'index_unavailable',
+    });
   });
 
   it('falls back when consulting the index threw', () => {

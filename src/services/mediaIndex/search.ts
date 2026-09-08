@@ -94,21 +94,34 @@ export function decideIndexAnswer(input: IndexDecisionInput): IndexDecision {
       // has been read yet. The coverage check below decides.
       break;
     case 'failed':
+      // A run that died at minute forty still read the first forty minutes,
+      // and the handler deliberately kept those windows and recorded their
+      // coverage. Refusing the whole index would send every later question to
+      // the footage — the expensive path — for footage that was already read.
+      // The coverage check below decides, and the unread stretches are named
+      // in the answer exactly as they are for a run still in progress.
+      break;
     case 'unavailable':
+      // Different thing: there was nothing to read, or the footage is gone.
       return {
         use: 'fallback',
         reason: 'index_unavailable',
-        detail: status.error ?? `the index is ${status.state}`,
+        detail: status.error ?? 'this video could not be read into vectors',
       };
     case 'ready':
     case 'partial':
       break;
   }
   if (status.coveredThroughSeconds <= 0) {
+    const notYet = status.state === 'queued' || status.state === 'running';
     return {
       use: 'fallback',
-      reason: status.state === 'queued' || status.state === 'running' ? 'index_not_ready' : 'no_coverage',
-      detail: 'no part of this video has been read into vectors yet',
+      reason: notYet ? 'index_not_ready' : status.state === 'failed' ? 'index_unavailable' : 'no_coverage',
+      detail: notYet
+        ? 'no part of this video has been read into vectors yet'
+        : status.state === 'failed'
+          ? status.error ?? 'reading this video into vectors failed before anything was stored'
+          : 'no part of this video has been read into vectors',
     };
   }
   if (input.error !== undefined) {
