@@ -181,7 +181,15 @@ async function main(): Promise<void> {
   startWorker(QUEUE_NAMES.scheduledPublish, handleScheduledPublish, 1);
   startWorker(QUEUE_NAMES.learningReport, handleLearningReport, 1);
 
-  logger.info('worker ready', { queues: Object.values(QUEUE_NAMES) });
+  // The queues actually being consumed, not every name that exists. Media
+  // indexing only starts when it is switched on, and a startup line listing a
+  // worker nobody started is how an operator concludes a queue is being
+  // drained when nothing is reading it.
+  logger.info('worker ready', {
+    queues: Object.values(QUEUE_NAMES).filter(
+      (queue) => queue !== QUEUE_NAMES.mediaIndexing || env.MEDIA_INDEX_ENABLED,
+    ),
+  });
 
   // Queued rather than run inline: the sweep goes through the same retention,
   // logging and shutdown handling as everything else, and a fixed job id keeps

@@ -13,6 +13,7 @@ import {
 } from '../../db/repositories/mediaIndex.js';
 import { packVector } from '../../services/mediaIndex/vectors.js';
 import { coveredThroughSeconds, unreadRanges } from '../../services/mediaIndex/coverage.js';
+import { estimateGpuCostUsd, gpuMsFrom } from '../../services/mediaIndex/cost.js';
 import { DEFAULT_WINDOW_PLAN, planWindows, windowKey, type IndexWindow } from '../../services/mediaIndex/windows.js';
 import { embedVideoIntervals } from '../../services/mediaIndex/qwen.js';
 import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
@@ -221,6 +222,9 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       }
       failures.push(...reply.failed);
 
+      // Priced from the time the GPU was actually held, not wall clock: the
+      // caller's clock includes queueing and transfer, which nobody bills for.
+      const gpuMs = gpuMsFrom([reply.metrics]);
       await recordModelUsage({
         videoId,
         provider: 'modal',
@@ -229,8 +233,15 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         promptTokens: 0,
         completionTokens: 0,
         totalTokens: 0,
+        costUsd: estimateGpuCostUsd(gpuMs),
         latencyMs: Date.now() - batchStarted,
-        metrics: { windows: batch.length, embedded: rows.length, failed: reply.failed.length, ...reply.metrics },
+        metrics: {
+          windows: batch.length,
+          embedded: rows.length,
+          failed: reply.failed.length,
+          gpuMs,
+          ...reply.metrics,
+        },
         startedAt: new Date(batchStarted),
       });
 

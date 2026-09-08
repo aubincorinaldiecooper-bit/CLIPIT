@@ -42,6 +42,7 @@ import {
   recordChunkFailure,
   recordDeckAvailability,
   recordDeckPlan,
+  recordRetrievalOutcome,
   recordSearchApproach,
   recordUncertainMatches,
   releaseDeckAndComplete,
@@ -102,6 +103,7 @@ import {
   type IndexFallbackReason,
 } from '../../services/mediaIndex/search.js';
 import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
+import { estimateGpuCostUsd } from '../../services/mediaIndex/cost.js';
 
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   const { clipRequestId } = job.data;
@@ -442,13 +444,31 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       log,
     });
     if (fromIndex.matchCount > 0) {
+      await recordRetrievalOutcome(clipRequestId, {
+        primary: 'media_index',
+        system: 'media_index',
+        fallbackReason: null,
+        primaryOutcome: fromIndex.outcome,
+      });
       outcome = 'completed';
       searchMode = resolved.mode;
       chunkCount = 0;
       return;
     }
-    if (fromIndex.fallback && fromIndex.fallback !== 'disabled') {
-      log.info('the media index handed the question on', { reason: fromIndex.fallback });
+    // Written to the row, not only the log. Every claim made for this design
+    // — how often the index answers, why it hands a question on, whether the
+    // fallback did better — can only be checked if the reason is durable. A
+    // reason that lives in a log line is not a record.
+    if (env.MEDIA_INDEX_ENABLED) {
+      await recordRetrievalOutcome(clipRequestId, {
+        primary: 'media_index',
+        system: 'clipit',
+        fallbackReason: fromIndex.fallback,
+        primaryOutcome: fromIndex.outcome,
+      });
+      if (fromIndex.fallback && fromIndex.fallback !== 'disabled') {
+        log.info('the media index handed the question on', { reason: fromIndex.fallback });
+      }
     }
 
     const notesAvailable = !correcting && video.indexStatus === 'ready';
@@ -1006,7 +1026,13 @@ async function answerFromMediaIndex(input: {
   mode: ResolvedSearchMode;
   correcting: boolean;
   log: Logger;
-}): Promise<{ matchCount: number; released: boolean; fallback: IndexFallbackReason | null }> {
+}): Promise<{
+  matchCount: number;
+  released: boolean;
+  fallback: IndexFallbackReason | null;
+  /** What the index actually produced, kept even when the fallback answered. */
+  outcome: Record<string, unknown> | null;
+}> {
   const { clipRequestId, video, chunks, instruction, mode, correcting, log } = input;
   const startedAt = performance.now();
 
@@ -1014,20 +1040,20 @@ async function answerFromMediaIndex(input: {
   // nothing at all — not a query, not a round trip — because every search in
   // the product goes through it.
   if (!env.MEDIA_INDEX_ENABLED) {
-    return { matchCount: 0, released: false, fallback: 'disabled' };
+    return { matchCount: 0, released: false, fallback: 'disabled', outcome: null };
   }
 
   const status = await getMediaIndexStatus(video.id);
   const before = decideIndexAnswer({ enabled: true, correcting, mode, status });
   if (before.use === 'fallback') {
-    return { matchCount: 0, released: false, fallback: before.reason };
+    return { matchCount: 0, released: false, fallback: before.reason, outcome: null };
   }
 
   // decideIndexAnswer has already refused a null status as `index_missing`,
   // so this cannot fire — it is here so the reads below are not resting on a
   // non-null assertion that a later edit could quietly invalidate.
   if (!status || status.dims === null) {
-    return { matchCount: 0, released: false, fallback: 'index_missing' };
+    return { matchCount: 0, released: false, fallback: 'index_missing', outcome: null };
   }
 
   // Marked as searching before any remote call. Embedding the question and
@@ -1037,6 +1063,10 @@ async function answerFromMediaIndex(input: {
   await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
 
   let result;
+  let windowsSearched = 0;
+  // The furthest second any stored window reaches. Past the contiguous
+  // prefix these do not count as coverage, but they WERE searched.
+  let snapshotEnd = 0;
   try {
     const snapshot = await listIndexedWindows(video.id);
     // Coverage came back with the windows, from one read. A re-index starting
@@ -1046,9 +1076,11 @@ async function answerFromMediaIndex(input: {
     // question is about an index that no longer exists.
     if (snapshot.runStartedAt?.getTime() !== status.startedAt?.getTime()) {
       log.info('the index was replaced while this question was being answered; handing it on');
-      return { matchCount: 0, released: false, fallback: 'index_not_ready' };
+      return { matchCount: 0, released: false, fallback: 'index_not_ready', outcome: null };
     }
     const windows = snapshot.windows;
+    windowsSearched = windows.length;
+    snapshotEnd = windows.reduce((furthest, window) => Math.max(furthest, window.endSeconds), 0);
     const source = video.proxyStorageKey ? await sourceIdentity(video.proxyStorageKey) : null;
     const videoUrl = video.proxyStorageKey
       ? await getStorage().createDownloadUrl(video.proxyStorageKey, {
@@ -1075,22 +1107,57 @@ async function answerFromMediaIndex(input: {
       log.warn('the index was made by different weights than the question; handing the question on', {
         reason: error.message,
       });
-      return { matchCount: 0, released: false, fallback: 'provenance_changed' };
+      return { matchCount: 0, released: false, fallback: 'provenance_changed', outcome: null };
     }
     log.warn('the media index could not answer; handing the question on', { err: error });
-    return { matchCount: 0, released: false, fallback: 'index_failed' };
+    return { matchCount: 0, released: false, fallback: 'index_failed', outcome: null };
   }
+
+  // Kept whether or not this answer is used. "The index found nothing" and
+  // "the index found three moments and the fallback still did better" are
+  // different facts, and only one of them is visible without this.
+  const outcome: Record<string, unknown> = {
+    windows: windowsSearched,
+    moments: result.moments.length,
+    topScore: result.moments[0]?.score ?? null,
+    reranked: result.reranked,
+    coveredThroughSeconds: result.coveredThroughSeconds,
+    model: result.model,
+    revision: result.revision,
+    elapsedMs: Math.round(performance.now() - startedAt),
+  };
 
   const after = decideIndexAnswer({
     enabled: true, correcting, mode, status, candidateCount: result.moments.length,
   });
   if (after.use === 'fallback') {
-    return { matchCount: 0, released: false, fallback: after.reason };
+    return { matchCount: 0, released: false, fallback: after.reason, outcome };
   }
 
   // Every moment that survived the relevance test, unless the person asked
   // for a number. The filter is what limits results here; an arbitrary cap on
   // top of it would silently drop hits the other search paths would return.
+  // Every paid call this question made, recorded before anything else can
+  // fail. A per-question cost that omits the calls the question actually made
+  // is the exact shape of error migration 027 was written about — and this
+  // path is the only writer of the `rerank` stage that migration 044 added.
+  for (const call of result.calls) {
+    await recordModelUsage({
+      videoId: video.id,
+      clipRequestId,
+      provider: 'modal',
+      model: call.model,
+      stage: call.stage,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      costUsd: estimateGpuCostUsd(call.gpuMs),
+      latencyMs: call.latencyMs,
+      metrics: { gpuMs: call.gpuMs, ...call.metrics },
+      startedAt: call.startedAt,
+    });
+  }
+
   const wanted = input.requestedResultCount ?? result.moments.length;
   const found: NewClipMatch[] = [];
   for (const moment of result.moments.slice(0, wanted)) {
@@ -1121,7 +1188,7 @@ async function answerFromMediaIndex(input: {
   }
 
   if (found.length === 0) {
-    return { matchCount: 0, released: false, fallback: 'no_candidates' };
+    return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
   }
 
   // Everything past the unbroken read has not been examined, and says so
@@ -1129,11 +1196,19 @@ async function answerFromMediaIndex(input: {
   // screen as an unexamined stretch, and "look again" escalates to the
   // footage rather than the person being told the video holds nothing there.
   const duration = video.durationSeconds ?? chunks.at(-1)?.globalEndSeconds ?? 0;
-  if (result.coveredThroughSeconds < duration - 0.5) {
+  // Everything past the unbroken read, MINUS what was searched anyway.
+  //
+  // Windows past a hole are still stored and were still compared against the
+  // question — they simply do not let the index claim an unbroken read. So
+  // reporting the whole tail as unexamined overstates it in the other
+  // direction, and telling somebody a stretch was never looked at when it was
+  // is the same failure as the reverse.
+  const searchedTail = snapshotEnd;
+  const unreadFrom = Math.max(result.coveredThroughSeconds, searchedTail);
+  if (unreadFrom < duration - 0.5) {
     const where = chunks.find(
       (chunk) =>
-        result.coveredThroughSeconds >= chunk.globalStartSeconds &&
-        result.coveredThroughSeconds < chunk.globalEndSeconds,
+        unreadFrom >= chunk.globalStartSeconds && unreadFrom < chunk.globalEndSeconds,
     ) ?? chunks.at(-1);
     if (where) {
       await recordChunkFailure(clipRequestId, {
@@ -1141,10 +1216,29 @@ async function answerFromMediaIndex(input: {
         chunkId: where.id,
         message: 'This stretch had not been read into the index when the question was asked',
         code: 'not_read_yet',
-        globalStartSeconds: result.coveredThroughSeconds,
+        globalStartSeconds: unreadFrom,
         globalEndSeconds: duration,
       });
     }
+  }
+
+  // Stretches the reranker could not read are named as unexamined, through
+  // the same channel a failed chunk uses. Left silent they would look like
+  // footage that was watched and found wanting.
+  for (const stretch of result.unread) {
+    const where = chunks.find(
+      (chunk) =>
+        stretch.startSeconds >= chunk.globalStartSeconds && stretch.startSeconds < chunk.globalEndSeconds,
+    ) ?? chunks.at(-1);
+    if (!where) continue;
+    await recordChunkFailure(clipRequestId, {
+      chunkIndex: where.chunkIndex,
+      chunkId: where.id,
+      message: `This stretch could not be examined: ${stretch.reason}`,
+      code: 'not_read_yet',
+      globalStartSeconds: stretch.startSeconds,
+      globalEndSeconds: stretch.endSeconds,
+    });
   }
 
   await insertMatches(clipRequestId, found);
@@ -1168,7 +1262,7 @@ async function answerFromMediaIndex(input: {
     elapsedMs: Math.round(performance.now() - startedAt),
   });
 
-  return { matchCount: finalCount, released, fallback: null };
+  return { matchCount: finalCount, released, fallback: null, outcome };
 }
 
 async function answerFromNotes(input: {

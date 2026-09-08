@@ -1,6 +1,7 @@
 import { env } from '../../config/env.js';
 import { cosineSimilarity } from './vectors.js';
 import { embedTexts, rerankVideoIntervals } from './qwen.js';
+import { gpuMsFrom } from './cost.js';
 import type { StoredWindow, MediaIndexStatus } from '../../db/repositories/mediaIndex.js';
 import type { ResolvedSearchMode } from '../../domain/types.js';
 
@@ -246,8 +247,36 @@ export function foldIntoMoments(ranked: readonly ScoredWindow[], maxSeconds = Nu
   return moments.sort((a, b) => b.score - a.score);
 }
 
+/** One remote call the search made, so the caller can record what it cost. */
+export interface IndexSearchCall {
+  stage: 'search' | 'rerank';
+  model: string;
+  /** Time the GPU was held, from the service's own metrics. */
+  gpuMs: number;
+  metrics: Record<string, unknown>;
+  startedAt: Date;
+  latencyMs: number;
+}
+
 export interface IndexSearchResult {
   moments: ScoredWindow[];
+  /**
+   * Shortlisted stretches the reranker could not read.
+   *
+   * Not "watched and found wanting" — nobody watched them. Reported so the
+   * answer can name them as unexamined instead of letting them sit at the
+   * bottom of a ranking, which reads as a verdict.
+   */
+  unread: Array<ScoredWindow & { reason: string }>;
+  /**
+   * Every paid call this search made.
+   *
+   * Returned rather than recorded here so persistence stays with the handler
+   * that owns the request. They must not go unrecorded: a per-question cost
+   * that omits the calls the question actually made is the exact shape of
+   * error migration 027 was written about.
+   */
+  calls: IndexSearchCall[];
   /** What the ranking was produced by, so a row can name it. */
   model: string;
   revision: string;
@@ -281,7 +310,17 @@ export interface IndexSearchInput {
  * wrong results.
  */
 export async function searchMediaIndex(input: IndexSearchInput): Promise<IndexSearchResult> {
+  const embedStartedAt = new Date();
+  const embedBegan = Date.now();
   const embedded = await embedTexts({ texts: [{ id: 'q', text: input.instruction }], isQuery: true });
+  const calls: IndexSearchCall[] = [{
+    stage: 'search',
+    model: embedded.model,
+    gpuMs: gpuMsFrom([embedded.metrics]),
+    metrics: embedded.metrics,
+    startedAt: embedStartedAt,
+    latencyMs: Date.now() - embedBegan,
+  }];
   const queryVector = embedded.embedded[0]?.embedding;
   if (!queryVector) {
     throw new Error('the embedding service returned no vector for the question');
@@ -316,6 +355,8 @@ export async function searchMediaIndex(input: IndexSearchInput): Promise<IndexSe
   if (moments.length === 0 || !input.rerank) {
     return {
       moments,
+      unread: [],
+      calls,
       model: embedded.model,
       revision: embedded.revision,
       reranked: false,
@@ -325,6 +366,8 @@ export async function searchMediaIndex(input: IndexSearchInput): Promise<IndexSe
 
   // Reranking watches the shortlisted footage rather than comparing vectors,
   // which is the step that tells "a sign" from "the RIGHT sign".
+  const rerankStartedAt = new Date();
+  const rerankBegan = Date.now();
   const reranked = await rerankVideoIntervals({
     query: input.instruction,
     videoUrl: input.rerank.videoUrl,
@@ -337,13 +380,34 @@ export async function searchMediaIndex(input: IndexSearchInput): Promise<IndexSe
     })),
   });
 
+  calls.push({
+    stage: 'rerank',
+    model: reranked.model,
+    gpuMs: gpuMsFrom([reranked.metrics]),
+    metrics: reranked.metrics,
+    startedAt: rerankStartedAt,
+    latencyMs: Date.now() - rerankBegan,
+  });
+
   const byKey = new Map(moments.map((moment) => [moment.windowKey, moment]));
   const ordered = reranked.ranked.flatMap((row) => {
     const moment = byKey.get(row.id);
     return moment ? [{ ...moment, score: row.score }] : [];
   });
 
+  // A candidate the reranker could not READ is not a candidate it judged
+  // irrelevant, and the two must not end up in the same pile. Ranked last on
+  // its vector score would say "watched, and unconvincing". These are carried
+  // out separately so the caller can say a stretch was not examined rather
+  // than examined and dismissed.
+  const unread = reranked.failed.flatMap((failure) => {
+    const moment = byKey.get(failure.id);
+    return moment ? [{ ...moment, reason: failure.reason }] : [];
+  });
+
   return {
+    unread,
+    calls,
     // A reranker that dropped candidates has not judged them irrelevant, so
     // anything it did not return keeps its vector score and its place behind
     // the ranked ones rather than disappearing.
