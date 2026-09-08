@@ -29,7 +29,10 @@ export type MatchSource = 'visual' | 'transcript' | 'multimodal';
  * mention it" is a weaker statement than "the video does not contain it", and
  * only one of the two paths can make the stronger claim.
  */
-export type AnsweredFrom = 'notes' | 'footage';
+// 'media_index' is the vectors: what the pictures look like, matched
+// against the question without watching the video again. A third kind of
+// memory, and named separately so a row can say which one answered.
+export type AnsweredFrom = 'notes' | 'footage' | 'media_index';
 
 /**
  * Which system found the moments: Clipit's own notes-then-footage search, or
