@@ -178,7 +178,14 @@ async function main(): Promise<void> {
    * Only when the feature is switched ON: a deliberate MEDIA_INDEX_ENABLED
    * =false must never start a consumer behind the operator's back.
    */
-  if (env.MEDIA_INDEX_ENABLED && !mediaIndexReady) {
+  //
+  // Only when a recovery is possible. A missing credential is not an outage:
+  // the environment is read once at startup, so a token that is absent now
+  // stays absent for this process's whole life. Watching for it would re-ask
+  // every minute and log the same error until shutdown — noise that buries the
+  // one startup line actually worth reading.
+  const modalCredentialsPresent = Boolean(env.MODAL_TOKEN_ID && env.MODAL_TOKEN_SECRET);
+  if (env.MEDIA_INDEX_ENABLED && !mediaIndexReady && modalCredentialsPresent) {
     watchMediaIndexRecovery(() => {
       startWorker(QUEUE_NAMES.mediaIndexing, handleMediaIndexing, env.MEDIA_INDEX_CONCURRENCY);
       logger.info('media index recovered; reading videos into vectors again', {

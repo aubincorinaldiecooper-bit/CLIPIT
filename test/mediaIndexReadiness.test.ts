@@ -144,6 +144,48 @@ describe('a blip at startup is not a verdict', () => {
     expect(check).toHaveBeenCalledTimes(3);
   });
 
+  it('never runs two checks at once, however long one takes', async () => {
+    // The bug a plain setInterval has. An interval fires on the clock whether
+    // or not the last check came back, and a readiness check is a network call
+    // that can outlast it. Clearing the timer does not cancel the checks
+    // already in flight, so several resolving true each start a consumer on
+    // the same queue — quietly doubling the GPU concurrency that was
+    // configured.
+    vi.useFakeTimers();
+    const onReady = vi.fn();
+    let release: ((ready: boolean) => void) | undefined;
+    const check = vi.fn(() => new Promise<boolean>((resolve) => { release = resolve; }));
+
+    watchMediaIndexRecovery(onReady, { intervalMs: 1_000, check });
+
+    // Five intervals pass while the first check is still hanging.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(check).toHaveBeenCalledTimes(1);
+
+    // It finally comes back ready. Exactly one consumer starts.
+    release?.(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onReady).toHaveBeenCalledTimes(1);
+
+    // And nothing is left running to start another.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(onReady).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops when told to, and starts nothing afterwards', async () => {
+    vi.useFakeTimers();
+    const onReady = vi.fn();
+    const check = vi.fn(async () => true);
+
+    const watch = watchMediaIndexRecovery(onReady, { intervalMs: 1_000, check });
+    watch.stop();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(check).not.toHaveBeenCalled();
+    expect(onReady).not.toHaveBeenCalled();
+  });
+
   it('survives a probe that rejects, and keeps trying', async () => {
     // A thrown re-check must never take the worker down over an optional
     // feature — and must not end the watch either, or one bad probe becomes

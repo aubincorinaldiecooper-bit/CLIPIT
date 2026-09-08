@@ -46,25 +46,60 @@ import { assertMediaIndexDeploymentsAvailable } from '../services/mediaIndex/qwe
 export function watchMediaIndexRecovery(
   onReady: () => void,
   options: { intervalMs?: number; check?: () => Promise<boolean> } = {},
-): NodeJS.Timeout {
+): { stop: () => void } {
+  const intervalMs = options.intervalMs ?? env.MEDIA_INDEX_RECHECK_INTERVAL_MS;
   const check = options.check ?? mediaIndexReadiness;
-  const timer = setInterval(() => {
+
+  // setTimeout after each check settles, NOT setInterval. An interval fires on
+  // the clock whether or not the last check came back, and a readiness check
+  // is a network call that can outlast it — so several would run at once, and
+  // clearing the timer would not cancel the ones already in flight. Each of
+  // those resolving true calls onReady, which starts a second consumer on the
+  // same queue and doubles the GPU concurrency the operator configured.
+  //
+  // Chaining makes overlap impossible rather than unlikely, and `settled`
+  // makes onReady once-only rather than once-if-the-timing-cooperates.
+  let settled = false;
+  let timer: NodeJS.Timeout | null = null;
+
+  const scheduleNext = (): void => {
+    if (settled) return;
+    timer = setTimeout(runCheck, intervalMs);
+    // Never hold a shutting-down worker open for a probe of an optional
+    // feature.
+    timer.unref();
+  };
+
+  const runCheck = (): void => {
     void check()
       .then((ready) => {
-        if (!ready) return;
-        // Cleared BEFORE onReady: if starting the consumer throws, the timer
-        // is already gone rather than firing again and starting a second one.
-        clearInterval(timer);
+        if (settled) return;
+        if (!ready) {
+          scheduleNext();
+          return;
+        }
+        // Set BEFORE onReady, so a throw while starting the consumer cannot
+        // leave the watch alive to start a second one.
+        settled = true;
         onReady();
       })
       .catch((error: unknown) => {
-        // Never let a rejected probe take the worker down. This is background
-        // work for an optional feature, and everything else here is working.
+        // Never let a rejected probe take the worker down: this is background
+        // work for an optional feature and everything else here is working.
+        // Keep watching, too — one bad probe ending the watch would be the
+        // permanent outage this exists to prevent.
         logger.warn('media index readiness re-check failed', { err: error });
+        scheduleNext();
       });
-  }, options.intervalMs ?? env.MEDIA_INDEX_RECHECK_INTERVAL_MS);
-  timer.unref();
-  return timer;
+  };
+
+  scheduleNext();
+  return {
+    stop: () => {
+      settled = true;
+      if (timer) clearTimeout(timer);
+    },
+  };
 }
 
 export async function mediaIndexReadiness(): Promise<boolean> {
