@@ -732,6 +732,19 @@ export type Env = Omit<z.infer<typeof envSchema>, 'MEDIA_INDEX_STALE_AFTER_SECON
  */
 const MISSED_HEARTBEATS_BEFORE_STOPPED = 3;
 
+/**
+ * How long one heartbeat write may take before the database gives up on it.
+ *
+ * Exported because two places must agree on it and neither may guess: the
+ * repository applies it as a statement timeout on the write, and the check
+ * below has to allow for it. Beats are CHAINED — the next is scheduled only
+ * once the current one settles — so the real gap between two beats is the
+ * interval PLUS however long the write took, and a threshold that counts only
+ * the interval will call a live run stopped while its heartbeat is still in
+ * flight.
+ */
+export const MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS = 10;
+
 function loadEnv(): Env {
   const parsed = envSchema.safeParse(process.env);
   if (!parsed.success) {
@@ -805,12 +818,20 @@ function loadEnv(): Env {
   // beats.
   const heartbeatSeconds = value.MEDIA_INDEX_HEARTBEAT_SECONDS;
 
+  // The gap between two beats is the interval PLUS the write, not the interval
+  // alone: beats are chained, so the next is scheduled only once the current
+  // one settles, and the write is allowed up to its statement timeout. A
+  // threshold above the interval but below their sum is accepted-looking and
+  // wrong — it expires while a perfectly healthy heartbeat is still in flight.
+  const slowestBeatSeconds = heartbeatSeconds + MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS;
+
   if (value.MEDIA_INDEX_STALE_AFTER_SECONDS !== undefined
-      && value.MEDIA_INDEX_STALE_AFTER_SECONDS <= heartbeatSeconds) {
+      && value.MEDIA_INDEX_STALE_AFTER_SECONDS <= slowestBeatSeconds) {
     problems.push(
       `MEDIA_INDEX_STALE_AFTER_SECONDS (${value.MEDIA_INDEX_STALE_AFTER_SECONDS}) must be greater than ` +
-        `MEDIA_INDEX_HEARTBEAT_SECONDS (${heartbeatSeconds}), or a run is called stopped between two ` +
-        'beats it was always going to miss',
+        `${slowestBeatSeconds} — MEDIA_INDEX_HEARTBEAT_SECONDS (${heartbeatSeconds}) plus the ` +
+        `${MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS}s a beat's own write is allowed — or a run is ` +
+        'called stopped while its heartbeat is still in flight',
     );
   }
 

@@ -70,10 +70,36 @@ describe('the stale threshold is measured in missed heartbeats', () => {
     expect(env.MEDIA_INDEX_STALE_AFTER_SECONDS).toBe(120);
   });
 
+  it('refuses a threshold that expires while a healthy beat is still in flight', async () => {
+    // Beats are chained: the next is scheduled only once the current one
+    // settles, and the write is allowed 10 seconds. So the real gap between
+    // beats is 30 + 10, and a threshold of 35 — comfortably above the interval
+    // and therefore accepted by a check that counted only the interval —
+    // expires while a perfectly healthy heartbeat is still waiting on its own
+    // write.
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((): never => {
+      throw new Error('process.exit');
+    }) as never);
+    const errors: unknown[][] = [];
+    const consoleError = vi.spyOn(console, 'error').mockImplementation((...args) => {
+      errors.push(args);
+    });
+
+    await expect(
+      loadEnv({ MEDIA_INDEX_HEARTBEAT_SECONDS: '30', MEDIA_INDEX_STALE_AFTER_SECONDS: '35' }),
+    ).rejects.toThrow('process.exit');
+
+    const said = errors.flat().join(' ');
+    expect(said).toContain('must be greater than 40');
+    expect(said).toContain('still in flight');
+
+    consoleError.mockRestore();
+    exit.mockRestore();
+  });
+
   it('refuses to start when set inside a single beat', async () => {
-    // A threshold under the heartbeat calls every run stopped between two
-    // beats it was always going to miss. Refused at startup, where it is one
-    // message, rather than discovered as a stream of wrong reasons.
+    // The blunt case, under the interval itself. Refused at startup, where it
+    // is one message, rather than discovered as a stream of wrong reasons.
     const exit = vi.spyOn(process, 'exit').mockImplementation(((): never => {
       throw new Error('process.exit');
     }) as never);
@@ -90,7 +116,7 @@ describe('the stale threshold is measured in missed heartbeats', () => {
     const said = errors.flat().join(' ');
     expect(said).toContain('MEDIA_INDEX_STALE_AFTER_SECONDS');
     // The message has to say why, not just that a rule was broken.
-    expect(said).toContain('between two beats it was always going to miss');
+    expect(said).toContain('still in flight');
 
     consoleError.mockRestore();
     exit.mockRestore();

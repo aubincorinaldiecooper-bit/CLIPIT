@@ -146,6 +146,54 @@ suite('a run can recognise its own identity', () => {
     }
   });
 
+  it('a fenced write never resurrects a row retention removed', async () => {
+    // The fence reads as ownership — write this only if the row is still mine
+    // — and an upsert cannot say that. PostgreSQL applies the ON CONFLICT
+    // condition to the UPDATE branch only, so with no row present it takes the
+    // INSERT path and the fence passes unconditionally.
+    //
+    // Rows go missing on purpose: retention deletes both media index tables
+    // when it claims a video's footage. An indexing job still in flight would
+    // then re-create a status row describing footage that no longer exists.
+    await openRun('video-retained');
+    const runId = await openRun('video-retained');
+
+    // Retention claims the footage.
+    await client.query("DELETE FROM media_index_fence_probe WHERE video_id = 'video-retained'");
+
+    // The in-flight run writes its next status. An UPDATE touches nothing.
+    const written = await client.query(
+      `UPDATE media_index_fence_probe SET started_at = now()
+        WHERE video_id = $1 AND run_id = $2`,
+      ['video-retained', runId],
+    );
+    expect(written.rowCount).toBe(0);
+
+    // And the row stays gone, rather than being quietly recreated.
+    const after = await client.query(
+      'SELECT 1 FROM media_index_fence_probe WHERE video_id = $1',
+      ['video-retained'],
+    );
+    expect(after.rowCount).toBe(0);
+
+    // The shape that used to run in its place puts the row back — this is the
+    // bug, demonstrated rather than described.
+    await client.query(
+      `INSERT INTO media_index_fence_probe (video_id, run_id, started_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (video_id) DO UPDATE SET started_at = now()
+       WHERE media_index_fence_probe.run_id = $2`,
+      ['video-retained', runId],
+    );
+    const resurrected = await client.query(
+      'SELECT 1 FROM media_index_fence_probe WHERE video_id = $1',
+      ['video-retained'],
+    );
+    expect(resurrected.rowCount).toBe(1);
+
+    await client.query("DELETE FROM media_index_fence_probe WHERE video_id = 'video-retained'");
+  });
+
   it('keeps started_at round-trippable, since it is still read into a Date', async () => {
     // No longer the identity, but still handed to JavaScript for reporting. A
     // stored value that cannot survive that trip is a trap either way.

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS } from '../../config/env.js';
 import { query, queryOne, queryRows, withTransaction } from '../pool.js';
 import { unpackVector } from '../../services/mediaIndex/vectors.js';
 
@@ -430,7 +431,7 @@ export async function touchMediaIndexRun(videoId: string, runId: string): Promis
   // SET LOCAL, so it lasts exactly this transaction and no pooled connection
   // carries it to unrelated work.
   return withTransaction(async (client) => {
-    await client.query("SET LOCAL statement_timeout = '10s'");
+    await client.query(`SET LOCAL statement_timeout = '${MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS}s'`);
     const result = await client.query(
       `UPDATE media_index_status
           SET updated_at = now()
@@ -448,18 +449,28 @@ export async function setMediaIndexStatus(
 ): Promise<void> {
   const { writeError: errorGiven, errorValue, clearFinished } = statusWriteDecision(state, patch);
 
-  await query(
-    `INSERT INTO media_index_status
-       (video_id, state, covered_through_seconds, windows_planned, windows_stored, windows_failed,
-        model, revision, dims, index_version, error, started_at, finished_at, updated_at)
-     VALUES ($1, $2, COALESCE($3, 0), COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
-             COALESCE($7, ''), COALESCE($8, ''), $9, COALESCE($10, ''),
-             CASE WHEN $14 THEN $11 ELSE NULL END,
-             $12,
-             CASE WHEN $15 THEN NULL ELSE $13 END,
-             now())
-     ON CONFLICT (video_id) DO UPDATE SET
-       state                   = EXCLUDED.state,
+  /**
+   * A fenced write may only ever UPDATE. It must never insert.
+   *
+   * The fence reads as ownership — "write this only if the row is still mine"
+   * — and an upsert cannot express that, because PostgreSQL applies the
+   * condition to the ON CONFLICT branch and takes the INSERT path when no row
+   * exists. A fence over a missing row therefore passed, unconditionally.
+   *
+   * That matters because rows go missing on purpose: retention deletes both
+   * media index tables when it claims a video's footage (services/retention).
+   * An indexing job still in flight would then re-create a status row for
+   * footage that has been removed — a video described as indexed, or as
+   * failing to index, when there is nothing left to read. Whoever asked for
+   * that footage to go would have no way of knowing.
+   *
+   * Unfenced writes keep the upsert: preprocessing opens the `queued` row that
+   * way, and it is the only caller that should ever bring a row into being.
+   */
+  const fenced = patch.ifRunId !== undefined || patch.ifState !== undefined;
+
+  const assignments = `
+       state                   = $2,
        covered_through_seconds = COALESCE($3, media_index_status.covered_through_seconds),
        windows_planned         = COALESCE($4, media_index_status.windows_planned),
        windows_stored          = COALESCE($5, media_index_status.windows_stored),
@@ -472,9 +483,29 @@ export async function setMediaIndexStatus(
        started_at              = COALESCE($12, media_index_status.started_at),
        finished_at             = CASE WHEN $15 THEN NULL
                                       ELSE COALESCE($13, media_index_status.finished_at) END,
-       updated_at              = now()
-     WHERE ($16::uuid IS NULL OR media_index_status.run_id = $16)
-       AND ($17::text[] IS NULL OR media_index_status.state = ANY($17))`,
+       updated_at              = now()`;
+
+  const fence = `($16::uuid IS NULL OR media_index_status.run_id = $16)
+       AND ($17::text[] IS NULL OR media_index_status.state = ANY($17))`;
+
+  const text = fenced
+    ? `UPDATE media_index_status SET ${assignments}
+     WHERE media_index_status.video_id = $1
+       AND ${fence}`
+    : `INSERT INTO media_index_status
+       (video_id, state, covered_through_seconds, windows_planned, windows_stored, windows_failed,
+        model, revision, dims, index_version, error, started_at, finished_at, updated_at)
+     VALUES ($1, $2, COALESCE($3, 0), COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
+             COALESCE($7, ''), COALESCE($8, ''), $9, COALESCE($10, ''),
+             CASE WHEN $14 THEN $11 ELSE NULL END,
+             $12,
+             CASE WHEN $15 THEN NULL ELSE $13 END,
+             now())
+     ON CONFLICT (video_id) DO UPDATE SET ${assignments}
+     WHERE ${fence}`;
+
+  await query(
+    text,
     [
       videoId,
       state,

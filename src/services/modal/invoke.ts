@@ -79,6 +79,20 @@ function lookup(target: ModalTarget): Promise<Function_> {
 
 /** Test seam, and what a not-found calls to force a fresh lookup. */
 export function resetModalHandles(): void {
+  // CLOSED, not merely dropped. A lookup that never answered keeps its gRPC
+  // call alive, and forgetting the reference does not end it — the readiness
+  // probe retries every minute during an outage, so one abandoned lookup and
+  // one client would be left behind per attempt, each holding a connection
+  // open for a request nothing is waiting for any more. close() ends the calls
+  // this client owns (they reject with ClientClosedError), which is what makes
+  // abandoning a probe safe to do repeatedly.
+  try {
+    client?.close();
+  } catch {
+    // Already closed, or closing threw: either way this client is being
+    // discarded, and a failure to close it must not become the caller's
+    // problem when the caller is a health check.
+  }
   client = null;
   handles.clear();
 }
