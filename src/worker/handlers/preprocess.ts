@@ -20,7 +20,8 @@ import {
 import { mib, readContainerMemory } from '../../lib/containerMemory.js';
 import { shouldDiscardOnUploadFailure } from '../../services/media/verticalPipeline.js';
 import { getVideo, replaceChunks, setIndexStatus, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
-import { enqueueIndexing, enqueueTranscription, type PreprocessingJob } from '../../queues/index.js';
+import { enqueueIndexing, enqueueSimpleMemIndexing, enqueueTranscription, type PreprocessingJob } from '../../queues/index.js';
+import { setSimpleMemIndexStatus } from '../../db/repositories/simplememIndex.js';
 
 
 interface DerivedMedia {
@@ -475,6 +476,21 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
           await setIndexStatus(videoId, 'failed', {
             error: `Could not queue indexing: ${errorMessage(error)}`,
           });
+        }
+      }
+
+      // 6. Send the video to Omni-SimpleMem as well, when it is being tried.
+      //    Its own read, its own row, its own failure: the notes above are
+      //    untouched by it, which is what keeps the fallback whole.
+      if (env.SIMPLEMEM_INDEX_ENABLED) {
+        try {
+          await setSimpleMemIndexStatus(videoId, 'queued');
+          await enqueueSimpleMemIndexing({ videoId });
+        } catch (error) {
+          log.error('could not queue SimpleMem indexing', { err: error });
+          await setSimpleMemIndexStatus(videoId, 'failed', {
+            error: `Could not queue SimpleMem indexing: ${errorMessage(error)}`,
+          }).catch(() => undefined);
         }
       }
     });

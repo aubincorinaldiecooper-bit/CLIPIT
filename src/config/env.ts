@@ -280,6 +280,49 @@ const envSchema = z.object({
   MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
   MEDIA_INDEX_MAX_RETRIES: int(2, 0, 5),
 
+  // --- Retrieval primary: Omni-SimpleMem tried first, Clipit's own search as the fallback
+  /**
+   * Which system a question goes to first. `clipit` is today's behaviour
+   * exactly: notes, then footage. `simplemem` asks the Omni-SimpleMem sidecar
+   * first and falls back to the Clipit path when the memory is not ready,
+   * cannot place the question in time, or finds nothing — each recorded on
+   * the request as its own reason, so the two can be compared from rows.
+   */
+  RETRIEVAL_PRIMARY: z.enum(['clipit', 'simplemem']).default('clipit'),
+  /** The sidecar (tools/simplemem/sidecar.py). Required when SimpleMem is primary or indexing. */
+  SIMPLEMEM_URL: z.string().trim().url().optional(),
+  /**
+   * Send each video to SimpleMem after preprocessing. Off, the primary above
+   * has nothing to answer from and every question falls back, which is
+   * allowed but pointless; startup refuses that combination.
+   */
+  SIMPLEMEM_INDEX_ENABLED: bool(false),
+  /**
+   * Frames a second SimpleMem samples. Its own default is one; the analysis
+   * proxy carries two, so up to two is meaningful. Every frame is a CLIP pass
+   * and, if it is kept, a captioning call, so this is a cost setting.
+   */
+  SIMPLEMEM_FRAME_FPS: num(1, 0.1, 2),
+  /**
+   * The most frames one video may be read into. SimpleMem's own default is
+   * 100 — the first hundred seconds of any video. Clipit asks for the whole
+   * length up to this ceiling and records how far the read got.
+   */
+  SIMPLEMEM_MAX_FRAMES: int(21_600, 1, 200_000),
+  /** Memories asked for per question. */
+  SIMPLEMEM_TOP_K: int(20, 1, 200),
+  /**
+   * Frames scoring under this are not moments. Zero means every returned
+   * frame counts. The scores are cosine similarities over captions and are
+   * not calibrated; set this from the evaluation, not from intuition.
+   */
+  SIMPLEMEM_MIN_SCORE: num(0, 0, 1),
+  /** Kept frames closer than this are one moment. */
+  SIMPLEMEM_GROUP_GAP_SECONDS: num(5, 0, 120),
+  SIMPLEMEM_REQUEST_TIMEOUT_MS: int(60_000, 1_000, 600_000),
+  /** Indexing waits for every frame's caption; a long video is many calls. */
+  SIMPLEMEM_INDEX_TIMEOUT_MS: int(3_600_000, 10_000, 21_600_000),
+
   OPENROUTER_API_BASE_URL: z.string().trim().default('https://openrouter.ai/api/v1'),
   OPENROUTER_API_KEY: nonEmpty('OPENROUTER_API_KEY'),
   /**
@@ -593,6 +636,17 @@ function loadEnv(): Env {
     problems.push(
       'MEDIA_INDEX_MIN_WINDOW_SECONDS must be <= MEDIA_INDEX_WINDOW_SECONDS, or no window ever qualifies',
     );
+  }
+  if (value.RETRIEVAL_PRIMARY === 'simplemem' && !value.SIMPLEMEM_URL) {
+    problems.push('RETRIEVAL_PRIMARY=simplemem requires SIMPLEMEM_URL');
+  }
+  if (value.RETRIEVAL_PRIMARY === 'simplemem' && !value.SIMPLEMEM_INDEX_ENABLED) {
+    problems.push(
+      'RETRIEVAL_PRIMARY=simplemem requires SIMPLEMEM_INDEX_ENABLED=true, or no video is ever remembered and every question falls back',
+    );
+  }
+  if (value.SIMPLEMEM_INDEX_ENABLED && !value.SIMPLEMEM_URL) {
+    problems.push('SIMPLEMEM_INDEX_ENABLED=true requires SIMPLEMEM_URL');
   }
   if (value.TRANSCRIPTION_ENABLED && !value.OPENROUTER_API_KEY) {
     problems.push(
