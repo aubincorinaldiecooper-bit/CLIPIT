@@ -79,22 +79,69 @@ function lookup(target: ModalTarget): Promise<Function_> {
 
 /** Test seam, and what a not-found calls to force a fresh lookup. */
 export function resetModalHandles(): void {
-  // CLOSED, not merely dropped. A lookup that never answered keeps its gRPC
-  // call alive, and forgetting the reference does not end it — the readiness
-  // probe retries every minute during an outage, so one abandoned lookup and
-  // one client would be left behind per attempt, each holding a connection
-  // open for a request nothing is waiting for any more. close() ends the calls
-  // this client owns (they reject with ClientClosedError), which is what makes
-  // abandoning a probe safe to do repeatedly.
-  try {
-    client?.close();
-  } catch {
-    // Already closed, or closing threw: either way this client is being
-    // discarded, and a failure to close it must not become the caller's
-    // problem when the caller is a health check.
-  }
+  // Drops the cache. Deliberately does NOT close the client: it is shared with
+  // every search in flight, and closing it would abort their calls. See
+  // probeModalTarget for why the health check no longer needs that.
   client = null;
   handles.clear();
+}
+
+/**
+ * Is this deployment resolvable? Asked on a client of this probe's own.
+ *
+ * A health check must not borrow the client that serves live traffic, and this
+ * one went through two wrong answers before that was obvious.
+ *
+ * Sharing the cached handle meant a lookup that hung was adopted by every
+ * later probe, so Modal could recover and the watch would never notice.
+ * Clearing the cache fixed that and left the abandoned call running, one per
+ * retry, each holding a connection. Closing the shared client on the way out
+ * ended those calls — and every search's call with them, because the recovery
+ * watch runs in the same process as the clip-search worker. A failed health
+ * check would have cancelled a person's search and sent it to the slow path.
+ *
+ * A client per probe ends all three. Nothing is cached, so nothing is
+ * poisoned; the client is closed in `finally`, so a hung lookup is ended
+ * rather than abandoned; and it was never anyone else's client, so no search
+ * notices. The cost is one connection set up and torn down per probe, which is
+ * the right price for a check that runs once a minute at worst.
+ */
+export async function probeModalTarget(target: ModalTarget): Promise<void> {
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
+    throw new ExternalServiceError(target.label, `${target.label} is not configured`, { retryable: false });
+  }
+
+  const probe = new ModalClient({
+    tokenId: env.MODAL_TOKEN_ID,
+    tokenSecret: env.MODAL_TOKEN_SECRET,
+    environment: env.MODAL_ENVIRONMENT,
+  });
+
+  try {
+    const cls = await probe.cls.fromName(target.app, target.className);
+    const instance = await cls.instance();
+    instance.method(target.method);
+  } catch (error) {
+    const failure = classify(target, error);
+    if (!failure.retryable) {
+      throw new ExternalServiceError(
+        target.label,
+        `Modal cannot resolve ${target.app}/${target.className}.${target.method} in environment ` +
+          `${env.MODAL_ENVIRONMENT}. Check the app name, the class name, and that Clipit's token may see it.`,
+        { retryable: false, cause: failure },
+      );
+    }
+    throw failure;
+  } finally {
+    // Ends this probe's own call, whether it answered, failed, or was
+    // abandoned by a deadline. Swallowed: a health check must not fail on its
+    // own cleanup.
+    try {
+      probe.close();
+    } catch {
+      // Already closed, or closing threw. Either way this client is going.
+    }
+  }
 }
 
 /**

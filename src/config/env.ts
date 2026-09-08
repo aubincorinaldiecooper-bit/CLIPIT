@@ -845,8 +845,14 @@ function loadEnv(): Env {
     // read dead reports a failure that never happened, while noticing a dead
     // one late only delays a fallback that already works — so the margin goes
     // to never accusing, and one dropped write is never a verdict.
+    // Missed beats counted at their SLOWEST, not at the interval. Derived from
+    // the interval alone, a heartbeat of 5s gave 15s — exactly one slow beat
+    // (5s of waiting plus the 10s its write is allowed), so an entirely
+    // healthy run could be called stopped on its first slow write. The default
+    // has to clear the same bar the explicit check enforces, or the check is
+    // stricter than the value it hands out.
     MEDIA_INDEX_STALE_AFTER_SECONDS:
-      value.MEDIA_INDEX_STALE_AFTER_SECONDS ?? heartbeatSeconds * MISSED_HEARTBEATS_BEFORE_STOPPED,
+      value.MEDIA_INDEX_STALE_AFTER_SECONDS ?? slowestBeatSeconds * MISSED_HEARTBEATS_BEFORE_STOPPED,
   };
 }
 

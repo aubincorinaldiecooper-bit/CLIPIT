@@ -42,9 +42,10 @@ describe('the stale threshold is measured in missed heartbeats', () => {
     });
 
     expect(env.MEDIA_INDEX_HEARTBEAT_SECONDS).toBe(30);
-    // Three, so one dropped write — a reset, a failover — is never a verdict,
-    // while a process that actually died is noticed in a minute and a half.
-    expect(env.MEDIA_INDEX_STALE_AFTER_SECONDS).toBe(90);
+    // Three beats at their SLOWEST — 30s of waiting plus the 10s each write is
+    // allowed — so one dropped write is never a verdict, while a process that
+    // actually died is noticed in a couple of minutes.
+    expect(env.MEDIA_INDEX_STALE_AFTER_SECONDS).toBe(120);
   });
 
   it('follows the heartbeat, not the request timeout', async () => {
@@ -58,7 +59,23 @@ describe('the stale threshold is measured in missed heartbeats', () => {
       MEDIA_INDEX_STALE_AFTER_SECONDS: undefined,
     });
 
-    expect(env.MEDIA_INDEX_STALE_AFTER_SECONDS).toBe(30);
+    // (10s interval + 10s write) x 3 missed beats.
+    expect(env.MEDIA_INDEX_STALE_AFTER_SECONDS).toBe(60);
+  });
+
+  it('gives a fast heartbeat a threshold its own beats can meet', async () => {
+    // The derived default has to clear the same bar the explicit check
+    // enforces, or the check is stricter than the value it hands out. At a 5s
+    // interval, counting beats at the interval gave 15s — exactly one slow
+    // beat (5s of waiting plus the 10s its write is allowed), so a healthy run
+    // could be called stopped on its first slow write.
+    const env = await loadEnv({
+      MEDIA_INDEX_HEARTBEAT_SECONDS: '5',
+      MEDIA_INDEX_STALE_AFTER_SECONDS: undefined,
+    });
+
+    expect(env.MEDIA_INDEX_STALE_AFTER_SECONDS).toBe(45);
+    expect(env.MEDIA_INDEX_STALE_AFTER_SECONDS).toBeGreaterThan(5 + 10);
   });
 
   it('still honours an explicit value clear of a beat', async () => {

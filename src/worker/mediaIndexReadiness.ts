@@ -2,7 +2,6 @@ import { env } from '../config/env.js';
 import { ExternalServiceError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { assertMediaIndexDeploymentsAvailable } from '../services/mediaIndex/qwen.js';
-import { resetModalHandles } from '../services/modal/invoke.js';
 
 /**
  * Whether videos can actually be read into vectors — asked once, at startup.
@@ -62,26 +61,15 @@ async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
 }
 
 /**
- * One probe, bounded, leaving nothing behind that would poison the next one.
+ * One probe, bounded.
  *
- * The deadline alone is not enough. The Modal client caches the promise for a
- * deployment lookup so repeat calls share one handle — which is right for
- * inference, and wrong here: abandoning the await on a timeout leaves that
- * pending promise in the cache, so every later probe adopts the SAME hung
- * lookup and times out again. Modal could come back and the watch would never
- * notice, which would quietly defeat the recovery it exists to provide.
- *
- * So a timed-out probe drops the cached handles. The cache holds media-index
- * targets only — MiniCPM keeps its own, in minicpmVideo.ts — so this costs one
- * fresh lookup next time and nothing else.
+ * Nothing is cleaned up here, and that is the point: probeModalTarget builds a
+ * client of its own and closes it in a finally, so an abandoned probe ends its
+ * own call and leaves no cached handle behind for the next one to adopt. This
+ * only has to stop the WAIT — the work is already accounted for.
  */
 async function probeWithin(timeoutMs: number): Promise<void> {
-  try {
-    await withDeadline(assertMediaIndexDeploymentsAvailable(), timeoutMs);
-  } catch (error) {
-    resetModalHandles();
-    throw error;
-  }
+  await withDeadline(assertMediaIndexDeploymentsAvailable(), timeoutMs);
 }
 
 /**

@@ -1,6 +1,6 @@
 import { env } from '../../config/env.js';
 import { ExternalServiceError } from '../../lib/errors.js';
-import { assertModalTargetAvailable, invokeModal, type ModalTarget } from '../modal/invoke.js';
+import { invokeModal, probeModalTarget, type ModalTarget } from '../modal/invoke.js';
 
 /**
  * Clipit's side of the two Qwen deployments.
@@ -55,8 +55,8 @@ export async function assertMediaIndexDeploymentsAvailable(): Promise<void> {
   // Both, always, and the reranker is not optional to check: a working
   // embedder with a missing reranker indexes every video successfully and then
   // fails at the first question, which is the more expensive half to discover.
-  await assertModalTargetAvailable(EMBED_VIDEO);
-  await assertModalTargetAvailable(RERANK);
+  await probeModalTarget(EMBED_VIDEO);
+  await probeModalTarget(RERANK);
 }
 
 export interface IntervalRequest {
