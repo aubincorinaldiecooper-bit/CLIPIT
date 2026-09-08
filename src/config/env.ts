@@ -290,6 +290,8 @@ const envSchema = z.object({
    * GPU-second, so this stays low until measured — the same reasoning that
    * keeps MINICPM_VIDEO_CONCURRENCY at one.
    */
+  /** Windows shortlisted from the vectors before the reranker watches them. */
+  MEDIA_INDEX_TOP_K: int(20, 1, 200),
   MEDIA_INDEX_CONCURRENCY: int(1, 1, 8),
   MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
   MEDIA_INDEX_MAX_RETRIES: int(2, 0, 5),
