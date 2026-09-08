@@ -48,17 +48,27 @@ import type { MediaIndexingJob } from '../../queues/index.js';
 const log = logger.child({ handler: 'media-indexing' });
 
 /** How the run identifies itself and its rows. */
-function provenanceOf(reply: { model: string; revision: string; dims: number }): WindowProvenance {
+function provenanceOf(
+  reply: { model: string; revision: string; dims: number },
+  sourceIdentity: string,
+): WindowProvenance {
   return {
     model: reply.model,
     revision: reply.revision,
     dims: reply.dims,
     indexVersion: env.MEDIA_INDEX_VERSION,
+    sourceIdentity,
   };
 }
 
 function samePlace(a: WindowProvenance, b: WindowProvenance): boolean {
-  return a.model === b.model && a.revision === b.revision && a.dims === b.dims && a.indexVersion === b.indexVersion;
+  return (
+    a.model === b.model &&
+    a.revision === b.revision &&
+    a.dims === b.dims &&
+    a.indexVersion === b.indexVersion &&
+    a.sourceIdentity === b.sourceIdentity
+  );
 }
 
 export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<void> {
@@ -107,7 +117,14 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
     const batchSize = env.MEDIA_INDEX_BATCH_WINDOWS;
 
     for (let offset = 0; offset < planned.length; offset += batchSize) {
-      const batch = planned.slice(offset, offset + batchSize);
+      // Windows already stored under this exact identity are not embedded
+      // again. That is what makes a resumed run cheap rather than merely
+      // correct: an attempt that died at minute forty picks up where it
+      // stopped instead of paying for the whole video a second time. The
+      // first batch always runs, because the run's identity is not known
+      // until something answers.
+      const batch = planned.slice(offset, offset + batchSize).filter((window) => !stored.has(windowKey(window)));
+      if (batch.length === 0) continue;
       // Re-signed per batch so a long run cannot expire halfway through.
       const videoUrl = await getStorage().createDownloadUrl(proxyKey, {
         expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
@@ -125,15 +142,30 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         })),
       });
 
-      const here = provenanceOf(reply);
+      const here = provenanceOf(reply, source.identity);
       if (provenance === null) {
         provenance = here;
         // Opens the run and clears anything stored under other weights, so a
         // video never carries a dead copy of itself. Rows matching this exact
         // provenance survive, which is what makes a resumed run cheap.
-        const cleared = await beginIndexRun(videoId, provenance);
-        if (cleared > 0) log.info('cleared windows from an earlier run', { videoId, cleared, ...provenance });
-        await setMediaIndexStatus(videoId, 'running', { windowsPlanned: planned.length });
+        const opened = await beginIndexRun(videoId, provenance);
+        if (opened.cleared > 0) {
+          log.info('cleared windows that describe other weights or other footage', {
+            videoId, cleared: opened.cleared, ...provenance,
+          });
+        }
+        // Windows already paid for under this exact identity. Counted towards
+        // coverage from the start, or a retry would report a video as unread
+        // when most of it is stored — and then re-embed all of it.
+        for (const key of opened.retained) stored.add(key);
+        if (opened.retained.length > 0) {
+          log.info('resuming an earlier run', { videoId, retained: opened.retained.length });
+        }
+        await setMediaIndexStatus(videoId, 'running', {
+          windowsPlanned: planned.length,
+          windowsStored: stored.size,
+          coveredThroughSeconds: coveredThroughSeconds(planned, stored, windowKey),
+        });
       } else if (!samePlace(provenance, here)) {
         // Mid-run the service began answering from different weights. Vectors
         // from two sets of weights are no more comparable than vectors from

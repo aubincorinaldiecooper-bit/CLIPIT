@@ -95,7 +95,12 @@ function classifyChunkFailure(reason: unknown): ChunkFailureCode {
  * recorded and skipped rather than failing the whole request.
  */
 import { getMediaIndexStatus, listIndexedWindows } from '../../db/repositories/mediaIndex.js';
-import { decideIndexAnswer, searchMediaIndex, type IndexFallbackReason } from '../../services/mediaIndex/search.js';
+import {
+  decideIndexAnswer,
+  IndexProvenanceChanged,
+  searchMediaIndex,
+  type IndexFallbackReason,
+} from '../../services/mediaIndex/search.js';
 import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
 
 /** Moments returned when the person did not write a number. */
@@ -1021,6 +1026,13 @@ async function answerFromMediaIndex(input: {
     return { matchCount: 0, released: false, fallback: before.reason };
   }
 
+  // decideIndexAnswer has already refused a null status as `index_missing`,
+  // so this cannot fire — it is here so the reads below are not resting on a
+  // non-null assertion that a later edit could quietly invalidate.
+  if (!status || status.dims === null) {
+    return { matchCount: 0, released: false, fallback: 'index_missing' };
+  }
+
   let result;
   try {
     const windows = await listIndexedWindows(video.id);
@@ -1034,7 +1046,8 @@ async function answerFromMediaIndex(input: {
     result = await searchMediaIndex({
       instruction,
       windows,
-      coveredThroughSeconds: status?.coveredThroughSeconds ?? 0,
+      coveredThroughSeconds: status.coveredThroughSeconds,
+      storedBy: { model: status.model, revision: status.revision, dims: status.dims },
       // Without the proxy there is no footage to rerank against, so the raw
       // vector order stands rather than the search failing.
       rerank: source && videoUrl
@@ -1042,11 +1055,17 @@ async function answerFromMediaIndex(input: {
         : undefined,
     });
   } catch (error) {
-    const decision = decideIndexAnswer({
-      enabled: true, correcting, mode, status, error: errorMessage(error),
-    });
+    // A model change since this video was indexed is not a failure to report
+    // as one: the index is simply stale, and the question goes to the notes
+    // while the video waits to be re-read.
+    if (error instanceof IndexProvenanceChanged) {
+      log.warn('the index was made by different weights than the question; handing the question on', {
+        reason: error.message,
+      });
+      return { matchCount: 0, released: false, fallback: 'provenance_changed' };
+    }
     log.warn('the media index could not answer; handing the question on', { err: error });
-    return { matchCount: 0, released: false, fallback: decision.use === 'fallback' ? decision.reason : 'index_failed' };
+    return { matchCount: 0, released: false, fallback: 'index_failed' };
   }
 
   const after = decideIndexAnswer({

@@ -664,6 +664,12 @@ function loadEnv(): Env {
   if (value.SIMPLEMEM_INDEX_ENABLED && !value.SIMPLEMEM_URL) {
     problems.push('SIMPLEMEM_INDEX_ENABLED=true requires SIMPLEMEM_URL');
   }
+  if (value.MEDIA_INDEX_ENABLED && (!value.MODAL_TOKEN_ID || !value.MODAL_TOKEN_SECRET)) {
+    // Without these every upload is accepted and then its indexing job fails
+    // one at a time, which reads as a broken product rather than a missing
+    // setting. Failing once at startup says what is actually wrong.
+    problems.push('MEDIA_INDEX_ENABLED=true requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET');
+  }
   if (value.TRANSCRIPTION_ENABLED && !value.OPENROUTER_API_KEY) {
     problems.push(
       'OPENROUTER_API_KEY is required when TRANSCRIPTION_ENABLED=true (set TRANSCRIPTION_ENABLED=false to run visual-only search)',

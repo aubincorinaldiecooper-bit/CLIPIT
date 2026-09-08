@@ -1,4 +1,4 @@
-import { query, queryOne, queryRows } from '../pool.js';
+import { query, queryOne, queryRows, withTransaction } from '../pool.js';
 import { unpackVector } from '../../services/mediaIndex/vectors.js';
 
 /**
@@ -87,6 +87,17 @@ export interface WindowProvenance {
   model: string;
   revision: string;
   indexVersion: string;
+  /**
+   * The store's content tag for the footage these vectors describe.
+   *
+   * Not decoration, and not implied by the rest. The analysis proxy lives at
+   * a deterministic key and re-processing overwrites it, so a REPLACED video
+   * has the same key, the same window keys and — if the model settings did
+   * not change — the same model, revision and dimensions. Without this, a run
+   * against new footage would keep every old window it did not reach and
+   * serve it as the new video.
+   */
+  sourceIdentity: string;
 }
 
 /**
@@ -130,26 +141,49 @@ export async function storeIndexedWindows(
       provenance.model,
       provenance.revision,
     );
-    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${windows.length * 8 + 1})`;
+    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${windows.length * 8 + 1}, $${windows.length * 8 + 2})`;
   });
-  values.push(provenance.indexVersion);
+  values.push(provenance.indexVersion, provenance.sourceIdentity);
 
-  const result = await query(
-    `INSERT INTO media_index
-       (video_id, window_key, start_seconds, end_seconds, embedding, dims, model, revision, index_version)
-     VALUES ${tuples.join(', ')}
-     ON CONFLICT (video_id, window_key) DO UPDATE SET
-       start_seconds = EXCLUDED.start_seconds,
-       end_seconds   = EXCLUDED.end_seconds,
-       embedding     = EXCLUDED.embedding,
-       dims          = EXCLUDED.dims,
-       model         = EXCLUDED.model,
-       revision      = EXCLUDED.revision,
-       index_version = EXCLUDED.index_version,
-       created_at    = now()`,
-    values as never,
-  );
-  return result.rowCount ?? 0;
+  // Refused once retention has claimed or removed the footage.
+  //
+  // An indexing job in flight when someone deletes their video would
+  // otherwise recreate rows describing bytes that are already gone — and
+  // retention has run its delete by then, so the description outlives the
+  // video for good.
+  //
+  // SELECT ... FOR UPDATE rather than a check beforehand: it locks the video
+  // row for this transaction, so retention's claim blocks until these rows
+  // are committed, and a claim that got there first makes this write find
+  // nothing and store nothing. A plain check would leave exactly the gap
+  // that matters open.
+  return withTransaction(async (client) => {
+    const guard = await client.query(
+      `SELECT 1 FROM videos
+        WHERE id = $1 AND footage_expired_at IS NULL AND footage_claimed_at IS NULL
+        FOR UPDATE`,
+      [videoId],
+    );
+    if (guard.rowCount === 0) return 0;
+
+    const result = await client.query(
+      `INSERT INTO media_index
+         (video_id, window_key, start_seconds, end_seconds, embedding, dims, model, revision, index_version, source_identity)
+       VALUES ${tuples.join(', ')}
+       ON CONFLICT (video_id, window_key) DO UPDATE SET
+         start_seconds   = EXCLUDED.start_seconds,
+         end_seconds     = EXCLUDED.end_seconds,
+         embedding       = EXCLUDED.embedding,
+         dims            = EXCLUDED.dims,
+         model           = EXCLUDED.model,
+         revision        = EXCLUDED.revision,
+         index_version   = EXCLUDED.index_version,
+         source_identity = EXCLUDED.source_identity,
+         created_at      = now()`,
+      values,
+    );
+    return result.rowCount ?? 0;
+  });
 }
 
 /**
@@ -187,6 +221,7 @@ export async function listIndexedWindows(videoId: string): Promise<StoredWindow[
         AND m.revision = s.revision
         AND m.dims = s.dims
         AND m.index_version = s.index_version
+        AND m.source_identity = s.source_identity
       ORDER BY m.start_seconds`,
     [videoId],
   );
@@ -339,24 +374,52 @@ export async function setMediaIndexStatus(
  * resumed run cheap: an attempt that died at minute forty picks up from the
  * windows already paid for rather than re-embedding the whole video.
  */
-export async function beginIndexRun(videoId: string, provenance: WindowProvenance): Promise<number> {
-  const removed = await query(
-    `DELETE FROM media_index
-      WHERE video_id = $1
-        AND (model <> $2 OR revision <> $3 OR dims <> $4 OR index_version <> $5)`,
-    [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion] as never,
-  );
+export async function beginIndexRun(
+  videoId: string,
+  provenance: WindowProvenance,
+): Promise<{ cleared: number; retained: string[] }> {
+  // One transaction. Deleting the old index and recording the new run are a
+  // single act: if the status write failed on its own, the previous index
+  // would be gone while its status still read `ready`, and every search would
+  // see a finished index with nothing in it until some later run repaired it.
+  return withTransaction(async (client) => {
+    const removed = await client.query(
+      `DELETE FROM media_index
+        WHERE video_id = $1
+          AND (model <> $2 OR revision <> $3 OR dims <> $4 OR index_version <> $5 OR source_identity <> $6)`,
+      [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity],
+    );
 
-  await setMediaIndexStatus(videoId, 'running', {
-    model: provenance.model,
-    revision: provenance.revision,
-    dims: provenance.dims,
-    indexVersion: provenance.indexVersion,
-    startedAt: new Date(),
-    error: null,
+    // What survived: windows already paid for under this exact identity. They
+    // are handed back so a resumed run counts them towards its coverage
+    // instead of reporting a video as unread when most of it is stored.
+    const kept = await client.query<{ window_key: string }>(
+      `SELECT window_key FROM media_index
+        WHERE video_id = $1 AND model = $2 AND revision = $3 AND dims = $4
+          AND index_version = $5 AND source_identity = $6`,
+      [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity],
+    );
+
+    await client.query(
+      `INSERT INTO media_index_status
+         (video_id, state, model, revision, dims, index_version, source_identity, error, started_at, finished_at, updated_at)
+       VALUES ($1, 'running', $2, $3, $4, $5, $6, NULL, now(), NULL, now())
+       ON CONFLICT (video_id) DO UPDATE SET
+         state           = 'running',
+         model           = $2,
+         revision        = $3,
+         dims            = $4,
+         index_version   = $5,
+         source_identity = $6,
+         error           = NULL,
+         started_at      = now(),
+         finished_at     = NULL,
+         updated_at      = now()`,
+      [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity],
+    );
+
+    return { cleared: removed.rowCount ?? 0, retained: kept.rows.map((row) => row.window_key) };
   });
-
-  return removed.rowCount ?? 0;
 }
 
 /** Removes a video's index. Called with its footage, so the two cannot drift apart. */

@@ -68,6 +68,22 @@ describe('cosineSimilarity', () => {
     expect(cosineSimilarity([0, 0, 0], [0, 0, 0])).toBe(0);
   });
 
+  it('stays finite for every value a float32 vector can hold', () => {
+    // Raised in review as an overflow: "a vector containing 1e30 is not
+    // similar to itself". It is — the accumulators are float64, and the
+    // largest sum of squares a 2048-dimension float32 vector can produce is
+    // about 2.4e80, against a limit near 1.8e308. Pinned so the claim does
+    // not come back.
+    expect(cosineSimilarity([1e30], [1e30])).toBeCloseTo(1);
+    expect(cosineSimilarity([1e-38], [1e-38])).toBeCloseTo(1);
+    expect(cosineSimilarity([3.4e38, 1e-38], [3.4e38, 1e-38])).toBeCloseTo(1);
+
+    const wide = new Array(2048).fill(3.4e38);
+    const self = cosineSimilarity(wide, wide);
+    expect(Number.isFinite(self)).toBe(true);
+    expect(self).toBeCloseTo(1);
+  });
+
   it('refuses to compare vectors of different sizes', () => {
     expect(() => cosineSimilarity([1, 2], [1, 2, 3])).toThrow(/2-dimension vector with a 3-dimension/);
   });

@@ -31,6 +31,7 @@ export type IndexFallbackReason =
   | 'index_unavailable'
   | 'no_coverage'
   | 'no_candidates'
+  | 'provenance_changed'
   | 'index_failed';
 
 export type IndexDecision =
@@ -172,10 +173,17 @@ export interface IndexSearchResult {
   coveredThroughSeconds: number;
 }
 
+export class IndexProvenanceChanged extends Error {}
+
 export interface IndexSearchInput {
   instruction: string;
   windows: readonly StoredWindow[];
   coveredThroughSeconds: number;
+  /**
+   * What the stored vectors were made by. The question is embedded by
+   * whatever the service is serving NOW, and the two must be the same thing.
+   */
+  storedBy: { model: string; revision: string; dims: number };
   /** Signed URL and identity, for the reranker. Omit to skip reranking. */
   rerank?: { videoUrl: string; videoKey: string; expectedBytes: number };
 }
@@ -193,6 +201,23 @@ export async function searchMediaIndex(input: IndexSearchInput): Promise<IndexSe
   const queryVector = embedded.embedded[0]?.embedding;
   if (!queryVector) {
     throw new Error('the embedding service returned no vector for the question');
+  }
+
+  // The question was just embedded by whatever the service is serving now.
+  // The windows were embedded whenever the video was uploaded. If those are
+  // not the same model AND the same weights, comparing them is meaningless —
+  // and when the dimensions happen to match it does not fail, it ranks. Well
+  // ordered, confident, and about nothing. A redeployment that changes the
+  // weights behind an unchanged model name is the ordinary way this happens.
+  if (
+    embedded.model !== input.storedBy.model ||
+    embedded.revision !== input.storedBy.revision ||
+    embedded.dims !== input.storedBy.dims
+  ) {
+    throw new IndexProvenanceChanged(
+      `the question was embedded by ${embedded.model}@${embedded.revision}/${embedded.dims}, but this video's ` +
+        `vectors were made by ${input.storedBy.model}@${input.storedBy.revision}/${input.storedBy.dims}`,
+    );
   }
 
   const ranked = rankWindows(queryVector, input.windows, env.MEDIA_INDEX_TOP_K);
