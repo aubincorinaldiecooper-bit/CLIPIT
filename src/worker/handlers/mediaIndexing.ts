@@ -118,6 +118,8 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
   const failures: Array<{ id: string; reason: string }> = [];
   let provenance: WindowProvenance | null = null;
   let runStartedAt: Date | null = null;
+  /** Containers whose startup this run has already paid for. */
+  const containersCharged = new Set<string>();
 
   try {
     // Read before the first signed URL is minted. The identity carries the
@@ -224,7 +226,18 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
 
       // Priced from the time the GPU was actually held, not wall clock: the
       // caller's clock includes queueing and transfer, which nobody bills for.
-      const gpuMs = gpuMsFrom([reply.metrics]);
+      //
+      // Startup is charged once per CONTAINER across the whole run, not once
+      // per batch. Loading the model is real billed time, but a warm
+      // container does not reload it — and gpuMsFrom on a single reply cannot
+      // know that, so twenty batches served by one container were being
+      // charged twenty model loads for the one that happened.
+      const container = typeof reply.metrics.container === 'string' ? reply.metrics.container : null;
+      const firstUse = container === null || !containersCharged.has(container);
+      if (container !== null) containersCharged.add(container);
+      const gpuMs = firstUse
+        ? gpuMsFrom([reply.metrics])
+        : gpuMsFrom([{ ...reply.metrics, startup_ms: undefined }]);
       await recordModelUsage({
         videoId,
         provider: 'modal',
@@ -240,6 +253,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
           embedded: rows.length,
           failed: reply.failed.length,
           gpuMs,
+          startupCharged: firstUse,
           ...reply.metrics,
         },
         startedAt: new Date(batchStarted),

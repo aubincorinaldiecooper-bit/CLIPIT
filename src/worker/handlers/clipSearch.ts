@@ -44,6 +44,7 @@ import {
   recordDeckPlan,
   recordRetrievalOutcome,
   recordSearchApproach,
+  settleRetrievalSystem,
   recordUncertainMatches,
   releaseDeckAndComplete,
   startClipRequest,
@@ -104,6 +105,8 @@ import {
   type IndexSearchCall,
 } from '../../services/mediaIndex/search.js';
 import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
+import { unreadRanges } from '../../services/mediaIndex/coverage.js';
+import { planWindows, windowKey } from '../../services/mediaIndex/windows.js';
 import { estimateGpuCostUsd } from '../../services/mediaIndex/cost.js';
 
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
@@ -461,9 +464,14 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // fallback did better — can only be checked if the reason is durable. A
     // reason that lives in a log line is not a record.
     if (env.MEDIA_INDEX_ENABLED) {
+      // The reason and what the index produced, but NOT a claim about who
+      // answered: the fallback has not run yet, and it can still fail. A row
+      // saying Clipit answered a question nothing answered is worse than a
+      // row that says nothing. completeRequest fills the system in when a
+      // path actually succeeds.
       await recordRetrievalOutcome(clipRequestId, {
         primary: 'media_index',
-        system: 'clipit',
+        system: null,
         fallbackReason: fromIndex.fallback,
         primaryOutcome: fromIndex.outcome,
       });
@@ -908,6 +916,13 @@ export async function completeRequest(input: {
   // Released and completed together, in one statement, so there is no
   // instant in which the moments are on the creator's screen while the
   // request still says 'searching' and a stale delivery could claim it.
+  // Which system answered, filled in now that one has. Notes and footage are
+  // both Clipit's own search; only the vectors are the other thing.
+  await settleRetrievalSystem(
+    input.clipRequestId,
+    input.answeredFrom === 'media_index' ? 'media_index' : 'clipit',
+  ).catch(() => undefined);
+
   const released = input.deckAttemptId
     ? await releaseDeckAndComplete(clipRequestId, input.deckAttemptId, input.answeredFrom)
     : false;
@@ -1087,9 +1102,8 @@ async function answerFromMediaIndex(input: {
 
   let result;
   let windowsSearched = 0;
-  // The furthest second any stored window reaches. Past the contiguous
-  // prefix these do not count as coverage, but they WERE searched.
-  let snapshotEnd = 0;
+  /** Exactly which windows were searched, so the gaps between them are known. */
+  let searchedWindowKeys: string[] = [];
   try {
     const snapshot = await listIndexedWindows(video.id);
     // Coverage came back with the windows, from one read. A re-index starting
@@ -1104,7 +1118,7 @@ async function answerFromMediaIndex(input: {
     }
     const windows = snapshot.windows;
     windowsSearched = windows.length;
-    snapshotEnd = windows.reduce((furthest, window) => Math.max(furthest, window.endSeconds), 0);
+    searchedWindowKeys = windows.map((window) => window.windowKey);
     const source = video.proxyStorageKey ? await sourceIdentity(video.proxyStorageKey) : null;
     const videoUrl = video.proxyStorageKey
       ? await getStorage().createDownloadUrl(video.proxyStorageKey, {
@@ -1152,6 +1166,12 @@ async function answerFromMediaIndex(input: {
     revision: result.revision,
     elapsedMs: Math.round(performance.now() - startedAt),
   };
+
+  // Recorded here, before the decision below can take an early exit. A
+  // consultation that found nothing still embedded the question and may still
+  // have reranked — a search that costs money and reports none is exactly the
+  // report that makes the comparison worthless.
+  await recordCalls();
 
   const after = decideIndexAnswer({
     enabled: true, correcting, mode, status, candidateCount: result.moments.length,
@@ -1207,30 +1227,39 @@ async function answerFromMediaIndex(input: {
   // screen as an unexamined stretch, and "look again" escalates to the
   // footage rather than the person being told the video holds nothing there.
   const duration = video.durationSeconds ?? chunks.at(-1)?.globalEndSeconds ?? 0;
-  // Everything past the unbroken read, MINUS what was searched anyway.
-  //
-  // Windows past a hole are still stored and were still compared against the
-  // question — they simply do not let the index claim an unbroken read. So
-  // reporting the whole tail as unexamined overstates it in the other
-  // direction, and telling somebody a stretch was never looked at when it was
-  // is the same failure as the reverse.
-  const searchedTail = snapshotEnd;
-  const unreadFrom = Math.max(result.coveredThroughSeconds, searchedTail);
-  if (unreadFrom < duration - 0.5) {
+
+  /**
+   * Every stretch the index did not read — each one, not just the tail.
+   *
+   * Two wrong answers were tried before this one. Reporting everything past
+   * the contiguous prefix OVERSTATES it: windows past a hole are stored and
+   * were compared against the question. Reporting only past the furthest
+   * stored window UNDERSTATES it, and hides a hole in the middle entirely —
+   * which is worse, because an unexamined moment then reads as an absence.
+   *
+   * So the planned grid is rebuilt and diffed against what is actually
+   * stored. The grid is deterministic from the video's length and the index
+   * settings, which is what makes this possible without storing the gaps.
+   */
+  const storedKeys = new Set(searchedWindowKeys);
+  const plannedNow = planWindows(duration, {
+    windowSeconds: env.MEDIA_INDEX_WINDOW_SECONDS,
+    strideSeconds: env.MEDIA_INDEX_STRIDE_SECONDS,
+    minWindowSeconds: env.MEDIA_INDEX_MIN_WINDOW_SECONDS,
+  });
+  for (const gap of unreadRanges(plannedNow, storedKeys, windowKey)) {
     const where = chunks.find(
-      (chunk) =>
-        unreadFrom >= chunk.globalStartSeconds && unreadFrom < chunk.globalEndSeconds,
+      (chunk) => gap.startSeconds >= chunk.globalStartSeconds && gap.startSeconds < chunk.globalEndSeconds,
     ) ?? chunks.at(-1);
-    if (where) {
-      await recordChunkFailure(clipRequestId, {
-        chunkIndex: where.chunkIndex,
-        chunkId: where.id,
-        message: 'This stretch had not been read into the index when the question was asked',
-        code: 'not_read_yet',
-        globalStartSeconds: unreadFrom,
-        globalEndSeconds: duration,
-      });
-    }
+    if (!where) continue;
+    await recordChunkFailure(clipRequestId, {
+      chunkIndex: where.chunkIndex,
+      chunkId: where.id,
+      message: 'This stretch had not been read into the index when the question was asked',
+      code: 'not_read_yet',
+      globalStartSeconds: gap.startSeconds,
+      globalEndSeconds: gap.endSeconds,
+    });
   }
 
   // Stretches the reranker could not read are named as unexamined, through
