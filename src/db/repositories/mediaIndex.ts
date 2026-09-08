@@ -307,6 +307,17 @@ export interface StatusPatch {
    * ready. Progress and completion carry the run that produced them.
    */
   ifRunStartedAt?: Date;
+  /**
+   * Write only while the row is in one of these states.
+   *
+   * For an attempt that failed BEFORE it opened a run: it has no run identity
+   * to be fenced on, and no claim on this row at all. Without a condition it
+   * would stamp its failure over a newer attempt that has since opened, or
+   * even completed — sending every later question to the slow path for a
+   * video that is in fact indexed. Restricting it to `queued` means it can
+   * only report a failure nobody has superseded.
+   */
+  ifState?: readonly MediaIndexState[];
 }
 
 /** States that mean the run is over, one way or another. */
@@ -393,7 +404,8 @@ export async function setMediaIndexStatus(
        finished_at             = CASE WHEN $15 THEN NULL
                                       ELSE COALESCE($13, media_index_status.finished_at) END,
        updated_at              = now()
-     WHERE $16::timestamptz IS NULL OR media_index_status.started_at = $16`,
+     WHERE ($16::timestamptz IS NULL OR media_index_status.started_at = $16)
+       AND ($17::text[] IS NULL OR media_index_status.state = ANY($17))`,
     [
       videoId,
       state,
@@ -411,6 +423,7 @@ export async function setMediaIndexStatus(
       errorGiven,
       clearFinished,
       patch.ifRunStartedAt ?? null,
+      patch.ifState ? [...patch.ifState] : null,
     ] as never,
   );
 }

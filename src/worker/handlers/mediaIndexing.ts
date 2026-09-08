@@ -84,12 +84,16 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
   // description of bytes that are going away, and retention has already run
   // its delete — so the row would outlive the video it describes.
   if (video.footageExpiredAt) {
-    await setMediaIndexStatus(videoId, 'unavailable', { error: 'the footage was removed before indexing began' });
+    await setMediaIndexStatus(videoId, 'unavailable', {
+      error: 'the footage was removed before indexing began',
+      ifState: ['queued'],
+    });
     return;
   }
   if (!video.proxyStorageKey || !video.durationSeconds) {
     await setMediaIndexStatus(videoId, 'unavailable', {
       error: !video.proxyStorageKey ? 'no analysis proxy to read' : 'the video has no known duration',
+      ifState: ['queued'],
     });
     return;
   }
@@ -101,7 +105,10 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
   };
   const planned = planWindows(video.durationSeconds, plan.windowSeconds ? plan : DEFAULT_WINDOW_PLAN);
   if (planned.length === 0) {
-    await setMediaIndexStatus(videoId, 'unavailable', { error: 'the video is too short to plan a single window' });
+    await setMediaIndexStatus(videoId, 'unavailable', {
+      error: 'the video is too short to plan a single window',
+      ifState: ['queued'],
+    });
     return;
   }
 
@@ -167,6 +174,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
           windowsPlanned: planned.length,
           windowsStored: stored.size,
           coveredThroughSeconds: coveredThroughSeconds(planned, stored, windowKey),
+          ifRunStartedAt: opened.runStartedAt,
         });
       } else if (!samePlace(provenance, here)) {
         // Mid-run the service began answering from different weights. Vectors
@@ -255,7 +263,7 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         coveredThroughSeconds: 0,
         finishedAt: new Date(),
         error: 'the analysis proxy was replaced while it was being indexed; these vectors describe two different videos',
-        ifRunStartedAt: runStartedAt ?? undefined,
+        ...(runStartedAt ? { ifRunStartedAt: runStartedAt } : { ifState: ['queued'] as const }),
       }).catch(() => undefined);
       log.warn('the footage was replaced mid-index; none of these vectors are believed', { videoId });
       return;
@@ -269,7 +277,10 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       windowsFailed: failures.length,
       coveredThroughSeconds: covered,
       finishedAt: new Date(),
-      ifRunStartedAt: runStartedAt ?? undefined,
+      // A resume that found every window already stored never opens a run and
+      // so has no identity to be fenced on; it may then only report over a
+      // still-`queued` row, never over a newer attempt.
+      ...(runStartedAt ? { ifRunStartedAt: runStartedAt } : { ifState: ['queued'] as const }),
       error: unread.length === 0
         ? null
         : `${unread.length} stretch(es) were not read: ${unread
@@ -297,7 +308,12 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       windowsFailed: failures.length,
       coveredThroughSeconds: coveredThroughSeconds(planned, stored, windowKey),
       finishedAt: new Date(),
-      ifRunStartedAt: runStartedAt ?? undefined,
+      // Fenced on this run when it got as far as opening one. If it did not,
+      // it never owned this row: it may only report over a `queued` state,
+      // so a delivery that died early cannot stamp `failed` over a newer
+      // attempt that has since opened or even finished — which would send
+      // every later question to the slow path for a video that is indexed.
+      ...(runStartedAt ? { ifRunStartedAt: runStartedAt } : { ifState: ['queued'] as const }),
       error: message,
     }).catch(() => undefined);
     log.error('media index failed', { videoId, err: error, stored: stored.size });
