@@ -9,6 +9,7 @@ import {
   beginIndexRun,
   setMediaIndexStatus,
   storeIndexedWindows,
+  touchMediaIndexRun,
   type WindowProvenance,
 } from '../../db/repositories/mediaIndex.js';
 import { packVector } from '../../services/mediaIndex/vectors.js';
@@ -72,9 +73,34 @@ function samePlace(a: WindowProvenance, b: WindowProvenance): boolean {
   );
 }
 
+/**
+ * Says "still alive" on a timer for as long as the run is working.
+ *
+ * Unref'd, so a worker shutting down is never held open by it, and every
+ * failure is swallowed: a missed beat is exactly what the threshold's margin
+ * is for, and a heartbeat that could crash the read it reports on would be
+ * worse than no heartbeat at all.
+ */
+function startHeartbeat(videoId: string, runStartedAt: Date): NodeJS.Timeout {
+  const timer = setInterval(() => {
+    void touchMediaIndexRun(videoId, runStartedAt)
+      .then((stillOurs) => {
+        // The row moved on without us — superseded by a newer run, or already
+        // finished. Stop claiming it.
+        if (!stillOurs) clearInterval(timer);
+      })
+      .catch((error: unknown) => {
+        log.warn('could not record that this indexing run is still alive', { videoId, err: error });
+      });
+  }, env.MEDIA_INDEX_HEARTBEAT_SECONDS * 1000);
+  timer.unref();
+  return timer;
+}
+
 export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<void> {
   const { videoId } = job.data;
   const started = Date.now();
+  let heartbeat: NodeJS.Timeout | null = null;
 
   const video = await getVideo(videoId);
   if (!video) {
@@ -161,6 +187,12 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         // provenance survive, which is what makes a resumed run cheap.
         const opened = await beginIndexRun(videoId, provenance);
         runStartedAt = opened.runStartedAt;
+        // From here the run owns the row, so from here it says it is alive —
+        // on its own timer, not when batches happen to finish. A batch may
+        // wait a long time for a Modal permit that searches also use, and
+        // then retry inside itself; none of that means nothing is reading
+        // this video, and only this tick can tell the difference.
+        heartbeat = startHeartbeat(videoId, opened.runStartedAt);
         if (opened.cleared > 0) {
           log.info('cleared windows that describe other weights or other footage', {
             videoId, cleared: opened.cleared, ...provenance,
@@ -367,5 +399,11 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
     });
     log.error('media index failed', { videoId, err: error, stored: stored.size });
     throw error;
+  } finally {
+    // Every exit, including the early return when the footage was swapped and
+    // including a throw. A heartbeat outliving its run would keep a dead row
+    // looking alive — the precise lie this whole mechanism exists to stop, and
+    // it would be this code telling it.
+    if (heartbeat) clearInterval(heartbeat);
   }
 }

@@ -362,21 +362,25 @@ const envSchema = z.object({
    */
   MEDIA_INDEX_RECHECK_INTERVAL_MS: int(60_000, 5_000, 3_600_000),
   /**
+   * How often a run reading a video says it is still alive.
+   *
+   * Deliberately separate from progress. Progress lands when a batch of
+   * windows returns, and a batch waits for a Modal permit that searches
+   * compete for, then retries internally — so time-since-progress measures how
+   * busy the system is, not whether anything is still reading. The heartbeat
+   * ticks regardless of what the batch is waiting for, which is the only way
+   * silence can honestly mean "the process is gone".
+   *
+   * Half a minute: one small UPDATE per running video, invisible next to a GPU
+   * call, and frequent enough that a dead run is noticed in a couple of
+   * minutes.
+   */
+  MEDIA_INDEX_HEARTBEAT_SECONDS: int(30, 5, 600),
+  /**
    * How long a run may say nothing before it is presumed to have stopped.
    *
-   * A live run writes its progress after every batch of windows, so silence is
-   * not slowness — it means the process reading this video is gone.
-   *
-   * DERIVED, not fixed, and unset by default: it resolves to three times
-   * MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS (see loadEnv). The correctness of this
-   * number is entirely a relationship to that one — a single embedding call
-   * may legally run for the whole request timeout, and the heartbeat is only
-   * written once the batch it belongs to returns, so anything at or below the
-   * request timeout declares a healthy read dead. A fixed 2700 was right only
-   * while the timeout stayed at its own default of 900; raising the timeout to
-   * its permitted maximum of 3600 and leaving this alone would have had
-   * searches call a legally-running first call stopped. Derived, that cannot
-   * drift apart, and an explicit value is checked against the same rule.
+   * Unset by default: it resolves to three missed heartbeats (see loadEnv),
+   * and an explicit value is refused if it falls at or under a single beat.
    *
    * This exists because of the one failure the indexing handler cannot report
    * on its own: it records `failed` in its error path, but that record is
@@ -386,7 +390,7 @@ const envSchema = z.object({
    * every question about it quietly takes the slow, expensive path while the
    * system says something reassuring and false.
    */
-  MEDIA_INDEX_STALE_AFTER_SECONDS: optionalInt(60, 86_400),
+  MEDIA_INDEX_STALE_AFTER_SECONDS: optionalInt(10, 86_400),
 
   // --- Retrieval primary: Omni-SimpleMem tried first, Clipit's own search as the fallback
   /**
@@ -720,26 +724,13 @@ export type Env = Omit<z.infer<typeof envSchema>, 'MEDIA_INDEX_STALE_AFTER_SECON
 };
 
 /**
- * The longest a HEALTHY batch can legally go without reporting progress.
+ * How many heartbeats a run may miss before it is presumed gone.
  *
- * Progress is written when a batch returns, and one batch is one invokeModal
- * call — which retries inside itself. So the silence to beat is not one
- * timeout but every attempt it is allowed, plus the waits between them:
- *
- *   (maxRetries + 1) attempts × the full request timeout
- *   + the backoff after each failed attempt, min(30s, 2^attempt)
- *
- * Mirrors the retry loop in services/modal/invoke.ts. If that backoff changes,
- * this changes with it — the two are one rule expressed twice, and the test in
- * mediaIndexStaleThreshold pins the arithmetic.
+ * Three, so a single dropped write — a connection reset, a failover — is not a
+ * verdict, while a process that actually died is noticed in a couple of
+ * minutes rather than an hour.
  */
-function longestHealthySilenceSeconds(requestTimeoutSeconds: number, maxRetries: number): number {
-  let backoffSeconds = 0;
-  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
-    backoffSeconds += Math.min(30, 2 ** attempt);
-  }
-  return (maxRetries + 1) * requestTimeoutSeconds + backoffSeconds;
-}
+const MISSED_HEARTBEATS_BEFORE_STOPPED = 3;
 
 function loadEnv(): Env {
   const parsed = envSchema.safeParse(process.env);
@@ -799,34 +790,27 @@ function loadEnv(): Env {
     );
   }
 
-  // A read is judged dead by its silence, so the threshold has to outlast the
-  // longest silence a LIVE read can produce — and that is NOT one request
-  // timeout. Progress is written once a batch returns, and one batch is one
-  // invokeModal call, which retries internally: MEDIA_INDEX_MAX_RETRIES + 1
-  // attempts, each bounded by the full request timeout, with exponential
-  // backoff between them. A batch that times out twice and succeeds on the
-  // third attempt is a HEALTHY batch that said nothing for three timeouts.
+  // A run is judged gone by its silence, and what it is silent BETWEEN is the
+  // heartbeat, not the batches. That distinction is the whole design.
   //
-  // At defaults that worst case is 2703s, against a threshold that a plain
-  // "three times the timeout" would have put at 2700 — accusing a live read by
-  // three seconds. Raise MEDIA_INDEX_MAX_RETRIES to its permitted 5 and the
-  // same arithmetic gives 5431s against 2700, which accuses it comfortably.
-  const worstHealthySilenceSeconds = longestHealthySilenceSeconds(
-    value.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
-    value.MEDIA_INDEX_MAX_RETRIES,
-  );
+  // Deriving this from batch timing was tried twice and is not fixable. A
+  // batch's duration is its permit wait plus its retries plus their backoff,
+  // and the permit wait — searches and indexing share the same permits — is
+  // bounded by nothing at all. Any multiplier over the request timeout is a
+  // guess about contention dressed as arithmetic, and every version of it
+  // eventually calls a healthy read dead.
+  //
+  // The heartbeat removes the guess: the worker says it is alive on a fixed
+  // timer whatever it is waiting for, so this only has to outlast a few missed
+  // beats.
+  const heartbeatSeconds = value.MEDIA_INDEX_HEARTBEAT_SECONDS;
 
-  // An explicit value may be tuned tighter than the derived default — an
-  // operator who knows their footage may want faster detection — but never
-  // into the range where a healthy batch is called dead.
   if (value.MEDIA_INDEX_STALE_AFTER_SECONDS !== undefined
-      && value.MEDIA_INDEX_STALE_AFTER_SECONDS <= worstHealthySilenceSeconds) {
+      && value.MEDIA_INDEX_STALE_AFTER_SECONDS <= heartbeatSeconds) {
     problems.push(
       `MEDIA_INDEX_STALE_AFTER_SECONDS (${value.MEDIA_INDEX_STALE_AFTER_SECONDS}) must be greater than ` +
-        `${worstHealthySilenceSeconds}, the longest a healthy batch can legally go without reporting ` +
-        `(MEDIA_INDEX_MAX_RETRIES=${value.MEDIA_INDEX_MAX_RETRIES} retries of ` +
-        `MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS=${value.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS}s plus backoff), ` +
-        'or a read still working inside its own limits is reported as a read that stopped',
+        `MEDIA_INDEX_HEARTBEAT_SECONDS (${heartbeatSeconds}), or a run is called stopped between two ` +
+        'beats it was always going to miss',
     );
   }
 
@@ -836,18 +820,12 @@ function loadEnv(): Env {
   }
   return {
     ...value,
-    // Twice the worst healthy silence. The two errors are not symmetric:
-    // declaring a live read dead reports a failure that never happened, while
-    // being slow to notice a dead one only delays a fallback that already
-    // works. So the margin goes to never accusing.
-    //
-    // The doubling is also what covers the one delay the arithmetic above does
-    // NOT model: a batch waits on the shared Modal semaphore before its first
-    // attempt, and the search path draws on the same permits. Those calls are
-    // short next to an embedding batch, so contention is absorbed by the
-    // margin rather than proven impossible — the honest description of this
-    // number is "generously past any healthy silence", not "provably past".
-    MEDIA_INDEX_STALE_AFTER_SECONDS: value.MEDIA_INDEX_STALE_AFTER_SECONDS ?? worstHealthySilenceSeconds * 2,
+    // Three missed beats. The two errors are not symmetric: declaring a live
+    // read dead reports a failure that never happened, while noticing a dead
+    // one late only delays a fallback that already works — so the margin goes
+    // to never accusing, and one dropped write is never a verdict.
+    MEDIA_INDEX_STALE_AFTER_SECONDS:
+      value.MEDIA_INDEX_STALE_AFTER_SECONDS ?? heartbeatSeconds * MISSED_HEARTBEATS_BEFORE_STOPPED,
   };
 }
 

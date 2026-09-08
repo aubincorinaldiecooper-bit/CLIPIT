@@ -32,10 +32,12 @@ vi.mock('../src/db/repositories/videos.js', () => ({ getVideo }));
 const setMediaIndexStatus = vi.fn(async () => true);
 const beginIndexRun = vi.fn(async () => ({ cleared: 0, retained: [], runStartedAt: new Date('2026-09-08T11:00:00Z') }));
 const storeIndexedWindows = vi.fn(async () => 0);
+const touchMediaIndexRun = vi.fn(async () => true);
 vi.mock('../src/db/repositories/mediaIndex.js', () => ({
   beginIndexRun,
   setMediaIndexStatus,
   storeIndexedWindows,
+  touchMediaIndexRun,
 }));
 
 vi.mock('../src/db/repositories/usage.js', () => ({ recordModelUsage: vi.fn(async () => undefined) }));
@@ -64,6 +66,106 @@ beforeEach(() => {
   setMediaIndexStatus.mockResolvedValue(true);
   beginIndexRun.mockResolvedValue({ cleared: 0, retained: [], runStartedAt: new Date('2026-09-08T11:00:00Z') });
   sourceIdentity.mockResolvedValue({ identity: 'sha-original', bytes: 1_000 });
+  touchMediaIndexRun.mockResolvedValue(true);
+});
+
+describe('a run says it is alive for as long as it is working', () => {
+  /**
+   * Why a heartbeat exists at all.
+   *
+   * Progress lands when a batch of windows returns, and a batch first waits
+   * for a Modal permit that SEARCHES also draw on — a wait no timeout bounds.
+   * Judging liveness by time-since-progress therefore measures how busy the
+   * system is, and starves a healthy run into looking dead. Only a tick that
+   * keeps running while the batch waits can tell the two apart.
+   */
+  const RUN_STARTED = new Date('2026-09-08T11:00:00Z');
+  const emptyBatch = {
+    embedded: [], failed: [], model: 'Qwen/Qwen3-VL-Embedding-2B', revision: '', dims: 2048, metrics: {},
+  };
+
+  /**
+   * A run only opens once the first batch has come back — that is where the
+   * model's identity is learned. Before then the row is still `queued`, which
+   * the read path never calls stopped, so the interesting case is the SECOND
+   * batch: the run is open, `running`, and stuck.
+   *
+   * A long enough video to need more than one batch of 32 windows.
+   */
+  const longVideo = () => {
+    getVideo.mockResolvedValue({
+      id: 'video-1',
+      proxyStorageKey: 'proxies/video-1.mp4',
+      durationSeconds: 400,
+      footageExpiredAt: null,
+    });
+  };
+
+  it('keeps saying so while a later batch is stuck waiting for a permit', async () => {
+    vi.useFakeTimers();
+    longVideo();
+    // First batch returns and opens the run; the next never comes back,
+    // because searches are holding the only Modal permit. Under the old rule
+    // this run went quiet and got called stopped while perfectly healthy.
+    embedVideoIntervals
+      .mockResolvedValueOnce(emptyBatch)
+      .mockImplementation(() => new Promise(() => {}));
+
+    void handleMediaIndexing(job);
+    await vi.advanceTimersByTimeAsync(0);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(touchMediaIndexRun).toHaveBeenCalledWith('video-1', RUN_STARTED);
+    const afterOne = touchMediaIndexRun.mock.calls.length;
+    expect(afterOne).toBeGreaterThan(0);
+
+    await vi.advanceTimersByTimeAsync(90_000);
+    // Still beating, with no batch having returned in all that time.
+    expect(touchMediaIndexRun.mock.calls.length).toBeGreaterThan(afterOne);
+
+    vi.useRealTimers();
+  });
+
+  it('stops beating once the run is over, so a dead row never looks alive', async () => {
+    vi.useFakeTimers();
+    longVideo();
+    embedVideoIntervals
+      .mockResolvedValueOnce(emptyBatch)
+      .mockRejectedValue(new Error('the embedding service refused every window'));
+
+    await expect(handleMediaIndexing(job)).rejects.toThrow('refused every window');
+
+    const afterRun = touchMediaIndexRun.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    // A heartbeat outliving its run would keep a dead row looking alive —
+    // this code telling the exact lie the mechanism exists to stop.
+    expect(touchMediaIndexRun.mock.calls.length).toBe(afterRun);
+
+    vi.useRealTimers();
+  });
+
+  it('gives up the beat when the row has moved on to another run', async () => {
+    vi.useFakeTimers();
+    longVideo();
+    embedVideoIntervals
+      .mockResolvedValueOnce(emptyBatch)
+      .mockImplementation(() => new Promise(() => {}));
+    // Superseded: a newer run owns this row now.
+    touchMediaIndexRun.mockResolvedValue(false);
+
+    void handleMediaIndexing(job);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const afterFirst = touchMediaIndexRun.mock.calls.length;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    await vi.advanceTimersByTimeAsync(300_000);
+    // One refusal is enough: this run must not keep a row it lost looking
+    // alive on behalf of the run that replaced it.
+    expect(touchMediaIndexRun.mock.calls.length).toBe(afterFirst);
+
+    vi.useRealTimers();
+  });
 });
 
 describe('a failure that could not be written down is still reported', () => {

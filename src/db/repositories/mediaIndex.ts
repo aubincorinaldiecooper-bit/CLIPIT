@@ -395,6 +395,35 @@ export function statusWriteDecision(state: MediaIndexState, patch: StatusPatch):
   };
 }
 
+/**
+ * "This run is still alive." Nothing else.
+ *
+ * The liveness signal, separated from progress on purpose. Progress arrives
+ * when a batch of windows returns, and a batch can legitimately take a very
+ * long time — it waits for a shared Modal permit that searches also draw on,
+ * then retries internally, each attempt allowed a full request timeout. Time
+ * since the last batch therefore measures how busy the system is, not whether
+ * anything is still reading this video, and no arithmetic over those settings
+ * turns one into the other: the permit wait is bounded by nothing at all.
+ *
+ * So the process says so itself, on a timer, while it is working. Silence then
+ * means the process is gone — which is the only thing the read path actually
+ * wants to know.
+ *
+ * Fenced on the run that opened the row: a worker whose run has been
+ * superseded cannot keep a newer attempt's row looking alive, and one that
+ * finished cannot revive a terminal state, because only `running` is touched.
+ */
+export async function touchMediaIndexRun(videoId: string, runStartedAt: Date): Promise<boolean> {
+  const result = await query(
+    `UPDATE media_index_status
+        SET updated_at = now()
+      WHERE video_id = $1 AND started_at = $2 AND state = 'running'`,
+    [videoId, runStartedAt],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
 export async function setMediaIndexStatus(
   videoId: string,
   state: MediaIndexState,
