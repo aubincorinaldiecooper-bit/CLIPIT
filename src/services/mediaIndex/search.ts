@@ -33,7 +33,21 @@ export type IndexFallbackReason =
   | 'no_coverage'
   | 'no_candidates'
   | 'provenance_changed'
-  | 'index_failed';
+  | 'index_failed'
+  /**
+   * A run that opened and then stopped saying anything.
+   *
+   * Distinct from `index_not_ready` on purpose, and the distinction is the
+   * whole point of this reason existing. A row reads `running` in two very
+   * different situations: a video being read right now, and a video whose read
+   * died in a way that could not be written down — the handler records
+   * `failed` in its own error path, but that write is itself a database call,
+   * and when IT fails the row keeps saying `running` with nobody left to
+   * correct it. Treating the second as the first tells every later question
+   * that reading is still in progress, forever, for a video nothing is
+   * touching.
+   */
+  | 'index_stopped';
 
 export type IndexDecision =
   | { use: 'index' }
@@ -49,6 +63,25 @@ export interface IndexDecisionInput {
   candidateCount?: number;
   /** Present when consulting it threw. */
   error?: string;
+  /** Injected so "has this run gone quiet" is testable rather than clock-bound. */
+  now?: Date;
+  /**
+   * How long a run may say nothing before it is presumed stopped. Defaults to
+   * the configured window; a live run writes its status after every batch, so
+   * silence for longer than this is not slowness.
+   */
+  staleAfterMs?: number;
+}
+
+/**
+ * A run that has gone quiet for longer than any batch could take.
+ *
+ * Only `queued` and `running` can go stale: every other state is terminal and
+ * means somebody finished writing the truth down.
+ */
+function hasStopped(status: MediaIndexStatus, now: Date, staleAfterMs: number): boolean {
+  if (status.state !== 'queued' && status.state !== 'running') return false;
+  return now.getTime() - status.updatedAt.getTime() > staleAfterMs;
 }
 
 /**
@@ -87,6 +120,8 @@ export function decideIndexAnswer(input: IndexDecisionInput): IndexDecision {
   if (!status) {
     return { use: 'fallback', reason: 'index_missing', detail: 'this video was never read into vectors' };
   }
+  const now = input.now ?? new Date();
+  const staleAfterMs = input.staleAfterMs ?? env.MEDIA_INDEX_STALE_AFTER_SECONDS * 1000;
   switch (status.state) {
     case 'queued':
     case 'running':
@@ -114,15 +149,27 @@ export function decideIndexAnswer(input: IndexDecisionInput): IndexDecision {
       break;
   }
   if (status.coveredThroughSeconds <= 0) {
-    const notYet = status.state === 'queued' || status.state === 'running';
+    // "Not yet" is a promise that something is coming. It may only be said
+    // while something actually is: a run still reporting. One that has gone
+    // quiet gets the truthful answer instead — it started and it stopped.
+    const stopped = hasStopped(status, now, staleAfterMs);
+    const notYet = (status.state === 'queued' || status.state === 'running') && !stopped;
     return {
       use: 'fallback',
-      reason: notYet ? 'index_not_ready' : status.state === 'failed' ? 'index_unavailable' : 'no_coverage',
+      reason: notYet
+        ? 'index_not_ready'
+        : stopped
+          ? 'index_stopped'
+          : status.state === 'failed'
+            ? 'index_unavailable'
+            : 'no_coverage',
       detail: notYet
         ? 'no part of this video has been read into vectors yet'
-        : status.state === 'failed'
-          ? status.error ?? 'reading this video into vectors failed before anything was stored'
-          : 'no part of this video has been read into vectors',
+        : stopped
+          ? 'reading this video into vectors started and then stopped without finishing, and nothing was stored'
+          : status.state === 'failed'
+            ? status.error ?? 'reading this video into vectors failed before anything was stored'
+            : 'no part of this video has been read into vectors',
     };
   }
   if (input.error !== undefined) {

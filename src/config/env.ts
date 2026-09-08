@@ -249,17 +249,24 @@ const envSchema = z.object({
   /**
    * Read every uploaded video into vectors.
    *
-   * Off by default, and deliberately so: turning it on starts a GPU call per
-   * batch of windows for every upload, and the two Modal services must
-   * actually be deployed for it to do anything but fail. Neither is a thing
-   * this process can check for itself, and a deploy that silently begins
-   * spending — or silently begins failing on every video — is not something
-   * to inherit by accident.
+   * On by default. It ships on because that is the decision that was made
+   * about this feature, and a default is where a decision like that lives.
    *
-   * This is a real switch, unlike the one it replaces: with it on, videos are
-   * indexed and questions consult the index.
+   * It shipped off once, guarded by the argument that turning it on starts a
+   * GPU call per batch of windows for every upload, and that the two Modal
+   * services must be deployed for it to do anything but fail — "neither is a
+   * thing this process can check for itself". The second half of that was
+   * simply untrue. `assertModalTargetAvailable` resolves a deployment without
+   * invoking it, and the worker now calls it at startup for both services
+   * (see worker/main.ts). So a missing deployment is one loud refusal to boot,
+   * not a silent failure on every upload, and the reason for the off default
+   * does not survive contact with the code that was already here.
+   *
+   * What remains true is the spending, and that is the point of the switch
+   * rather than an argument against its default: with this on, every upload
+   * costs GPU time, which is what reading every video into vectors is.
    */
-  MEDIA_INDEX_ENABLED: bool(false),
+  MEDIA_INDEX_ENABLED: bool(true),
   MEDIA_INDEX_VERSION: z.string().trim().default('v1'),
   /**
    * The exact weights, when they are known. A model NAME is not an identity:
@@ -317,6 +324,23 @@ const envSchema = z.object({
   MEDIA_INDEX_CONCURRENCY: int(1, 1, 8),
   MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
   MEDIA_INDEX_MAX_RETRIES: int(2, 0, 5),
+  /**
+   * How long a run may say nothing before it is presumed to have stopped.
+   *
+   * A live run writes its progress after every batch of windows, so silence is
+   * not slowness — it means the process reading this video is gone. The
+   * default is three times the per-call timeout, which is longer than any
+   * single batch can legally take, so a working read can never trip it.
+   *
+   * This exists because of the one failure the indexing handler cannot report
+   * on its own: it records `failed` in its error path, but that record is
+   * itself a database write, and when THAT write fails the row keeps saying
+   * `running` with nothing left alive to correct it. Without this, such a
+   * video is described as "still being read" for as long as it exists, and
+   * every question about it quietly takes the slow, expensive path while the
+   * system says something reassuring and false.
+   */
+  MEDIA_INDEX_STALE_AFTER_SECONDS: int(2700, 60, 86_400),
 
   // --- Retrieval primary: Omni-SimpleMem tried first, Clipit's own search as the fallback
   /**
@@ -686,12 +710,14 @@ function loadEnv(): Env {
   if (value.SIMPLEMEM_INDEX_ENABLED && !value.SIMPLEMEM_URL) {
     problems.push('SIMPLEMEM_INDEX_ENABLED=true requires SIMPLEMEM_URL');
   }
-  if (value.MEDIA_INDEX_ENABLED && (!value.MODAL_TOKEN_ID || !value.MODAL_TOKEN_SECRET)) {
-    // Without these every upload is accepted and then its indexing job fails
-    // one at a time, which reads as a broken product rather than a missing
-    // setting. Failing once at startup says what is actually wrong.
-    problems.push('MEDIA_INDEX_ENABLED=true requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET');
-  }
+  // MEDIA_INDEX_ENABLED's demand for Modal credentials is NOT checked here,
+  // and the reason is the difference between a degraded feature and an outage.
+  // This file is loaded by both processes, and only the worker ever calls
+  // Modal — the API reads MEDIA_INDEX_ENABLED nowhere. A check here fails the
+  // API for the absence of a credential it must never be given, which is the
+  // same rule the MiniCPM token already follows: "the API never receives
+  // infrastructure credentials it does not use" (worker/main.ts). Enforced
+  // there, on the process that actually spends the token.
   if (value.TRANSCRIPTION_ENABLED && !value.OPENROUTER_API_KEY) {
     problems.push(
       'OPENROUTER_API_KEY is required when TRANSCRIPTION_ENABLED=true (set TRANSCRIPTION_ENABLED=false to run visual-only search)',

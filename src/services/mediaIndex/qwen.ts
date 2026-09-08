@@ -1,6 +1,6 @@
 import { env } from '../../config/env.js';
 import { ExternalServiceError } from '../../lib/errors.js';
-import { invokeModal, type ModalTarget } from '../modal/invoke.js';
+import { assertModalTargetAvailable, invokeModal, type ModalTarget } from '../modal/invoke.js';
 
 /**
  * Clipit's side of the two Qwen deployments.
@@ -39,6 +39,25 @@ const RERANK: ModalTarget = {
   method: 'rerank_video_intervals',
   label: 'qwen-reranker',
 };
+
+/**
+ * Resolve both deployments without invoking either.
+ *
+ * Reading videos into vectors is on by default, so the failure this prevents
+ * is the one that costs most to diagnose: an app name that does not resolve
+ * turns every upload into its own failed indexing job, hours apart, each
+ * looking like a broken product rather than a missing deployment. Modal does
+ * not start a GPU until a method is called, so asking whether these exist is
+ * free — and it is the check whose supposed absence was once the argument for
+ * shipping the whole feature switched off.
+ */
+export async function assertMediaIndexDeploymentsAvailable(): Promise<void> {
+  // Both, always, and the reranker is not optional to check: a working
+  // embedder with a missing reranker indexes every video successfully and then
+  // fails at the first question, which is the more expensive half to discover.
+  await assertModalTargetAvailable(EMBED_VIDEO);
+  await assertModalTargetAvailable(RERANK);
+}
 
 export interface IntervalRequest {
   id: string;

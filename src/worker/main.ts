@@ -15,6 +15,7 @@ import {
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
 import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVideo.js';
+import { assertMediaIndexDeploymentsAvailable } from '../services/mediaIndex/qwen.js';
 import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
@@ -94,6 +95,14 @@ function checkVideoProviderConfig(): void {
   if (env.VIDEO_PROVIDER === 'minicpm' && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
     throw new Error('VIDEO_PROVIDER=minicpm requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker');
   }
+  // Same rule, same reason: reading videos into vectors is Modal work, and
+  // this is the only process that does it. Checked here rather than in the
+  // shared config so a missing credential stops the indexing, not the API —
+  // an API that will not boot is an outage, and it would be an outage over a
+  // secret it is deliberately never given.
+  if (env.MEDIA_INDEX_ENABLED && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
+    throw new Error('MEDIA_INDEX_ENABLED=true requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker');
+  }
 }
 
 async function checkBinaries(): Promise<void> {
@@ -123,6 +132,10 @@ async function main(): Promise<void> {
     // at upload and searching its footage both pass through the same gate.
     videoCallConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
     indexing: env.INDEXING_ENABLED,
+    // On by default now, and it spends GPU time on every upload — an operator
+    // reading one startup line should be able to see that without going
+    // looking for it.
+    mediaIndex: env.MEDIA_INDEX_ENABLED,
     retrievalPrimary: env.RETRIEVAL_PRIMARY,
     simplememIndexing: env.SIMPLEMEM_INDEX_ENABLED,
     youtubeIngestion: env.YOUTUBE_INGESTION_ENABLED,
@@ -146,6 +159,50 @@ async function main(): Promise<void> {
     });
   }
 
+  /**
+   * Are the two Qwen services actually deployed?
+   *
+   * Asked once here rather than discovered one upload at a time. Modal does
+   * not start a GPU to answer, so it costs nothing, and it turns "every video
+   * fails to index, hours apart, for reasons nobody reads" into one line at
+   * startup naming exactly what is missing.
+   *
+   * DELIBERATELY NOT FATAL, unlike the MiniCPM check above, and the difference
+   * is what each one is load-bearing for. MiniCPM is how this product watches
+   * video: without it there is no search worth running, so refusing to boot is
+   * honest. The Media Index only ADDS a way to answer — every question it
+   * cannot take still has the notes and the footage behind it. Killing the
+   * worker over it would stop ingestion, transcription, search and rendering
+   * for a feature none of them need, which trades a degraded extra for a total
+   * outage.
+   *
+   * So: loud, specific, and survivable. The queue is left unconsumed rather
+   * than consumed badly, because a job that fails on every attempt still burns
+   * retries and still writes a failure row per upload.
+   */
+  let mediaIndexReady = env.MEDIA_INDEX_ENABLED;
+  if (env.MEDIA_INDEX_ENABLED) {
+    try {
+      await assertMediaIndexDeploymentsAvailable();
+      logger.info('media index deployments available', {
+        environment: env.MODAL_ENVIRONMENT,
+        embedApp: env.MEDIA_INDEX_EMBED_APP,
+        rerankApp: env.MEDIA_INDEX_RERANK_APP,
+      });
+    } catch (error) {
+      mediaIndexReady = false;
+      // error, not warn: this is switched ON and not working. It must not read
+      // as routine, and it must name the remedy rather than the symptom.
+      logger.error('MEDIA_INDEX_ENABLED is on but its Modal services could not be resolved; videos will NOT be read into vectors', {
+        environment: env.MODAL_ENVIRONMENT,
+        embedApp: env.MEDIA_INDEX_EMBED_APP,
+        rerankApp: env.MEDIA_INDEX_RERANK_APP,
+        remedy: 'deploy both Modal apps, or set MEDIA_INDEX_ENABLED=false to stop asking for them',
+        err: error,
+      });
+    }
+  }
+
   startWorker(QUEUE_NAMES.ingestion, handleIngestion, env.INGESTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.preprocessing, handlePreprocessing, env.PREPROCESS_CONCURRENCY);
   startWorker(QUEUE_NAMES.transcription, handleTranscription, env.TRANSCRIPTION_CONCURRENCY);
@@ -158,7 +215,7 @@ async function main(): Promise<void> {
   // concurrency that matters is set on the Modal service, not here. One at a
   // time locally keeps a long video from holding several signed URLs open and
   // several downloads warm on the far side at once.
-  if (env.MEDIA_INDEX_ENABLED) {
+  if (mediaIndexReady) {
     startWorker(QUEUE_NAMES.mediaIndexing, handleMediaIndexing, env.MEDIA_INDEX_CONCURRENCY);
   }
   // One at a time as well: a SimpleMem read is a captioning call per kept
@@ -187,8 +244,12 @@ async function main(): Promise<void> {
   // drained when nothing is reading it.
   logger.info('worker ready', {
     queues: Object.values(QUEUE_NAMES).filter(
-      (queue) => queue !== QUEUE_NAMES.mediaIndexing || env.MEDIA_INDEX_ENABLED,
+      (queue) => queue !== QUEUE_NAMES.mediaIndexing || mediaIndexReady,
     ),
+    // Named separately from the queue list so "switched on" and "actually
+    // working" can never be read as the same fact. On with this false is the
+    // one combination worth going and looking at the error above for.
+    mediaIndexReady,
   });
 
   // Queued rather than run inline: the sweep goes through the same retention,

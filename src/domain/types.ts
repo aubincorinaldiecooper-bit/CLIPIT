@@ -66,7 +66,9 @@ export type FallbackReason =
   | 'not_visual'
   | 'no_coverage'
   | 'provenance_changed'
-  | 'index_failed';
+  | 'index_failed'
+  /** A read that opened, stopped, and never got to say why. */
+  | 'index_stopped';
 
 /**
  * What a person thought of a match.

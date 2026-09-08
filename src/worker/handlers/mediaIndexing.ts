@@ -289,7 +289,17 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
         finishedAt: new Date(),
         error: 'the analysis proxy was replaced while it was being indexed; these vectors describe two different videos',
         ...(runStartedAt ? { ifRunStartedAt: runStartedAt } : { ifState: ['queued'] as const }),
-      }).catch(() => undefined);
+      }).catch((writeError: unknown) => {
+        // Swallowed so the handler still returns rather than throwing over a
+        // condition it has already handled correctly — but never silently.
+        // This write is the only thing that would have told anyone the vectors
+        // were abandoned; losing it leaves the row reading `running` for a
+        // video nothing is reading.
+        log.error('could not record that the footage was replaced mid-index; the status row is now stale', {
+          videoId,
+          err: writeError,
+        });
+      });
       log.warn('the footage was replaced mid-index; none of these vectors are believed', { videoId });
       return;
     }
@@ -340,7 +350,21 @@ export async function handleMediaIndexing(job: Job<MediaIndexingJob>): Promise<v
       // every later question to the slow path for a video that is indexed.
       ...(runStartedAt ? { ifRunStartedAt: runStartedAt } : { ifState: ['queued'] as const }),
       error: message,
-    }).catch(() => undefined);
+    }).catch((writeError: unknown) => {
+      // Deliberately swallowed: the original failure is what this job must
+      // report, and throwing this one instead would replace a real cause with
+      // a database blip. But it is never lost quietly. This is the write whose
+      // failure leaves the row saying `running` forever — the one case the
+      // handler cannot correct from here, and the reason the read path treats
+      // a run that has gone quiet as stopped (MEDIA_INDEX_STALE_AFTER_SECONDS).
+      log.error('could not record that indexing failed; the status row will keep saying it is running', {
+        videoId,
+        err: writeError,
+        // The failure that was meant to be written down, so it survives in the
+        // log even though it never reached the row.
+        unrecordedFailure: message,
+      });
+    });
     log.error('media index failed', { videoId, err: error, stored: stored.size });
     throw error;
   }
