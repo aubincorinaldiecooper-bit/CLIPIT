@@ -6,6 +6,9 @@ import {
 import { clearClipKeysForVideo, listClipKeysForVideo } from '../db/repositories/clips.js';
 import { clearVariantsForVideo, listVariantKeysForVideo } from '../db/repositories/clipVariants.js';
 import { deleteScenes } from '../db/repositories/scenes.js';
+import { deleteSimpleMemIndex } from '../db/repositories/simplememIndex.js';
+import { env } from '../config/env.js';
+import { simplememDeleteVideo } from './retrieval/simplemem/client.js';
 import { deleteTranscript } from '../db/repositories/transcripts.js';
 import {
   claimFootageForExpiry,
@@ -141,6 +144,18 @@ async function removeClaimedFootage(
   // alternative is trying the same failing deletes forever while the rest of
   // the video stays half-removed. The count above is the record.
   await Promise.all([deleteScenes(videoId), deleteTranscript(videoId)]);
+  // SimpleMem's memory of the video is footage too — frames of it, stored on
+  // the sidecar's disk — so it goes with the rest. Best-effort like the
+  // objects above, and loud when it fails: a memory nobody can name is an
+  // orphan on somebody else's disk.
+  if (env.SIMPLEMEM_URL) {
+    try {
+      await simplememDeleteVideo(videoId);
+    } catch (error) {
+      log.warn('SimpleMem memory could not be deleted and is now an orphan on the sidecar', { videoId, err: error });
+    }
+  }
+  await deleteSimpleMemIndex(videoId);
   await clearThumbnailsForVideo(videoId);
   await clearClipKeysForVideo(videoId);
   await clearVariantsForVideo(videoId);

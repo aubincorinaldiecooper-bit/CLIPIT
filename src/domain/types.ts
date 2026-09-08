@@ -32,6 +32,24 @@ export type MatchSource = 'visual' | 'transcript' | 'multimodal';
 export type AnsweredFrom = 'notes' | 'footage';
 
 /**
+ * Which system found the moments: Clipit's own notes-then-footage search, or
+ * Omni-SimpleMem, tried first when configured as the primary. One or the
+ * other, never a blend — see migration 043 and services/retrieval/simplemem.
+ */
+export type RetrievalSystem = 'clipit' | 'simplemem';
+
+/** Why the primary did not answer; see services/retrieval/simplemem/candidates.ts. */
+export type FallbackReason =
+  | 'correction'
+  | 'index_missing'
+  | 'index_not_ready'
+  | 'index_unavailable'
+  | 'unsupported_mode'
+  | 'no_candidates'
+  | 'below_score'
+  | 'primary_failed';
+
+/**
  * What a person thought of a match.
  *
  * Confidence is the model's opinion of its own answer; this is the only thing
@@ -210,6 +228,14 @@ export interface ClipRequest {
   chunkErrors: ChunkError[];
   chunkDegradations: ChunkDegradation[];
   answeredFrom: AnsweredFrom | null;
+  /** What was configured as the primary when this question was decided. */
+  retrievalPrimary: RetrievalSystem | null;
+  /** Which system the moments actually came from. */
+  retrievalSystem: RetrievalSystem | null;
+  /** Set when the primary was tried, or skipped by rule, and the fallback answered. */
+  fallbackReason: FallbackReason | null;
+  /** What the primary returned, counted, whether or not it won. */
+  primaryOutcome: Record<string, unknown> | null;
   uncertainMatches: UncertainMatch[];
   /**
    * Whether this request owes a finished 9:16 deck, and whether that deck

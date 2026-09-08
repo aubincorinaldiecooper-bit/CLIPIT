@@ -6,10 +6,12 @@ import type {
   ClipMatch,
   ClipRequest,
   ClipRequestStatus,
+  FallbackReason,
   MatchFeedback,
   MatchFeedbackReason,
   MatchSource,
   ResolvedSearchMode,
+  RetrievalSystem,
   SearchMode,
   UncertainMatch,
 } from '../../domain/types.js';
@@ -31,6 +33,10 @@ interface ClipRequestRow {
   chunk_errors: ChunkError[];
   chunk_degradations: ChunkDegradation[] | null;
   answered_from: AnsweredFrom | null;
+  retrieval_primary: RetrievalSystem | null;
+  retrieval_system: RetrievalSystem | null;
+  fallback_reason: FallbackReason | null;
+  primary_outcome: Record<string, unknown> | null;
   uncertain_matches: UncertainMatch[] | null;
   presentation_target: 'original' | 'vertical' | null;
   requested_result_count: number | null;
@@ -59,6 +65,10 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     chunkDegradations: row.chunk_degradations ?? [],
     chunkErrors: row.chunk_errors ?? [],
     answeredFrom: row.answered_from ?? null,
+    retrievalPrimary: row.retrieval_primary ?? null,
+    retrievalSystem: row.retrieval_system ?? null,
+    fallbackReason: row.fallback_reason ?? null,
+    primaryOutcome: row.primary_outcome ?? null,
     uncertainMatches: row.uncertain_matches ?? [],
     presentationTarget: row.presentation_target ?? null,
     requestedResultCount: row.requested_result_count ?? null,
@@ -218,6 +228,36 @@ export async function recordSearchApproach(
             updated_at = now()
       WHERE id = $1`,
     [requestId, input.notesConsulted, input.correctionOf ?? null],
+  );
+}
+
+/**
+ * Records which system answered, and why the other did not.
+ *
+ * Written once per question at the moment the decision is made, and never
+ * blended: `system` is the one whose moments were stored. `primaryOutcome`
+ * is kept even when the fallback won — the primary's counts are the other
+ * half of the comparison, and a row that only says "fell back" cannot say
+ * whether falling back was right.
+ */
+export async function recordRetrievalOutcome(
+  requestId: string,
+  input: {
+    primary: RetrievalSystem;
+    system: RetrievalSystem;
+    fallbackReason: FallbackReason | null;
+    primaryOutcome: Record<string, unknown> | null;
+  },
+): Promise<void> {
+  await queryOne(
+    `UPDATE clip_requests
+        SET retrieval_primary = $2,
+            retrieval_system  = $3,
+            fallback_reason   = $4,
+            primary_outcome   = $5::jsonb,
+            updated_at        = now()
+      WHERE id = $1`,
+    [requestId, input.primary, input.system, input.fallbackReason, input.primaryOutcome === null ? null : JSON.stringify(input.primaryOutcome)],
   );
 }
 
