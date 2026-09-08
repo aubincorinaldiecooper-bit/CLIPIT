@@ -25,10 +25,16 @@ export function packVector(values: readonly number[]): Buffer {
   const buffer = Buffer.allocUnsafe(values.length * BYTES_PER_FLOAT);
   for (let i = 0; i < values.length; i += 1) {
     const value = values[i];
-    if (value === undefined || !Number.isFinite(value)) {
-      throw new Error(`embedding value at index ${i} is not a finite number (${String(value)})`);
+    // Finite in JavaScript is not the same as finite in float32. 1e39 passes
+    // Number.isFinite and becomes Infinity the moment it is written, and an
+    // infinity poisons every comparison it takes part in — the whole video
+    // then scores as similar to nothing. Math.fround is exactly the rounding
+    // writeFloatLE will apply, so this checks the value that actually lands.
+    const stored = Math.fround(value ?? Number.NaN);
+    if (value === undefined || !Number.isFinite(value) || !Number.isFinite(stored)) {
+      throw new Error(`embedding value at index ${i} is not a finite float32 (${String(value)})`);
     }
-    buffer.writeFloatLE(value, i * BYTES_PER_FLOAT);
+    buffer.writeFloatLE(stored, i * BYTES_PER_FLOAT);
   }
   return buffer;
 }

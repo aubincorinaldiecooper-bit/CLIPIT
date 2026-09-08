@@ -128,7 +128,12 @@ function mapTotals(rows: TotalsRow[]): UsageTotals[] {
  * someone searches, and cost-per-video silently becomes a function of how
  * popular the video is.
  */
-const INGESTION_STAGES: UsageStage[] = ['transcription', 'indexing'];
+// What it costs to make one video searchable. 'embedding' belongs here:
+// making the vectors IS part of reading the video, and leaving it out
+// would report a per-video ingestion cost that quietly excludes a stage
+// we pay for — the same shape of error migration 027 was written about.
+// 'rerank' is deliberately absent: it runs per question, not per video.
+const INGESTION_STAGES: UsageStage[] = ['transcription', 'indexing', 'embedding'];
 
 /** Cost of making one video searchable. Excludes searches run against it. */
 export async function usageForVideo(videoId: string): Promise<UsageTotals[]> {

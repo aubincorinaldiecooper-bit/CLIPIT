@@ -333,6 +333,13 @@ export async function serializeClipRequest(
      */
     answeredFrom: request.answeredFrom,
     /**
+     * Which system found the moments, and — when the configured primary did
+     * not — why not. Attribution for the comparison, not a promise to the
+     * person: answeredFrom above still says what kind of evidence it was.
+     */
+    retrievalSystem: request.retrievalSystem,
+    fallbackReason: request.fallbackReason,
+    /**
      * Moments the model reported and our threshold discarded. Not results —
      * they cannot be turned into clips and are not counted. They are here so
      * an answer can say "I saw something at 04:12 I wasn't sure about" instead

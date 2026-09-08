@@ -19,6 +19,7 @@ import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
 import { handleIndexing } from './handlers/indexing.js';
+import { handleSimpleMemIndexing } from './handlers/simplememIndexing.js';
 import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
 import { handleClipVariant } from './handlers/clipVariant.js';
@@ -121,6 +122,8 @@ async function main(): Promise<void> {
     // at upload and searching its footage both pass through the same gate.
     videoCallConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
     indexing: env.INDEXING_ENABLED,
+    retrievalPrimary: env.RETRIEVAL_PRIMARY,
+    simplememIndexing: env.SIMPLEMEM_INDEX_ENABLED,
     youtubeIngestion: env.YOUTUBE_INGESTION_ENABLED,
   });
 
@@ -150,6 +153,9 @@ async function main(): Promise<void> {
   // second video indexing in parallel would only queue behind it while making
   // a search someone is waiting on wait longer.
   startWorker(QUEUE_NAMES.indexing, handleIndexing, 1);
+  // One at a time as well: a SimpleMem read is a captioning call per kept
+  // frame, and the sidecar is one process on one box.
+  startWorker(QUEUE_NAMES.simplememIndexing, handleSimpleMemIndexing, 1);
   startWorker(QUEUE_NAMES.clipSearch, handleClipSearch, env.CLIP_SEARCH_CONCURRENCY);
   startWorker(QUEUE_NAMES.clipGeneration, handleClipGeneration, env.CLIP_GENERATION_CONCURRENCY);
   // Reframes share the clip renderer's budget: both are ffmpeg encodes of

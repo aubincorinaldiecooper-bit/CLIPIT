@@ -22,6 +22,7 @@ const clears = {
   deleteScenes: vi.fn(),
   deleteTranscript: vi.fn(),
   deleteMediaIndex: vi.fn(),
+  deleteSimpleMemIndex: vi.fn(),
 };
 const order: string[] = [];
 const claimedAt = new Date('2026-09-02T20:30:00Z');
@@ -54,6 +55,9 @@ vi.mock('../src/db/repositories/transcripts.js', () => ({
 }));
 vi.mock('../src/db/repositories/mediaIndex.js', () => ({
   deleteMediaIndex: (...args: unknown[]) => clears.deleteMediaIndex(...args),
+}));
+vi.mock('../src/db/repositories/simplememIndex.js', () => ({
+  deleteSimpleMemIndex: (...args: unknown[]) => clears.deleteSimpleMemIndex(...args),
 }));
 vi.mock('../src/services/storage/s3.js', () => ({
   getStorage: () => ({
@@ -97,11 +101,14 @@ describe('expireVideoFootage', () => {
     expect(order.filter((step) => step === 'remove')).toHaveLength(3);
     expect(result).toEqual({ outcome: 'removed', objectsDeleted: 3, objectsFailed: 0 });
     expect(videos.markFootageExpired).toHaveBeenCalledWith('v1');
-    // Everything derived from the footage goes with it. An index left behind
-    // would keep answering questions about seconds nobody can watch any more.
+    // Everything derived from the footage goes with it: the notes, the
+    // transcript, the vectors, and a SimpleMem memory that is frames of the
+    // video on another disk. Anything left behind would keep answering
+    // questions about seconds nobody can watch any more.
     expect(clears.deleteScenes).toHaveBeenCalledWith('v1');
     expect(clears.deleteTranscript).toHaveBeenCalledWith('v1');
     expect(clears.deleteMediaIndex).toHaveBeenCalledWith('v1');
+    expect(clears.deleteSimpleMemIndex).toHaveBeenCalledWith('v1');
   });
 
   it('lets an owner remove their own video whoever it belonged to before', async () => {

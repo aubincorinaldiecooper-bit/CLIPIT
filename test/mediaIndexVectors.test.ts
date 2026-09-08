@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { cosineSimilarity, packVector, unpackVector } from '../src/services/mediaIndex/vectors.js';
+import { statusWriteDecision } from '../src/db/repositories/mediaIndex.js';
 
 /**
  * A vector that survives storage and comes back wrong is worse than one that
@@ -23,8 +24,17 @@ describe('packVector / unpackVector', () => {
   });
 
   it('refuses to store a value that is not a finite number', () => {
-    expect(() => packVector([1, Number.NaN, 3])).toThrow(/index 1 is not a finite number/);
-    expect(() => packVector([Number.POSITIVE_INFINITY])).toThrow(/not a finite number/);
+    expect(() => packVector([1, Number.NaN, 3])).toThrow(/index 1 is not a finite float32/);
+    expect(() => packVector([Number.POSITIVE_INFINITY])).toThrow(/not a finite float32/);
+  });
+
+  it('refuses a value that is finite in JavaScript but infinite once stored', () => {
+    // 1e39 passes Number.isFinite and becomes Infinity as a float32. Stored,
+    // it would turn every comparison it touches into NaN.
+    expect(() => packVector([1e39])).toThrow(/not a finite float32/);
+    expect(() => packVector([-1e39])).toThrow(/not a finite float32/);
+    // The largest value that does survive is kept.
+    expect(() => packVector([3.4e38])).not.toThrow();
   });
 
   it('refuses to read a vector whose byte length does not match its stated size', () => {
@@ -72,5 +82,45 @@ describe('cosineSimilarity', () => {
 
     expect(cosineSimilarity(query, nearBack)).toBeGreaterThan(cosineSimilarity(query, farBack));
     expect(cosineSimilarity(query, nearBack)).toBeCloseTo(cosineSimilarity(query, near), 5);
+  });
+});
+
+
+describe('statusWriteDecision', () => {
+  it('keeps the recorded failure when a later write does not mention it', () => {
+    // The bug this pins: a progress update on a failed row erased why it failed.
+    expect(statusWriteDecision('failed', { windowsStored: 5 }).writeError).toBe(false);
+  });
+
+  it('clears the failure when a fresh run starts', () => {
+    for (const state of ['queued', 'running'] as const) {
+      const decision = statusWriteDecision(state, {});
+      expect(decision.writeError).toBe(true);
+      expect(decision.errorValue).toBeNull();
+    }
+  });
+
+  it('writes an error that was given, and clears one given as null', () => {
+    expect(statusWriteDecision('failed', { error: 'the model refused' })).toMatchObject({
+      writeError: true,
+      errorValue: 'the model refused',
+    });
+    expect(statusWriteDecision('ready', { error: null })).toMatchObject({
+      writeError: true,
+      errorValue: null,
+    });
+  });
+
+  it('empties the finish time whenever the run is not over', () => {
+    // Otherwise a row reads `running` and claims it finished during the last
+    // attempt — two things that cannot both be true.
+    expect(statusWriteDecision('queued', {}).clearFinished).toBe(true);
+    expect(statusWriteDecision('running', {}).clearFinished).toBe(true);
+  });
+
+  it('keeps the finish time on every state that means the run is over', () => {
+    for (const state of ['ready', 'partial', 'failed', 'unavailable'] as const) {
+      expect(statusWriteDecision(state, {}).clearFinished).toBe(false);
+    }
   });
 });

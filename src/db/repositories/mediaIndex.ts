@@ -164,6 +164,14 @@ export async function storeIndexedWindows(
  * saying so, which is the one thing coverage exists to prevent.
  */
 export async function listIndexedWindows(videoId: string): Promise<StoredWindow[]> {
+  // Joined to the status row so only windows from the CURRENT run are
+  // returned. A re-index under a different model, revision, dimension count
+  // or index version writes new rows for the keys it reaches and leaves the
+  // rest behind; without this filter those survivors would be searched
+  // alongside the new ones. Same-sized vectors from two different models do
+  // not throw — they score, plausibly and meaninglessly, which is worse than
+  // failing. No status row means nothing has been indexed under a known
+  // provenance, so nothing is returned.
   const rows = await queryRows<{
     window_key: string;
     start_seconds: string | number;
@@ -171,10 +179,15 @@ export async function listIndexedWindows(videoId: string): Promise<StoredWindow[
     embedding: Buffer;
     dims: number;
   }>(
-    `SELECT window_key, start_seconds, end_seconds, embedding, dims
-       FROM media_index
-      WHERE video_id = $1
-      ORDER BY start_seconds`,
+    `SELECT m.window_key, m.start_seconds, m.end_seconds, m.embedding, m.dims
+       FROM media_index m
+       JOIN media_index_status s ON s.video_id = m.video_id
+      WHERE m.video_id = $1
+        AND m.model = s.model
+        AND m.revision = s.revision
+        AND m.dims = s.dims
+        AND m.index_version = s.index_version
+      ORDER BY m.start_seconds`,
     [videoId],
   );
 
@@ -200,29 +213,85 @@ export interface StatusPatch {
   revision?: string;
   dims?: number;
   indexVersion?: string;
+  /**
+   * Absent leaves whatever is recorded alone; an explicit null clears it.
+   * The difference matters: a progress update that happened not to mention
+   * the error must not erase why the last attempt failed.
+   */
   error?: string | null;
   startedAt?: Date;
   finishedAt?: Date;
 }
 
+/** States that mean the run is over, one way or another. */
+const TERMINAL_STATES: ReadonlySet<MediaIndexState> = new Set<MediaIndexState>([
+  'ready',
+  'partial',
+  'failed',
+  'unavailable',
+]);
+
 /**
  * Writes where a video's indexing has got to.
  *
- * Upsert rather than insert-then-update so the first progress report does not
- * need a row to already exist, and so a re-index does not have to clear
- * anything first.
+ * Upsert rather than insert-then-update, so the first progress report does not
+ * need a row to already exist and a re-index does not have to clear anything.
+ *
+ * Two fields need more care than the counters:
+ *
+ * `error` survives a progress update that does not mention it. Collapsing an
+ * absent error into null would mean any later write erased the reason the last
+ * attempt failed, leaving a failed row that cannot say why.
+ *
+ * `finished_at` is cleared whenever the state is not terminal. Keeping the
+ * previous run's completion time would produce a row reading `running` and
+ * claiming it finished twenty minutes ago — two facts that cannot both be true.
  */
+export interface StatusWrite {
+  /** True when the error column is written at all; false leaves it as it was. */
+  writeError: boolean;
+  /** The value to write, when writeError. */
+  errorValue: string | null;
+  /** True when finished_at must be emptied, because this run is not over. */
+  clearFinished: boolean;
+}
+
+/**
+ * What a status write does to the two fields that are not simple counters.
+ *
+ * Pure, and exported, because both of the rules here were got wrong first
+ * time: an omitted error erased the reason a run failed, and a restarted run
+ * inherited the previous run's completion time. They are worth a test that
+ * does not need a database.
+ */
+export function statusWriteDecision(state: MediaIndexState, patch: StatusPatch): StatusWrite {
+  const terminal = TERMINAL_STATES.has(state);
+  return {
+    // Explicitly given wins. Otherwise a fresh run (queued/running) starts
+    // with a clean error, and a terminal state keeps the one already recorded.
+    writeError: 'error' in patch || !terminal,
+    errorValue: 'error' in patch ? (patch.error ?? null) : null,
+    clearFinished: !terminal,
+  };
+}
+
 export async function setMediaIndexStatus(
   videoId: string,
   state: MediaIndexState,
   patch: StatusPatch = {},
 ): Promise<void> {
+  const { writeError: errorGiven, errorValue, clearFinished } = statusWriteDecision(state, patch);
+
   await query(
     `INSERT INTO media_index_status
        (video_id, state, covered_through_seconds, windows_planned, windows_stored, windows_failed,
         model, revision, dims, index_version, error, started_at, finished_at, updated_at)
      VALUES ($1, $2, COALESCE($3, 0), COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
-             COALESCE($7, ''), COALESCE($8, ''), $9, COALESCE($10, ''), $11, $12, $13, now())
+             COALESCE($7, ''), COALESCE($8, ''), $9, COALESCE($10, ''),
+             CASE WHEN $14 THEN $11 ELSE NULL END,
+             $12,
+             CASE WHEN $15 THEN NULL ELSE $13 END,
+             now())
      ON CONFLICT (video_id) DO UPDATE SET
        state                   = EXCLUDED.state,
        covered_through_seconds = COALESCE($3, media_index_status.covered_through_seconds),
@@ -233,9 +302,10 @@ export async function setMediaIndexStatus(
        revision                = COALESCE($8, media_index_status.revision),
        dims                    = COALESCE($9, media_index_status.dims),
        index_version           = COALESCE($10, media_index_status.index_version),
-       error                   = $11,
+       error                   = CASE WHEN $14 THEN $11 ELSE media_index_status.error END,
        started_at              = COALESCE($12, media_index_status.started_at),
-       finished_at             = COALESCE($13, media_index_status.finished_at),
+       finished_at             = CASE WHEN $15 THEN NULL
+                                      ELSE COALESCE($13, media_index_status.finished_at) END,
        updated_at              = now()`,
     [
       videoId,
@@ -248,11 +318,45 @@ export async function setMediaIndexStatus(
       patch.revision ?? null,
       patch.dims ?? null,
       patch.indexVersion ?? null,
-      patch.error ?? null,
+      errorValue,
       patch.startedAt ?? null,
       patch.finishedAt ?? null,
+      errorGiven,
+      clearFinished,
     ] as never,
   );
+}
+
+/**
+ * Opens an indexing run, and makes it the only run this video has.
+ *
+ * Any window stored under different provenance is deleted first. The read
+ * filter already refuses to return those rows, so this is not what keeps a
+ * search honest — it is what stops a video accumulating a dead copy of itself
+ * every time the model is changed.
+ *
+ * Windows matching this exact provenance are KEPT, which is what makes a
+ * resumed run cheap: an attempt that died at minute forty picks up from the
+ * windows already paid for rather than re-embedding the whole video.
+ */
+export async function beginIndexRun(videoId: string, provenance: WindowProvenance): Promise<number> {
+  const removed = await query(
+    `DELETE FROM media_index
+      WHERE video_id = $1
+        AND (model <> $2 OR revision <> $3 OR dims <> $4 OR index_version <> $5)`,
+    [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion] as never,
+  );
+
+  await setMediaIndexStatus(videoId, 'running', {
+    model: provenance.model,
+    revision: provenance.revision,
+    dims: provenance.dims,
+    indexVersion: provenance.indexVersion,
+    startedAt: new Date(),
+    error: null,
+  });
+
+  return removed.rowCount ?? 0;
 }
 
 /** Removes a video's index. Called with its footage, so the two cannot drift apart. */
