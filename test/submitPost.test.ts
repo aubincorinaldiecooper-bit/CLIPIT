@@ -40,7 +40,7 @@ vi.mock('../src/db/repositories/social.js', () => ({
   },
 }));
 
-const { submitRecordedPost } = await import('../src/services/social/submitPost.js');
+const { isAmbiguousSubmissionError, submitRecordedPost } = await import('../src/services/social/submitPost.js');
 
 const input = {
   postId: 'post-1',
@@ -81,7 +81,10 @@ describe('submitRecordedPost', () => {
     createDownloadUrl.mockResolvedValue('https://signed.example/clip.mp4');
     createPost.mockRejectedValue(new FakeZernioApiError('bad request', 400));
 
-    await expect(submitRecordedPost(input)).rejects.toThrow('bad request');
+    const error = await submitRecordedPost(input).catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(FakeZernioApiError);
+    expect(isAmbiguousSubmissionError(error)).toBe(false);
     expect(updates).toEqual([{ id: 'post-1', status: 'failed' }]);
   });
 
@@ -92,7 +95,10 @@ describe('submitRecordedPost', () => {
     createDownloadUrl.mockResolvedValue('https://signed.example/clip.mp4');
     createPost.mockRejectedValue(new Error('socket hang up'));
 
-    await expect(submitRecordedPost(input)).rejects.toThrow('socket hang up');
+    const error = await submitRecordedPost(input).catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({ message: 'socket hang up' });
+    expect(isAmbiguousSubmissionError(error)).toBe(true);
     expect(updates).toEqual([]);
   });
 });

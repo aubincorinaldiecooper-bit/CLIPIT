@@ -3,6 +3,13 @@ import { getStorage } from '../storage/s3.js';
 import { zernio, ZernioApiError } from '../zernio/client.js';
 import { updatePublishedPost } from '../../db/repositories/social.js';
 
+const ambiguousSubmissionErrors = new WeakSet<Error>();
+
+/** Whether an error happened after the provider request was sent without a response. */
+export function isAmbiguousSubmissionError(error: unknown): boolean {
+  return error instanceof Error && ambiguousSubmissionErrors.has(error);
+}
+
 /**
  * Hand one recorded post to the publishing service.
  *
@@ -61,8 +68,16 @@ export async function submitRecordedPost(input: {
     // duplicate in front of someone's audience.
     if (cause instanceof ZernioApiError) {
       await updatePublishedPost(input.postId, { zernioPostId: null, status: 'failed' });
+      throw cause;
     }
-    throw cause;
+
+    // Keep the original Error (and therefore its message/stack) while tagging
+    // it for callers that also manage the row. Without this signal an outer
+    // catch cannot distinguish a rejected request from a request whose
+    // response was lost, and may undo the guarded `submitting` state.
+    const ambiguousError = cause instanceof Error ? cause : new Error(String(cause));
+    ambiguousSubmissionErrors.add(ambiguousError);
+    throw ambiguousError;
   }
 
   const updated = await updatePublishedPost(input.postId, {
