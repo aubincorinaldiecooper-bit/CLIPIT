@@ -37,6 +37,25 @@ describe('conversational answer contract', () => {
     ).text).toBe('It happens at 00:12. The final 40 seconds were not examined.');
   });
 
+  it('does not ask the model to render a coverage note that the contract appends', async () => {
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      const request = JSON.parse(String(init?.body));
+      const prompt = JSON.parse(request.messages[1].content);
+      expect(prompt).not.toHaveProperty('coverage_note');
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"answer":"It happens at 00:12.","citation_ids":["m1"]}' } }],
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    const answer = await writeConversationalAnswer({
+      question: 'Where is it?',
+      evidence: [{ id: 'm1', startSeconds: 12, endSeconds: 18, description: 'Moment', source: 'visual' }],
+      coverageNote: 'The final 40 seconds were not examined.',
+    });
+
+    expect(answer.text).toBe('It happens at 00:12. The final 40 seconds were not examined.');
+  });
+
   it('uses Qwen Flash without reasoning for every final response', async () => {
     globalThis.fetch = vi.fn(async (_url, init) => {
       const request = JSON.parse(String(init?.body));

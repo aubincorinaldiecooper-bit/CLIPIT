@@ -646,7 +646,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           // about was inside the gap.
           globalStartSeconds: chunk.globalStartSeconds,
           globalEndSeconds: chunk.globalEndSeconds,
-        });
+        }, deckAttemptId);
         completed += 1;
         await job.updateProgress({
           stage: 'searching',
@@ -1260,14 +1260,18 @@ async function answerFromSimpleMem(input: {
       unreadTail.startSeconds >= item.globalStartSeconds && unreadTail.startSeconds < item.globalEndSeconds,
     ) ?? input.chunks.at(-1);
     if (chunk) {
-      await recordChunkFailure(input.clipRequestId, {
+      const stillOwned = await recordChunkFailure(input.clipRequestId, {
         chunkIndex: chunk.chunkIndex,
         chunkId: chunk.id,
         message: 'Omni-SimpleMem indexing stopped before the end of the video.',
         code: 'not_read_yet',
         globalStartSeconds: unreadTail.startSeconds,
         globalEndSeconds: unreadTail.endSeconds,
-      });
+      }, input.deckAttemptId!);
+      if (!stillOwned) {
+        input.log.info('another delivery owns this request; discarding stale SimpleMem coverage');
+        return { matchCount: verified.candidates.length, released: false, fallback: null, outcome };
+      }
     }
   }
   for (const failure of verified.failed) {
@@ -1275,14 +1279,18 @@ async function answerFromSimpleMem(input: {
       failure.startSeconds >= item.globalStartSeconds && failure.startSeconds < item.globalEndSeconds,
     ) ?? input.chunks.at(-1);
     if (!chunk) continue;
-    await recordChunkFailure(input.clipRequestId, {
+    const stillOwned = await recordChunkFailure(input.clipRequestId, {
       chunkIndex: chunk.chunkIndex,
       chunkId: chunk.id,
       message: `Omni-SimpleMem found this candidate, but the reranker could not verify it: ${failure.reason}`,
       code: 'not_read_yet',
       globalStartSeconds: failure.startSeconds,
       globalEndSeconds: failure.endSeconds,
-    });
+    }, input.deckAttemptId!);
+    if (!stillOwned) {
+      input.log.info('another delivery owns this request; discarding stale SimpleMem coverage');
+      return { matchCount: verified.candidates.length, released: false, fallback: null, outcome };
+    }
   }
   const wanted = input.requestedResultCount ?? verified.candidates.length;
   const found: NewClipMatch[] = [];
@@ -1595,7 +1603,7 @@ async function answerFromMediaIndex(input: {
       code: 'not_read_yet',
       globalStartSeconds: gap.startSeconds,
       globalEndSeconds: gap.endSeconds,
-    });
+    }, input.deckAttemptId!);
   }
 
   // Stretches the reranker could not read are named as unexamined, through
@@ -1614,7 +1622,7 @@ async function answerFromMediaIndex(input: {
       code: 'not_read_yet',
       globalStartSeconds: stretch.startSeconds,
       globalEndSeconds: stretch.endSeconds,
-    });
+    }, input.deckAttemptId!);
   }
 
   await insertMatches(clipRequestId, found);
@@ -1812,7 +1820,7 @@ async function answerFromNotes(input: {
       code: readComplete ? 'not_in_notes' : 'not_read_yet',
       globalStartSeconds: gap.startSeconds,
       globalEndSeconds: gap.endSeconds,
-    });
+    }, input.deckAttemptId!);
   }
 
   if (unread.length > 0) {

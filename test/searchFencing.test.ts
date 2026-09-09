@@ -41,6 +41,17 @@ describe('a retry must never reach into the library', () => {
 });
 
 describe('a superseded attempt must not release an answer', () => {
+  it('cannot add stale coverage gaps after a newer delivery takes ownership', () => {
+    const failure = between(repo, 'export async function recordChunkFailure', '/**\n * Records that a chunk was searched');
+    expect(failure).toContain('deck_attempt_id = $3::uuid');
+    expect(failure).toContain('RETURNING id');
+
+    const simpleMem = between(handler, 'async function answerFromSimpleMem', '/**\n * Answers from what was written down');
+    expect(simpleMem).toContain('recordChunkFailure(input.clipRequestId');
+    expect(simpleMem).toContain('input.deckAttemptId!');
+    expect(simpleMem).toContain('discarding stale SimpleMem coverage');
+  });
+
   it('fences the release to the attempt that planned it, and releases and completes in one statement', () => {
     const release = between(repo, 'export async function releaseDeckAndComplete', 'export async function recordDeckAvailability');
     expect(release).toContain('deck_attempt_id = $2');

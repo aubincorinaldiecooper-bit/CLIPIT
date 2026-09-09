@@ -166,15 +166,22 @@ export async function recordChunkCompleted(requestId: string): Promise<void> {
 }
 
 /** A failed chunk is recorded and skipped — it never fails the whole search. */
-export async function recordChunkFailure(requestId: string, error: ChunkError): Promise<void> {
-  await queryOne(
+export async function recordChunkFailure(
+  requestId: string,
+  error: ChunkError,
+  /** The delivery that observed the gap. Superseded deliveries must not amend the winner's coverage. */
+  deckAttemptId: string,
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET chunks_failed = chunks_failed + 1,
             chunk_errors = chunk_errors || $2::jsonb,
             updated_at = now()
-      WHERE id = $1`,
-    [requestId, JSON.stringify([error])],
+      WHERE id = $1 AND deck_attempt_id = $3::uuid
+      RETURNING id`,
+    [requestId, JSON.stringify([error]), deckAttemptId],
   );
+  return Boolean(row);
 }
 
 /**
