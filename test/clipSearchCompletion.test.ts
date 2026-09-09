@@ -178,6 +178,19 @@ describe('a search completes on find', () => {
     }));
   });
 
+  it('combines retrieval and reranker coverage limitations', async () => {
+    listMatches.mockResolvedValue(moments(1));
+    getClipRequest.mockResolvedValueOnce({
+      id: 'request-1', videoId: 'video-1', instruction: 'find it', chunksFailed: 2,
+    });
+
+    await complete({ coverageNote: 'Omni-SimpleMem only examined the first 100 of 900 seconds.' });
+
+    expect(writeConversationalAnswer).toHaveBeenCalledWith(expect.objectContaining({
+      coverageNote: 'Omni-SimpleMem only examined the first 100 of 900 seconds. 2 section(s) of the video could not be examined.',
+    }));
+  });
+
   it('releases found moments with a grounded fallback when answer prose fails', async () => {
     listMatches.mockResolvedValue(moments(2));
     writeConversationalAnswer.mockRejectedValueOnce(new Error('answer provider unavailable'));

@@ -43,13 +43,23 @@ function extractJson(text: string): unknown {
 }
 
 /** Validates that Qwen cited only evidence it actually supplied. */
-export function parseConversationalAnswer(raw: string, evidenceIds: ReadonlySet<string>): Omit<ConversationalAnswer, 'provider' | 'model' | 'promptVersion'> {
+export function parseConversationalAnswer(
+  raw: string,
+  evidenceIds: ReadonlySet<string>,
+  coverageNote?: string | null,
+): Omit<ConversationalAnswer, 'provider' | 'model' | 'promptVersion'> {
   const parsed = responseSchema.safeParse(extractJson(raw));
   if (!parsed.success) throw new Error('response did not match the conversational answer contract');
   const citationIds = [...new Set(parsed.data.citation_ids)];
   if (citationIds.some((id) => !evidenceIds.has(id))) throw new Error('response cited evidence that was not supplied');
   if (evidenceIds.size > 0 && citationIds.length === 0) throw new Error('response did not cite its supplied evidence');
-  return { text: parsed.data.answer, citationIds };
+  // Coverage is a fact established by retrieval, not prose the answer model
+  // is allowed to discard. Prompting for it is useful for fluency, but the
+  // contract itself appends the exact durable limitation when it is absent.
+  const text = coverageNote && !parsed.data.answer.includes(coverageNote)
+    ? `${parsed.data.answer} ${coverageNote}`
+    : parsed.data.answer;
+  return { text, citationIds };
 }
 
 export async function writeConversationalAnswer(input: {
@@ -123,7 +133,11 @@ export async function writeConversationalAnswer(input: {
       }
       const content = payload.choices?.[0]?.message?.content;
       if (!content) throw new ExternalServiceError('openrouter-answer', 'Qwen Flash returned no answer', { retryable: false });
-      const parsed = parseConversationalAnswer(content, new Set(input.evidence.map((item) => item.id)));
+      const parsed = parseConversationalAnswer(
+        content,
+        new Set(input.evidence.map((item) => item.id)),
+        input.coverageNote,
+      );
       return { ...parsed, provider: 'openrouter', model, promptVersion };
     } catch (error) {
       lastError = error;
