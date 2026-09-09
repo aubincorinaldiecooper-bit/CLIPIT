@@ -5,10 +5,14 @@
 `simplemem` in this repository means the upstream
 [Omni-SimpleMem](https://github.com/aiming-lab/SimpleMem/tree/main/OmniSimpleMem)
 multimodal memory system, not PostgreSQL vector storage. When
-`RETRIEVAL_PRIMARY=simplemem`, Clipit queries that video memory first, turns
+`RETRIEVAL_PRIMARY=simplemem`, Clipit normally queries that video memory first, turns
 timestamped visual memories into clip candidates, and falls back through the
 native Media Index, upload-time notes, and finally the source footage when the
 memory is unavailable or inconclusive.
+
+While upload-time notes are still being built, Clipit may first use the partial
+notes already available so an early question can finish without waiting. Once
+indexing has settled, the order is Omni-SimpleMem, Media Index, notes, footage.
 
 Before an Omni-SimpleMem candidate can become answer evidence, Clipit's Qwen
 video reranker watches that exact source interval. Memory proposes; the

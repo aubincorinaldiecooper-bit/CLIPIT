@@ -349,7 +349,9 @@ export async function serializeClipRequest(
      */
     retrievalSystem: request.retrievalSystem,
     fallbackReason: request.fallbackReason,
-    answer: request.conversationalAnswer
+    // The answer is written before the final fenced release. Keep it private
+    // until that same attempt has completed, just like its moment cards.
+    answer: request.status === 'completed' && request.conversationalAnswer
       ? {
           text: request.conversationalAnswer.text,
           citations: request.conversationalAnswer.citationIds.flatMap((id) => {

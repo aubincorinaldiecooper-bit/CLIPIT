@@ -47,6 +47,12 @@ describe('a superseded attempt must not release an answer', () => {
     expect(release).toContain('RETURNING id');
     expect(release).toContain('deck_completed_at = now()');
     expect(release).toContain("status            = 'completed'");
+    expect(release).not.toContain('retrieval_primary IS NOT NULL');
+  });
+
+  it('does not serialize an answer until its fenced release completes', () => {
+    const serializers = readFileSync(path.join(__dirname, '..', 'src/api/serializers.ts'), 'utf8');
+    expect(serializers).toContain("request.status === 'completed' && request.conversationalAnswer");
   });
 
   it('fences every terminal status write to the owning attempt', () => {
@@ -56,6 +62,7 @@ describe('a superseded attempt must not release an answer', () => {
     expect(finish).toContain('deck_attempt_id IS NULL');
     expect(finish).not.toContain("status <> 'completed'");
     expect(finish).toContain('RETURNING id');
+    expect(finish).toContain("answer_text = CASE WHEN $2 = 'failed' THEN NULL");
   });
 
   it('claims on entry, before the first thing that can fail, and plans against that claim', () => {

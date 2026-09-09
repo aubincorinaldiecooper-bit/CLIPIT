@@ -418,11 +418,12 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     });
 
     /**
-     * Memory first.
+     * Memory before a full footage read.
      *
      * The video was read once at upload; a question it can answer costs a
      * second and a fraction of a cent instead of re-reading the whole video.
-     * Skipped when correcting, because the notes are what was just disputed.
+     * A partial set of in-progress notes was already tried above; that lets an
+     * early question finish without waiting. Corrections skip every memory.
      *
      * Finding nothing here is NOT an answer. The notes are what the indexer
      * thought worth writing down, so their silence means "not mentioned", not
@@ -434,14 +435,14 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // upload is not covering what people ask, while no notes at all says
     // nothing about the reading and everything about the video's age.
     /**
-     * The vectors first, when there are any.
+     * Omni-SimpleMem first once upload-time reading has settled.
      *
      * Another memory, asked before the notes because it holds a different
-     * thing: the notes say what a model thought worth writing down, and the
-     * vectors are what the pictures look like. Anything but a confident hit
-     * hands the question straight on to the notes below, with the reason
-     * recorded — the index is never allowed to end a search by finding
-     * nothing.
+     * thing: the notes say what a model thought worth writing down, while its
+     * timestamped visual memories describe selected frames. Anything but
+     * a confident hit hands the question straight on to the notes below, with
+     * the reason recorded — the index is never allowed to end a search by
+     * finding nothing.
      */
     const fromSimpleMem = await answerFromSimpleMem({
       clipRequestId,
@@ -515,9 +516,23 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         fallbackReason: fromIndex.fallback,
         primaryOutcome: fromIndex.outcome,
       });
-      if (fromIndex.fallback && fromIndex.fallback !== 'disabled') {
-        log.info('the media index handed the question on', { reason: fromIndex.fallback });
-      }
+    } else if (env.MEDIA_INDEX_ENABLED && env.RETRIEVAL_PRIMARY === 'simplemem') {
+      // There is one primary/fallback column pair, so retain the nested media
+      // fallback inside the primary outcome instead of overwriting the reason
+      // SimpleMem handed off. This makes both decisions durable.
+      await recordRetrievalOutcome(clipRequestId, {
+        primary: 'simplemem',
+        system: null,
+        fallbackReason: fromSimpleMem.fallback,
+        primaryOutcome: {
+          ...(fromSimpleMem.outcome ?? {}),
+          mediaIndexFallback: fromIndex.fallback,
+          mediaIndexOutcome: fromIndex.outcome,
+        },
+      });
+    }
+    if (env.MEDIA_INDEX_ENABLED && fromIndex.fallback && fromIndex.fallback !== 'disabled') {
+      log.info('the media index handed the question on', { reason: fromIndex.fallback });
     }
 
     const notesAvailable = !correcting && video.indexStatus === 'ready';
@@ -1016,7 +1031,7 @@ export async function completeRequest(input: {
   // Which system answered goes in with the release itself: one fenced
   // statement, so it cannot name an answer that was superseded and cannot be
   // lost if this process stops. Notes and footage are both Clipit's own
-  // search; only the vectors are the other thing.
+  // search; only the external retrieval systems are the other thing.
   const released = input.deckAttemptId
     ? await releaseDeckAndComplete(
         clipRequestId,
