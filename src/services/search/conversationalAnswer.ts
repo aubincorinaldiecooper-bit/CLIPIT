@@ -9,7 +9,7 @@ const SYSTEM_PROMPT = [
   'The difficult retrieval and visual verification have already happened. Explain the evidence clearly and briefly.',
   'Never invent, adjust, average, or infer a timestamp. Cite only evidence ids supplied below.',
   'If no evidence was found, say that no verified answer was found. Do not claim the event is absent from the video.',
-  'Mention a limitation when the supplied coverage note says some footage was not examined.',
+  'Do not add coverage limitations; Clipit appends its canonical coverage note after your answer.',
   'Return only JSON: {"answer":"...","citation_ids":["evidence-id"]}.',
 ].join('\n');
 
@@ -54,11 +54,9 @@ export function parseConversationalAnswer(
   if (citationIds.some((id) => !evidenceIds.has(id))) throw new Error('response cited evidence that was not supplied');
   if (evidenceIds.size > 0 && citationIds.length === 0) throw new Error('response did not cite its supplied evidence');
   // Coverage is a fact established by retrieval, not prose the answer model
-  // is allowed to discard. Prompting for it is useful for fluency, but the
-  // contract itself appends the exact durable limitation when it is absent.
-  const text = coverageNote && !parsed.data.answer.includes(coverageNote)
-    ? `${parsed.data.answer} ${coverageNote}`
-    : parsed.data.answer;
+  // is allowed to paraphrase. It is deliberately absent from the model input
+  // and appended exactly once at this deterministic boundary.
+  const text = coverageNote ? `${parsed.data.answer} ${coverageNote}` : parsed.data.answer;
   return { text, citationIds };
 }
 
@@ -85,7 +83,7 @@ export async function writeConversationalAnswer(input: {
     model,
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: JSON.stringify({ question: input.question, evidence, coverage_note: input.coverageNote ?? null }) },
+      { role: 'user', content: JSON.stringify({ question: input.question, evidence }) },
     ],
     max_tokens: env.OPENROUTER_ANSWER_MAX_TOKENS,
     temperature: env.OPENROUTER_ANSWER_TEMPERATURE,
