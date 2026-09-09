@@ -10,6 +10,11 @@ timestamped visual memories into clip candidates, and falls back through the
 native Media Index, upload-time notes, and finally the source footage when the
 memory is unavailable or inconclusive.
 
+Before an Omni-SimpleMem candidate can become answer evidence, Clipit's Qwen
+video reranker watches that exact source interval. Memory proposes; the
+reranker verifies. Candidates the reranker cannot read are reported as
+unexamined and never presented as verified answers.
+
 `SIMPLEMEM_URL` must expose Clipit's adapter contract: `GET /health`, `PUT
 /videos/:videoId`, `POST /videos/:videoId/query`, and `DELETE /videos/:videoId`.
 The adapter must preserve each extracted frame's timestamp; upstream

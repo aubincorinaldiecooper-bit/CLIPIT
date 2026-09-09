@@ -109,11 +109,12 @@ import {
 import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
 import { unreadRanges } from '../../services/mediaIndex/coverage.js';
 import { planWindows, windowKey } from '../../services/mediaIndex/windows.js';
-import { estimateGpuCostUsd } from '../../services/mediaIndex/cost.js';
+import { estimateGpuCostUsd, gpuMsFrom } from '../../services/mediaIndex/cost.js';
 import { writeConversationalAnswer } from '../../services/search/conversationalAnswer.js';
 import { getSimpleMemIndex } from '../../db/repositories/simplememIndex.js';
 import { simplememQuery } from '../../services/retrieval/simplemem/client.js';
 import { decideFallback, mapCandidates } from '../../services/retrieval/simplemem/candidates.js';
+import { rerankSimpleMemCandidates } from '../../services/retrieval/simplemem/rerank.js';
 
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   const { clipRequestId } = job.data;
@@ -1131,8 +1132,8 @@ async function answerFromSimpleMem(input: {
     minScore: env.SIMPLEMEM_MIN_SCORE,
     durationSeconds: input.video.durationSeconds,
   });
-  const outcome = {
-    candidates: mapping.candidates.length,
+  const baseOutcome = {
+    retrievedCandidates: mapping.candidates.length,
     totalCandidates: reply.totalCandidates,
     ignored: mapping.ignored,
     elapsedMs: reply.elapsedMs,
@@ -1140,12 +1141,87 @@ async function answerFromSimpleMem(input: {
   };
   const decision = decideFallback({ indexState, mode: input.mode, correcting: input.correcting, mapping });
   if (decision.use === 'fallback') {
-    return { matchCount: 0, released: false, fallback: decision.reason, outcome };
+    return { matchCount: 0, released: false, fallback: decision.reason, outcome: baseOutcome };
+  }
+
+  if (!input.video.proxyStorageKey) {
+    return {
+      matchCount: 0,
+      released: false,
+      fallback: 'primary_failed',
+      outcome: { ...baseOutcome, rerankError: 'Video has no analysis proxy to verify' },
+    };
+  }
+
+  let verified;
+  try {
+    const source = await sourceIdentity(input.video.proxyStorageKey);
+    const videoUrl = await getStorage().createDownloadUrl(input.video.proxyStorageKey, {
+      expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
+    });
+    const startedAt = new Date();
+    const began = performance.now();
+    verified = await rerankSimpleMemCandidates({
+      query: input.instruction,
+      candidates: mapping.candidates,
+      videoUrl,
+      videoKey: source.identity,
+      expectedBytes: source.sizeBytes,
+    });
+    await recordModelUsage({
+      videoId: input.video.id,
+      clipRequestId: input.clipRequestId,
+      provider: 'modal',
+      model: verified.result.model,
+      stage: 'rerank',
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      costUsd: estimateGpuCostUsd(gpuMsFrom([verified.result.metrics])),
+      latencyMs: Math.round(performance.now() - began),
+      metrics: { ...verified.result.metrics, source: 'simplemem' },
+      startedAt,
+    }).catch(() => undefined);
+  } catch (error) {
+    const detail = errorMessage(error);
+    input.log.warn('Omni-SimpleMem candidates could not be verified; using fallback retrieval', { err: error });
+    return {
+      matchCount: 0,
+      released: false,
+      fallback: 'primary_failed',
+      outcome: { ...baseOutcome, rerankError: detail },
+    };
+  }
+
+  const outcome = {
+    ...baseOutcome,
+    verifiedCandidates: verified.candidates.length,
+    rerankFailures: verified.failed.length,
+    rerankModel: verified.result.model,
+    rerankRevision: verified.result.revision,
+    rerankMetrics: verified.result.metrics,
+  };
+  if (verified.candidates.length === 0) {
+    return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
   }
   await clearPreviousAttempt(input.clipRequestId, input.log, input.deckAttemptId);
-  const wanted = input.requestedResultCount ?? mapping.candidates.length;
+  for (const failure of verified.failed) {
+    const chunk = input.chunks.find((item) =>
+      failure.startSeconds >= item.globalStartSeconds && failure.startSeconds < item.globalEndSeconds,
+    ) ?? input.chunks.at(-1);
+    if (!chunk) continue;
+    await recordChunkFailure(input.clipRequestId, {
+      chunkIndex: chunk.chunkIndex,
+      chunkId: chunk.id,
+      message: `Omni-SimpleMem found this candidate, but the reranker could not verify it: ${failure.reason}`,
+      code: 'not_read_yet',
+      globalStartSeconds: failure.startSeconds,
+      globalEndSeconds: failure.endSeconds,
+    });
+  }
+  const wanted = input.requestedResultCount ?? verified.candidates.length;
   const found: NewClipMatch[] = [];
-  for (const candidate of mapping.candidates.slice(0, wanted)) {
+  for (const candidate of verified.candidates.slice(0, wanted)) {
     const chunk = input.chunks.find((item) =>
       candidate.startSeconds >= item.globalStartSeconds && candidate.startSeconds < item.globalEndSeconds,
     ) ?? input.chunks.at(-1);
