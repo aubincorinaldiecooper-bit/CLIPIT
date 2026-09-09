@@ -16,6 +16,7 @@ import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
 import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVideo.js';
 import { mediaIndexReadiness, watchMediaIndexRecovery } from './mediaIndexReadiness.js';
+import { assertRerankerDeploymentAvailable } from '../services/mediaIndex/qwen.js';
 import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
@@ -160,6 +161,16 @@ async function main(): Promise<void> {
   }
 
   const mediaIndexReady = await mediaIndexReadiness();
+  if (env.RETRIEVAL_PRIMARY === 'simplemem') {
+    if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
+      throw new Error('RETRIEVAL_PRIMARY=simplemem requires Modal credentials for candidate verification');
+    }
+    await assertRerankerDeploymentAvailable(15_000);
+    logger.info('Omni-SimpleMem reranker deployment available', {
+      app: env.MEDIA_INDEX_RERANK_APP,
+      model: env.MEDIA_INDEX_RERANK_MODEL,
+    });
+  }
 
   /**
    * If Modal was down when this worker booted, keep asking.

@@ -32,7 +32,7 @@ export type MatchSource = 'visual' | 'transcript' | 'multimodal';
 // 'media_index' is the vectors: what the pictures look like, matched
 // against the question without watching the video again. A third kind of
 // memory, and named separately so a row can say which one answered.
-export type AnsweredFrom = 'notes' | 'footage' | 'media_index';
+export type AnsweredFrom = 'notes' | 'footage' | 'media_index' | 'simplemem';
 
 /**
  * Which system found the moments: Clipit's own notes-then-footage search, or
@@ -259,6 +259,13 @@ export interface ClipRequest {
   fallbackReason: FallbackReason | null;
   /** What the primary returned, counted, whether or not it won. */
   primaryOutcome: Record<string, unknown> | null;
+  conversationalAnswer: {
+    text: string;
+    citationIds: string[];
+    provider: string;
+    model: string;
+    promptVersion: string;
+  } | null;
   uncertainMatches: UncertainMatch[];
   /**
    * Whether this request owes a finished 9:16 deck, and whether that deck

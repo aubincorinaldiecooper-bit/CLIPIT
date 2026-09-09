@@ -63,6 +63,11 @@ export async function assertMediaIndexDeploymentsAvailable(timeoutMs: number): P
   await probeModalTarget(RERANK, timeoutMs);
 }
 
+/** The reranker is also a required verifier for Omni-SimpleMem retrieval. */
+export async function assertRerankerDeploymentAvailable(timeoutMs: number): Promise<void> {
+  await probeModalTarget(RERANK, timeoutMs);
+}
+
 export interface IntervalRequest {
   id: string;
   /** Seconds INTO THE FILE at the URL — not source seconds. The caller maps. */

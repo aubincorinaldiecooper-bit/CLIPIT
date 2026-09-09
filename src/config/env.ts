@@ -445,6 +445,10 @@ const envSchema = z.object({
    * the comparison point if this proves weak at on-screen text.
    */
   OPENROUTER_VIDEO_MODEL: z.string().trim().default('qwen/qwen3.6-flash'),
+  /** Qwen Flash writes every final chat response from already-grounded evidence. */
+  OPENROUTER_ANSWER_MODEL: z.string().trim().default('qwen/qwen3.6-flash'),
+  OPENROUTER_ANSWER_MAX_TOKENS: int(700, 128, 4_000),
+  OPENROUTER_ANSWER_TEMPERATURE: num(0.1, 0, 1),
   /**
    * How many calls carrying video may be in flight at once — the whole
    * account, covering both reading a video at upload and searching its

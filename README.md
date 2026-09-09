@@ -1,5 +1,38 @@
 # CLIPIT — backend
 
+## Omni-SimpleMem retrieval
+
+`simplemem` in this repository means the upstream
+[Omni-SimpleMem](https://github.com/aiming-lab/SimpleMem/tree/main/OmniSimpleMem)
+multimodal memory system, not PostgreSQL vector storage. When
+`RETRIEVAL_PRIMARY=simplemem`, Clipit queries that video memory first, turns
+timestamped visual memories into clip candidates, and falls back through the
+native Media Index, upload-time notes, and finally the source footage when the
+memory is unavailable or inconclusive.
+
+Before an Omni-SimpleMem candidate can become answer evidence, Clipit's Qwen
+video reranker watches that exact source interval. Memory proposes; the
+reranker verifies. Candidates the reranker cannot read are reported as
+unexamined and never presented as verified answers.
+
+`SIMPLEMEM_URL` must expose Clipit's adapter contract: `GET /health`, `PUT
+/videos/:videoId`, `POST /videos/:videoId/query`, and `DELETE /videos/:videoId`.
+The adapter must preserve each extracted frame's timestamp; upstream
+Omni-SimpleMem currently computes timestamps during video processing but does
+not include them in its standard query response. Clipit does not invent a
+timeline position for an untimed memory.
+
+[EvolveMem](https://github.com/aiming-lab/SimpleMem/tree/main/EvolveMem) is a
+separate self-evolving retrieval research system. It is not silently enabled by
+the `simplemem` setting. Adopting it requires an explicit evaluation and
+promotion workflow rather than changing the video-memory query contract.
+
+Every completed search is explained by one text-only Qwen Flash call. It sees
+only the user's question and the evidence already retrieved and verified by the
+pipeline; it does not search or rerank the video again. The response and its
+validated evidence citations are stored with the request, while basic and
+complex questions deliberately use the same model and prompt contract.
+
 User-directed AI video clipping. Give it a long video, describe the moment you
 want in plain language, and get back playable MP4 clips.
 
