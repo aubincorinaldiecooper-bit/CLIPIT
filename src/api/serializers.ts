@@ -292,6 +292,8 @@ function clipRequestProgress(request: ClipRequest, candidatesFound: number): Cli
             // saying otherwise would dress a recollection up as a search.
             request.answeredFrom === 'notes'
             ? 'Answered from what I remember of this video'
+            : request.answeredFrom === 'simplemem'
+              ? 'Answered from Omni-SimpleMem video memory'
             : request.answeredFrom === 'media_index'
               ? // Also a recollection, not a search: the vectors were made at
                 // upload and no segment was read to answer this. Partial
@@ -347,6 +349,26 @@ export async function serializeClipRequest(
      */
     retrievalSystem: request.retrievalSystem,
     fallbackReason: request.fallbackReason,
+    answer: request.conversationalAnswer
+      ? {
+          text: request.conversationalAnswer.text,
+          citations: request.conversationalAnswer.citationIds.flatMap((id) => {
+            const match = matches?.find((candidate) => candidate.id === id);
+            return match
+              ? [{
+                  matchId: id,
+                  startSeconds: match.globalStartSeconds,
+                  endSeconds: match.globalEndSeconds,
+                  startTimecode: formatTimecode(match.globalStartSeconds),
+                  endTimecode: formatTimecode(match.globalEndSeconds),
+                }]
+              : [];
+          }),
+          provider: request.conversationalAnswer.provider,
+          model: request.conversationalAnswer.model,
+          promptVersion: request.conversationalAnswer.promptVersion,
+        }
+      : null,
     /**
      * Moments the model reported and our threshold discarded. Not results —
      * they cannot be turned into clips and are not counted. They are here so
