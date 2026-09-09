@@ -11,7 +11,7 @@ import { getVideo } from '../../db/repositories/videos.js';
 import { claimVariant } from '../../db/repositories/clipVariants.js';
 import { aspectOfSource, groupTargetsByShape } from '../media/platformShapes.js';
 import { enqueueClipVariant } from '../../queues/index.js';
-import { submitRecordedPost } from './submitPost.js';
+import { isAmbiguousSubmissionError, submitRecordedPost } from './submitPost.js';
 
 /**
  * The act of publishing one clip, complete: resolve the accounts, group them
@@ -196,17 +196,24 @@ export async function executeClipPublish(input: {
       const message = cause instanceof Error && cause.message ? cause.message : 'A publish group could not be submitted.';
       failures.push(message);
       if (post) {
+        // If the provider received the request but its response was lost,
+        // submitRecordedPost deliberately leaves this row `submitting`.
+        // Preserve that guarded state: changing it to `failed` here would
+        // allow an immediate retry to create a duplicate public post.
+        const ambiguousSubmission = isAmbiguousSubmissionError(cause);
         posts.push({
           id: post.id,
           clipId,
-          status: 'failed',
+          status: ambiguousSubmission ? 'submitting' : 'failed',
           targets: group.targets,
           aspect: group.aspect ?? 'source',
           createdAt: post.created_at.toISOString(),
         });
-        await updatePublishedPost(post.id, { zernioPostId: null, status: 'failed' }).catch((statusCause) =>
-          logger.error('could not mark failed publish group', { postId: post!.id, err: statusCause }),
-        );
+        if (!ambiguousSubmission) {
+          await updatePublishedPost(post.id, { zernioPostId: null, status: 'failed' }).catch((statusCause) =>
+            logger.error('could not mark failed publish group', { postId: post!.id, err: statusCause }),
+          );
+        }
       }
       // A failed first claim means another request owns the entire publish;
       // no later shape group from this request may be submitted.
