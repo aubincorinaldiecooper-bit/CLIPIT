@@ -133,19 +133,18 @@ describe('handleScheduledPublish', () => {
     expect(rows.markScheduledPostFired).not.toHaveBeenCalled();
   });
 
-  it('keeps every created post attached when a later shape group fails', async () => {
+  it('keeps every per-group outcome attached when a later shape group fails', async () => {
     rows.claimScheduledPost.mockResolvedValue(claimedRow);
-    const partial = Object.assign(new Error('Instagram could not be handed off.'), {
-      posts: [{ id: 'post-youtube' }, { id: 'post-instagram' }],
-    });
-    executeClipPublish.mockRejectedValue(partial);
+    executeClipPublish.mockResolvedValue([
+      { id: 'post-youtube', status: 'submitted' },
+      { id: 'post-instagram', status: 'failed' },
+    ]);
 
     await expect(handleScheduledPublish(job())).resolves.toBeUndefined();
 
     expect(rows.markScheduledPostFired).toHaveBeenCalledWith(
       'sched-1',
       ['post-youtube', 'post-instagram'],
-      'Instagram could not be handed off.',
     );
     expect(rows.markScheduledPostFailed).not.toHaveBeenCalled();
   });
