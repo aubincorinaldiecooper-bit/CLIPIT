@@ -47,13 +47,6 @@ export interface PublishedPostSummary {
   createdAt: string;
 }
 
-export class PartialPublishError extends Error {
-  constructor(message: string, public readonly posts: PublishedPostSummary[]) {
-    super(message);
-    this.name = 'PartialPublishError';
-  }
-}
-
 export async function executeClipPublish(input: {
   userId: string;
   workspaceId: string;
@@ -97,6 +90,7 @@ export async function executeClipPublish(input: {
 
   const posts: PublishedPostSummary[] = [];
   const failures: string[] = [];
+  let attemptClaimed = false;
 
   for (const [groupIndex, group] of groups.entries()) {
     let post: Awaited<ReturnType<typeof insertPublishedPost>> | null = null;
@@ -127,6 +121,7 @@ export async function executeClipPublish(input: {
           'This clip was already submitted moments ago. Check your accounts before publishing it again.',
         );
       }
+      attemptClaimed = true;
 
       if (group.aspect === null) {
         // The clip as shot is the right file — submit it now.
@@ -195,6 +190,31 @@ export async function executeClipPublish(input: {
     } catch (cause) {
       const message = cause instanceof Error && cause.message ? cause.message : 'A publish group could not be submitted.';
       failures.push(message);
+      // Once the first group has claimed this publish attempt, every later
+      // group needs a durable outcome even when it fails before its normal
+      // row is created (for example, while claiming a render variant).
+      // Without this row the successful earlier groups are the only visible
+      // evidence, and returning an error invites the caller to retry them.
+      if (!post && attemptClaimed) {
+        try {
+          post = await insertPublishedPost({
+            userId,
+            workspaceId,
+            clipId,
+            zernioPostId: null,
+            caption: input.caption,
+            targets: group.targets,
+            status: 'failed',
+            variantId: null,
+          });
+        } catch (recordCause) {
+          logger.error('could not record failed publish group', {
+            clipId,
+            aspect: group.aspect ?? 'source',
+            err: recordCause,
+          });
+        }
+      }
       if (post) {
         posts.push({
           id: post.id,
@@ -210,12 +230,22 @@ export async function executeClipPublish(input: {
       }
       // A failed first claim means another request owns the entire publish;
       // no later shape group from this request may be submitted.
-      if (groupIndex === 0 && !post) throw cause;
+      if (!attemptClaimed) throw cause;
     }
   }
 
   if (failures.length > 0) {
-    throw new PartialPublishError(failures.join(' '), posts);
+    // The attempt has durable per-group outcomes now. Return all of them so
+    // immediate callers do not retry successful groups and scheduled callers
+    // attach both successes and failures to the promise. A total failure
+    // after the claim is likewise represented by failed post rows.
+    logger.error('clip publish completed with failed groups', {
+      clipId,
+      targets: targets.length,
+      posts: posts.length,
+      failures,
+    });
+    return posts;
   }
   logger.info('clip publish submitted', { clipId, targets: targets.length, posts: posts.length });
   return posts;
