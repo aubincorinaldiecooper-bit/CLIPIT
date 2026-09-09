@@ -81,6 +81,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   releaseDeckAndComplete.mockResolvedValue(true);
   recordConversationalAnswer.mockResolvedValue(true);
+  writeConversationalAnswer.mockResolvedValue({
+    text: 'It happens at 00:00.', citationIds: [], provider: 'openrouter' as const,
+    model: 'qwen/qwen3.6-flash', promptVersion: 'prompt-v1',
+  });
 });
 
 describe('a search completes on find', () => {
@@ -139,6 +143,56 @@ describe('a search completes on find', () => {
       { availableCandidateCount: 5, effectiveDeckTarget: 3 },
       'attempt-1',
     );
+  });
+
+  it('gives the answer model the same highest-confidence moments the screen shows', async () => {
+    listMatches.mockResolvedValue([
+      ...moments(1).map((item) => ({ ...item, id: 'early', confidence: 0.2 })),
+      ...moments(1).map((item) => ({ ...item, id: 'strong', confidence: 0.95, globalStartSeconds: 60 })),
+    ]);
+
+    await complete({ requestedResultCount: 1 });
+
+    expect(writeConversationalAnswer).toHaveBeenCalledWith(expect.objectContaining({
+      evidence: [expect.objectContaining({ id: 'strong' })],
+    }));
+  });
+
+  it('asks the effective prior question when the stored request is a correction', async () => {
+    listMatches.mockResolvedValue(moments(1));
+
+    await complete({ question: 'Where does the price appear?' });
+
+    expect(writeConversationalAnswer).toHaveBeenCalledWith(expect.objectContaining({
+      question: 'Where does the price appear?',
+    }));
+  });
+
+  it('passes retrieval-specific partial coverage to the answer model', async () => {
+    listMatches.mockResolvedValue(moments(1));
+
+    await complete({ coverageNote: 'Only the first 100 of 900 seconds were remembered.' });
+
+    expect(writeConversationalAnswer).toHaveBeenCalledWith(expect.objectContaining({
+      coverageNote: 'Only the first 100 of 900 seconds were remembered.',
+    }));
+  });
+
+  it('releases found moments with a grounded fallback when answer prose fails', async () => {
+    listMatches.mockResolvedValue(moments(2));
+    writeConversationalAnswer.mockRejectedValueOnce(new Error('answer provider unavailable'));
+
+    const released = await complete();
+
+    expect(released).toBe(true);
+    expect(recordConversationalAnswer).toHaveBeenCalledWith('request-1', 'attempt-1', {
+      text: 'Found 2 verified moments.',
+      citationIds: ['match-1', 'match-2'],
+      provider: 'clipit',
+      model: 'deterministic-fallback',
+      promptVersion: 'answer-fallback-v1',
+    });
+    expect(releaseDeckAndComplete).toHaveBeenCalledOnce();
   });
 
   it('never pads a written number: three asked for and two found is two', async () => {
