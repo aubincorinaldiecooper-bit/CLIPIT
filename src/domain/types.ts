@@ -66,7 +66,11 @@ export type FallbackReason =
   | 'not_visual'
   | 'no_coverage'
   | 'provenance_changed'
-  | 'index_failed';
+  | 'index_failed'
+  /** A read that opened, stopped, and never got to say why. */
+  | 'index_stopped'
+  /** The vectors describe footage the video no longer has. */
+  | 'index_footage_replaced';
 
 /**
  * What a person thought of a match.

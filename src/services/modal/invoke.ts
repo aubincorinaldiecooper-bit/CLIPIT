@@ -79,8 +79,81 @@ function lookup(target: ModalTarget): Promise<Function_> {
 
 /** Test seam, and what a not-found calls to force a fresh lookup. */
 export function resetModalHandles(): void {
+  // Drops the cache. ModalClient.close() only clears the client's token and
+  // does not cancel RPCs already in flight, so calling it here would neither
+  // help those calls nor make this reset stronger.
   client = null;
   handles.clear();
+}
+
+/**
+ * Is this deployment resolvable? Asked on a client of this probe's own.
+ *
+ * A health check must not borrow the client that serves live traffic, and this
+ * one went through two wrong answers before that was obvious.
+ *
+ * Sharing the cached handle meant a lookup that hung was adopted by every
+ * later probe, so Modal could recover and the watch would never notice.
+ * Clearing the cache fixed that and left the abandoned call running, one per
+ * retry, each holding a connection. An earlier version then treated closing
+ * the client as cancellation. Direct tests against silent TCP and HTTP/2
+ * peers showed that assumption was false: close() did not settle the lookup.
+ *
+ * A client per probe keeps its state out of the shared cache, and a real
+ * Promise.race makes the caller's deadline effective. The SDK exposes no
+ * cancellation for the underlying lookup, so a timed-out RPC may continue
+ * until its transport settles; close() is still called to discard the probe's
+ * credentials, but is not part of the deadline mechanism.
+ */
+export async function probeModalTarget(target: ModalTarget, timeoutMs: number): Promise<void> {
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
+    throw new ExternalServiceError(target.label, `${target.label} is not configured`, { retryable: false });
+  }
+
+  const probe = new ModalClient({
+    tokenId: env.MODAL_TOKEN_ID,
+    tokenSecret: env.MODAL_TOKEN_SECRET,
+    environment: env.MODAL_ENVIRONMENT,
+  });
+
+  let timer: NodeJS.Timeout;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ExternalServiceError(
+      target.label,
+      `Modal did not resolve ${target.app}/${target.className} within ${timeoutMs}ms`,
+      { retryable: true },
+    )), timeoutMs);
+    timer.unref();
+  });
+
+  try {
+    const lookup = (async () => {
+      const cls = await probe.cls.fromName(target.app, target.className);
+      const instance = await cls.instance();
+      instance.method(target.method);
+    })();
+    await Promise.race([lookup, deadline]);
+  } catch (error) {
+    const failure = classify(target, error);
+    if (!failure.retryable) {
+      throw new ExternalServiceError(
+        target.label,
+        `Modal cannot resolve ${target.app}/${target.className}.${target.method} in environment ` +
+          `${env.MODAL_ENVIRONMENT}. Check the app name, the class name, and that Clipit's token may see it.`,
+        { retryable: false, cause: failure },
+      );
+    }
+    throw failure;
+  } finally {
+    clearTimeout(timer!);
+    // close() clears the SDK client's token. It does not cancel a lookup that
+    // is already in flight, so the race above—not this cleanup—bounds startup.
+    try {
+      probe.close();
+    } catch {
+      // Already closed, or closing threw. Either way this client is going.
+    }
+  }
 }
 
 /**

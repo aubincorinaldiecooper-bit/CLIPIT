@@ -33,7 +33,32 @@ export type IndexFallbackReason =
   | 'no_coverage'
   | 'no_candidates'
   | 'provenance_changed'
-  | 'index_failed';
+  | 'index_failed'
+  /**
+   * A run that opened and then stopped saying anything.
+   *
+   * Distinct from `index_not_ready` on purpose, and the distinction is the
+   * whole point of this reason existing. A row reads `running` in two very
+   * different situations: a video being read right now, and a video whose read
+   * died in a way that could not be written down — the handler records
+   * `failed` in its own error path, but that write is itself a database call,
+   * and when IT fails the row keeps saying `running` with nobody left to
+   * correct it. Treating the second as the first tells every later question
+   * that reading is still in progress, forever, for a video nothing is
+   * touching.
+   */
+  | 'index_stopped'
+  /**
+   * The vectors describe footage this video no longer has.
+   *
+   * The analysis proxy lives at a fixed key and re-processing overwrites it,
+   * so vectors can outlive the pictures they were made from. The handler voids
+   * a run when it notices — but that noticing is a database write, and when it
+   * fails the row keeps its old identity and every window stays searchable.
+   * Answering from those would return moments, with timestamps, from a video
+   * that is gone: not a worse answer, an answer about something else.
+   */
+  | 'index_footage_replaced';
 
 export type IndexDecision =
   | { use: 'index' }
@@ -49,6 +74,74 @@ export interface IndexDecisionInput {
   candidateCount?: number;
   /** Present when consulting it threw. */
   error?: string;
+  /** Injected so "has this run gone quiet" is testable rather than clock-bound. */
+  now?: Date;
+  /**
+   * How long a run may say nothing before it is presumed stopped. Defaults to
+   * the configured window; a live run writes its status after every batch, so
+   * silence for longer than this is not slowness.
+   */
+  staleAfterMs?: number;
+}
+
+/**
+ * Do these vectors still describe this video?
+ *
+ * The analysis proxy lives at a fixed key and re-processing overwrites it, so
+ * vectors can outlive the pictures they were made from. The handler voids a
+ * run when it notices the swap — but that noticing is a database write, and
+ * when it fails the row keeps its old identity and every window stays
+ * searchable. Answering from those returns moments, with timestamps, from a
+ * video that is gone: not a worse answer, an answer about something else.
+ *
+ * The model-provenance check catches a changed MODEL. Nothing else catches
+ * changed pictures, and from the outside the two failures look the same —
+ * confident, well-ordered, and about the wrong thing.
+ *
+ * AN EMPTY STORED IDENTITY IS REFUSED TOO, and the first version of this let
+ * it through on the grounds that refusing would "retire working indexes over a
+ * value nobody ever set". That reason does not survive checking. Only
+ * storeIndexedWindows writes these rows, only the indexing handler calls it,
+ * and that handler has never run in production — the switch has been off on
+ * main since the table existed. There are no such indexes to retire.
+ *
+ * And even if there were, the two mistakes are not the same size. Refusing a
+ * good index costs one slower answer, from the notes and the footage that sit
+ * behind this. Accepting a stale one costs an answer about a different video,
+ * delivered with timestamps and full confidence. The doubt goes to refusing.
+ *
+ * A missing CURRENT identity is different: nothing to compare is not evidence
+ * of a mismatch, and the coverage rules already decide what an index with no
+ * readable footage behind it may say.
+ */
+export function footageWasReplaced(indexedSourceIdentity: string, currentSourceIdentity: string | null): boolean {
+  if (currentSourceIdentity === null) return false;
+  return indexedSourceIdentity !== currentSourceIdentity;
+}
+
+/**
+ * A run that has gone quiet for longer than any batch could take.
+ *
+ * ONLY `running`, and the exclusion of `queued` is the whole care of this
+ * function. A running row has a heartbeat: the handler writes its progress
+ * after every batch, so silence is evidence. A queued row has none — it is
+ * stamped once when the job is enqueued and then waits, and with indexing
+ * concurrency at 1 a perfectly healthy video can sit behind a long one for
+ * hours. Its age measures the size of the backlog, not whether anything is
+ * wrong, and calling that "stopped" would assert a failure that never
+ * happened — the exact move this file exists to prevent.
+ *
+ * The cost of that care is a job the queue genuinely dropped: it keeps saying
+ * "not read yet" rather than being noticed here. That is the right way round.
+ * Saying "not yet" about a video nobody got to is true but incomplete;
+ * saying "it stopped" about one waiting its turn is simply false, and telling
+ * the difference needs the queue itself, which this decision cannot see.
+ *
+ * Every other state is terminal: somebody finished writing the truth down.
+ */
+function hasStopped(status: MediaIndexStatus, now: Date, staleAfterMs: number): boolean {
+  if (status.state !== 'running') return false;
+  return now.getTime() - status.updatedAt.getTime() > staleAfterMs;
 }
 
 /**
@@ -87,6 +180,8 @@ export function decideIndexAnswer(input: IndexDecisionInput): IndexDecision {
   if (!status) {
     return { use: 'fallback', reason: 'index_missing', detail: 'this video was never read into vectors' };
   }
+  const now = input.now ?? new Date();
+  const staleAfterMs = input.staleAfterMs ?? env.MEDIA_INDEX_STALE_AFTER_SECONDS * 1000;
   switch (status.state) {
     case 'queued':
     case 'running':
@@ -114,15 +209,27 @@ export function decideIndexAnswer(input: IndexDecisionInput): IndexDecision {
       break;
   }
   if (status.coveredThroughSeconds <= 0) {
-    const notYet = status.state === 'queued' || status.state === 'running';
+    // "Not yet" is a promise that something is coming. It may only be said
+    // while something actually is: a run still reporting. One that has gone
+    // quiet gets the truthful answer instead — it started and it stopped.
+    const stopped = hasStopped(status, now, staleAfterMs);
+    const notYet = (status.state === 'queued' || status.state === 'running') && !stopped;
     return {
       use: 'fallback',
-      reason: notYet ? 'index_not_ready' : status.state === 'failed' ? 'index_unavailable' : 'no_coverage',
+      reason: notYet
+        ? 'index_not_ready'
+        : stopped
+          ? 'index_stopped'
+          : status.state === 'failed'
+            ? 'index_unavailable'
+            : 'no_coverage',
       detail: notYet
         ? 'no part of this video has been read into vectors yet'
-        : status.state === 'failed'
-          ? status.error ?? 'reading this video into vectors failed before anything was stored'
-          : 'no part of this video has been read into vectors',
+        : stopped
+          ? 'reading this video into vectors started and then stopped without finishing, and nothing was stored'
+          : status.state === 'failed'
+            ? status.error ?? 'reading this video into vectors failed before anything was stored'
+            : 'no part of this video has been read into vectors',
     };
   }
   if (input.error !== undefined) {

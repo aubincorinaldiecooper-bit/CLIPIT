@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   decideIndexAnswer,
+  footageWasReplaced,
   foldIntoMoments,
   keepRelevant,
   rankWindows,
@@ -32,6 +33,156 @@ function status(over: Partial<MediaIndexStatus> = {}): MediaIndexStatus {
 }
 
 const base: IndexDecisionInput = { enabled: true, correcting: false, mode: 'visual', status: status() };
+
+describe('vectors that describe footage the video no longer has', () => {
+  /**
+   * The handler voids a run when it notices the proxy was swapped. That
+   * noticing is a database write, and when it fails the row keeps its old
+   * identity and every window stays searchable — so a question would come back
+   * with moments, and timestamps, from a video that is gone. Not a worse
+   * answer: an answer about something else.
+   */
+  it('are refused when the stored identity disagrees with the footage', () => {
+    expect(footageWasReplaced('sha-original', 'sha-replaced')).toBe(true);
+  });
+
+  it('are used when they match', () => {
+    expect(footageWasReplaced('sha-original', 'sha-original')).toBe(false);
+  });
+
+  it('are refused when nothing recorded what they were built from', () => {
+    // This asserted the opposite when it was written, on the grounds that
+    // refusing would retire working legacy indexes. Checked since: only the
+    // indexing handler writes these rows, and it has never run in production,
+    // so there are no legacy indexes to retire.
+    //
+    // The two mistakes are also not the same size. Refusing a good index costs
+    // one slower answer; accepting a stale one costs an answer about a
+    // different video. Unknown provenance goes to refusing.
+    expect(footageWasReplaced('', 'sha-anything')).toBe(true);
+  });
+
+  it('are used when the video has no readable footage to compare against', () => {
+    // Nothing to compare is not evidence of a mismatch, and the coverage rules
+    // already decide what an index with no footage behind it may answer.
+    expect(footageWasReplaced('sha-original', null)).toBe(false);
+  });
+});
+
+describe('a read that stopped is never described as a read still going', () => {
+  /**
+   * The gap this closes.
+   *
+   * The indexing handler records `failed` when a read dies. That record is
+   * itself a database write, and when IT fails the row keeps saying `running`
+   * with nothing alive to correct it. Before this, such a video was described
+   * as "not read yet" to every question, forever — a promise that something
+   * was coming, about a video nothing was touching. These pin the difference
+   * between a read in progress and a read that stopped.
+   */
+  const NOW = new Date('2026-09-08T12:00:00Z');
+  const minutesAgo = (n: number) => new Date(NOW.getTime() - n * 60_000);
+  const stale = { now: NOW, staleAfterMs: 45 * 60_000 };
+
+  it('still says "not yet" while a run is genuinely reporting', () => {
+    // Wrote its progress a minute ago: it is alive, and "not yet" is true.
+    const decision = decideIndexAnswer({
+      ...base,
+      ...stale,
+      status: status({ state: 'running', coveredThroughSeconds: 0, updatedAt: minutesAgo(1) }),
+    });
+
+    expect(decision).toEqual({
+      use: 'fallback',
+      reason: 'index_not_ready',
+      detail: 'no part of this video has been read into vectors yet',
+    });
+  });
+
+  it('calls a run that has gone quiet stopped, not pending', () => {
+    // Nothing written for an hour. A live run writes after every batch, so
+    // this is not slowness — the process reading this video is gone.
+    const decision = decideIndexAnswer({
+      ...base,
+      ...stale,
+      status: status({ state: 'running', coveredThroughSeconds: 0, updatedAt: minutesAgo(60) }),
+    });
+
+    expect(decision.use).toBe('fallback');
+    // The reason a question falls back is recorded on the request, so this is
+    // the difference between an operator seeing "still indexing" forever and
+    // seeing that these reads die.
+    expect(decision).toMatchObject({ reason: 'index_stopped' });
+    expect((decision as { detail: string }).detail).toContain('started and then stopped');
+  });
+
+  it('never calls a long-queued video stopped — waiting in line is not failing', () => {
+    // This test asserted the opposite when it was written, and the assertion
+    // was wrong. A queued row is stamped once, when the job is enqueued, and
+    // then gets nothing until a worker picks it up. With indexing concurrency
+    // at 1, a healthy video sits behind a long one for as long as that one
+    // takes — so age measures the backlog, not whether anything broke.
+    //
+    // Calling that "started and stopped" would report a failure that never
+    // happened. "Not read yet" is the true answer for a video still in the
+    // queue, however long the queue is.
+    const decision = decideIndexAnswer({
+      ...base,
+      ...stale,
+      status: status({ state: 'queued', coveredThroughSeconds: 0, updatedAt: minutesAgo(90) }),
+    });
+
+    expect(decision).toMatchObject({ reason: 'index_not_ready' });
+  });
+
+  it('still answers from the part a stopped run did read', () => {
+    // The point of keeping a dead run's windows: two minutes were read
+    // correctly and are worth answering from. Going quiet does not throw that
+    // away and send the question to the expensive path for footage already read.
+    const decision = decideIndexAnswer({
+      ...base,
+      ...stale,
+      candidateCount: 2,
+      status: status({ state: 'running', coveredThroughSeconds: 120, updatedAt: minutesAgo(60) }),
+    });
+
+    expect(decision).toEqual({ use: 'index' });
+  });
+
+  it('never calls a finished run stale, however long ago it finished', () => {
+    // A video read last month is read. Only queued and running can go quiet;
+    // every other state means somebody wrote the truth down.
+    const decision = decideIndexAnswer({
+      ...base,
+      ...stale,
+      candidateCount: 1,
+      status: status({ state: 'ready', updatedAt: minutesAgo(60 * 24 * 30) }),
+    });
+
+    expect(decision).toEqual({ use: 'index' });
+  });
+
+  it('does not reclassify a run whose failure WAS recorded', () => {
+    // The handler got its write through: the row says `failed` and names the
+    // cause. That answer is better than "stopped" and must survive.
+    const decision = decideIndexAnswer({
+      ...base,
+      ...stale,
+      status: status({
+        state: 'failed',
+        coveredThroughSeconds: 0,
+        updatedAt: minutesAgo(60),
+        error: 'the embedding service refused every window',
+      }),
+    });
+
+    expect(decision).toEqual({
+      use: 'fallback',
+      reason: 'index_unavailable',
+      detail: 'the embedding service refused every window',
+    });
+  });
+});
 
 describe('decideIndexAnswer', () => {
   it('answers from the vectors when the video was read and something matched', () => {
