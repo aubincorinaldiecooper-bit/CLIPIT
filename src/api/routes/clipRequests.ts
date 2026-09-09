@@ -29,6 +29,11 @@ import {
 } from '../serializers.js';
 import { parse } from '../validation.js';
 import { MATCH_FEEDBACK_REASONS, type Clip, type MatchFeedbackReason } from '../../domain/types.js';
+import {
+  CHAT_RETRIEVAL_SIGNAL_TYPES,
+  recordChatRetrievalSignal,
+  type ChatRetrievalSignalType,
+} from '../../db/repositories/chatRetrievalSignals.js';
 
 const uuidSchema = z.string().uuid('must be a UUID');
 
@@ -66,6 +71,32 @@ const feedbackSchema = z.object({
   reason: z.enum(MATCH_FEEDBACK_REASONS as [MatchFeedbackReason, ...MatchFeedbackReason[]]).nullish(),
 });
 
+export const chatSignalSchema = z.object({
+  event: z.enum(CHAT_RETRIEVAL_SIGNAL_TYPES as unknown as [
+    ChatRetrievalSignalType,
+    ...ChatRetrievalSignalType[],
+  ]),
+  /** Required for a timestamp click; useful context for a missing section. */
+  timestampSeconds: z.number().finite().nonnegative().max(86_400_000).nullish(),
+  /** The new request produced by a follow-up, when one already exists. */
+  relatedClipRequestId: uuidSchema.nullish(),
+  detail: z.string().trim().max(2_000).nullish(),
+  metadata: z.record(z.string(), z.unknown()).refine(
+    (value) => JSON.stringify(value).length <= 8_192,
+    'must serialize to at most 8192 characters',
+  ).optional(),
+  /** Generated once in the browser so delivery retries are idempotent. */
+  clientEventId: uuidSchema.nullish(),
+}).superRefine((value, context) => {
+  if (value.event === 'timestamp_clicked' && value.timestampSeconds == null) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['timestampSeconds'],
+      message: 'is required for timestamp_clicked',
+    });
+  }
+});
+
 const generateSchema = z
   .object({
     /** Omit to generate every match found by the search. */
@@ -100,6 +131,42 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
       clipRequest: await serializeClipRequest(clipRequest, matches, clipsByMatchId, { candidatesFound: allMatches.length }),
       clips: await Promise.all(clips.map((clip: Clip) => serializeClip(clip))),
     });
+  });
+
+  /**
+   * Append-only behavioral evidence for conversational retrieval evaluation.
+   * These are interactions, not conclusions: EvolveMem may learn from them,
+   * but it must never interpret one click as permission to alter production.
+   */
+  app.post('/api/clip-requests/:requestId/signals', { preHandler: requireSession }, async (request, reply) => {
+    await enforceRateLimits(request, [
+      { scope: 'read', perSession: env.RATE_LIMIT_READ_PER_SESSION_MINUTE, windowSeconds: MINUTE },
+    ]);
+    const { requestId } = parse(z.object({ requestId: uuidSchema }), request.params, 'path parameters');
+    const body = parse(chatSignalSchema, request.body ?? {});
+
+    const clipRequest = await getClipRequest(requestId);
+    if (!clipRequest) throw HttpError.notFound('Clip request not found');
+    assertOwnership(request, clipRequest, 'Clip request');
+
+    if (body.relatedClipRequestId) {
+      const related = await getClipRequest(body.relatedClipRequestId);
+      if (!related || related.videoId !== clipRequest.videoId) {
+        throw HttpError.badRequest('Related clip request must belong to the same video');
+      }
+      assertOwnership(request, related, 'Related clip request');
+    }
+
+    const signal = await recordChatRetrievalSignal({
+      clipRequestId: requestId,
+      eventType: body.event,
+      timestampSeconds: body.timestampSeconds ?? null,
+      relatedClipRequestId: body.relatedClipRequestId ?? null,
+      detail: body.detail ?? null,
+      metadata: body.metadata,
+      clientEventId: body.clientEventId ?? null,
+    });
+    return reply.code(201).send({ signal });
   });
 
   /**

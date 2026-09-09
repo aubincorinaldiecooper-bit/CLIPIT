@@ -15,17 +15,22 @@ const listMatches = vi.fn(async (): Promise<Array<Record<string, unknown>>> => [
 const finishClipRequest = vi.fn(async () => true);
 const releaseDeckAndComplete = vi.fn(async () => true);
 const recordDeckAvailability = vi.fn(async () => undefined);
+const recordConversationalAnswer = vi.fn(async () => true);
+const getClipRequest = vi.fn(async () => ({
+  id: 'request-1', videoId: 'video-1', instruction: 'find it', chunksFailed: 0,
+}));
 
 vi.mock('../src/db/repositories/clipRequests.js', () => ({
   claimClipRequestAttempt: vi.fn(),
   finishClipRequest,
-  getClipRequest: vi.fn(),
+  getClipRequest,
   getPreviousClipRequest: vi.fn(),
   insertMatches: vi.fn(),
   listMatches,
   recordChunkCompleted: vi.fn(),
   recordChunkDegraded: vi.fn(),
   recordChunkFailure: vi.fn(),
+  recordConversationalAnswer,
   recordDeckAvailability,
   recordDeckPlan: vi.fn(),
   recordRetrievalOutcome: vi.fn(async () => undefined),
@@ -34,6 +39,12 @@ vi.mock('../src/db/repositories/clipRequests.js', () => ({
   releaseDeckAndComplete,
   startClipRequest: vi.fn(),
 }));
+
+const writeConversationalAnswer = vi.fn(async () => ({
+  text: 'It happens at 00:00.', citationIds: [], provider: 'openrouter' as const,
+  model: 'qwen/qwen3.6-flash', promptVersion: 'prompt-v1',
+}));
+vi.mock('../src/services/search/conversationalAnswer.js', () => ({ writeConversationalAnswer }));
 
 const downloadToFile = vi.fn(async () => undefined);
 const uploadFile = vi.fn(async () => undefined);
@@ -69,6 +80,7 @@ const complete = (over: Partial<Parameters<typeof completeRequest>[0]> = {}) =>
 beforeEach(() => {
   vi.clearAllMocks();
   releaseDeckAndComplete.mockResolvedValue(true);
+  recordConversationalAnswer.mockResolvedValue(true);
 });
 
 describe('a search completes on find', () => {
@@ -83,6 +95,12 @@ describe('a search completes on find', () => {
     // for an answer nobody saw; written after, a worker that stops in between
     // loses it for good, because a completed request cannot be re-claimed.
     expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'notes', 'clipit');
+    expect(writeConversationalAnswer).toHaveBeenCalledOnce();
+    expect(recordConversationalAnswer).toHaveBeenCalledWith(
+      'request-1',
+      'attempt-1',
+      expect.objectContaining({ model: 'qwen/qwen3.6-flash' }),
+    );
     // What was found is what is shown: four, not a deck target of three.
     expect(recordDeckAvailability).toHaveBeenCalledWith(
       'request-1',

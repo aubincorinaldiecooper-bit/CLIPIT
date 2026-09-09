@@ -40,6 +40,7 @@ import {
   recordChunkCompleted,
   recordChunkDegraded,
   recordChunkFailure,
+  recordConversationalAnswer,
   recordDeckAvailability,
   recordDeckPlan,
   recordRetrievalOutcome,
@@ -64,6 +65,7 @@ import type {
   ChunkFailureCode,
   MatchSource,
   AnsweredFrom,
+  FallbackReason,
   ResolvedSearchMode,
   UncertainMatch,
   Video,
@@ -108,6 +110,10 @@ import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
 import { unreadRanges } from '../../services/mediaIndex/coverage.js';
 import { planWindows, windowKey } from '../../services/mediaIndex/windows.js';
 import { estimateGpuCostUsd } from '../../services/mediaIndex/cost.js';
+import { writeConversationalAnswer } from '../../services/search/conversationalAnswer.js';
+import { getSimpleMemIndex } from '../../db/repositories/simplememIndex.js';
+import { simplememQuery } from '../../services/retrieval/simplemem/client.js';
+import { decideFallback, mapCandidates } from '../../services/retrieval/simplemem/candidates.js';
 
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   const { clipRequestId } = job.data;
@@ -436,6 +442,39 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
      * recorded — the index is never allowed to end a search by finding
      * nothing.
      */
+    const fromSimpleMem = await answerFromSimpleMem({
+      clipRequestId,
+      deckAttemptId,
+      requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
+      video,
+      chunks,
+      instruction,
+      mode: resolved.mode,
+      correcting,
+      log,
+    });
+    if (fromSimpleMem.matchCount > 0) {
+      await recordRetrievalOutcome(clipRequestId, {
+        primary: 'simplemem',
+        system: 'simplemem',
+        fallbackReason: null,
+        primaryOutcome: fromSimpleMem.outcome,
+      });
+      outcome = 'completed';
+      searchMode = resolved.mode;
+      chunkCount = 0;
+      return;
+    }
+    if (env.RETRIEVAL_PRIMARY === 'simplemem') {
+      await recordRetrievalOutcome(clipRequestId, {
+        primary: 'simplemem',
+        system: null,
+        fallbackReason: fromSimpleMem.fallback,
+        primaryOutcome: fromSimpleMem.outcome,
+      });
+      log.info('Omni-SimpleMem handed the question on', { reason: fromSimpleMem.fallback });
+    }
+
     const fromIndex = await answerFromMediaIndex({
       clipRequestId,
       deckAttemptId,
@@ -449,10 +488,10 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     });
     if (fromIndex.matchCount > 0) {
       await recordRetrievalOutcome(clipRequestId, {
-        primary: 'media_index',
+        primary: env.RETRIEVAL_PRIMARY === 'simplemem' ? 'simplemem' : 'media_index',
         system: 'media_index',
-        fallbackReason: null,
-        primaryOutcome: fromIndex.outcome,
+        fallbackReason: env.RETRIEVAL_PRIMARY === 'simplemem' ? fromSimpleMem.fallback : null,
+        primaryOutcome: env.RETRIEVAL_PRIMARY === 'simplemem' ? fromSimpleMem.outcome : fromIndex.outcome,
       });
       outcome = 'completed';
       searchMode = resolved.mode;
@@ -463,7 +502,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // — how often the index answers, why it hands a question on, whether the
     // fallback did better — can only be checked if the reason is durable. A
     // reason that lives in a log line is not a record.
-    if (env.MEDIA_INDEX_ENABLED) {
+    if (env.MEDIA_INDEX_ENABLED && env.RETRIEVAL_PRIMARY !== 'simplemem') {
       // The reason and what the index produced, but NOT a claim about who
       // answered: the fallback has not run yet, and it can still fail. A row
       // saying Clipit answered a question nothing answered is worse than a
@@ -905,9 +944,43 @@ export async function completeRequest(input: {
   // whether it exists and whether it already suits TikTok are different
   // questions, and discovery answers only the first.
   const found = await listMatches(clipRequestId);
+  if (!input.deckAttemptId) {
+    log.warn('answer has no active attempt; refusing to spend an unfenced model call', { clipRequestId });
+    return false;
+  }
+  const request = await getClipRequest(clipRequestId);
+  if (!request) throw new Error('Clip request disappeared before its answer could be written');
   const shown = input.requestedResultCount !== null && input.requestedResultCount > 0
     ? Math.min(found.length, input.requestedResultCount)
     : found.length;
+
+  const answer = await writeConversationalAnswer({
+    question: request.instruction,
+    evidence: found.slice(0, shown).map((match) => ({
+      id: match.id,
+      startSeconds: match.globalStartSeconds,
+      endSeconds: match.globalEndSeconds,
+      description: match.description,
+      quote: match.quote,
+      source: match.source,
+    })),
+    coverageNote: request.chunksFailed > 0
+      ? `${request.chunksFailed} section(s) of the video could not be examined.`
+      : null,
+    onUsage: (usage) => {
+      void recordModelUsage({
+        ...usage,
+        stage: 'answer',
+        videoId: request.videoId,
+        clipRequestId,
+      });
+    },
+  });
+  const answerStored = await recordConversationalAnswer(clipRequestId, input.deckAttemptId, answer);
+  if (!answerStored) {
+    log.warn('answer was superseded while Qwen Flash was writing it', { clipRequestId });
+    return false;
+  }
   await recordDeckAvailability(clipRequestId, {
     availableCandidateCount: found.length,
     effectiveDeckTarget: shown,
@@ -925,7 +998,11 @@ export async function completeRequest(input: {
         clipRequestId,
         input.deckAttemptId,
         input.answeredFrom,
-        input.answeredFrom === 'media_index' ? 'media_index' : 'clipit',
+        input.answeredFrom === 'media_index'
+          ? 'media_index'
+          : input.answeredFrom === 'simplemem'
+            ? 'simplemem'
+            : 'clipit',
       )
     : false;
   if (!released) {
@@ -1012,6 +1089,98 @@ const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
   transcript: 'transcript',
   both: 'multimodal',
 };
+
+/** Ask Omni-SimpleMem first when configured, falling through on every miss. */
+async function answerFromSimpleMem(input: {
+  clipRequestId: string;
+  deckAttemptId: string | null;
+  requestedResultCount: number | null;
+  video: Video;
+  chunks: VideoChunk[];
+  instruction: string;
+  mode: ResolvedSearchMode;
+  correcting: boolean;
+  log: Logger;
+}): Promise<{
+  matchCount: number;
+  released: boolean;
+  fallback: FallbackReason | null;
+  outcome: Record<string, unknown> | null;
+}> {
+  if (env.RETRIEVAL_PRIMARY !== 'simplemem') {
+    return { matchCount: 0, released: false, fallback: 'disabled', outcome: null };
+  }
+  const index = await getSimpleMemIndex(input.video.id);
+  const indexState = index?.status ?? 'missing';
+  const before = decideFallback({ indexState, mode: input.mode, correcting: input.correcting });
+  if (before.use === 'fallback') {
+    return { matchCount: 0, released: false, fallback: before.reason, outcome: null };
+  }
+  await startClipRequest(input.clipRequestId, { chunksTotal: 0, resolvedMode: input.mode });
+  let reply;
+  try {
+    reply = await simplememQuery({ videoId: input.video.id, query: input.instruction, topK: env.SIMPLEMEM_TOP_K });
+  } catch (error) {
+    const detail = errorMessage(error);
+    input.log.warn('Omni-SimpleMem query failed; using Clipit retrieval', { err: error });
+    return { matchCount: 0, released: false, fallback: 'primary_failed', outcome: { error: detail } };
+  }
+  const mapping = mapCandidates(reply.items, {
+    fps: index?.fps ?? env.SIMPLEMEM_FRAME_FPS,
+    groupGapSeconds: env.SIMPLEMEM_GROUP_GAP_SECONDS,
+    minScore: env.SIMPLEMEM_MIN_SCORE,
+    durationSeconds: input.video.durationSeconds,
+  });
+  const outcome = {
+    candidates: mapping.candidates.length,
+    totalCandidates: reply.totalCandidates,
+    ignored: mapping.ignored,
+    elapsedMs: reply.elapsedMs,
+    coveredThroughSeconds: index?.coveredThroughSeconds ?? null,
+  };
+  const decision = decideFallback({ indexState, mode: input.mode, correcting: input.correcting, mapping });
+  if (decision.use === 'fallback') {
+    return { matchCount: 0, released: false, fallback: decision.reason, outcome };
+  }
+  await clearPreviousAttempt(input.clipRequestId, input.log, input.deckAttemptId);
+  const wanted = input.requestedResultCount ?? mapping.candidates.length;
+  const found: NewClipMatch[] = [];
+  for (const candidate of mapping.candidates.slice(0, wanted)) {
+    const chunk = input.chunks.find((item) =>
+      candidate.startSeconds >= item.globalStartSeconds && candidate.startSeconds < item.globalEndSeconds,
+    ) ?? input.chunks.at(-1);
+    if (!chunk) continue;
+    const local = mapGlobalRangeToChunk(chunk, candidate);
+    if (!local) continue;
+    found.push({
+      chunkId: chunk.id,
+      localStartSeconds: local.localStartSeconds,
+      localEndSeconds: local.localEndSeconds,
+      globalStartSeconds: local.globalStartSeconds,
+      globalEndSeconds: local.globalEndSeconds,
+      description: candidate.description || `A moment matching "${input.instruction}"`,
+      confidence: Math.max(0, Math.min(1, candidate.score)),
+      source: 'visual',
+      provider: 'omni-simplemem',
+      model: typeof index?.config?.visual === 'string' ? index.config.visual : 'Omni-SimpleMem',
+    });
+  }
+  if (found.length === 0) return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
+  await insertMatches(input.clipRequestId, found);
+  const finalCount = await aggregateStoredMatches(input.clipRequestId, input.chunks, input.deckAttemptId);
+  await withWorkDir(`simplemem-${input.clipRequestId}`, async (dir) => {
+    await attachSearchThumbnails({ clipRequestId: input.clipRequestId, video: input.video, workDir: dir, log: input.log });
+  });
+  const released = await completeRequest({
+    clipRequestId: input.clipRequestId,
+    answeredFrom: 'simplemem',
+    deckAttemptId: input.deckAttemptId,
+    requestedResultCount: input.requestedResultCount,
+    log: input.log,
+  });
+  input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, ...outcome });
+  return { matchCount: finalCount, released, fallback: null, outcome };
+}
 
 
 /**

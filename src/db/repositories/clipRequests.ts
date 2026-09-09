@@ -37,6 +37,11 @@ interface ClipRequestRow {
   retrieval_system: RetrievalSystem | null;
   fallback_reason: FallbackReason | null;
   primary_outcome: Record<string, unknown> | null;
+  answer_text: string | null;
+  answer_citations: string[] | null;
+  answer_provider: string | null;
+  answer_model: string | null;
+  answer_prompt_version: string | null;
   uncertain_matches: UncertainMatch[] | null;
   presentation_target: 'original' | 'vertical' | null;
   requested_result_count: number | null;
@@ -69,6 +74,15 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     retrievalSystem: row.retrieval_system ?? null,
     fallbackReason: row.fallback_reason ?? null,
     primaryOutcome: row.primary_outcome ?? null,
+    conversationalAnswer: row.answer_text && row.answer_provider && row.answer_model && row.answer_prompt_version
+      ? {
+          text: row.answer_text,
+          citationIds: row.answer_citations ?? [],
+          provider: row.answer_provider,
+          model: row.answer_model,
+          promptVersion: row.answer_prompt_version,
+        }
+      : null,
     uncertainMatches: row.uncertain_matches ?? [],
     presentationTarget: row.presentation_target ?? null,
     requestedResultCount: row.requested_result_count ?? null,
@@ -349,10 +363,36 @@ export async function recordDeckPlan(
             available_candidate_count = NULL,
             effective_deck_target    = NULL,
             deck_completed_at        = NULL,
+            answer_text              = NULL,
+            answer_citations         = '[]'::jsonb,
+            answer_provider          = NULL,
+            answer_model             = NULL,
+            answer_prompt_version    = NULL,
             updated_at               = now()
       WHERE id = $1 AND deck_attempt_id = $4
       RETURNING id`,
     [requestId, plan.presentationTarget, plan.requestedResultCount, attemptId],
+  );
+  return row !== null;
+}
+
+/** Stores the exact grounded response, fenced to the search attempt that produced its evidence. */
+export async function recordConversationalAnswer(
+  requestId: string,
+  attemptId: string,
+  answer: { text: string; citationIds: string[]; provider: string; model: string; promptVersion: string },
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
+    `UPDATE clip_requests
+        SET answer_text           = $3,
+            answer_citations      = $4::jsonb,
+            answer_provider       = $5,
+            answer_model          = $6,
+            answer_prompt_version = $7,
+            updated_at            = now()
+      WHERE id = $1 AND deck_attempt_id = $2 AND status <> 'completed'
+      RETURNING id`,
+    [requestId, attemptId, answer.text, JSON.stringify(answer.citationIds), answer.provider, answer.model, answer.promptVersion],
   );
   return row !== null;
 }

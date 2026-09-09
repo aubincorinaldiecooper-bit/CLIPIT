@@ -18,7 +18,8 @@ export type UsageStage =
   // ranking the shortlist they produce. Rolled together they would hide
   // which half the money goes to.
   | 'embedding'
-  | 'rerank';
+  | 'rerank'
+  | 'answer';
 
 export interface ModelTokenUsage {
   promptTokens: number;
