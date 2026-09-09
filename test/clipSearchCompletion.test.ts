@@ -178,16 +178,35 @@ describe('a search completes on find', () => {
     }));
   });
 
-  it('combines retrieval and reranker coverage limitations', async () => {
+  it('does not repeat a persisted gap already described by a retrieval note', async () => {
+    listMatches.mockResolvedValue(moments(1));
+    getClipRequest.mockResolvedValueOnce({
+      id: 'request-1', videoId: 'video-1', instruction: 'find it', chunksFailed: 1,
+    });
+
+    await complete({
+      coverageNote: 'Omni-SimpleMem only examined the first 100 of 900 seconds.',
+      coverageFailuresDescribed: 1,
+    });
+
+    expect(writeConversationalAnswer).toHaveBeenCalledWith(expect.objectContaining({
+      coverageNote: 'Omni-SimpleMem only examined the first 100 of 900 seconds.',
+    }));
+  });
+
+  it('preserves additional reranker coverage limitations without repeating the retrieval gap', async () => {
     listMatches.mockResolvedValue(moments(1));
     getClipRequest.mockResolvedValueOnce({
       id: 'request-1', videoId: 'video-1', instruction: 'find it', chunksFailed: 2,
     });
 
-    await complete({ coverageNote: 'Omni-SimpleMem only examined the first 100 of 900 seconds.' });
+    await complete({
+      coverageNote: 'Omni-SimpleMem only examined the first 100 of 900 seconds.',
+      coverageFailuresDescribed: 1,
+    });
 
     expect(writeConversationalAnswer).toHaveBeenCalledWith(expect.objectContaining({
-      coverageNote: 'Omni-SimpleMem only examined the first 100 of 900 seconds. 2 section(s) of the video could not be examined.',
+      coverageNote: 'Omni-SimpleMem only examined the first 100 of 900 seconds. 1 section(s) of the video could not be examined.',
     }));
   });
 

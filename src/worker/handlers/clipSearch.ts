@@ -952,6 +952,8 @@ export async function completeRequest(input: {
   question?: string;
   /** A retrieval-specific limitation that cannot be inferred from chunk failures. */
   coverageNote?: string | null;
+  /** Persisted failures already described by coverageNote; prevents reporting the same gap twice. */
+  coverageFailuresDescribed?: number;
   log: Logger;
 }): Promise<boolean> {
   const { clipRequestId, log } = input;
@@ -990,8 +992,9 @@ export async function completeRequest(input: {
       quote: match.quote,
       source: match.source,
     }));
-  const chunkCoverageNote = request.chunksFailed > 0
-    ? `${request.chunksFailed} section(s) of the video could not be examined.`
+  const undescribedFailures = Math.max(0, request.chunksFailed - (input.coverageFailuresDescribed ?? 0));
+  const chunkCoverageNote = undescribedFailures > 0
+    ? `${undescribedFailures} section(s) of the video could not be examined.`
     : null;
   // Retrieval systems can leave different holes in the same answer. Never
   // let one warning win merely because it was discovered first.
@@ -1246,13 +1249,15 @@ async function answerFromSimpleMem(input: {
     return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
   }
   await clearPreviousAttempt(input.clipRequestId, input.log, input.deckAttemptId);
-  if (input.video.durationSeconds !== null
+  const unreadTail = input.video.durationSeconds !== null
       && index?.coveredThroughSeconds !== null
       && index?.coveredThroughSeconds !== undefined
-      && index.coveredThroughSeconds + 0.001 < input.video.durationSeconds) {
-    const startSeconds = Math.max(0, index.coveredThroughSeconds);
+      && index.coveredThroughSeconds + 0.001 < input.video.durationSeconds
+    ? { startSeconds: Math.max(0, index.coveredThroughSeconds), endSeconds: input.video.durationSeconds }
+    : null;
+  if (unreadTail) {
     const chunk = input.chunks.find((item) =>
-      startSeconds >= item.globalStartSeconds && startSeconds < item.globalEndSeconds,
+      unreadTail.startSeconds >= item.globalStartSeconds && unreadTail.startSeconds < item.globalEndSeconds,
     ) ?? input.chunks.at(-1);
     if (chunk) {
       await recordChunkFailure(input.clipRequestId, {
@@ -1260,8 +1265,8 @@ async function answerFromSimpleMem(input: {
         chunkId: chunk.id,
         message: 'Omni-SimpleMem indexing stopped before the end of the video.',
         code: 'not_read_yet',
-        globalStartSeconds: startSeconds,
-        globalEndSeconds: input.video.durationSeconds,
+        globalStartSeconds: unreadTail.startSeconds,
+        globalEndSeconds: unreadTail.endSeconds,
       });
     }
   }
@@ -1318,6 +1323,10 @@ async function answerFromSimpleMem(input: {
       && index.coveredThroughSeconds + 0.001 < input.video.durationSeconds
       ? `Omni-SimpleMem only examined the first ${Math.round(index.coveredThroughSeconds)} of ${Math.round(input.video.durationSeconds)} seconds.`
       : null,
+    // The unread tail is also persisted above for the structured API. Tell
+    // completion that this one failure already has the precise prose note;
+    // reranker failures remain undescribed and therefore retain their warning.
+    coverageFailuresDescribed: unreadTail ? 1 : 0,
     log: input.log,
   });
   input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, ...outcome });
