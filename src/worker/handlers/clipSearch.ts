@@ -990,9 +990,12 @@ export async function completeRequest(input: {
       quote: match.quote,
       source: match.source,
     }));
-  const coverageNote = input.coverageNote ?? (request.chunksFailed > 0
-      ? `${request.chunksFailed} section(s) of the video could not be examined.`
-      : null);
+  const chunkCoverageNote = request.chunksFailed > 0
+    ? `${request.chunksFailed} section(s) of the video could not be examined.`
+    : null;
+  // Retrieval systems can leave different holes in the same answer. Never
+  // let one warning win merely because it was discovered first.
+  const coverageNote = [input.coverageNote, chunkCoverageNote].filter(Boolean).join(' ') || null;
   let answer;
   try {
     answer = await writeConversationalAnswer({
@@ -1243,6 +1246,25 @@ async function answerFromSimpleMem(input: {
     return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
   }
   await clearPreviousAttempt(input.clipRequestId, input.log, input.deckAttemptId);
+  if (input.video.durationSeconds !== null
+      && index?.coveredThroughSeconds !== null
+      && index?.coveredThroughSeconds !== undefined
+      && index.coveredThroughSeconds + 0.001 < input.video.durationSeconds) {
+    const startSeconds = Math.max(0, index.coveredThroughSeconds);
+    const chunk = input.chunks.find((item) =>
+      startSeconds >= item.globalStartSeconds && startSeconds < item.globalEndSeconds,
+    ) ?? input.chunks.at(-1);
+    if (chunk) {
+      await recordChunkFailure(input.clipRequestId, {
+        chunkIndex: chunk.chunkIndex,
+        chunkId: chunk.id,
+        message: 'Omni-SimpleMem indexing stopped before the end of the video.',
+        code: 'not_read_yet',
+        globalStartSeconds: startSeconds,
+        globalEndSeconds: input.video.durationSeconds,
+      });
+    }
+  }
   for (const failure of verified.failed) {
     const chunk = input.chunks.find((item) =>
       failure.startSeconds >= item.globalStartSeconds && failure.startSeconds < item.globalEndSeconds,

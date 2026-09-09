@@ -29,6 +29,14 @@ describe('conversational answer contract', () => {
     )).toThrow(/did not cite/);
   });
 
+  it('cannot omit a supplied coverage limitation from valid JSON', () => {
+    expect(parseConversationalAnswer(
+      '{"answer":"It happens at 00:12.","citation_ids":["m1"]}',
+      new Set(['m1']),
+      'The final 40 seconds were not examined.',
+    ).text).toBe('It happens at 00:12. The final 40 seconds were not examined.');
+  });
+
   it('uses Qwen Flash without reasoning for every final response', async () => {
     globalThis.fetch = vi.fn(async (_url, init) => {
       const request = JSON.parse(String(init?.body));

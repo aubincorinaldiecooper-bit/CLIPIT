@@ -568,19 +568,41 @@ export async function getPreviousClipRequest(input: {
   // from a new tab with a fresh session. A guest's can only mean this tab's.
   const row = input.userId
     ? await queryOne<ClipRequestRow>(
-        `SELECT * FROM clip_requests
-          WHERE video_id = $1 AND user_id = $2 AND created_at < $3
-          ORDER BY created_at DESC
-          LIMIT 1`,
+        `WITH RECURSIVE effective AS (
+           SELECT r.*, ARRAY[r.id] AS correction_path
+             FROM clip_requests r
+            WHERE r.id = (
+              SELECT id FROM clip_requests
+               WHERE video_id = $1 AND user_id = $2 AND created_at < $3
+               ORDER BY created_at DESC LIMIT 1
+            )
+           UNION ALL
+           SELECT prior.*, effective.correction_path || prior.id
+             FROM effective
+             JOIN clip_requests prior ON prior.id = effective.corrected_request_id
+            WHERE NOT prior.id = ANY(effective.correction_path)
+         )
+         SELECT * FROM effective ORDER BY cardinality(correction_path) DESC LIMIT 1`,
         [input.videoId, input.userId, input.before],
       )
     : await queryOne<ClipRequestRow>(
-        `SELECT * FROM clip_requests
-          WHERE video_id = $1
-            AND session_id IS NOT DISTINCT FROM $2
-            AND created_at < $3
-          ORDER BY created_at DESC
-          LIMIT 1`,
+        `WITH RECURSIVE effective AS (
+           SELECT r.*, ARRAY[r.id] AS correction_path
+             FROM clip_requests r
+            WHERE r.id = (
+              SELECT id FROM clip_requests
+               WHERE video_id = $1
+                 AND session_id IS NOT DISTINCT FROM $2
+                 AND created_at < $3
+               ORDER BY created_at DESC LIMIT 1
+            )
+           UNION ALL
+           SELECT prior.*, effective.correction_path || prior.id
+             FROM effective
+             JOIN clip_requests prior ON prior.id = effective.corrected_request_id
+            WHERE NOT prior.id = ANY(effective.correction_path)
+         )
+         SELECT * FROM effective ORDER BY cardinality(correction_path) DESC LIMIT 1`,
         [input.videoId, input.sessionId, input.before],
       );
   return row ? mapRequest(row) : null;
