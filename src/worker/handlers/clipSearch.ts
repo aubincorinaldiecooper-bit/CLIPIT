@@ -98,6 +98,7 @@ function classifyChunkFailure(reason: unknown): ChunkFailureCode {
 import { getMediaIndexStatus, listIndexedWindows } from '../../db/repositories/mediaIndex.js';
 import {
   decideIndexAnswer,
+  footageWasReplaced,
   IndexProvenanceChanged,
   searchMediaIndex,
   type IndexFallbackReason,
@@ -1122,6 +1123,19 @@ async function answerFromMediaIndex(input: {
     windowsSearched = windows.length;
     searchedWindowKeys = windows.map((window) => window.windowKey);
     const source = video.proxyStorageKey ? await sourceIdentity(video.proxyStorageKey) : null;
+    // Do these vectors still describe this video? Checked here because this is
+    // the first point where both identities exist: what the index was built
+    // from came back with the windows, and what the video IS was just read
+    // from the store. A run voided by a swap the handler could not write down
+    // would otherwise stay searchable and answer with timestamps into footage
+    // that has been replaced.
+    if (footageWasReplaced(snapshot.sourceIdentity, source?.identity ?? null)) {
+      log.info('these vectors describe footage this video no longer has; handing the question on', {
+        videoId: video.id,
+      });
+      await recordCalls();
+      return { matchCount: 0, released: false, fallback: 'index_footage_replaced', outcome: null };
+    }
     const videoUrl = video.proxyStorageKey
       ? await getStorage().createDownloadUrl(video.proxyStorageKey, {
           expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,

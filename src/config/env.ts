@@ -32,6 +32,29 @@ const int = (defaultValue: number, min?: number, max?: number) =>
       })(),
     );
 
+/**
+ * An integer with NO default, left undefined when unset so the caller can
+ * derive one from another setting after parsing.
+ *
+ * For the case a static default cannot honestly serve: a value whose whole
+ * correctness is a relationship to a second setting the operator can move
+ * independently. A fixed number there is right only until somebody changes
+ * the other one, and then it is silently wrong.
+ */
+const optionalInt = (min?: number, max?: number) =>
+  z
+    .string()
+    .optional()
+    .transform((value) => (value === undefined || value === '' ? undefined : Number(value)))
+    .pipe(
+      (() => {
+        let schema = z.number().int();
+        if (min !== undefined) schema = schema.min(min);
+        if (max !== undefined) schema = schema.max(max);
+        return schema.optional();
+      })(),
+    );
+
 const num = (defaultValue: number, min?: number, max?: number) =>
   z
     .string()
@@ -249,17 +272,24 @@ const envSchema = z.object({
   /**
    * Read every uploaded video into vectors.
    *
-   * Off by default, and deliberately so: turning it on starts a GPU call per
-   * batch of windows for every upload, and the two Modal services must
-   * actually be deployed for it to do anything but fail. Neither is a thing
-   * this process can check for itself, and a deploy that silently begins
-   * spending — or silently begins failing on every video — is not something
-   * to inherit by accident.
+   * On by default. It ships on because that is the decision that was made
+   * about this feature, and a default is where a decision like that lives.
    *
-   * This is a real switch, unlike the one it replaces: with it on, videos are
-   * indexed and questions consult the index.
+   * It shipped off once, guarded by the argument that turning it on starts a
+   * GPU call per batch of windows for every upload, and that the two Modal
+   * services must be deployed for it to do anything but fail — "neither is a
+   * thing this process can check for itself". The second half of that was
+   * simply untrue. `assertModalTargetAvailable` resolves a deployment without
+   * invoking it, and the worker now calls it at startup for both services
+   * (see worker/main.ts). So a missing deployment is one loud refusal to boot,
+   * not a silent failure on every upload, and the reason for the off default
+   * does not survive contact with the code that was already here.
+   *
+   * What remains true is the spending, and that is the point of the switch
+   * rather than an argument against its default: with this on, every upload
+   * costs GPU time, which is what reading every video into vectors is.
    */
-  MEDIA_INDEX_ENABLED: bool(false),
+  MEDIA_INDEX_ENABLED: bool(true),
   MEDIA_INDEX_VERSION: z.string().trim().default('v1'),
   /**
    * The exact weights, when they are known. A model NAME is not an identity:
@@ -317,6 +347,50 @@ const envSchema = z.object({
   MEDIA_INDEX_CONCURRENCY: int(1, 1, 8),
   MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
   MEDIA_INDEX_MAX_RETRIES: int(2, 0, 5),
+  /**
+   * How often a worker that found Modal unreachable at startup asks again.
+   *
+   * The startup check retries over a few seconds, which covers a blip during a
+   * deploy but not an outage lasting minutes. Without this, such an outage
+   * leaves indexing off for the process's whole lifetime while uploads keep
+   * queueing work nothing consumes — and recovery needs a human to notice and
+   * restart a worker that looks entirely healthy.
+   *
+   * A minute: cheap enough to be invisible (resolving a deployment does not
+   * start a GPU) and short enough that recovery is measured in minutes rather
+   * than however long it takes somebody to look.
+   */
+  MEDIA_INDEX_RECHECK_INTERVAL_MS: int(60_000, 5_000, 3_600_000),
+  /**
+   * How often a run reading a video says it is still alive.
+   *
+   * Deliberately separate from progress. Progress lands when a batch of
+   * windows returns, and a batch waits for a Modal permit that searches
+   * compete for, then retries internally — so time-since-progress measures how
+   * busy the system is, not whether anything is still reading. The heartbeat
+   * ticks regardless of what the batch is waiting for, which is the only way
+   * silence can honestly mean "the process is gone".
+   *
+   * Half a minute: one small UPDATE per running video, invisible next to a GPU
+   * call, and frequent enough that a dead run is noticed in a couple of
+   * minutes.
+   */
+  MEDIA_INDEX_HEARTBEAT_SECONDS: int(30, 5, 600),
+  /**
+   * How long a run may say nothing before it is presumed to have stopped.
+   *
+   * Unset by default: it resolves to three missed heartbeats (see loadEnv),
+   * and an explicit value is refused if it falls at or under a single beat.
+   *
+   * This exists because of the one failure the indexing handler cannot report
+   * on its own: it records `failed` in its error path, but that record is
+   * itself a database write, and when THAT write fails the row keeps saying
+   * `running` with nothing left alive to correct it. Without this, such a
+   * video is described as "still being read" for as long as it exists, and
+   * every question about it quietly takes the slow, expensive path while the
+   * system says something reassuring and false.
+   */
+  MEDIA_INDEX_STALE_AFTER_SECONDS: optionalInt(10, 86_400),
 
   // --- Retrieval primary: Omni-SimpleMem tried first, Clipit's own search as the fallback
   /**
@@ -640,7 +714,36 @@ const envSchema = z.object({
   JOB_BACKOFF_MS: int(5_000, 100, 600_000),
 });
 
-export type Env = z.infer<typeof envSchema>;
+/**
+ * MEDIA_INDEX_STALE_AFTER_SECONDS is optional in the schema and always present
+ * here: loadEnv derives it from the request timeout when it is unset, so every
+ * consumer gets a number and none of them has to know where it came from.
+ */
+export type Env = Omit<z.infer<typeof envSchema>, 'MEDIA_INDEX_STALE_AFTER_SECONDS'> & {
+  MEDIA_INDEX_STALE_AFTER_SECONDS: number;
+};
+
+/**
+ * How many heartbeats a run may miss before it is presumed gone.
+ *
+ * Three, so a single dropped write — a connection reset, a failover — is not a
+ * verdict, while a process that actually died is noticed in a couple of
+ * minutes rather than an hour.
+ */
+const MISSED_HEARTBEATS_BEFORE_STOPPED = 3;
+
+/**
+ * How long one heartbeat write may take before the database gives up on it.
+ *
+ * Exported because two places must agree on it and neither may guess: the
+ * repository applies it as a statement timeout on the write, and the check
+ * below has to allow for it. Beats are CHAINED — the next is scheduled only
+ * once the current one settles — so the real gap between two beats is the
+ * interval PLUS however long the write took, and a threshold that counts only
+ * the interval will call a live run stopped while its heartbeat is still in
+ * flight.
+ */
+export const MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS = 10;
 
 function loadEnv(): Env {
   const parsed = envSchema.safeParse(process.env);
@@ -686,15 +789,49 @@ function loadEnv(): Env {
   if (value.SIMPLEMEM_INDEX_ENABLED && !value.SIMPLEMEM_URL) {
     problems.push('SIMPLEMEM_INDEX_ENABLED=true requires SIMPLEMEM_URL');
   }
-  if (value.MEDIA_INDEX_ENABLED && (!value.MODAL_TOKEN_ID || !value.MODAL_TOKEN_SECRET)) {
-    // Without these every upload is accepted and then its indexing job fails
-    // one at a time, which reads as a broken product rather than a missing
-    // setting. Failing once at startup says what is actually wrong.
-    problems.push('MEDIA_INDEX_ENABLED=true requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET');
-  }
+  // MEDIA_INDEX_ENABLED's demand for Modal credentials is NOT checked here,
+  // and the reason is the difference between a degraded feature and an outage.
+  // This file is loaded by both processes, and only the worker ever calls
+  // Modal — the API reads MEDIA_INDEX_ENABLED nowhere. A check here fails the
+  // API for the absence of a credential it must never be given, which is the
+  // same rule the MiniCPM token already follows: "the API never receives
+  // infrastructure credentials it does not use" (worker/main.ts). Enforced
+  // there, on the process that actually spends the token.
   if (value.TRANSCRIPTION_ENABLED && !value.OPENROUTER_API_KEY) {
     problems.push(
       'OPENROUTER_API_KEY is required when TRANSCRIPTION_ENABLED=true (set TRANSCRIPTION_ENABLED=false to run visual-only search)',
+    );
+  }
+
+  // A run is judged gone by its silence, and what it is silent BETWEEN is the
+  // heartbeat, not the batches. That distinction is the whole design.
+  //
+  // Deriving this from batch timing was tried twice and is not fixable. A
+  // batch's duration is its permit wait plus its retries plus their backoff,
+  // and the permit wait — searches and indexing share the same permits — is
+  // bounded by nothing at all. Any multiplier over the request timeout is a
+  // guess about contention dressed as arithmetic, and every version of it
+  // eventually calls a healthy read dead.
+  //
+  // The heartbeat removes the guess: the worker says it is alive on a fixed
+  // timer whatever it is waiting for, so this only has to outlast a few missed
+  // beats.
+  const heartbeatSeconds = value.MEDIA_INDEX_HEARTBEAT_SECONDS;
+
+  // The gap between two beats is the interval PLUS the write, not the interval
+  // alone: beats are chained, so the next is scheduled only once the current
+  // one settles, and the write is allowed up to its statement timeout. A
+  // threshold above the interval but below their sum is accepted-looking and
+  // wrong — it expires while a perfectly healthy heartbeat is still in flight.
+  const slowestBeatSeconds = heartbeatSeconds + MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS;
+
+  if (value.MEDIA_INDEX_STALE_AFTER_SECONDS !== undefined
+      && value.MEDIA_INDEX_STALE_AFTER_SECONDS <= slowestBeatSeconds) {
+    problems.push(
+      `MEDIA_INDEX_STALE_AFTER_SECONDS (${value.MEDIA_INDEX_STALE_AFTER_SECONDS}) must be greater than ` +
+        `${slowestBeatSeconds} — MEDIA_INDEX_HEARTBEAT_SECONDS (${heartbeatSeconds}) plus the ` +
+        `${MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS}s a beat's own write is allowed — or a run is ` +
+        'called stopped while its heartbeat is still in flight',
     );
   }
 
@@ -702,7 +839,21 @@ function loadEnv(): Env {
     console.error(`\nInvalid environment configuration:\n${problems.map((p) => `  - ${p}`).join('\n')}\n`);
     process.exit(1);
   }
-  return value;
+  return {
+    ...value,
+    // Three missed beats. The two errors are not symmetric: declaring a live
+    // read dead reports a failure that never happened, while noticing a dead
+    // one late only delays a fallback that already works — so the margin goes
+    // to never accusing, and one dropped write is never a verdict.
+    // Missed beats counted at their SLOWEST, not at the interval. Derived from
+    // the interval alone, a heartbeat of 5s gave 15s — exactly one slow beat
+    // (5s of waiting plus the 10s its write is allowed), so an entirely
+    // healthy run could be called stopped on its first slow write. The default
+    // has to clear the same bar the explicit check enforces, or the check is
+    // stricter than the value it hands out.
+    MEDIA_INDEX_STALE_AFTER_SECONDS:
+      value.MEDIA_INDEX_STALE_AFTER_SECONDS ?? slowestBeatSeconds * MISSED_HEARTBEATS_BEFORE_STOPPED,
+  };
 }
 
 export const env: Env = loadEnv();

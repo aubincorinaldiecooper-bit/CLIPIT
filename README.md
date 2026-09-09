@@ -141,6 +141,12 @@ BUCKET_NAME=clipit
 OPENROUTER_API_KEY=…
 ```
 
+Reading videos into vectors is on in production and off in `.env.example`
+(`MEDIA_INDEX_ENABLED=false`), because it needs Modal credentials and two
+deployed Modal apps that a local checkout does not have. Left on without them
+the worker still boots and everything above still works — it just logs an
+error about a feature you did not ask for.
+
 Against MinIO also set `AWS_ENDPOINT_URL=http://127.0.0.1:9000` and
 `S3_FORCE_PATH_STYLE=true`. MinIO rejects the CORS rule the API applies on
 boot; the log line is expected there and only affects browser uploads, which

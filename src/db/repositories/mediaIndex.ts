@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS } from '../../config/env.js';
 import { query, queryOne, queryRows, withTransaction } from '../pool.js';
 import { unpackVector } from '../../services/mediaIndex/vectors.js';
 
@@ -128,7 +130,7 @@ export function buildWindowInsert(
   windows: readonly IndexedWindow[],
   provenance: WindowProvenance,
   packVector: (values: readonly number[]) => Buffer,
-  runStartedAt: Date,
+  runId: string,
 ): { text: string; values: unknown[] } {
   const PER_WINDOW = 8;
   const values: unknown[] = [];
@@ -150,12 +152,12 @@ export function buildWindowInsert(
       `$${base + 6}, $${base + 7}, $${base + 8}, $${shared + 1}, $${shared + 2}, $${shared + 3})`
     );
   });
-  values.push(provenance.indexVersion, provenance.sourceIdentity, runStartedAt);
+  values.push(provenance.indexVersion, provenance.sourceIdentity, runId);
 
   return {
     text:
       `INSERT INTO media_index
-         (video_id, window_key, start_seconds, end_seconds, embedding, dims, model, revision, index_version, source_identity, run_started_at)
+         (video_id, window_key, start_seconds, end_seconds, embedding, dims, model, revision, index_version, source_identity, run_id)
        VALUES ${tuples.join(', ')}
        ON CONFLICT (video_id, window_key) DO UPDATE SET
          start_seconds   = EXCLUDED.start_seconds,
@@ -166,7 +168,7 @@ export function buildWindowInsert(
          revision        = EXCLUDED.revision,
          index_version   = EXCLUDED.index_version,
          source_identity = EXCLUDED.source_identity,
-         run_started_at  = EXCLUDED.run_started_at,
+         run_id          = EXCLUDED.run_id,
          created_at      = now()`,
     values,
   };
@@ -189,7 +191,7 @@ export async function storeIndexedWindows(
   windows: readonly IndexedWindow[],
   provenance: WindowProvenance,
   packVector: (values: readonly number[]) => Buffer,
-  runStartedAt: Date,
+  runId: string,
 ): Promise<number> {
   if (windows.length === 0) return 0;
 
@@ -200,7 +202,7 @@ export async function storeIndexedWindows(
     );
   }
 
-  const statement = buildWindowInsert(videoId, windows, provenance, packVector, runStartedAt);
+  const statement = buildWindowInsert(videoId, windows, provenance, packVector, runId);
 
   return withTransaction(async (client) => {
     // Locks the video row for this transaction, so retention's claim blocks
@@ -218,8 +220,8 @@ export async function storeIndexedWindows(
     // overlapping attempt writes nothing rather than overwriting the newer
     // run's work with vectors that every read would then filter out.
     const current = await client.query(
-      `SELECT 1 FROM media_index_status WHERE video_id = $1 AND started_at = $2`,
-      [videoId, runStartedAt],
+      `SELECT 1 FROM media_index_status WHERE video_id = $1 AND run_id IS NOT NULL AND run_id = $2`,
+      [videoId, runId],
     );
     if (current.rowCount === 0) return 0;
 
@@ -245,6 +247,16 @@ export interface IndexSnapshot {
   runStartedAt: Date | null;
   /** Its coverage, likewise — so the two can never describe different runs. */
   coveredThroughSeconds: number;
+  /**
+   * WHICH FOOTAGE these vectors describe.
+   *
+   * Read in the same query for the same reason as the rest: so a caller can
+   * check the vectors against the video that exists NOW. The proxy key is
+   * mutable and re-processing overwrites it, so vectors can outlive the
+   * footage they were made from — and the model-identity check catches a
+   * changed model, not changed pictures.
+   */
+  sourceIdentity: string;
 }
 
 /**
@@ -272,9 +284,10 @@ export async function listIndexedWindows(videoId: string): Promise<IndexSnapshot
     dims: number;
     run_started_at: Date | null;
     covered_through_seconds: string | number;
+    source_identity: string;
   }>(
     `SELECT m.window_key, m.start_seconds, m.end_seconds, m.embedding, m.dims,
-            s.started_at AS run_started_at, s.covered_through_seconds
+            s.started_at AS run_started_at, s.covered_through_seconds, s.source_identity
        FROM media_index m
        JOIN media_index_status s ON s.video_id = m.video_id
       WHERE m.video_id = $1
@@ -296,6 +309,7 @@ export async function listIndexedWindows(videoId: string): Promise<IndexSnapshot
     })),
     runStartedAt: rows[0]?.run_started_at ?? null,
     coveredThroughSeconds: Number(rows[0]?.covered_through_seconds ?? 0),
+    sourceIdentity: rows[0]?.source_identity ?? '',
   };
 }
 
@@ -329,7 +343,7 @@ export interface StatusPatch {
    * coverage over the live run's, and a partial index would read as fully
    * ready. Progress and completion carry the run that produced them.
    */
-  ifRunStartedAt?: Date;
+  ifRunId?: string;
   /**
    * Write only while the row is in one of these states.
    *
@@ -395,6 +409,51 @@ export function statusWriteDecision(state: MediaIndexState, patch: StatusPatch):
   };
 }
 
+/**
+ * "This run is still alive." Nothing else.
+ *
+ * The liveness signal, separated from progress on purpose. Progress arrives
+ * when a batch of windows returns, and a batch can legitimately take a very
+ * long time — it waits for a shared Modal permit that searches also draw on,
+ * then retries internally, each attempt allowed a full request timeout. Time
+ * since the last batch therefore measures how busy the system is, not whether
+ * anything is still reading this video, and no arithmetic over those settings
+ * turns one into the other: the permit wait is bounded by nothing at all.
+ *
+ * So the process says so itself, on a timer, while it is working. Silence then
+ * means the process is gone — which is the only thing the read path actually
+ * wants to know.
+ *
+ * Fenced on the run that opened the row: a worker whose run has been
+ * superseded cannot keep a newer attempt's row looking alive, and one that
+ * finished cannot revive a terminal state, because only `running` is touched.
+ */
+export async function touchMediaIndexRun(videoId: string, runId: string): Promise<boolean> {
+  // Bounded IN THE DATABASE, not merely awaited with a timer beside it.
+  //
+  // The caller schedules the next beat only once this one settles, so a write
+  // that never settles stops the heartbeat for good and lets the read path
+  // call a working run stopped — the exact lie the heartbeat exists to
+  // prevent. Abandoning the promise in the application would fix the stall and
+  // leave the query holding a pool connection, so a sick database would lose
+  // connections one beat at a time. A statement timeout ends it at the far
+  // end: the query is cancelled, the connection comes back, and the rejection
+  // reaches the caller, which logs a missed beat and schedules the next.
+  //
+  // SET LOCAL, so it lasts exactly this transaction and no pooled connection
+  // carries it to unrelated work.
+  return withTransaction(async (client) => {
+    await client.query(`SET LOCAL statement_timeout = '${MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS}s'`);
+    const result = await client.query(
+      `UPDATE media_index_status
+          SET updated_at = now()
+        WHERE video_id = $1 AND run_id IS NOT NULL AND run_id = $2 AND state = 'running'`,
+      [videoId, runId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  });
+}
+
 export async function setMediaIndexStatus(
   videoId: string,
   state: MediaIndexState,
@@ -402,18 +461,28 @@ export async function setMediaIndexStatus(
 ): Promise<void> {
   const { writeError: errorGiven, errorValue, clearFinished } = statusWriteDecision(state, patch);
 
-  await query(
-    `INSERT INTO media_index_status
-       (video_id, state, covered_through_seconds, windows_planned, windows_stored, windows_failed,
-        model, revision, dims, index_version, error, started_at, finished_at, updated_at)
-     VALUES ($1, $2, COALESCE($3, 0), COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
-             COALESCE($7, ''), COALESCE($8, ''), $9, COALESCE($10, ''),
-             CASE WHEN $14 THEN $11 ELSE NULL END,
-             $12,
-             CASE WHEN $15 THEN NULL ELSE $13 END,
-             now())
-     ON CONFLICT (video_id) DO UPDATE SET
-       state                   = EXCLUDED.state,
+  /**
+   * A fenced write may only ever UPDATE. It must never insert.
+   *
+   * The fence reads as ownership — "write this only if the row is still mine"
+   * — and an upsert cannot express that, because PostgreSQL applies the
+   * condition to the ON CONFLICT branch and takes the INSERT path when no row
+   * exists. A fence over a missing row therefore passed, unconditionally.
+   *
+   * That matters because rows go missing on purpose: retention deletes both
+   * media index tables when it claims a video's footage (services/retention).
+   * An indexing job still in flight would then re-create a status row for
+   * footage that has been removed — a video described as indexed, or as
+   * failing to index, when there is nothing left to read. Whoever asked for
+   * that footage to go would have no way of knowing.
+   *
+   * Unfenced writes keep the upsert: preprocessing opens the `queued` row that
+   * way, and it is the only caller that should ever bring a row into being.
+   */
+  const fenced = patch.ifRunId !== undefined || patch.ifState !== undefined;
+
+  const assignments = `
+       state                   = $2,
        covered_through_seconds = COALESCE($3, media_index_status.covered_through_seconds),
        windows_planned         = COALESCE($4, media_index_status.windows_planned),
        windows_stored          = COALESCE($5, media_index_status.windows_stored),
@@ -424,11 +493,38 @@ export async function setMediaIndexStatus(
        index_version           = COALESCE($10, media_index_status.index_version),
        error                   = CASE WHEN $14 THEN $11 ELSE media_index_status.error END,
        started_at              = COALESCE($12, media_index_status.started_at),
+       -- Queueing REVOKES the previous run. Without this the old run's id
+       -- stays on the row, so a handler still in flight over footage that has
+       -- since been replaced passes every fence and writes windows describing
+       -- a video that is gone. The queued state is written by preprocessing
+       -- alone and means exactly "a new attempt is coming", so nothing from
+       -- the old one may land after it.
+       run_id                  = CASE WHEN $2 = 'queued' THEN NULL ELSE media_index_status.run_id END,
        finished_at             = CASE WHEN $15 THEN NULL
                                       ELSE COALESCE($13, media_index_status.finished_at) END,
-       updated_at              = now()
-     WHERE ($16::timestamptz IS NULL OR media_index_status.started_at = $16)
-       AND ($17::text[] IS NULL OR media_index_status.state = ANY($17))`,
+       updated_at              = now()`;
+
+  const fence = `($16::uuid IS NULL OR (media_index_status.run_id IS NOT NULL AND media_index_status.run_id = $16))
+       AND ($17::text[] IS NULL OR media_index_status.state = ANY($17))`;
+
+  const text = fenced
+    ? `UPDATE media_index_status SET ${assignments}
+     WHERE media_index_status.video_id = $1
+       AND ${fence}`
+    : `INSERT INTO media_index_status
+       (video_id, state, covered_through_seconds, windows_planned, windows_stored, windows_failed,
+        model, revision, dims, index_version, error, started_at, finished_at, updated_at)
+     VALUES ($1, $2, COALESCE($3, 0), COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
+             COALESCE($7, ''), COALESCE($8, ''), $9, COALESCE($10, ''),
+             CASE WHEN $14 THEN $11 ELSE NULL END,
+             $12,
+             CASE WHEN $15 THEN NULL ELSE $13 END,
+             now())
+     ON CONFLICT (video_id) DO UPDATE SET ${assignments}
+     WHERE ${fence}`;
+
+  await query(
+    text,
     [
       videoId,
       state,
@@ -445,7 +541,7 @@ export async function setMediaIndexStatus(
       patch.finishedAt ?? null,
       errorGiven,
       clearFinished,
-      patch.ifRunStartedAt ?? null,
+      patch.ifRunId ?? null,
       patch.ifState ? [...patch.ifState] : null,
     ] as never,
   );
@@ -466,12 +562,29 @@ export async function setMediaIndexStatus(
 export async function beginIndexRun(
   videoId: string,
   provenance: WindowProvenance,
-): Promise<{ cleared: number; retained: string[]; runStartedAt: Date }> {
+): Promise<{ cleared: number; retained: string[]; runId: string } | null> {
   // One transaction. Deleting the old index and recording the new run are a
   // single act: if the status write failed on its own, the previous index
   // would be gone while its status still read `ready`, and every search would
   // see a finished index with nothing in it until some later run repaired it.
   return withTransaction(async (client) => {
+    // Retention's claim comes first. storeIndexedWindows already locks this
+    // row before writing windows; opening a run did not, so retention could
+    // claim a video and delete both index tables while the first embedding
+    // call was still in flight, and this would then recreate a `running`
+    // status for footage that no longer exists — a deleted video reported as
+    // being indexed, for ever, with nothing to correct it.
+    //
+    // Same lock, same conditions: retention blocks until this commits, and a
+    // claim that got here first makes this find nothing and open nothing.
+    const claimable = await client.query(
+      `SELECT 1 FROM videos
+        WHERE id = $1 AND footage_expired_at IS NULL AND footage_claimed_at IS NULL
+        FOR UPDATE`,
+      [videoId],
+    );
+    if (claimable.rowCount === 0) return null;
+
     const removed = await client.query(
       `DELETE FROM media_index
         WHERE video_id = $1
@@ -489,10 +602,19 @@ export async function beginIndexRun(
       [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity],
     );
 
-    const opened = await client.query<{ started_at: Date }>(
+    // Minted here rather than taken from the clock. Every write this run makes
+    // proves its identity by presenting this value back, and a timestamp could
+    // not do that job: it loses its microseconds crossing into JavaScript, and
+    // rounding it to survive the trip would let two runs that began in the same
+    // millisecond share one identity — the older then passing every fence
+    // belonging to the newer. A uuid has nothing to round and nothing to
+    // collide. See migration 050.
+    const runId = randomUUID();
+
+    const opened = await client.query<{ run_id: string }>(
       `INSERT INTO media_index_status
-         (video_id, state, model, revision, dims, index_version, source_identity, error, started_at, finished_at, updated_at)
-       VALUES ($1, 'running', $2, $3, $4, $5, $6, NULL, now(), NULL, now())
+         (video_id, state, model, revision, dims, index_version, source_identity, error, run_id, started_at, finished_at, updated_at)
+       VALUES ($1, 'running', $2, $3, $4, $5, $6, NULL, $7, now(), NULL, now())
        ON CONFLICT (video_id) DO UPDATE SET
          state           = 'running',
          model           = $2,
@@ -501,17 +623,21 @@ export async function beginIndexRun(
          index_version   = $5,
          source_identity = $6,
          error           = NULL,
+         run_id          = $7,
          started_at      = now(),
          finished_at     = NULL,
          updated_at      = now()
-       RETURNING started_at`,
-      [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity],
+       RETURNING run_id`,
+      [videoId, provenance.model, provenance.revision, provenance.dims, provenance.indexVersion, provenance.sourceIdentity, runId],
     );
 
-    const runStartedAt = opened.rows[0]?.started_at;
-    if (!runStartedAt) throw new Error('the index run could not be opened');
+    // Read back rather than assumed: if the upsert wrote no row this run does
+    // not own the status, and going on to store windows under an identity
+    // nothing recognises would leave vectors no fence would ever accept.
+    const owned = opened.rows[0]?.run_id;
+    if (!owned) throw new Error('the index run could not be opened');
 
-    return { cleared: removed.rowCount ?? 0, retained: kept.rows.map((row) => row.window_key), runStartedAt };
+    return { cleared: removed.rowCount ?? 0, retained: kept.rows.map((row) => row.window_key), runId: owned };
   });
 }
 
