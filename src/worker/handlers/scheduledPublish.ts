@@ -80,6 +80,17 @@ export async function handleScheduledPublish(job: Job<ScheduledPublishJob>, toke
     logger.info('scheduled publish fired', { scheduledPostId, clipId: claimed.clip_id, posts: posts.length });
   } catch (cause) {
     const message = cause instanceof Error && cause.message ? cause.message : 'The publish could not be submitted.';
+    const partialPosts = (cause as { posts?: Array<{ id: string }> } | null)?.posts;
+    if (Array.isArray(partialPosts) && partialPosts.length > 0) {
+      // Some groups were already handed off. Keep their durable rows attached
+      // to the schedule and let the listing derive posted/partly_failed from
+      // those rows instead of erasing real work behind a blanket failure.
+      await markScheduledPostFired(scheduledPostId, partialPosts.map((post) => post.id), message);
+      logger.error('scheduled publish partly failed', {
+        scheduledPostId, clipId: claimed.clip_id, posts: partialPosts.length, err: cause,
+      });
+      return;
+    }
     await markScheduledPostFailed(scheduledPostId, message);
     logger.error('scheduled publish failed', { scheduledPostId, clipId: claimed.clip_id, err: cause });
   }

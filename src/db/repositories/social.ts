@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { queryOne, queryRows } from '../pool.js';
+import { queryOne, queryRows, withTransaction } from '../pool.js';
 
 /**
  * Rows for the Zernio-backed publishing plumbing (migration 016). Everything
@@ -209,6 +209,45 @@ export async function insertPublishedPost(input: {
     ],
   );
   return row!;
+}
+
+/**
+ * Atomically reserve one publish attempt and create its first post row.
+ *
+ * The transaction-scoped advisory lock serializes only requests for the same
+ * user and clip.  The fresh-row check and insert therefore cannot both be
+ * passed by concurrent HTTP requests, while the winning request may still
+ * create further rows for its other shape groups normally.
+ */
+export async function claimPublishedPost(
+  input: Parameters<typeof insertPublishedPost>[0],
+  withinSeconds: number,
+): Promise<PublishedPostRow | null> {
+  return withTransaction(async (client) => {
+    const lockKey = `${input.userId}:${input.clipId}`;
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [lockKey]);
+    const active = await client.query<PublishedPostRow>(
+      `SELECT id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at
+         FROM published_posts
+        WHERE user_id = $1 AND clip_id = $2 AND status IN ('submitting', 'rendering')
+          AND created_at > now() - ($3 || ' seconds')::interval
+        ORDER BY created_at DESC LIMIT 1`,
+      [input.userId, input.clipId, String(withinSeconds)],
+    );
+    if (active.rows[0]) return null;
+
+    const inserted = await client.query<PublishedPostRow>(
+      `INSERT INTO published_posts
+         (user_id, workspace_id, clip_id, zernio_post_id, caption, targets, status, variant_id)
+       VALUES ($1, $7, $2, $3, $4, $5::jsonb, $6, $8)
+       RETURNING id, user_id, clip_id, zernio_post_id, caption, targets, status, created_at`,
+      [
+        input.userId, input.clipId, input.zernioPostId, input.caption,
+        JSON.stringify(input.targets), input.status, input.workspaceId, input.variantId ?? null,
+      ],
+    );
+    return inserted.rows[0]!;
+  });
 }
 
 /**
