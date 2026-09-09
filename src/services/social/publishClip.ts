@@ -2,7 +2,7 @@ import { HttpError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { getClip } from '../../db/repositories/clips.js';
 import {
-  findInFlightPublish,
+  claimPublishedPost,
   insertPublishedPost,
   listSocialAccounts,
   updatePublishedPost,
@@ -47,6 +47,13 @@ export interface PublishedPostSummary {
   createdAt: string;
 }
 
+export class PartialPublishError extends Error {
+  constructor(message: string, public readonly posts: PublishedPostSummary[]) {
+    super(message);
+    this.name = 'PartialPublishError';
+  }
+}
+
 export async function executeClipPublish(input: {
   userId: string;
   workspaceId: string;
@@ -78,17 +85,6 @@ export async function executeClipPublish(input: {
     }
   }
 
-  // The record is written BEFORE the external call, so a post Zernio
-  // accepts can never be one CLIPIT has no memory of. A retry that arrives
-  // while a submission for this clip is still in flight (or whose outcome
-  // was lost) is refused instead of duplicated on every account.
-  const inFlight = await findInFlightPublish(userId, clipId, PUBLISH_RETRY_GUARD_SECONDS);
-  if (inFlight) {
-    throw HttpError.conflict(
-      'This clip was already submitted moments ago. Check your accounts before publishing it again.',
-    );
-  }
-
   // Each platform gets the SHAPE it wants — a 16:9 concert clip goes to
   // TikTok as a 9:16 cut, to a YouTube upload as itself — and the person
   // pressing Publish never has to know that. The publishing service takes
@@ -100,91 +96,127 @@ export async function executeClipPublish(input: {
   const groups = groupTargetsByShape(targetList, sourceAspect);
 
   const posts: PublishedPostSummary[] = [];
+  const failures: string[] = [];
 
-  for (const group of groups) {
-    // A shaped group claims its render BEFORE the record is written, so
-    // the record can carry which render it waits on — that link is what
-    // lets a second publish racing onto the same render still be
-    // submitted when the one render finishes.
-    const claimed = group.aspect === null ? null : await claimVariant(clipId, group.aspect, clip.focusPct);
+  for (const [groupIndex, group] of groups.entries()) {
+    let post: Awaited<ReturnType<typeof insertPublishedPost>> | null = null;
+    try {
+      // A shaped group claims its render BEFORE the record is written, so
+      // the record can carry which render it waits on — that link is what
+      // lets a second publish racing onto the same render still be
+      // submitted when the one render finishes.
+      const claimed = group.aspect === null ? null : await claimVariant(clipId, group.aspect, clip.focusPct);
 
-    const post = await insertPublishedPost({
-      userId,
-      workspaceId,
-      clipId,
-      zernioPostId: null,
-      caption: input.caption,
-      targets: group.targets,
-      status: 'submitting',
-      variantId: claimed?.variant.id ?? null,
-    });
-
-    if (group.aspect === null) {
-      // The clip as shot is the right file — submit it now.
-      const { status } = await submitRecordedPost({
-        postId: post.id,
+      const postInput = {
+        userId,
+        workspaceId,
+        clipId,
+        zernioPostId: null,
         caption: input.caption,
         targets: group.targets,
-        storageKey: clip.storageKey,
+        status: 'submitting',
+        variantId: claimed?.variant.id ?? null,
+      };
+      // Claim and create the first group in one database transaction. Later
+      // groups belong to that winning attempt and must not trip its own guard.
+      post = groupIndex === 0
+        ? await claimPublishedPost(postInput, PUBLISH_RETRY_GUARD_SECONDS)
+        : await insertPublishedPost(postInput);
+      if (!post) {
+        throw HttpError.conflict(
+          'This clip was already submitted moments ago. Check your accounts before publishing it again.',
+        );
+      }
+
+      if (group.aspect === null) {
+        // The clip as shot is the right file — submit it now.
+        const { status } = await submitRecordedPost({
+          postId: post.id,
+          caption: input.caption,
+          targets: group.targets,
+          storageKey: clip.storageKey,
+        });
+        posts.push({
+          id: post.id,
+          clipId,
+          status,
+          targets: group.targets,
+          aspect: 'source',
+          createdAt: post.created_at.toISOString(),
+        });
+        continue;
+      }
+
+      // This shape needs a cut. If a file for exactly this shape and framing
+      // already exists, post it now; otherwise mark the post as waiting and
+      // queue the render — the worker submits every waiting post the moment
+      // the file is ready. Pressing Publish stays ONE act either way.
+      const variant = claimed!.variant;
+      if (variant.status === 'ready' && variant.storageKey) {
+        const { status } = await submitRecordedPost({
+          postId: post.id,
+          caption: input.caption,
+          targets: group.targets,
+          storageKey: variant.storageKey,
+        });
+        posts.push({
+          id: post.id,
+          clipId,
+          status,
+          targets: group.targets,
+          aspect: group.aspect,
+          createdAt: post.created_at.toISOString(),
+        });
+        continue;
+      }
+
+      await updatePublishedPost(post.id, { zernioPostId: null, status: 'rendering' });
+      await enqueueClipVariant({
+        clipId,
+        variantId: variant.id,
+        aspect: group.aspect,
+        focusPct: clip.focusPct,
+        postId: post.id,
+      });
+      logger.info('clip publish waiting on reframe', {
+        clipId,
+        aspect: group.aspect,
+        variantId: variant.id,
+        claimedFresh: claimed!.created,
       });
       posts.push({
         id: post.id,
         clipId,
-        status,
-        targets: group.targets,
-        aspect: 'source',
-        createdAt: post.created_at.toISOString(),
-      });
-      continue;
-    }
-
-    // This shape needs a cut. If a file for exactly this shape and framing
-    // already exists, post it now; otherwise mark the post as waiting and
-    // queue the render — the worker submits every waiting post the moment
-    // the file is ready. Pressing Publish stays ONE act either way.
-    const variant = claimed!.variant;
-    if (variant.status === 'ready' && variant.storageKey) {
-      const { status } = await submitRecordedPost({
-        postId: post.id,
-        caption: input.caption,
-        targets: group.targets,
-        storageKey: variant.storageKey,
-      });
-      posts.push({
-        id: post.id,
-        clipId,
-        status,
+        status: 'rendering',
         targets: group.targets,
         aspect: group.aspect,
         createdAt: post.created_at.toISOString(),
       });
-      continue;
+    } catch (cause) {
+      const message = cause instanceof Error && cause.message ? cause.message : 'A publish group could not be submitted.';
+      failures.push(message);
+      if (post) {
+        posts.push({
+          id: post.id,
+          clipId,
+          status: 'failed',
+          targets: group.targets,
+          aspect: group.aspect ?? 'source',
+          createdAt: post.created_at.toISOString(),
+        });
+        await updatePublishedPost(post.id, { zernioPostId: null, status: 'failed' }).catch((statusCause) =>
+          logger.error('could not mark failed publish group', { postId: post!.id, err: statusCause }),
+        );
+      }
+      // A failed first claim means another request owns the entire publish;
+      // no later shape group from this request may be submitted.
+      if (groupIndex === 0 && !post) throw cause;
     }
-
-    await updatePublishedPost(post.id, { zernioPostId: null, status: 'rendering' });
-    await enqueueClipVariant({
-      clipId,
-      variantId: variant.id,
-      aspect: group.aspect,
-      focusPct: clip.focusPct,
-      postId: post.id,
-    });
-    logger.info('clip publish waiting on reframe', {
-      clipId,
-      aspect: group.aspect,
-      variantId: variant.id,
-      claimedFresh: claimed!.created,
-    });
-    posts.push({
-      id: post.id,
-      clipId,
-      status: 'rendering',
-      targets: group.targets,
-      aspect: group.aspect,
-      createdAt: post.created_at.toISOString(),
-    });
   }
 
+  if (failures.length > 0) {
+    throw new PartialPublishError(failures.join(' '), posts);
+  }
   logger.info('clip publish submitted', { clipId, targets: targets.length, posts: posts.length });
   return posts;
 }

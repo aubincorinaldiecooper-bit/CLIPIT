@@ -81,12 +81,12 @@ export async function claimScheduledPost(id: string): Promise<ScheduledPostRow |
  * those rows become it (a shape still being cut can still fail later, and
  * saying "fired" without them would call that a success).
  */
-export async function markScheduledPostFired(id: string, postIds: string[]): Promise<void> {
+export async function markScheduledPostFired(id: string, postIds: string[], error: string | null = null): Promise<void> {
   await queryRows(
     `UPDATE scheduled_posts
-        SET status = 'fired', fired_at = now(), error = NULL, post_ids = $2::jsonb
+        SET status = 'fired', fired_at = now(), error = $3, post_ids = $2::jsonb
       WHERE id = $1 AND status = 'firing'`,
-    [id, JSON.stringify(postIds)],
+    [id, JSON.stringify(postIds), error?.slice(0, 500) ?? null],
   );
 }
 
