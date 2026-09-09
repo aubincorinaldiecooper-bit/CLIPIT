@@ -51,4 +51,19 @@ describe('conversational answer contract', () => {
     expect(answer.citationIds).toEqual(['m1']);
     expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ model: 'qwen/qwen3.6-flash', totalTokens: 30 }));
   });
+
+  it('records a billable successful response before rejecting empty content', async () => {
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      choices: [{ message: { content: null } }],
+      usage: { prompt_tokens: 12, completion_tokens: 1, total_tokens: 13, cost: 0.0004 },
+    }), { status: 200 })) as typeof fetch;
+    const onUsage = vi.fn();
+
+    await expect(writeConversationalAnswer({
+      question: 'Where is it?', evidence: [], onUsage,
+    })).rejects.toThrow(/returned no answer/);
+
+    expect(onUsage).toHaveBeenCalledOnce();
+    expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ totalTokens: 13, costUsd: 0.0004 }));
+  });
 });

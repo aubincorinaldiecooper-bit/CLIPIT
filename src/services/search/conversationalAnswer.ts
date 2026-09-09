@@ -108,9 +108,9 @@ export async function writeConversationalAnswer(input: {
         choices?: Array<{ message?: { content?: string | null } }>;
         usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; cost?: number };
       };
-      const content = payload.choices?.[0]?.message?.content;
-      if (!content) throw new ExternalServiceError('openrouter-answer', 'Qwen Flash returned no answer', { retryable: false });
-      const parsed = parseConversationalAnswer(content, new Set(input.evidence.map((item) => item.id)));
+      // A successful HTTP response is billable even when its content is empty
+      // or violates our answer contract. Account for it before either of
+      // those validations can throw and trigger another paid attempt.
       const latencyMs = Math.round(performance.now() - started);
       if (input.onUsage && payload.usage) {
         input.onUsage({
@@ -121,6 +121,9 @@ export async function writeConversationalAnswer(input: {
           latencyMs, provider: 'openrouter', model, promptVersion,
         });
       }
+      const content = payload.choices?.[0]?.message?.content;
+      if (!content) throw new ExternalServiceError('openrouter-answer', 'Qwen Flash returned no answer', { retryable: false });
+      const parsed = parseConversationalAnswer(content, new Set(input.evidence.map((item) => item.id)));
       return { ...parsed, provider: 'openrouter', model, promptVersion };
     } catch (error) {
       lastError = error;

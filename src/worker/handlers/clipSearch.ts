@@ -418,11 +418,12 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     });
 
     /**
-     * Memory first.
+     * Memory before a full footage read.
      *
      * The video was read once at upload; a question it can answer costs a
      * second and a fraction of a cent instead of re-reading the whole video.
-     * Skipped when correcting, because the notes are what was just disputed.
+     * A partial set of in-progress notes was already tried above; that lets an
+     * early question finish without waiting. Corrections skip every memory.
      *
      * Finding nothing here is NOT an answer. The notes are what the indexer
      * thought worth writing down, so their silence means "not mentioned", not
@@ -434,14 +435,14 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // upload is not covering what people ask, while no notes at all says
     // nothing about the reading and everything about the video's age.
     /**
-     * The vectors first, when there are any.
+     * Omni-SimpleMem first once upload-time reading has settled.
      *
      * Another memory, asked before the notes because it holds a different
-     * thing: the notes say what a model thought worth writing down, and the
-     * vectors are what the pictures look like. Anything but a confident hit
-     * hands the question straight on to the notes below, with the reason
-     * recorded — the index is never allowed to end a search by finding
-     * nothing.
+     * thing: the notes say what a model thought worth writing down, while its
+     * timestamped visual memories describe selected frames. Anything but
+     * a confident hit hands the question straight on to the notes below, with
+     * the reason recorded — the index is never allowed to end a search by
+     * finding nothing.
      */
     const fromSimpleMem = await answerFromSimpleMem({
       clipRequestId,
@@ -515,9 +516,23 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         fallbackReason: fromIndex.fallback,
         primaryOutcome: fromIndex.outcome,
       });
-      if (fromIndex.fallback && fromIndex.fallback !== 'disabled') {
-        log.info('the media index handed the question on', { reason: fromIndex.fallback });
-      }
+    } else if (env.MEDIA_INDEX_ENABLED && env.RETRIEVAL_PRIMARY === 'simplemem') {
+      // There is one primary/fallback column pair, so retain the nested media
+      // fallback inside the primary outcome instead of overwriting the reason
+      // SimpleMem handed off. This makes both decisions durable.
+      await recordRetrievalOutcome(clipRequestId, {
+        primary: 'simplemem',
+        system: null,
+        fallbackReason: fromSimpleMem.fallback,
+        primaryOutcome: {
+          ...(fromSimpleMem.outcome ?? {}),
+          mediaIndexFallback: fromIndex.fallback,
+          mediaIndexOutcome: fromIndex.outcome,
+        },
+      });
+    }
+    if (env.MEDIA_INDEX_ENABLED && fromIndex.fallback && fromIndex.fallback !== 'disabled') {
+      log.info('the media index handed the question on', { reason: fromIndex.fallback });
     }
 
     const notesAvailable = !correcting && video.indexStatus === 'ready';
@@ -675,6 +690,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       const released = await completeRequest({
         clipRequestId, answeredFrom: 'footage', deckAttemptId, log,
         requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
+        question: instruction,
       });
       if (!released) {
         // Another delivery owns the answer now; this one stands down.
@@ -932,6 +948,10 @@ export async function completeRequest(input: {
   deckAttemptId: string | null;
   /** A number the person wrote, or null: the only cap there is. */
   requestedResultCount: number | null;
+  /** The effective question, which differs from the stored words for a correction. */
+  question?: string;
+  /** A retrieval-specific limitation that cannot be inferred from chunk failures. */
+  coverageNote?: string | null;
   log: Logger;
 }): Promise<boolean> {
   const { clipRequestId, log } = input;
@@ -951,32 +971,50 @@ export async function completeRequest(input: {
   }
   const request = await getClipRequest(clipRequestId);
   if (!request) throw new Error('Clip request disappeared before its answer could be written');
-  const shown = input.requestedResultCount !== null && input.requestedResultCount > 0
+  const shownCount = input.requestedResultCount !== null && input.requestedResultCount > 0
     ? Math.min(found.length, input.requestedResultCount)
     : found.length;
-
-  const answer = await writeConversationalAnswer({
-    question: request.instruction,
-    evidence: found.slice(0, shown).map((match) => ({
+  // Use the exact same confidence selection as the API. listMatches is in
+  // timeline order, so slicing it here used to let the answer cite early
+  // cards while the UI displayed the strongest cards instead.
+  const shownIds = new Set([...found]
+    .sort((a, b) => b.confidence - a.confidence || a.id.localeCompare(b.id))
+    .slice(0, shownCount)
+    .map((match) => match.id));
+  const shown = found.filter((match) => shownIds.has(match.id));
+  const evidence = shown.map((match) => ({
       id: match.id,
       startSeconds: match.globalStartSeconds,
       endSeconds: match.globalEndSeconds,
       description: match.description,
       quote: match.quote,
       source: match.source,
-    })),
-    coverageNote: request.chunksFailed > 0
+    }));
+  const coverageNote = input.coverageNote ?? (request.chunksFailed > 0
       ? `${request.chunksFailed} section(s) of the video could not be examined.`
-      : null,
-    onUsage: (usage) => {
-      void recordModelUsage({
-        ...usage,
-        stage: 'answer',
-        videoId: request.videoId,
-        clipRequestId,
-      });
-    },
-  });
+      : null);
+  let answer;
+  try {
+    answer = await writeConversationalAnswer({
+      question: input.question ?? request.instruction,
+      evidence,
+      coverageNote,
+      onUsage: (usage) => {
+        void recordModelUsage({ ...usage, stage: 'answer', videoId: request.videoId, clipRequestId });
+      },
+    });
+  } catch (error) {
+    // Answer prose is an enhancement, not the owner of retrieval. Preserve
+    // the already-found, thumbnailed evidence when that final model is down.
+    log.warn('answer model failed; releasing the grounded moments without generated prose', { clipRequestId, err: error });
+    answer = {
+      text: `${shown.length === 0 ? 'No verified moments were found.' : `Found ${shown.length} verified moment${shown.length === 1 ? '' : 's'}.`}${coverageNote ? ` ${coverageNote}` : ''}`,
+      citationIds: shown.map((match) => match.id),
+      provider: 'clipit',
+      model: 'deterministic-fallback',
+      promptVersion: 'answer-fallback-v1',
+    };
+  }
   const answerStored = await recordConversationalAnswer(clipRequestId, input.deckAttemptId, answer);
   if (!answerStored) {
     log.warn('answer was superseded while Qwen Flash was writing it', { clipRequestId });
@@ -984,7 +1022,7 @@ export async function completeRequest(input: {
   }
   await recordDeckAvailability(clipRequestId, {
     availableCandidateCount: found.length,
-    effectiveDeckTarget: shown,
+    effectiveDeckTarget: shown.length,
   }, input.deckAttemptId);
 
   // Released and completed together, in one statement, so there is no
@@ -993,7 +1031,7 @@ export async function completeRequest(input: {
   // Which system answered goes in with the release itself: one fenced
   // statement, so it cannot name an answer that was superseded and cannot be
   // lost if this process stops. Notes and footage are both Clipit's own
-  // search; only the vectors are the other thing.
+  // search; only the external retrieval systems are the other thing.
   const released = input.deckAttemptId
     ? await releaseDeckAndComplete(
         clipRequestId,
@@ -1018,7 +1056,7 @@ export async function completeRequest(input: {
     clipRequestId,
     answeredFrom: input.answeredFrom,
     found: found.length,
-    shown,
+    shown: shown.length,
   });
   return true;
 }
@@ -1252,6 +1290,12 @@ async function answerFromSimpleMem(input: {
     answeredFrom: 'simplemem',
     deckAttemptId: input.deckAttemptId,
     requestedResultCount: input.requestedResultCount,
+    question: input.instruction,
+    coverageNote: input.video.durationSeconds !== null
+      && index?.coveredThroughSeconds !== null && index?.coveredThroughSeconds !== undefined
+      && index.coveredThroughSeconds + 0.001 < input.video.durationSeconds
+      ? `Omni-SimpleMem only examined the first ${Math.round(index.coveredThroughSeconds)} of ${Math.round(input.video.durationSeconds)} seconds.`
+      : null,
     log: input.log,
   });
   input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, ...outcome });
@@ -1552,6 +1596,7 @@ async function answerFromMediaIndex(input: {
   const released = await completeRequest({
     clipRequestId, answeredFrom: 'media_index', deckAttemptId: input.deckAttemptId, log,
     requestedResultCount: input.requestedResultCount,
+    question: input.instruction,
   });
 
   log.info('answered from the media index', {
@@ -1759,6 +1804,7 @@ async function answerFromNotes(input: {
   const released = await completeRequest({
     clipRequestId, answeredFrom: 'notes', deckAttemptId: input.deckAttemptId, log,
     requestedResultCount: input.requestedResultCount,
+    question: input.instruction,
   });
 
   const answerLog = {

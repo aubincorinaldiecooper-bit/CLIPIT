@@ -430,8 +430,9 @@ export async function releaseDeckAndComplete(
    * cannot be claimed again to repair it. One fenced statement is the only
    * place both are impossible.
    *
-   * Only set on a request already part of a comparison, and only while still
-   * blank, so a completion cannot overwrite a decision already recorded.
+   * Only set while still blank, so a completion cannot overwrite a decision
+   * already recorded. The primary may intentionally still be null: the
+   * SimpleMem success path records its comparison immediately after release.
    */
   retrievalSystem: RetrievalSystem | null = null,
 ): Promise<boolean> {
@@ -443,7 +444,6 @@ export async function releaseDeckAndComplete(
             answered_from     = COALESCE($3, answered_from),
             retrieval_system  = CASE
                                   WHEN $4::text IS NOT NULL
-                                   AND retrieval_primary IS NOT NULL
                                    AND retrieval_system IS NULL
                                   THEN $4::text
                                   ELSE retrieval_system
@@ -534,6 +534,11 @@ export async function finishClipRequest(
         SET status = $2,
             error_message = $3,
             answered_from = COALESCE($4, answered_from),
+            answer_text = CASE WHEN $2 = 'failed' THEN NULL ELSE answer_text END,
+            answer_citations = CASE WHEN $2 = 'failed' THEN '[]'::jsonb ELSE answer_citations END,
+            answer_provider = CASE WHEN $2 = 'failed' THEN NULL ELSE answer_provider END,
+            answer_model = CASE WHEN $2 = 'failed' THEN NULL ELSE answer_model END,
+            answer_prompt_version = CASE WHEN $2 = 'failed' THEN NULL ELSE answer_prompt_version END,
             updated_at = now()
       WHERE id = $1
         AND ($5::uuid IS NOT NULL
