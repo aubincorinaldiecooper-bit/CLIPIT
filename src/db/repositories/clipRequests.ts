@@ -231,24 +231,13 @@ export async function recordUncertainMatches(
   );
 }
 
-/**
- * Records what this question can teach us, before the footage goes.
- *
- * `notesConsulted` separates two answers that otherwise look identical: the
- * notes were read and had nothing, versus there were no notes to read. Only
- * the first says anything about whether reading at upload is working.
- */
-export async function recordSearchApproach(
-  requestId: string,
-  input: { notesConsulted: boolean; correctionOf?: string | null },
-): Promise<void> {
+/** Records the request a correction refers to. */
+export async function recordCorrection(requestId: string, correctionOf: string): Promise<void> {
   await queryOne(
     `UPDATE clip_requests
-        SET notes_consulted = $2,
-            corrected_request_id = COALESCE($3, corrected_request_id),
-            updated_at = now()
+        SET corrected_request_id = $2, updated_at = now()
       WHERE id = $1`,
-    [requestId, input.notesConsulted, input.correctionOf ?? null],
+    [requestId, correctionOf],
   );
 }
 
@@ -890,54 +879,29 @@ export async function listMatchesByIds(requestId: string, matchIds: string[]): P
 }
 
 
-/**
- * What the last day of use taught us. See docs/learning-loop.md.
- *
- * Deliberately an aggregate plus a verbatim list. The numbers say whether
- * reading at upload is paying off; the list of questions the notes could not
- * answer is the part worth actually reading, because each one is something a
- * person wanted from their video that nobody thought to write down.
- */
+/** Current learning signals, independent of retired retrieval systems. */
 export interface LearningSummary {
-  answeredFromNotes: number;
+  answeredFromSimpleMem: number;
   answeredFromFootage: number;
   corrections: number;
-  notesSilent: number;
   approved: number;
   rejected: number;
   averageConfidenceApproved: number | null;
   averageConfidenceRejected: number | null;
-  questionsNotesCouldNotAnswer: string[];
 }
 
 export async function summariseLearning(sinceHours: number): Promise<LearningSummary> {
   const interval = `${Math.max(1, Math.floor(sinceHours))} hours`;
-
-  const requests = await queryOne<{
-    from_notes: number;
-    from_footage: number;
-    corrections: number;
-    notes_silent: number;
-  }>(
+  const requests = await queryOne<{ from_simplemem: number; from_footage: number; corrections: number }>(
     `SELECT
-       count(*) FILTER (WHERE answered_from = 'notes')::int AS from_notes,
+       count(*) FILTER (WHERE answered_from = 'simplemem')::int AS from_simplemem,
        count(*) FILTER (WHERE answered_from = 'footage')::int AS from_footage,
-       count(*) FILTER (WHERE corrected_request_id IS NOT NULL)::int AS corrections,
-       -- The notes were read and had nothing. Not the same as having no notes.
-       count(*) FILTER (
-         WHERE notes_consulted AND answered_from = 'footage' AND corrected_request_id IS NULL
-       )::int AS notes_silent
+       count(*) FILTER (WHERE corrected_request_id IS NOT NULL)::int AS corrections
      FROM clip_requests
      WHERE status = 'completed' AND created_at >= now() - $1::interval`,
     [interval],
   );
-
-  const verdicts = await queryOne<{
-    approved: number;
-    rejected: number;
-    avg_approved: number | null;
-    avg_rejected: number | null;
-  }>(
+  const verdicts = await queryOne<{ approved: number; rejected: number; avg_approved: number | null; avg_rejected: number | null }>(
     `SELECT
        count(*) FILTER (WHERE feedback = 'approved')::int AS approved,
        count(*) FILTER (WHERE feedback = 'rejected')::int AS rejected,
@@ -947,33 +911,13 @@ export async function summariseLearning(sinceHours: number): Promise<LearningSum
      WHERE feedback IS NOT NULL AND feedback_at >= now() - $1::interval`,
     [interval],
   );
-
-  const silent = await queryRows<{ instruction: string }>(
-    `SELECT instruction
-       FROM clip_requests
-      WHERE status = 'completed'
-        AND notes_consulted
-        AND answered_from = 'footage'
-        AND corrected_request_id IS NULL
-        AND created_at >= now() - $1::interval
-      ORDER BY created_at DESC
-      LIMIT 20`,
-    [interval],
-  );
-
   return {
-    answeredFromNotes: requests?.from_notes ?? 0,
+    answeredFromSimpleMem: requests?.from_simplemem ?? 0,
     answeredFromFootage: requests?.from_footage ?? 0,
     corrections: requests?.corrections ?? 0,
-    notesSilent: requests?.notes_silent ?? 0,
     approved: verdicts?.approved ?? 0,
     rejected: verdicts?.rejected ?? 0,
-    averageConfidenceApproved: verdicts?.avg_approved === null || verdicts?.avg_approved === undefined
-      ? null
-      : Number(Number(verdicts.avg_approved).toFixed(3)),
-    averageConfidenceRejected: verdicts?.avg_rejected === null || verdicts?.avg_rejected === undefined
-      ? null
-      : Number(Number(verdicts.avg_rejected).toFixed(3)),
-    questionsNotesCouldNotAnswer: silent.map((row) => row.instruction),
+    averageConfidenceApproved: verdicts?.avg_approved == null ? null : Number(Number(verdicts.avg_approved).toFixed(3)),
+    averageConfidenceRejected: verdicts?.avg_rejected == null ? null : Number(Number(verdicts.avg_rejected).toFixed(3)),
   };
 }

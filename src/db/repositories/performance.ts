@@ -15,7 +15,6 @@ import { queryOne, queryRows } from '../pool.js';
  */
 
 export interface AnswerPerformance {
-  /** 'notes' — recalled from what was written at upload. 'footage' — re-read. */
   answeredFrom: string;
   answers: number;
   medianSeconds: number | null;
@@ -88,11 +87,7 @@ export async function summarisePerformance(hours: number): Promise<PerformanceSu
     [interval],
   );
 
-  /**
-   * Reading a video at upload. `index_ms` is recorded by the read itself, so
-   * this is the real wall clock rather than the span between model calls,
-   * which understates it by about one call.
-   */
+  /** SimpleMem indexing wall clock and model cost for current video memory. */
   const reads = await queryOne<{
     reads: number;
     median_seconds: string | null;
@@ -102,24 +97,23 @@ export async function summarisePerformance(hours: number): Promise<PerformanceSu
     median_ratio: string | null;
   }>(
     `WITH per_video AS (
-       SELECT v.id,
-              v.index_ms / 1000.0 AS seconds,
+       SELECT s.video_id AS id,
+              s.index_ms / 1000.0 AS seconds,
               v.duration_seconds,
               COALESCE(SUM(u.cost_usd), 0) AS cost
-         FROM videos v
-         LEFT JOIN model_usage u ON u.video_id = v.id AND u.stage = 'indexing'
-        WHERE v.index_ms IS NOT NULL
-          AND v.updated_at >= now() - $1::interval
-        GROUP BY v.id, v.index_ms, v.duration_seconds
+         FROM simplemem_index s
+         JOIN videos v ON v.id = s.video_id
+         LEFT JOIN model_usage u ON u.video_id = s.video_id AND u.stage = 'indexing'
+        WHERE s.index_ms IS NOT NULL
+          AND s.updated_at >= now() - $1::interval
+        GROUP BY s.video_id, s.index_ms, v.duration_seconds
      )
      SELECT count(*)::int AS reads,
             percentile_cont(0.5) WITHIN GROUP (ORDER BY seconds) AS median_seconds,
             percentile_cont(0.95) WITHIN GROUP (ORDER BY seconds) AS p95_seconds,
             percentile_cont(0.5) WITHIN GROUP (ORDER BY cost) AS median_cost,
             SUM(cost) AS total_cost,
-            percentile_cont(0.5) WITHIN GROUP (
-              ORDER BY CASE WHEN seconds > 0 THEN duration_seconds / seconds END
-            ) AS median_ratio
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY CASE WHEN seconds > 0 THEN duration_seconds / seconds END) AS median_ratio
        FROM per_video`,
     [interval],
   );

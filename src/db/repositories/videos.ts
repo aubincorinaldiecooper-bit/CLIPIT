@@ -1,7 +1,5 @@
 import { queryOne, queryRows } from '../pool.js';
-import { coveredSeconds } from './scenes.js';
 import type {
-  IndexStatus,
   SourceType,
   TranscriptSource,
   TranscriptStatus,
@@ -43,9 +41,6 @@ interface VideoRow {
   transcript_segment_count: number;
   footage_expired_at: Date | null;
   footage_claimed_at?: Date | null;
-  index_status: IndexStatus;
-  index_error: string | null;
-  scene_count: number;
   created_at: Date;
   updated_at: Date;
 }
@@ -84,11 +79,6 @@ function mapVideo(row: VideoRow): Video {
     transcriptSegmentCount: row.transcript_segment_count,
     footageExpiredAt: row.footage_expired_at ?? null,
     footageClaimedAt: row.footage_claimed_at ?? null,
-    indexStatus: row.index_status,
-    // Filled by getVideoWithReadProgress; zero unless it was asked for.
-    indexReadThroughSeconds: 0,
-    indexError: row.index_error,
-    sceneCount: row.scene_count,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -127,19 +117,6 @@ export async function createVideo(input: CreateVideoInput): Promise<Video> {
   return mapVideo(row!);
 }
 
-/**
- * A video with how much of it its notes describe.
- *
- * Kept as a separate read rather than a column: the seconds the notes cover
- * are derivable from the notes themselves, and a duplicate of it in `videos`
- * is one more thing that can disagree with the truth. Coverage, not the
- * furthest second reached — see coveredSeconds for why.
- */
-export async function getVideoWithReadProgress(videoId: string): Promise<Video | null> {
-  const video = await getVideo(videoId);
-  if (!video) return null;
-  return { ...video, indexReadThroughSeconds: await coveredSeconds(videoId) };
-}
 
 /**
  * The caller's own library of videos, newest first, footage intact only.
@@ -396,41 +373,6 @@ export async function markFootageExpired(videoId: string): Promise<void> {
             updated_at = now()
       WHERE id = $1`,
     [videoId],
-  );
-}
-
-export async function setIndexStatus(
-  videoId: string,
-  status: IndexStatus,
-  options: {
-    error?: string | null;
-    sceneCount?: number;
-    indexMs?: number;
-    /**
-     * The configuration this video was read under, snapshotted at read time.
-     * Settings drift; a row that says what was set when it was written is
-     * what keeps last month's numbers comparable to this month's.
-     */
-    analysisConfig?: Record<string, unknown>;
-  } = {},
-): Promise<void> {
-  await queryOne(
-    `UPDATE videos
-        SET index_status = $2,
-            index_error = $3,
-            scene_count = COALESCE($4, scene_count),
-            index_ms = COALESCE($5, index_ms),
-            analysis_config = COALESCE($6, analysis_config),
-            updated_at = now()
-      WHERE id = $1`,
-    [
-      videoId,
-      status,
-      options.error ?? null,
-      options.sceneCount ?? null,
-      options.indexMs ?? null,
-      options.analysisConfig ? JSON.stringify(options.analysisConfig) : null,
-    ],
   );
 }
 

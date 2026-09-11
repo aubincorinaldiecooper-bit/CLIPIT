@@ -226,13 +226,13 @@ const envSchema = z.object({
       const parsed = Number(value);
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
     }),
-  // --- Retrieval primary: Omni-SimpleMem tried first, Clipit's own search as the fallback
+  // --- Retrieval primary: Omni-SimpleMem first, direct footage search as fallback
   /**
-   * Which system a question goes to first. `clipit` is today's behaviour
-   * exactly: notes, then footage. `simplemem` asks the Omni-SimpleMem sidecar
-   * first and falls back to the Clipit path when the memory is not ready,
-   * cannot place the question in time, or finds nothing — each recorded on
-   * the request as its own reason, so the two can be compared from rows.
+   * Which retrieval system a question goes to first. `clipit` means direct
+   * actual-footage search. `simplemem` asks Omni-SimpleMem first, verifies
+   * candidates against the actual footage, and falls back to direct footage
+   * when memory is not ready, cannot place the question in time, or finds
+   * nothing. Each handoff reason is recorded so the paths stay measurable.
    */
   RETRIEVAL_PRIMARY: z.enum(['clipit', 'simplemem']).default('clipit'),
   /** The sidecar (tools/simplemem/sidecar.py). Required when SimpleMem is primary or indexing. */
@@ -286,16 +286,14 @@ const envSchema = z.object({
   OPENROUTER_ANSWER_MAX_TOKENS: int(700, 128, 4_000),
   OPENROUTER_ANSWER_TEMPERATURE: num(0.1, 0, 1),
   /**
-   * How many calls carrying video may be in flight at once — the whole
-   * account, covering both reading a video at upload and searching its
-   * footage. One number because the provider's limit is one limit: giving
-   * reading its own allowance simply meant reading and searching could add up
-   * to more than either was allowed.
+   * How many actual-footage model calls may be in flight at once across the
+   * worker. Verification and direct footage search share one provider ceiling;
+   * separate limits would let the two paths exceed it together.
    *
-   * Measured: ten chunks at 4 read a 20-minute video in 130 seconds, three
-   * rounds of about forty-five. 8 makes it two. Raise it from a real upload,
-   * not a guess — past the provider's ceiling this turns into retries, which
-   * makes everything slower rather than faster.
+   * Measured footage searches showed that raising concurrency reduces the
+   * number of chunk rounds only while the provider can really sustain it.
+   * Raise this from observed searches, not a guess — past the provider's
+   * ceiling retries make the system slower rather than faster.
    */
   OPENROUTER_VIDEO_CONCURRENCY: int(8, 1, 16),
   /**
@@ -322,13 +320,12 @@ const envSchema = z.object({
   /**
    * A question is accepted the moment the video's bytes have landed; the
    * answer waits here for the video to be prepared (its analysis segments),
-   * polling at this rate, before it goes on to wait for the notes above.
-   * Past the timeout the question fails with a plain message rather than
-   * sitting forever on a preparation that will not finish.
+   * polling at this rate. Past the timeout the question fails with a plain
+   * message rather than sitting forever on a preparation that will not finish.
    */
   PREPARATION_WAIT_TIMEOUT_MS: int(600_000, 0, 3_600_000),
   PREPARATION_WAIT_POLL_MS: int(3_000, 500, 60_000),
-  /** Room for the answer to a notes lookup: a list of moments, nothing more. */
+  /** Sampling temperature for actual-footage video search responses. */
   OPENROUTER_VIDEO_TEMPERATURE: num(0.1, 0, 2),
   OPENROUTER_STT_MODEL: z.string().trim().default('openai/whisper-1'),
   /** Optional attribution headers OpenRouter uses for app ranking. */

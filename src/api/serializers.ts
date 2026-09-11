@@ -91,20 +91,6 @@ export function serializeVideo(video: Video, chunks?: VideoChunk[]) {
       segmentCount: video.transcriptSegmentCount,
       error: video.transcriptError,
     },
-    index: {
-      status: video.indexStatus,
-      sceneCount: video.sceneCount,
-      /**
-       * How far into the video the notes reach, in seconds. Measured, and it
-       * moves: notes are written chunk by chunk, so this climbs while the read
-       * is running. It is what lets a screen say "read 8 of 20 minutes"
-       * without anybody inventing a percentage.
-       */
-      readThroughSeconds: video.indexReadThroughSeconds,
-      readThroughTimecode:
-        video.indexReadThroughSeconds > 0 ? formatTimecode(video.indexReadThroughSeconds) : null,
-      error: video.indexError,
-    },
     createdAt: video.createdAt.toISOString(),
     updatedAt: video.updatedAt.toISOString(),
     ...(chunks
@@ -290,19 +276,9 @@ function clipRequestProgress(request: ClipRequest, candidatesFound: number): Cli
             // that turns a coverage gap into an apparent absence. The same
             // applies to answering from memory: no segment was read, and
             // saying otherwise would dress a recollection up as a search.
-            request.answeredFrom === 'notes'
-            ? 'Answered from what I remember of this video'
-            : request.answeredFrom === 'simplemem'
+            request.answeredFrom === 'simplemem'
               ? 'Answered from Omni-SimpleMem video memory'
-            : request.answeredFrom === 'media_index'
-              ? // Also a recollection, not a search: the vectors were made at
-                // upload and no segment was read to answer this. Partial
-                // coverage is named rather than glossed, exactly as a footage
-                // search names the chunks it could not examine.
-                request.chunksFailed > 0
-                ? 'Answered from what this video looks like — part of it has not been read yet'
-                : 'Answered from what this video looks like'
-            : request.chunksFailed > 0
+              : request.chunksFailed > 0
               ? `Searched ${request.chunksCompleted} of ${total} segments — ${request.chunksFailed} could not be examined`
               : `Search complete (${total} segments)`
           : (request.errorMessage ?? 'Search failed');

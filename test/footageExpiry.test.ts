@@ -19,7 +19,6 @@ const clears = {
   clearThumbnailsForVideo: vi.fn(),
   clearClipKeysForVideo: vi.fn(),
   clearVariantsForVideo: vi.fn(),
-  deleteScenes: vi.fn(),
   deleteTranscript: vi.fn(),
   deleteSimpleMemIndex: vi.fn(),
 };
@@ -48,7 +47,6 @@ vi.mock('../src/db/repositories/clipVariants.js', () => ({
   clearVariantsForVideo: (...args: unknown[]) => clears.clearVariantsForVideo(...args),
   listVariantKeysForVideo: vi.fn(async () => []),
 }));
-vi.mock('../src/db/repositories/scenes.js', () => ({ deleteScenes: (...args: unknown[]) => clears.deleteScenes(...args) }));
 vi.mock('../src/db/repositories/transcripts.js', () => ({
   deleteTranscript: (...args: unknown[]) => clears.deleteTranscript(...args),
 }));
@@ -97,11 +95,10 @@ describe('expireVideoFootage', () => {
     expect(order.filter((step) => step === 'remove')).toHaveLength(3);
     expect(result).toEqual({ outcome: 'removed', objectsDeleted: 3, objectsFailed: 0 });
     expect(videos.markFootageExpired).toHaveBeenCalledWith('v1');
-    // Everything derived from the footage goes with it: the notes, the
-    // transcript and a SimpleMem memory that is frames of the
+    // Everything still derived from the footage goes with it: the transcript
+    // and a SimpleMem memory that is frames of the
     // video on another disk. Anything left behind would keep answering
     // questions about seconds nobody can watch any more.
-    expect(clears.deleteScenes).toHaveBeenCalledWith('v1');
     expect(clears.deleteTranscript).toHaveBeenCalledWith('v1');
     expect(clears.deleteSimpleMemIndex).toHaveBeenCalledWith('v1');
   });

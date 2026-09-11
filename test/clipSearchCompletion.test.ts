@@ -34,7 +34,7 @@ vi.mock('../src/db/repositories/clipRequests.js', () => ({
   recordDeckAvailability,
   recordDeckPlan: vi.fn(),
   recordRetrievalOutcome: vi.fn(async () => undefined),
-  recordSearchApproach: vi.fn(),
+  recordCorrection: vi.fn(),
   recordUncertainMatches: vi.fn(),
   releaseDeckAndComplete,
   startClipRequest: vi.fn(),
@@ -75,7 +75,7 @@ const moments = (count: number, durationSeconds = 20) =>
   }));
 
 const complete = (over: Partial<Parameters<typeof completeRequest>[0]> = {}) =>
-  completeRequest({ clipRequestId: 'request-1', answeredFrom: 'notes', deckAttemptId: 'attempt-1', requestedResultCount: null, log, ...over });
+  completeRequest({ clipRequestId: 'request-1', answeredFrom: 'footage', deckAttemptId: 'attempt-1', requestedResultCount: null, log, ...over });
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -98,7 +98,7 @@ describe('a search completes on find', () => {
     // statement: written before it, a superseded attempt would name a system
     // for an answer nobody saw; written after, a worker that stops in between
     // loses it for good, because a completed request cannot be re-claimed.
-    expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'notes', 'clipit');
+    expect(releaseDeckAndComplete).toHaveBeenCalledWith('request-1', 'attempt-1', 'footage', 'clipit');
     expect(writeConversationalAnswer).toHaveBeenCalledOnce();
     expect(recordConversationalAnswer).toHaveBeenCalledWith(
       'request-1',

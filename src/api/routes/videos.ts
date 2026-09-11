@@ -9,7 +9,6 @@ import { originalKey, sanitizeFilename } from '../../services/storage/types.js';
 import {
   createVideo,
   getVideo,
-  getVideoWithReadProgress,
   listChunks,
   listVideosForPrincipal,
   setVideoStatus,
@@ -447,14 +446,9 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const { videoId } = parse(z.object({ videoId: uuidSchema }), request.params, 'path parameters');
 
-    // This route is a pure read. Ingestion starts only through the explicit
-    // POST /api/videos/:videoId/uploaded, so polling for status never has a
-    // side effect and there is exactly one path into the pipeline.
-    //
-    // Read with the note progress: this is the route the client polls, and how
-    // far the notes reach is the one honest thing it can show while a video is
-    // being read.
-    const video = await getVideoWithReadProgress(videoId);
+    // This route is a pure read. SimpleMem progress belongs to retrieval, not
+    // a retired upload-time notes index, so status comes straight from the video.
+    const video = await getVideo(videoId);
     if (!video) throw HttpError.notFound('Video not found');
     assertOwnership(request, video, 'Video');
 
@@ -518,7 +512,7 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     // A question is accepted the moment there is a video to ask about. The
     // answer waits, inside the search, for whatever it genuinely needs —
-    // the preparation, the notes, the transcript — and says so as it does.
+    // the preparation and transcript — and says so as it does.
     // Refusing here until the whole preparation had finished was a minute
     // of dead send button in the observed session (services/search/readiness).
     const acceptance = questionAcceptance(video.status);
