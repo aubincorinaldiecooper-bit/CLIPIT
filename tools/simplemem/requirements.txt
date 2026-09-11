@@ -3,3 +3,5 @@ simplemem @ https://github.com/aiming-lab/SimpleMem/archive/db80b6a7c591e0ea730a
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 python-multipart==0.0.20
+# Durable SimpleMem archives use the same S3-compatible storage contract as Clipit.
+boto3>=1.35,<2
