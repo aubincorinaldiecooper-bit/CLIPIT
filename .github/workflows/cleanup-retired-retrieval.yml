@@ -24,6 +24,7 @@ jobs:
       - run: npm ci
       - run: node scripts/cleanup-retired-retrieval.mjs
       - run: node scripts/cleanup-retired-retrieval-finalize.mjs
+      - run: node scripts/cleanup-retired-retrieval-disabled.mjs
       - run: npm run typecheck
       - run: npm test
       - name: Verify retired runtime residue is gone
