@@ -113,7 +113,7 @@ describe('formatIssue', () => {
       context: snapshotContext({
         viewport: '1280x800',
         video: { id: 'v-1', status: 'ready', errorMessage: null, durationSeconds: 765.9, width: 4096, height: 2160, indexStatus: 'ready', transcriptStatus: 'ready' },
-        clipRequest: { id: 'q-1', instruction: 'top 5 funniest moments', status: 'completed', errorMessage: null, resolvedMode: 'visual', answeredFrom: 'notes', requestedResultCount: 5, availableCandidateCount: 4, effectiveDeckTarget: 4 },
+        clipRequest: { id: 'q-1', instruction: 'top 5 funniest moments', status: 'completed', errorMessage: null, resolvedMode: 'visual', answeredFrom: 'simplemem', requestedResultCount: 5, availableCandidateCount: 4, effectiveDeckTarget: 4 },
         clips: [{ id: 'c-1', clipMatchId: 'm-1', status: 'failed', errorMessage: 'ffmpeg exited 1', presentation: 'vertical', derivativeStatus: 'failed' }],
       }) as unknown as Record<string, unknown>,
     }));

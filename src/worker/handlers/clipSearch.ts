@@ -156,18 +156,15 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   const waitedMs = job.data.waitedMs ?? 0;
   /**
    * Milliseconds spent parked for the video's preparation, counted apart
-   * from the notes' and the transcript's allowances. A six-minute
-   * preparation (a 4 GB file, 2026-09-04) must not use up the four minutes
-   * the notes are allowed afterwards, or a slow file would be sent to the
-   * footage — fifty times the cost — for an answer the notes were about to
-   * give (Devin's finding on #95).
+   * from the transcript wait. A large upload can spend minutes preparing;
+   * that time must not consume the separate allowance for speech readiness.
    */
   const preparationWaitedMs = job.data.preparationWaitedMs ?? 0;
 
   try {
     // A question is accepted the moment the video's bytes have landed; the
     // answer waits here for the video to be prepared — its analysis segments
-    // — the same way it waits for the notes and the transcript further down.
+    // — before retrieval or transcript-dependent search can proceed.
     // Bounded, so a preparation that never finishes still ends in an answer:
     // a refusal, said plainly, rather than a question parked for good.
     const preparation = preparationWait(video.status, preparationWaitedMs, env.PREPARATION_WAIT_TIMEOUT_MS);
@@ -254,10 +251,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // handed one finished card — the progressive reveal the whole rule forbids,
     // appearing only under timing nobody tests for.
     //
-    // It sits above the retrieval path deliberately. Answering from memory is a
-    // real answer and reaches finishClipRequest on its own; if the plan were
-    // recorded further down, a question answered from the notes would never be
-    // marked as owing a deck at all.
+    // It sits above the retrieval path deliberately. Answering from SimpleMem is
+    // a real answer and reaches completion on its own; if the plan were recorded
+    // further down, a memory answer would never be marked as owing a deck at all.
     //
     // It also CLEARS any previous completion, so a retrying job cannot serve
     // last run's finished deck while it rebuilds this one.

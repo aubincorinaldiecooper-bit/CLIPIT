@@ -31,7 +31,7 @@ export type RetrievalSystem = 'clipit' | 'simplemem';
  * line cannot answer "how often, and why" — which is the whole point of
  * recording which system answered at all.
  *
- * See services/mediaIndex/search.ts and services/retrieval/simplemem/candidates.ts.
+ * See services/retrieval/simplemem/candidates.ts.
  */
 export type FallbackReason =
   | 'correction'
@@ -242,20 +242,7 @@ export interface ClipRequest {
  * timeout or transport failure is worth another attempt.
  */
 export type ChunkFailureCode =
-  /**
-   * Not a failure of this search at all: the stretch was never described when
-   * the video was read at upload, so an answer from the notes cannot speak for
-   * it. Reported the same way as an unsearched chunk because it means the same
-   * thing to the person reading it — nobody looked there.
-   */
-  | 'not_in_notes'
-  /**
-   * Not a failure at all: when this question was asked, the video had not been
-   * read that far yet. Distinct from `not_in_notes`, which means the read
-   * finished and that stretch is missing from it — one resolves itself in a
-   * minute, the other never will, and telling a person "I couldn't look there"
-   * about the first is simply untrue.
-   */
+  /** SimpleMem or its verifier did not cover this source window yet. */
   | 'not_read_yet'
   | 'provider_content_filter'
   | 'provider_error'
