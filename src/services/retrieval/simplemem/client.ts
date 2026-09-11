@@ -60,7 +60,7 @@ function baseUrl(): string {
 }
 
 function internalToken(): string {
-  const value = process.env.SIMPLEMEM_INTERNAL_TOKEN?.trim();
+  const value = env.SIMPLEMEM_INTERNAL_TOKEN?.trim();
   if (!value || value.length < 32) {
     throw new ExternalServiceError(SERVICE, 'SIMPLEMEM_INTERNAL_TOKEN is not configured', { retryable: false });
   }
