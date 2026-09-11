@@ -74,7 +74,6 @@ export interface ReportContextSnapshot {
     durationSeconds: number | null;
     width: number | null;
     height: number | null;
-    indexStatus: string | null;
     transcriptStatus: string | null;
   } | null;
   clipRequest: {
@@ -112,7 +111,6 @@ export function snapshotContext(input: {
     durationSeconds: number | null;
     width: number | null;
     height: number | null;
-    indexStatus: string | null;
     transcriptStatus: string | null;
   } | null;
   clipRequest: {
@@ -145,7 +143,6 @@ export function snapshotContext(input: {
           durationSeconds: input.video.durationSeconds,
           width: input.video.width,
           height: input.video.height,
-          indexStatus: input.video.indexStatus,
           transcriptStatus: input.video.transcriptStatus,
         }
       : null,
@@ -190,7 +187,7 @@ export function formatIssue(report: PlatformReport): { title: string; body: stri
     const v = context.video;
     lines.push('## The video', '', `- Id: \`${v.id}\``, `- Status: ${v.status}${v.error ? ` — ${v.error}` : ''}`,
       `- Length: ${v.durationSeconds ?? '?'} s, ${v.width ?? '?'}×${v.height ?? '?'}`,
-      `- Notes: ${v.indexStatus ?? '?'} · Transcript: ${v.transcriptStatus ?? '?'}`, '');
+      `- Transcript: ${v.transcriptStatus ?? '?'}`, '');
   }
   if (context.clipRequest) {
     const r = context.clipRequest;

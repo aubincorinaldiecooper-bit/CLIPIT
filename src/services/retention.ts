@@ -5,7 +5,6 @@ import {
 } from '../db/repositories/clipRequests.js';
 import { clearClipKeysForVideo, listClipKeysForVideo } from '../db/repositories/clips.js';
 import { clearVariantsForVideo, listVariantKeysForVideo } from '../db/repositories/clipVariants.js';
-import { deleteScenes } from '../db/repositories/scenes.js';
 import { deleteSimpleMemIndex } from '../db/repositories/simplememIndex.js';
 import { env } from '../config/env.js';
 import { simplememDeleteVideo } from './retrieval/simplemem/client.js';
@@ -93,10 +92,10 @@ async function removeClaimedFootage(
     }
   }
 
-  // Notes and transcript are derived data. SimpleMem's durable archive is
+  // Transcript is derived data. SimpleMem's durable archive is
   // deleted through the sidecar; if that fails, release the claim so retention
   // retries rather than leaving a durable visual memory behind.
-  await Promise.all([deleteScenes(videoId), deleteTranscript(videoId)]);
+  await deleteTranscript(videoId);
   if (env.SIMPLEMEM_URL) {
     try {
       await simplememDeleteVideo(videoId);

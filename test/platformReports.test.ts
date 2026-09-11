@@ -56,11 +56,11 @@ describe('snapshotContext', () => {
   it('copies the states a fix needs and nothing else', () => {
     const snapshot = snapshotContext({
       viewport: '1280x800',
-      video: { id: 'v-1', status: 'ready', errorMessage: null, durationSeconds: 765.9, width: 4096, height: 2160, indexStatus: 'ready', transcriptStatus: 'ready', ownerEmail: 'x@y' } as never,
-      clipRequest: { id: 'q-1', instruction: 'top 5 funniest moments', status: 'completed', errorMessage: null, resolvedMode: 'visual', answeredFrom: 'notes', requestedResultCount: 5, availableCandidateCount: 4, effectiveDeckTarget: 4 },
+      video: { id: 'v-1', status: 'ready', errorMessage: null, durationSeconds: 765.9, width: 4096, height: 2160, transcriptStatus: 'ready', ownerEmail: 'x@y' } as never,
+      clipRequest: { id: 'q-1', instruction: 'top 5 funniest moments', status: 'completed', errorMessage: null, resolvedMode: 'visual', answeredFrom: 'simplemem', requestedResultCount: 5, availableCandidateCount: 4, effectiveDeckTarget: 4 },
       clips: [{ id: 'c-1', clipMatchId: 'm-1', status: 'generating', errorMessage: null, presentation: 'vertical', derivativeStatus: 'pending' }],
     });
-    expect(snapshot.video).toEqual({ id: 'v-1', status: 'ready', error: null, durationSeconds: 765.9, width: 4096, height: 2160, indexStatus: 'ready', transcriptStatus: 'ready' });
+    expect(snapshot.video).toEqual({ id: 'v-1', status: 'ready', error: null, durationSeconds: 765.9, width: 4096, height: 2160, transcriptStatus: 'ready' });
     expect(snapshot.clipRequest?.requestedResultCount).toBe(5);
     expect(snapshot.clips).toEqual([{ id: 'c-1', matchId: 'm-1', status: 'generating', error: null, presentation: 'vertical', derivativeStatus: 'pending' }]);
     expect(JSON.stringify(snapshot)).not.toContain('x@y');

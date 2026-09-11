@@ -35,7 +35,6 @@ export async function handleLearningReport(job: Job<LearningReportJob>): Promise
   for (const path of performance.answers) {
     log.info('how questions were answered', {
       hours: performance.hours,
-      // 'notes' means recalled; 'footage' means the video was re-read.
       from: path.answeredFrom,
       answers: path.answers,
       // What the person waited, from asking to being answered.
@@ -61,7 +60,7 @@ export async function handleLearningReport(job: Job<LearningReportJob>): Promise
     });
   }
 
-  const answered = summary.answeredFromNotes + summary.answeredFromFootage;
+  const answered = summary.answeredFromSimpleMem + summary.answeredFromFootage;
   if (answered === 0 && summary.approved + summary.rejected === 0) {
     log.info('nothing to learn from yet', { hours: env.LEARNING_REPORT_HOURS });
     return;
@@ -69,12 +68,9 @@ export async function handleLearningReport(job: Job<LearningReportJob>): Promise
 
   log.info('what we learned', {
     hours: env.LEARNING_REPORT_HOURS,
-    // Is reading at upload paying off? This is the number that says so.
-    answeredFromMemory: summary.answeredFromNotes,
+    answeredFromMemory: summary.answeredFromSimpleMem,
     answeredFromFootage: summary.answeredFromFootage,
-    memoryShare: answered > 0 ? Number((summary.answeredFromNotes / answered).toFixed(2)) : null,
-    // The notes were read and had nothing. Distinct from a video with no notes.
-    notesSilent: summary.notesSilent,
+    memoryShare: answered > 0 ? Number((summary.answeredFromSimpleMem / answered).toFixed(2)) : null,
     // People telling us we were wrong. The strongest signal we collect.
     corrections: summary.corrections,
     approved: summary.approved,
@@ -85,12 +81,4 @@ export async function handleLearningReport(job: Job<LearningReportJob>): Promise
     averageConfidenceRejected: summary.averageConfidenceRejected,
   });
 
-  // The part worth actually reading: things people wanted from their video
-  // that nobody thought to write down at upload. A recurring subject here is a
-  // line missing from the indexing prompt.
-  if (summary.questionsNotesCouldNotAnswer.length > 0) {
-    log.info('questions the notes could not answer', {
-      questions: summary.questionsNotesCouldNotAnswer,
-    });
-  }
 }

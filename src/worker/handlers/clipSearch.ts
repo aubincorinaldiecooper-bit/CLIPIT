@@ -41,7 +41,7 @@ import {
   recordDeckAvailability,
   recordDeckPlan,
   recordRetrievalOutcome,
-  recordSearchApproach,
+  recordCorrection,
   recordUncertainMatches,
   releaseDeckAndComplete,
   startClipRequest,
@@ -238,7 +238,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       });
       // The strongest signal there is — a person saying our answer was wrong.
       // Stored so it survives the footage and can be counted later.
-      await recordSearchApproach(clipRequestId, { notesConsulted: false, correctionOf: previous.id });
+      await recordCorrection(clipRequestId, previous.id);
       log.info('treating this as a correction rather than a new question', {
         said: request.instruction,
         lookingAgainFor: instruction,
@@ -323,23 +323,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       ...(correcting ? { correctionOf: request.instruction } : {}),
     });
 
-    /**
-     * Memory before a full footage read.
-     *
-     * The video was read once at upload; a question it can answer costs a
-     * second and a fraction of a cent instead of re-reading the whole video.
-     * A partial set of in-progress notes was already tried above; that lets an
-     * early question finish without waiting. Corrections skip every memory.
-     *
-     * Finding nothing here is NOT an answer. The notes are what the indexer
-     * thought worth writing down, so their silence means "not mentioned", not
-     * "not present" — and the search falls through to the footage rather than
-     * reporting an absence it cannot vouch for.
-     */
-    // Recorded whether or not the notes are consulted, because the two cases
-    // answer different questions later: notes read and silent says reading at
-    // upload is not covering what people ask, while no notes at all says
-    // nothing about the reading and everything about the video's age.
     /**
      * Omni-SimpleMem is the memory/retrieval layer. A confident candidate is
      * verified against actual footage before it can become evidence. A miss or
@@ -855,18 +838,14 @@ export async function completeRequest(input: {
   // request still says 'searching' and a stale delivery could claim it.
   // Which system answered goes in with the release itself: one fenced
   // statement, so it cannot name an answer that was superseded and cannot be
-  // lost if this process stops. Notes and footage are both Clipit's own
-  // search; only the external retrieval systems are the other thing.
+  // lost if this process stops. SimpleMem is the memory path; direct footage
+  // search is Clipit's grounding fallback.
   const released = input.deckAttemptId
     ? await releaseDeckAndComplete(
         clipRequestId,
         input.deckAttemptId,
         input.answeredFrom,
-        input.answeredFrom === 'media_index'
-          ? 'media_index'
-          : input.answeredFrom === 'simplemem'
-            ? 'simplemem'
-            : 'clipit',
+        input.answeredFrom === 'simplemem' ? 'simplemem' : 'clipit',
       )
     : false;
   if (!released) {

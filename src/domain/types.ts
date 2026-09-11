@@ -6,9 +6,6 @@ export type TranscriptStatus = 'pending' | 'queued' | 'running' | 'ready' | 'fai
 
 export type TranscriptSource = 'youtube_captions' | 'openrouter_stt';
 
-/** State of the ingest-time visual understanding (scene index) for a video. */
-export type IndexStatus = 'pending' | 'queued' | 'running' | 'ready' | 'failed' | 'unavailable';
-
 export type ClipRequestStatus = 'pending' | 'searching' | 'completed' | 'failed';
 
 export type ClipStatus = 'pending' | 'generating' | 'ready' | 'failed';
@@ -21,27 +18,11 @@ export type ResolvedSearchMode = 'visual' | 'transcript' | 'both';
 
 export type MatchSource = 'visual' | 'transcript' | 'multimodal';
 
-/**
- * Whether a question was answered from the notes taken at upload, or by
- * reading the footage again.
- *
- * Not a performance detail. The notes are a summary, so "the notes do not
- * mention it" is a weaker statement than "the video does not contain it", and
- * only one of the two paths can make the stronger claim.
- */
-// 'media_index' is the vectors: what the pictures look like, matched
-// against the question without watching the video again. A third kind of
-// memory, and named separately so a row can say which one answered.
-export type AnsweredFrom = 'notes' | 'footage' | 'media_index' | 'simplemem';
+/** Which evidence path actually produced the verified moments. */
+export type AnsweredFrom = 'footage' | 'simplemem';
 
-/**
- * Which system found the moments: Clipit's own notes-then-footage search, or
- * Omni-SimpleMem, tried first when configured as the primary. One or the
- * other, never a blend — see migration 043 and services/retrieval/simplemem.
- */
-// 'media_index' is the vectors. Named alongside the others so one row can
-// say which of the three found the moments, and which did not get to try.
-export type RetrievalSystem = 'clipit' | 'simplemem' | 'media_index';
+/** Which retrieval system produced the moments. */
+export type RetrievalSystem = 'clipit' | 'simplemem';
 
 /**
  * Why the primary did not answer.
@@ -61,16 +42,7 @@ export type FallbackReason =
   | 'no_candidates'
   | 'below_score'
   | 'primary_failed'
-  // The Media Index's own reasons.
-  | 'disabled'
-  | 'not_visual'
-  | 'no_coverage'
-  | 'provenance_changed'
-  | 'index_failed'
-  /** A read that opened, stopped, and never got to say why. */
-  | 'index_stopped'
-  /** The vectors describe footage the video no longer has. */
-  | 'index_footage_replaced';
+  | 'disabled';
 
 /**
  * What a person thought of a match.
@@ -187,29 +159,8 @@ export interface Video {
   footageExpiredAt: Date | null;
   /** Set while a removal is running; see claimFootageForExpiry. */
   footageClaimedAt: Date | null;
-  indexStatus: IndexStatus;
-  /**
-   * How far into the video the notes reach, in seconds. Zero unless the video
-   * was loaded with `getVideoWithReadProgress`.
-   */
-  indexReadThroughSeconds: number;
-  indexError: string | null;
-  sceneCount: number;
   createdAt: Date;
   updatedAt: Date;
-}
-
-/**
- * One entry in a video's scene index: what the model saw during
- * [startSeconds, endSeconds] of the source, written at ingest time.
- */
-export interface VideoScene {
-  id: string;
-  videoId: string;
-  sceneIndex: number;
-  startSeconds: number;
-  endSeconds: number;
-  description: string;
 }
 
 export interface VideoChunk {
