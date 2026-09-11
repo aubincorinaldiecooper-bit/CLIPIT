@@ -141,22 +141,19 @@ async function removeClaimedFootage(
     }
   }
 
-  // The database is updated even when some objects refused to go, because the
-  // alternative is trying the same failing deletes forever while the rest of
-  // the video stays half-removed. The count above is the record.
-  // The Media Index describes footage that is about to stop existing. Its
-  // vectors go with it: an index of deleted footage would keep answering
-  // questions about seconds nobody can watch any more.
+  // The database is updated even when some ordinary storage objects refused to
+  // go, because retrying all of those forever would leave the rest of the video
+  // half-removed. SimpleMem durable memory is different: if its delete fails,
+  // the sidecar has already purged the local cache but the durable archive may
+  // still contain derived frames. In that case we deliberately fail this
+  // removal so the footage claim is released and a later sweep retries it.
   await Promise.all([deleteScenes(videoId), deleteTranscript(videoId), deleteMediaIndex(videoId)]);
-  // SimpleMem's memory of the video is footage too — frames of it, stored on
-  // the sidecar's disk — so it goes with the rest. Best-effort like the
-  // objects above, and loud when it fails: a memory nobody can name is an
-  // orphan on somebody else's disk.
   if (env.SIMPLEMEM_URL) {
     try {
       await simplememDeleteVideo(videoId);
     } catch (error) {
-      log.warn('SimpleMem memory could not be deleted and is now an orphan on the sidecar', { videoId, err: error });
+      log.warn('SimpleMem durable memory could not be fully deleted; retention will retry', { videoId, err: error });
+      throw error;
     }
   }
   await deleteSimpleMemIndex(videoId);
