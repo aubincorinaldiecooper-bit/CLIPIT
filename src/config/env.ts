@@ -240,6 +240,8 @@ const envSchema = z.object({
   RETRIEVAL_PRIMARY: z.enum(['clipit', 'simplemem']).default('clipit'),
   /** The sidecar (tools/simplemem/sidecar.py). Required when SimpleMem is primary or indexing. */
   SIMPLEMEM_URL: z.string().trim().url().optional(),
+  /** Shared internal credential required whenever this process can call the sidecar. */
+  SIMPLEMEM_INTERNAL_TOKEN: z.string().trim().min(32).optional(),
   /**
    * Send each video to SimpleMem after preprocessing. Off, the primary above
    * has nothing to answer from and every question falls back, which is
@@ -557,6 +559,9 @@ function loadEnv(): Env {
   }
   if (value.RETRIEVAL_PRIMARY === 'simplemem' && !value.SIMPLEMEM_URL) {
     problems.push('RETRIEVAL_PRIMARY=simplemem requires SIMPLEMEM_URL');
+  }
+  if (value.SIMPLEMEM_URL && !value.SIMPLEMEM_INTERNAL_TOKEN) {
+    problems.push('SIMPLEMEM_URL requires SIMPLEMEM_INTERNAL_TOKEN with at least 32 characters');
   }
   if (value.RETRIEVAL_PRIMARY === 'simplemem' && !value.SIMPLEMEM_INDEX_ENABLED) {
     problems.push(

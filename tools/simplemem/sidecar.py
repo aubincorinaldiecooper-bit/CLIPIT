@@ -290,14 +290,14 @@ def _read_archive_marker(video_dir: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _cache_ready(video_dir: Path) -> bool:
+def _cache_ready(video_dir: Path, expected_video_id: str | None = None) -> bool:
     if not video_dir.is_dir() or not _timeline_path(video_dir).exists():
         return False
     # When durable archives are configured, only a cache entry backed by a
     # committed manifest marker is eligible to suppress archive restoration.
     if _archive_configured():
         marker = _read_archive_marker(video_dir)
-        if marker is None or marker.get("videoId") != video_dir.name:
+        if marker is None or marker.get("videoId") != (expected_video_id or video_dir.name):
             return False
     try:
         # A valid upstream memory contains more than Clipit's two metadata
@@ -326,7 +326,7 @@ def _assert_timeline_compatible(timeline: dict[str, Any]) -> None:
 def _prepare_cache_for_query(video_id: str) -> tuple[Path, bool]:
     final_dir = _video_dir(video_id)
     backup_dir = final_dir.with_name(f"{final_dir.name}.previous")
-    if _cache_ready(final_dir):
+    if _cache_ready(final_dir, video_id):
         return final_dir, False
 
     if final_dir.exists():
@@ -334,7 +334,7 @@ def _prepare_cache_for_query(video_id: str) -> tuple[Path, bool]:
 
     # A process death during replacement can leave the previous committed cache
     # parked beside the final path. Recover it before paying for an S3 restore.
-    if _cache_ready(backup_dir):
+    if _cache_ready(backup_dir, video_id):
         backup_dir.replace(final_dir)
         return final_dir, False
     if backup_dir.exists():
@@ -343,7 +343,7 @@ def _prepare_cache_for_query(video_id: str) -> tuple[Path, bool]:
     restored = _restore_sync(video_id)
     if not restored:
         raise HTTPException(status_code=404, detail="video memory not found")
-    if not _cache_ready(final_dir):
+    if not _cache_ready(final_dir, video_id):
         shutil.rmtree(final_dir, ignore_errors=True)
         raise RuntimeError("restored SimpleMem cache is incomplete")
     return final_dir, True
@@ -362,7 +362,6 @@ def _archive_sync(video_id: str, video_dir: Path) -> dict[str, Any] | None:
     os.close(fd)
     archive_path = Path(raw_path)
     new_key: str | None = None
-    manifest_committed = False
     try:
         # This marker describes the cache copy, not the memory itself.
         _archive_marker(video_dir).unlink(missing_ok=True)
@@ -389,7 +388,6 @@ def _archive_sync(video_id: str, video_dir: Path) -> dict[str, Any] | None:
             Body=json.dumps(manifest, separators=(",", ":")).encode("utf-8"),
             ContentType="application/json",
         )
-        manifest_committed = True
         _mark_archived(video_dir, manifest)
 
         # Only after the new manifest is durable may the previous generation
@@ -401,14 +399,12 @@ def _archive_sync(video_id: str, video_dir: Path) -> dict[str, Any] | None:
                 log.warning("could not delete previous SimpleMem archive generation: %s", type(exc).__name__)
         return manifest
     except Exception:
-        # A failed pre-commit replacement must leave the prior manifest and its
-        # referenced bytes intact. The new unreferenced generation is safe to
-        # remove unless it is the same content-addressed key as the prior one.
-        if new_key and not manifest_committed and new_key != previous_key:
-            try:
-                client.delete_object(Bucket=bucket, Key=new_key)
-            except Exception:
-                pass
+        # Once the generation upload succeeded and the manifest write was
+        # attempted, an exception cannot tell us whether S3 rejected the write
+        # or committed it and only lost the response. Deleting the new
+        # generation here could therefore delete the bytes referenced by a
+        # successfully committed manifest. Leave a possible orphan instead; a
+        # later successful replacement/delete can clean it safely.
         raise
     finally:
         archive_path.unlink(missing_ok=True)
@@ -670,7 +666,23 @@ def _query_sync(video_id: str, question: str, top_k: int) -> dict[str, Any]:
     total_candidates = 0
     cache: dict[str, int]
     try:
-        result = memory.query(question, top_k=top_k)
+        # Upstream Omni-SimpleMem derives its own strategy and otherwise
+        # replaces the caller's top_k with 5/10/20 depending on query type.
+        # Clipit owns the candidate budget, so preserve every other strategy
+        # choice while making our requested top_k authoritative. This memory
+        # instance is request-local and sidecar operations are serialized.
+        original_strategy = memory.query_processor.determine_retrieval_strategy
+
+        def clipit_strategy(parsed):
+            strategy = dict(original_strategy(parsed))
+            strategy["top_k"] = top_k
+            return strategy
+
+        memory.query_processor.determine_retrieval_strategy = clipit_strategy
+        try:
+            result = memory.query(question, top_k=top_k)
+        finally:
+            memory.query_processor.determine_retrieval_strategy = original_strategy
         total_candidates = int(getattr(result, "total_candidates", len(result.items)) or len(result.items))
         for row in result.items:
             if not isinstance(row, dict):
