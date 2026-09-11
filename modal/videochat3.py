@@ -10,8 +10,8 @@ One L4-backed service owns the model weights and exposes two jobs:
   strict relevance judgement. Only this path is eligible to become evidence
   after Clipit's retrieval/reranking stages have narrowed the search.
 
-The service is deliberately separate from MiniCPM so the two models can scale
-independently for concurrent searches. Both use L4 GPUs.
+The service is separate from MiniCPM so the two models can scale independently
+for concurrent searches. Both use L4 GPUs.
 """
 
 from __future__ import annotations
@@ -32,23 +32,27 @@ import modal
 
 APP_NAME = "clipit-videochat3"
 MODEL_ID = "MCG-NJU/VideoChat3-4B"
-# Verified upstream commit reference attached to inference_fast_vc3.py.
-# Override after an explicit upstream review; do not silently follow main.
 MODEL_REVISION = os.environ.get("VIDEOCHAT3_REVISION", "37fa901")
 WEIGHTS_DIR = "/weights/hf"
+FLASH_ATTN_WHEEL = (
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/"
+    "flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
+)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "curl", "libgl1", "libglib2.0-0")
-    .pip_install(
-        "torch",
-        "transformers",
+    .uv_pip_install(
+        "torch==2.6.0",
+        "transformers>=4.57.0,<4.58",
         "accelerate",
         "huggingface-hub",
         "qwen-vl-utils",
         "opencv-python-headless",
+        "decord",
         "pillow",
         "safetensors",
+        FLASH_ATTN_WHEEL,
     )
 )
 
@@ -127,14 +131,12 @@ def _parse_verdict(text: str) -> dict[str, Any]:
 class VideoChat3Service:
     @modal.enter()
     def load(self) -> None:
+        import flash_attn
         from huggingface_hub import hf_hub_download, snapshot_download
 
         os.environ.setdefault("HF_HOME", WEIGHTS_DIR)
         started = time.time()
 
-        # Resolve one immutable local snapshot for both modes. The official
-        # streaming implementation is downloaded from the same revision as
-        # the weights so code and model cannot drift independently.
         self.model_path = snapshot_download(
             MODEL_ID,
             revision=MODEL_REVISION,
@@ -157,25 +159,13 @@ class VideoChat3Service:
         self.StreamingSession = module.StreamingSession
         self.VideoFrameExtractor = module.VideoFrameExtractor
 
-        # The official fast engine owns model+processor once. verify_intervals
-        # reuses those same objects rather than loading VideoChat3 a second time.
-        try:
-            self.engine = module.VideoChat3StreamEngine(
-                self.model_path,
-                device="auto",
-                attn_implementation="flash_attention_2",
-            )
-            self.attention = "flash_attention_2"
-        except Exception:
-            # FlashAttention is an optimisation, not an evidence requirement.
-            # The stock Transformers attention path keeps the deployment usable
-            # on images where flash-attn is unavailable.
-            self.engine = module.VideoChat3StreamEngine(
-                self.model_path,
-                device="auto",
-                attn_implementation="sdpa",
-            )
-            self.attention = "sdpa"
+        self.engine = module.VideoChat3StreamEngine(
+            self.model_path,
+            device="auto",
+            attn_implementation="flash_attention_2",
+        )
+        self.attention = "flash_attention_2"
+        self.flash_attention_version = getattr(flash_attn, "__version__", "unknown")
 
         self.revision = MODEL_REVISION
         self.container = uuid.uuid4().hex[:12]
@@ -188,6 +178,7 @@ class VideoChat3Service:
             "model": MODEL_ID,
             "revision": self.revision,
             "attention": self.attention,
+            "flash_attention_version": self.flash_attention_version,
             "container": self.container,
             "startup_ms": self.startup_ms,
         }
@@ -202,11 +193,6 @@ class VideoChat3Service:
         max_rounds: int = 32,
         max_events: int = 64,
     ) -> dict[str, Any]:
-        """Progressively inspect one internet-video candidate.
-
-        Responses are timestamped retrieval observations. They are never a
-        final claim: Clipit still embeds/reranks and then calls verification.
-        """
         started = time.time()
         with tempfile.TemporaryDirectory(prefix="clipit-vc3-watch-") as raw_dir:
             source = Path(raw_dir) / "source.mp4"
@@ -222,9 +208,10 @@ class VideoChat3Service:
                 temperature=0.0,
             )
             events: list[dict[str, Any]] = []
+            total_rounds = extractor.get_total_rounds()
             try:
                 interval = 1.0 / extractor.actual_fps if extractor.actual_fps > 0 else 1.0
-                for round_idx in range(extractor.get_total_rounds()):
+                for round_idx in range(total_rounds):
                     frame = extractor.get_frame_at_round(round_idx)
                     start_seconds = round_idx * interval
                     end_seconds = min(extractor.duration, start_seconds + interval)
@@ -257,7 +244,7 @@ class VideoChat3Service:
                     "startup_ms": self.startup_ms,
                     "source_bytes": size,
                     "target_fps": target_fps,
-                    "rounds": extractor.get_total_rounds(),
+                    "rounds": total_rounds,
                     "total_ms": int((time.time() - started) * 1000),
                 },
             }
@@ -323,7 +310,6 @@ class VideoChat3Service:
         candidates: list[dict[str, Any]],
         expected_bytes: int | None = None,
     ) -> dict[str, Any]:
-        """Re-watch exact candidate intervals and return only explicit verdicts."""
         started = time.time()
         with tempfile.TemporaryDirectory(prefix="clipit-vc3-verify-") as raw_dir:
             work = Path(raw_dir)
