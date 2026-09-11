@@ -111,11 +111,8 @@ const envSchema = z.object({
   // --- OpenRouter video understanding and speech-to-text -----------------
   TRANSCRIPTION_ENABLED: bool(true),
   /**
-   * Which service reads the actual video. `openrouter` is the current
-   * behaviour, unchanged. `minicpm` sends chunks to our own MiniCPM-V 4.6
-   * deployment on Modal instead. Notes lookups and transcription stay on
-   * OpenRouter under either setting — this switch governs only the calls that
-   * carry video.
+   * Which service reads actual footage for verification/search. `openrouter`
+   * is the default; `minicpm` sends footage to our own MiniCPM-V 4.6 deployment.
    */
   VIDEO_PROVIDER: z.enum(['openrouter', 'minicpm']).default('openrouter'),
   /**
@@ -323,27 +320,6 @@ const envSchema = z.object({
    */
   OPENROUTER_VIDEO_REASONING_MAX_TOKENS: int(2500, 256, 32_000),
   /**
-   * Reading a video into notes at upload, so a question can be answered from
-   * text instead of re-watching the whole video every time it is asked.
-   *
-   * This was built, then switched off as a side effect of merging the
-   * actual-video search — see CLAUDE.md. It is back on the model that watches
-   * video rather than the sampled stills it originally used.
-   */
-  INDEXING_ENABLED: bool(true),
-  /**
-   * How long a question waits for the video to finish being read.
-   *
-   * Measured: reading a 20-minute video takes about 130 seconds, and searching
-   * the same video's footage takes about the same. So waiting costs the person
-   * nothing in time and saves fifty times the money — a question answered from
-   * notes cost $0.0013 against $0.06 for the same question against footage.
-   * Past the timeout we stop waiting and read the footage, because a person
-   * waiting on a stuck index must still get an answer.
-   */
-  INDEX_WAIT_TIMEOUT_MS: int(240_000, 0, 900_000),
-  INDEX_WAIT_POLL_MS: int(4_000, 500, 60_000),
-  /**
    * A question is accepted the moment the video's bytes have landed; the
    * answer waits here for the video to be prepared (its analysis segments),
    * polling at this rate, before it goes on to wait for the notes above.
@@ -352,26 +328,7 @@ const envSchema = z.object({
    */
   PREPARATION_WAIT_TIMEOUT_MS: int(600_000, 0, 3_600_000),
   PREPARATION_WAIT_POLL_MS: int(3_000, 500, 60_000),
-  /**
-   * Room for a description of everything in one chunk, which runs far longer
-   * than a list of matching moments. An answer cut off mid-scene leaves a hole
-   * in the notes that nothing downstream can see.
-   */
-  INDEX_ANSWER_MAX_TOKENS: int(3000, 512, 16_000),
-  /**
-   * How many notes lookups run at once. Higher than the video concurrency
-   * because these carry no video: they are a text prompt and a short answer.
-   */
-  OPENROUTER_TEXT_CONCURRENCY: int(8, 1, 32),
-  /**
-   * Notes sent to the model in one request. A long video's notes do not fit
-   * comfortably in a single prompt, and splitting them keeps every note in
-   * front of the model rather than truncating the tail of a long video —
-   * which would silently make the end of it unsearchable.
-   */
-  NOTES_PER_LOOKUP: int(250, 20, 2000),
   /** Room for the answer to a notes lookup: a list of moments, nothing more. */
-  NOTES_ANSWER_MAX_TOKENS: int(1500, 256, 8192),
   OPENROUTER_VIDEO_TEMPERATURE: num(0.1, 0, 2),
   OPENROUTER_STT_MODEL: z.string().trim().default('openai/whisper-1'),
   /** Optional attribution headers OpenRouter uses for app ranking. */

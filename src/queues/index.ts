@@ -6,7 +6,6 @@ export const QUEUE_NAMES = {
   ingestion: 'video-ingestion',
   preprocessing: 'video-preprocessing',
   transcription: 'video-transcription',
-  indexing: 'video-indexing',
   simplememIndexing: 'simplemem-indexing',
   clipSearch: 'clip-search',
   clipGeneration: 'clip-generation',
@@ -32,11 +31,6 @@ export interface TranscriptionJob {
   captionsStorageKey?: string | null;
 }
 
-/** Read a video into notes, once, after preprocessing. */
-export interface IndexingJob {
-  videoId: string;
-}
-
 /** Send a video to Omni-SimpleMem to be remembered, once, after preprocessing. */
 export interface SimpleMemIndexingJob {
   videoId: string;
@@ -44,12 +38,12 @@ export interface SimpleMemIndexingJob {
 
 export interface ClipSearchJob {
   clipRequestId: string;
-  /** Milliseconds already spent waiting for an in-flight transcript or index. */
+  /** Milliseconds already spent waiting for an in-flight transcript. */
   waitedMs?: number;
   /**
    * Milliseconds already spent waiting for the video to be prepared. Kept
-   * apart from `waitedMs`: the notes and the transcript get their whole
-   * allowance once the video is ready, however long preparation took.
+   * apart from `waitedMs`: transcript waiting gets its whole allowance once
+   * the video is ready, however long preparation took.
    */
   preparationWaitedMs?: number;
 }
@@ -165,7 +159,6 @@ let queues: {
   ingestion: Queue<IngestionJob>;
   preprocessing: Queue<PreprocessingJob>;
   transcription: Queue<TranscriptionJob>;
-  indexing: Queue<IndexingJob>;
   simplememIndexing: Queue<SimpleMemIndexingJob>;
   clipSearch: Queue<ClipSearchJob>;
   clipGeneration: Queue<ClipGenerationJob>;
@@ -184,7 +177,6 @@ export function getQueues() {
       ingestion: new Queue<IngestionJob>(QUEUE_NAMES.ingestion, { connection, defaultJobOptions }),
       preprocessing: new Queue<PreprocessingJob>(QUEUE_NAMES.preprocessing, { connection, defaultJobOptions }),
       transcription: new Queue<TranscriptionJob>(QUEUE_NAMES.transcription, { connection, defaultJobOptions }),
-      indexing: new Queue<IndexingJob>(QUEUE_NAMES.indexing, { connection, defaultJobOptions }),
       simplememIndexing: new Queue<SimpleMemIndexingJob>(QUEUE_NAMES.simplememIndexing, { connection, defaultJobOptions }),
       clipSearch: new Queue<ClipSearchJob>(QUEUE_NAMES.clipSearch, { connection, defaultJobOptions }),
       clipGeneration: new Queue<ClipGenerationJob>(QUEUE_NAMES.clipGeneration, { connection, defaultJobOptions }),
@@ -265,10 +257,6 @@ export async function enqueuePreprocessing(data: PreprocessingJob): Promise<void
 
 export async function enqueueTranscription(data: TranscriptionJob): Promise<void> {
   await addWithStableId(getQueues().transcription, 'transcribe', data, `transcribe-${data.videoId}`);
-}
-
-export async function enqueueIndexing(data: IndexingJob): Promise<void> {
-  await addWithStableId(getQueues().indexing, 'index', data, `index-${data.videoId}`);
 }
 
 export async function enqueueSimpleMemIndexing(data: SimpleMemIndexingJob): Promise<void> {
