@@ -1,39 +1,45 @@
-name: Complete SimpleMem migration
+name: Validate completed SimpleMem migration
 
 on:
   push:
     branches:
       - feat/simplemem-production
     paths:
-      - scripts/complete-simplemem-migration.mjs
+      - src/**
+      - test/**
+      - package.json
+      - package-lock.json
+      - .env.example
       - .github/workflows/complete-simplemem-migration.yml
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  migrate:
-    if: github.event.head_commit.message != 'Complete SimpleMem migration'
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: feat/simplemem-production
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - name: Apply migration cleanup
-        run: |
-          sed -i 's/throw new Error(/console.warn(/' scripts/complete-simplemem-migration.mjs
-          node scripts/complete-simplemem-migration.mjs
-      - name: Commit migration before validation
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Complete SimpleMem migration"
-          git push origin HEAD:feat/simplemem-production
       - run: npm ci
-      - run: npm run typecheck
+      - name: Typecheck
+        id: typecheck
+        shell: bash
+        run: |
+          set +e
+          npm run typecheck 2>&1 | tee typecheck-output.txt
+          code=${PIPESTATUS[0]}
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simplemem-typecheck
+          path: typecheck-output.txt
+      - name: Fail on typecheck errors
+        if: steps.typecheck.outputs.exit_code != '0'
+        run: exit 1
       - run: npm test
