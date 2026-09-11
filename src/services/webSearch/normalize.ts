@@ -20,6 +20,10 @@ function isTrackingParam(name: string): boolean {
   return lower.startsWith('utm_') || TRACKING_PARAMS.has(lower);
 }
 
+function isDomain(host: string, domain: string): boolean {
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
 export function canonicalizeVideoUrl(value: string): { canonicalUrl: string; hostname: string | null } {
   try {
     const url = new URL(value);
@@ -39,12 +43,12 @@ export function canonicalizeVideoUrl(value: string): { canonicalUrl: string; hos
 export function classifyVideoPlatform(hostname: string | null): VideoPlatform {
   if (!hostname) return 'other';
   const host = hostname.toLowerCase();
-  if (host === 'youtu.be' || host.endsWith('youtube.com')) return 'youtube';
-  if (host.endsWith('tiktok.com')) return 'tiktok';
-  if (host.endsWith('instagram.com')) return 'instagram';
-  if (host === 'x.com' || host.endsWith('twitter.com')) return 'x';
-  if (host.endsWith('facebook.com') || host.endsWith('fb.watch')) return 'facebook';
-  if (host.endsWith('vimeo.com')) return 'vimeo';
+  if (host === 'youtu.be' || isDomain(host, 'youtube.com')) return 'youtube';
+  if (isDomain(host, 'tiktok.com')) return 'tiktok';
+  if (isDomain(host, 'instagram.com')) return 'instagram';
+  if (host === 'x.com' || isDomain(host, 'twitter.com')) return 'x';
+  if (isDomain(host, 'facebook.com') || isDomain(host, 'fb.watch')) return 'facebook';
+  if (isDomain(host, 'vimeo.com')) return 'vimeo';
   return 'other';
 }
 
