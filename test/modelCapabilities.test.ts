@@ -1,5 +1,19 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { assertVideoInputSupported, resetVideoModelCapabilityCache } from '../src/services/search/modelCapabilities.js';
+process.env.VIDEO_PROVIDER = 'openrouter';
+vi.mock('../src/services/media/ffmpeg.js', () => ({
+  createProbeClip: async (file: string) => {
+    const { writeFile } = await import('node:fs/promises');
+    const ftyp = Buffer.alloc(24);
+    ftyp.writeUInt32BE(24, 0);
+    ftyp.write('ftyp', 4, 'ascii');
+    ftyp.write('isom', 8, 'ascii');
+    const mdat = Buffer.alloc(10_000);
+    mdat.writeUInt32BE(10_000, 0);
+    mdat.write('mdat', 4, 'ascii');
+    await writeFile(file, Buffer.concat([ftyp, mdat]));
+  },
+}));
+const { assertVideoInputSupported, resetVideoModelCapabilityCache } = await import('../src/services/search/modelCapabilities.js');
 
 /** The slug `env.OPENROUTER_VIDEO_MODEL` defaults to in test config. */
 const CONFIGURED_MODEL = 'qwen/qwen3.6-flash';

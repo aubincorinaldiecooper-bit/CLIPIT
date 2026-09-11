@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
-import { isSupportedYoutubeUrl } from '../../services/media/ytdlp.js';
 import { getStorage } from '../../services/storage/s3.js';
 import { expireVideoFootage } from '../../services/retention.js';
 import { originalKey, sanitizeFilename } from '../../services/storage/types.js';
@@ -50,19 +49,13 @@ const PART_SIZE_BYTES = 512 * 1024 * 1024;
 /** Six hours of high-bitrate footage with room to spare. */
 const MAX_UPLOAD_BYTES = 64 * 1024 * 1024 * 1024;
 
-const createVideoSchema = z.discriminatedUnion('sourceType', [
-  z.object({
-    sourceType: z.literal('youtube'),
-    url: z.string().trim().min(1, 'url is required'),
-  }),
-  z.object({
-    sourceType: z.literal('upload'),
-    filename: z.string().trim().min(1, 'filename is required').max(255),
-    contentType: z.string().trim().max(120).optional(),
-    /** Announced so the server can decide single-PUT versus part-by-part. */
-    sizeBytes: z.number().int().positive().max(MAX_UPLOAD_BYTES).optional(),
-  }),
-]);
+const createVideoSchema = z.object({
+  sourceType: z.literal('upload'),
+  filename: z.string().trim().min(1, 'filename is required').max(255),
+  contentType: z.string().trim().max(120).optional(),
+  /** Announced so the server can decide single-PUT versus part-by-part. */
+  sizeBytes: z.number().int().positive().max(MAX_UPLOAD_BYTES).optional(),
+});
 
 const partUrlSchema = z.object({
   uploadId: z.string().trim().min(1).max(2048),
@@ -129,7 +122,7 @@ async function issueUploadUrl(videoId: string, filename: string, contentType: st
 
 export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
   /**
-   * Creates a video from a YouTube URL, or reserves one for a direct upload.
+   * Reserves a direct upload. Web search sources enter only after source resolution has acquired bytes.
    * Uploads are handed a presigned PUT URL so large files never pass through
    * this server.
    */
@@ -145,34 +138,6 @@ export async function registerVideoRoutes(app: FastifyInstance): Promise<void> {
 
     const body = parse(createVideoSchema, request.body);
     const sessionId = request.principal?.sessionId ?? null;
-
-    if (body.sourceType === 'youtube') {
-      if (!env.YOUTUBE_INGESTION_ENABLED) {
-        throw HttpError.badRequest('YouTube links are not accepted right now — upload the video file instead');
-      }
-      if (!isSupportedYoutubeUrl(body.url)) {
-        throw HttpError.badRequest('url must be a public YouTube video URL');
-      }
-
-      const video = await createVideo({
-        sessionId,
-        userId: request.principal?.userId ?? null,
-        // Uploads land in the person's own library, always. A shared room
-      // holds clips people send it, never videos.
-        workspaceId: request.principal?.ownWorkspaceId ?? null,
-        sourceType: 'youtube',
-        sourceUrl: body.url,
-        status: 'queued',
-      });
-
-      await enqueueIngestion({ videoId: video.id });
-      // Not awaited: the GPU takes tens of seconds to come back from zero,
-      // and that wait belongs to the download, not to this response.
-      void warmMiniCpm('youtube-queued');
-      logger.info('youtube video queued', { videoId: video.id });
-
-      return reply.code(201).send({ video: serializeVideo(video) });
-    }
 
     const filename = sanitizeFilename(body.filename);
     const contentType = resolveContentType(filename, body.contentType);

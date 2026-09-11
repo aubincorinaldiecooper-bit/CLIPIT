@@ -13,15 +13,11 @@ import {
   QUEUE_NAMES,
 } from '../queues/index.js';
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
-import { assertYtdlpAvailable } from '../services/media/ytdlp.js';
 import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVideo.js';
-import { mediaIndexReadiness, watchMediaIndexRecovery } from './mediaIndexReadiness.js';
-import { assertRerankerDeploymentAvailable } from '../services/mediaIndex/qwen.js';
 import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
 import { handleIndexing } from './handlers/indexing.js';
-import { handleMediaIndexing } from './handlers/mediaIndexing.js';
 import { handleSimpleMemIndexing } from './handlers/simplememIndexing.js';
 import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
@@ -96,21 +92,10 @@ function checkVideoProviderConfig(): void {
   if (env.VIDEO_PROVIDER === 'minicpm' && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
     throw new Error('VIDEO_PROVIDER=minicpm requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker');
   }
-  // The Media Index's own credential requirement is NOT checked here, and the
-  // reason is the one this function would otherwise get wrong twice over.
-  // Throwing here stops every worker before any of them start — ingestion,
-  // transcription, search, rendering — over a credential only the optional
-  // vector index needs. It is checked in mediaIndexReadiness() instead, which
-  // degrades that one feature and leaves the rest of the product running.
-  // MiniCPM stays fatal above because MiniCPM is how this product watches
-  // video; there is nothing left to degrade to.
 }
 
 async function checkBinaries(): Promise<void> {
   const checks: Array<[string, () => Promise<unknown>]> = [['ffmpeg/ffprobe', assertFfmpegAvailable]];
-  if (env.YOUTUBE_INGESTION_ENABLED) {
-    checks.push(['yt-dlp', assertYtdlpAvailable]);
-  }
 
   for (const [label, check] of checks) {
     try {
@@ -136,10 +121,8 @@ async function main(): Promise<void> {
     // On by default now, and it spends GPU time on every upload — an operator
     // reading one startup line should be able to see that without going
     // looking for it.
-    mediaIndex: env.MEDIA_INDEX_ENABLED,
     retrievalPrimary: env.RETRIEVAL_PRIMARY,
     simplememIndexing: env.SIMPLEMEM_INDEX_ENABLED,
-    youtubeIngestion: env.YOUTUBE_INGESTION_ENABLED,
   });
 
   checkVideoProviderConfig();
@@ -160,51 +143,6 @@ async function main(): Promise<void> {
     });
   }
 
-  const mediaIndexReady = await mediaIndexReadiness();
-  if (env.RETRIEVAL_PRIMARY === 'simplemem') {
-    if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
-      throw new Error('RETRIEVAL_PRIMARY=simplemem requires Modal credentials for candidate verification');
-    }
-    await assertRerankerDeploymentAvailable(15_000);
-    logger.info('Omni-SimpleMem reranker deployment available', {
-      app: env.MEDIA_INDEX_RERANK_APP,
-      model: env.MEDIA_INDEX_RERANK_MODEL,
-    });
-  }
-
-  /**
-   * If Modal was down when this worker booted, keep asking.
-   *
-   * The startup check retries for a few seconds, which covers a blip but not
-   * an outage: a Modal incident lasting minutes would otherwise leave indexing
-   * off for this process's whole lifetime, while uploads keep queueing jobs
-   * nothing consumes. Recovery would then need somebody to notice and restart
-   * a worker that looks perfectly healthy.
-   *
-   * So the readiness question is asked again on a timer until it is answered
-   * yes, and the consumer starts then. Queued jobs are picked up at that
-   * point: delayed, not lost. The timer is unref'd so it never holds the
-   * process open, and it stops the moment the queue is being consumed.
-   *
-   * Only when the feature is switched ON: a deliberate MEDIA_INDEX_ENABLED
-   * =false must never start a consumer behind the operator's back.
-   */
-  //
-  // Only when a recovery is possible. A missing credential is not an outage:
-  // the environment is read once at startup, so a token that is absent now
-  // stays absent for this process's whole life. Watching for it would re-ask
-  // every minute and log the same error until shutdown — noise that buries the
-  // one startup line actually worth reading.
-  const modalCredentialsPresent = Boolean(env.MODAL_TOKEN_ID && env.MODAL_TOKEN_SECRET);
-  if (env.MEDIA_INDEX_ENABLED && !mediaIndexReady && modalCredentialsPresent) {
-    watchMediaIndexRecovery(() => {
-      startWorker(QUEUE_NAMES.mediaIndexing, handleMediaIndexing, env.MEDIA_INDEX_CONCURRENCY);
-      logger.info('media index recovered; reading videos into vectors again', {
-        queue: QUEUE_NAMES.mediaIndexing,
-      });
-    });
-  }
-
   startWorker(QUEUE_NAMES.ingestion, handleIngestion, env.INGESTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.preprocessing, handlePreprocessing, env.PREPROCESS_CONCURRENCY);
   startWorker(QUEUE_NAMES.transcription, handleTranscription, env.TRANSCRIPTION_CONCURRENCY);
@@ -213,13 +151,6 @@ async function main(): Promise<void> {
   // second video indexing in parallel would only queue behind it while making
   // a search someone is waiting on wait longer.
   startWorker(QUEUE_NAMES.indexing, handleIndexing, 1);
-  // Reading a video into vectors is a GPU call per batch of windows, and the
-  // concurrency that matters is set on the Modal service, not here. One at a
-  // time locally keeps a long video from holding several signed URLs open and
-  // several downloads warm on the far side at once.
-  if (mediaIndexReady) {
-    startWorker(QUEUE_NAMES.mediaIndexing, handleMediaIndexing, env.MEDIA_INDEX_CONCURRENCY);
-  }
   // One at a time as well: a SimpleMem read is a captioning call per kept
   // frame, and the sidecar is one process on one box.
   startWorker(QUEUE_NAMES.simplememIndexing, handleSimpleMemIndexing, 1);
@@ -240,19 +171,7 @@ async function main(): Promise<void> {
   startWorker(QUEUE_NAMES.scheduledPublish, handleScheduledPublish, 1);
   startWorker(QUEUE_NAMES.learningReport, handleLearningReport, 1);
 
-  // The queues actually being consumed, not every name that exists. Media
-  // indexing only starts when it is switched on, and a startup line listing a
-  // worker nobody started is how an operator concludes a queue is being
-  // drained when nothing is reading it.
-  logger.info('worker ready', {
-    queues: Object.values(QUEUE_NAMES).filter(
-      (queue) => queue !== QUEUE_NAMES.mediaIndexing || mediaIndexReady,
-    ),
-    // Named separately from the queue list so "switched on" and "actually
-    // working" can never be read as the same fact. On with this false is the
-    // one combination worth going and looking at the error above for.
-    mediaIndexReady,
-  });
+  logger.info('worker ready', { queues: Object.values(QUEUE_NAMES) });
 
   // Queued rather than run inline: the sweep goes through the same retention,
   // logging and shutdown handling as everything else, and a fixed job id keeps

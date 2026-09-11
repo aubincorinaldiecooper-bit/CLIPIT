@@ -24,8 +24,8 @@ import { UsageTally } from '../../services/usageTally.js';
  * audio is split only to satisfy the transcription API's request-size limit,
  * and each piece's offset is added back so all stored timestamps are global.
  *
- * For YouTube sources, creator or automatic captions downloaded by yt-dlp are
- * used when present, and OpenRouter STT is the fallback.
+ * If source acquisition supplied a timestamped caption file, use it first;
+ * otherwise OpenRouter STT produces the transcript from the stored source.
  */
 /** Shortest span a stored segment may occupy, so it can still be matched. */
 const MIN_SEGMENT_SECONDS = 0.5;
@@ -58,7 +58,7 @@ export async function handleTranscription(job: Job<TranscriptionJob>): Promise<v
   try {
     const captionsKey = job.data.captionsStorageKey ?? video.captionsStorageKey;
 
-    if (env.YOUTUBE_PREFER_CAPTIONS && captionsKey) {
+    if (captionsKey) {
       const segments = await transcribeFromCaptions(captionsKey);
       if (segments.length > 0) {
         await store(videoId, segments, 'youtube_captions');

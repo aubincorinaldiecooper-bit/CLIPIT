@@ -34,21 +34,12 @@ export async function registerHealthRoutes(app: FastifyInstance): Promise<void> 
         maxSourceDurationSeconds: env.MAX_SOURCE_DURATION_SECONDS,
         analysisChunkSeconds: env.ANALYSIS_CHUNK_SECONDS,
         transcriptionEnabled: env.TRANSCRIPTION_ENABLED,
-        youtubeIngestionEnabled: env.YOUTUBE_INGESTION_ENABLED,
-        // Which service reads video, and the model that answers for it.
         videoProvider: env.VIDEO_PROVIDER,
         model: env.VIDEO_PROVIDER === 'minicpm' ? 'openbmb/MiniCPM-V-4.6' : env.OPENROUTER_VIDEO_MODEL,
-        // Presence only — no probe. Invoking the Modal class wakes a GPU,
-        // and Railway polls this route; a health check that costs
-        // GPU-seconds per poll would be a bill, not a check. Deeper probing
-        // is a deliberate decision, not a default.
         ...(env.VIDEO_PROVIDER === 'minicpm'
           ? {
               minicpm: {
                 modalApp: env.MODAL_APP_NAME,
-                // THIS process's env only. The worker is the one that needs
-                // the token; an API deliberately running without it (least
-                // privilege) will honestly say false here.
                 tokenConfigured: Boolean(env.MODAL_TOKEN_ID && env.MODAL_TOKEN_SECRET),
               },
             }
