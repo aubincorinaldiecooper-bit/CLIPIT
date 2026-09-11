@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ from typing import Any
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 import simplemem
@@ -46,6 +47,9 @@ ARCHIVE_PREFIX = os.environ.get("SIMPLEMEM_ARCHIVE_PREFIX", "simplemem/v1").stri
 CACHE_HIGH_WATER_BYTES = int(os.environ.get("SIMPLEMEM_CACHE_HIGH_WATER_BYTES", str(4 * 1024**3)))
 CACHE_LOW_WATER_BYTES = int(os.environ.get("SIMPLEMEM_CACHE_LOW_WATER_BYTES", str(3 * 1024**3)))
 ARCHIVE_SCHEMA_VERSION = 1
+EMBEDDING_VERSION = os.environ.get("SIMPLEMEM_EMBEDDING_VERSION", "v1").strip() or "v1"
+MAX_UPLOAD_BYTES = int(os.environ.get("SIMPLEMEM_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
+INTERNAL_TOKEN = os.environ.get("SIMPLEMEM_INTERNAL_TOKEN", "").strip()
 
 operation_lock = asyncio.Lock()
 app = FastAPI(title="Clipit Omni-SimpleMem", version="2")
@@ -172,6 +176,21 @@ def _assert_archive_configuration() -> None:
         raise RuntimeError("durable SimpleMem archive is required but S3-compatible storage is not configured")
     if CACHE_LOW_WATER_BYTES <= 0 or CACHE_HIGH_WATER_BYTES <= CACHE_LOW_WATER_BYTES:
         raise RuntimeError("SimpleMem cache watermarks are invalid")
+    if MAX_UPLOAD_BYTES <= 0:
+        raise RuntimeError("SimpleMem upload byte limit is invalid")
+
+
+def _assert_internal_token_configuration() -> None:
+    if len(INTERNAL_TOKEN) < 32:
+        raise RuntimeError("SIMPLEMEM_INTERNAL_TOKEN must be configured with at least 32 characters")
+
+
+def _authorize_internal(
+    token: str | None = Header(default=None, alias="X-Clipit-SimpleMem-Token"),
+) -> None:
+    _assert_internal_token_configuration()
+    if token is None or not hmac.compare_digest(token, INTERNAL_TOKEN):
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 
 def _s3_client():
@@ -258,6 +277,76 @@ def _load_manifest(video_id: str) -> dict[str, Any] | None:
     ):
         raise RuntimeError("SimpleMem archive manifest is invalid")
     return manifest
+
+
+def _read_archive_marker(video_dir: Path) -> dict[str, Any] | None:
+    marker = _archive_marker(video_dir)
+    if not marker.exists():
+        return None
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _cache_ready(video_dir: Path) -> bool:
+    if not video_dir.is_dir() or not _timeline_path(video_dir).exists():
+        return False
+    # When durable archives are configured, only a cache entry backed by a
+    # committed manifest marker is eligible to suppress archive restoration.
+    if _archive_configured():
+        marker = _read_archive_marker(video_dir)
+        if marker is None or marker.get("videoId") != video_dir.name:
+            return False
+    try:
+        # A valid upstream memory contains more than Clipit's two metadata
+        # files. This is intentionally format-agnostic; opening it below is the
+        # final validation and triggers archive recovery if upstream rejects it.
+        return any(
+            child.name not in {TIMELINE_FILE, ARCHIVE_MARKER_FILE}
+            for child in video_dir.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _assert_timeline_compatible(timeline: dict[str, Any]) -> None:
+    if (
+        timeline.get("crossModalModel") != SHARED_CLIP_MODEL
+        or timeline.get("crossModalDim") != SHARED_CLIP_DIM
+        or timeline.get("embeddingVersion") != EMBEDDING_VERSION
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="video memory embedding identity changed; reindex required",
+        )
+
+
+def _prepare_cache_for_query(video_id: str) -> tuple[Path, bool]:
+    final_dir = _video_dir(video_id)
+    backup_dir = final_dir.with_name(f"{final_dir.name}.previous")
+    if _cache_ready(final_dir):
+        return final_dir, False
+
+    if final_dir.exists():
+        shutil.rmtree(final_dir, ignore_errors=True)
+
+    # A process death during replacement can leave the previous committed cache
+    # parked beside the final path. Recover it before paying for an S3 restore.
+    if _cache_ready(backup_dir):
+        backup_dir.replace(final_dir)
+        return final_dir, False
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+    restored = _restore_sync(video_id)
+    if not restored:
+        raise HTTPException(status_code=404, detail="video memory not found")
+    if not _cache_ready(final_dir):
+        shutil.rmtree(final_dir, ignore_errors=True)
+        raise RuntimeError("restored SimpleMem cache is incomplete")
+    return final_dir, True
 
 
 def _archive_sync(video_id: str, video_dir: Path) -> dict[str, Any] | None:
@@ -516,6 +605,7 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
                 "frames": frames,
                 "crossModalModel": SHARED_CLIP_MODEL,
                 "crossModalDim": SHARED_CLIP_DIM,
+                "embeddingVersion": EMBEDDING_VERSION,
             },
         )
 
@@ -556,15 +646,26 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
 def _query_sync(video_id: str, question: str, top_k: int) -> dict[str, Any]:
     _assert_archive_configuration()
     started = time.perf_counter()
-    video_dir = _video_dir(video_id)
-    restored = False
-    if not video_dir.exists():
-        restored = _restore_sync(video_id)
-        if not restored:
-            raise HTTPException(status_code=404, detail="video memory not found")
-
-    frame_map = _read_timeline(video_dir)["frames"]
-    memory = _open_memory(video_dir)
+    video_dir, restored = _prepare_cache_for_query(video_id)
+    timeline = _read_timeline(video_dir)
+    _assert_timeline_compatible(timeline)
+    frame_map = timeline["frames"]
+    try:
+        memory = _open_memory(video_dir)
+    except Exception:
+        # Timeline/marker presence catches interrupted writes cheaply. If the
+        # upstream store itself is corrupt, discard the cache and retry exactly
+        # once from the committed durable generation.
+        if restored or not _archive_configured():
+            raise
+        shutil.rmtree(video_dir, ignore_errors=True)
+        if not _restore_sync(video_id):
+            raise
+        restored = True
+        timeline = _read_timeline(video_dir)
+        _assert_timeline_compatible(timeline)
+        frame_map = timeline["frames"]
+        memory = _open_memory(video_dir)
     items: list[dict[str, Any]] = []
     total_candidates = 0
     cache: dict[str, int]
@@ -645,7 +746,15 @@ async def health() -> dict[str, Any]:
             "highWaterBytes": CACHE_HIGH_WATER_BYTES,
             "lowWaterBytes": CACHE_LOW_WATER_BYTES,
         },
+        "embeddingVersion": EMBEDDING_VERSION,
+        "maxUploadBytes": MAX_UPLOAD_BYTES,
+        "authConfigured": len(INTERNAL_TOKEN) >= 32,
     }
+
+
+@app.get("/ready")
+async def ready(_: None = Depends(_authorize_internal)) -> dict[str, Any]:
+    return await health()
 
 
 @app.put("/videos/{video_id}")
@@ -655,6 +764,7 @@ async def index_video(
     fps: float = Form(..., gt=0, le=2),
     max_frames: int = Form(..., ge=1, le=200_000),
     duration_seconds: float = Form(..., gt=0),
+    _: None = Depends(_authorize_internal),
 ) -> dict[str, Any]:
     _safe_video_id(video_id)
     suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
@@ -662,10 +772,14 @@ async def index_video(
     os.close(fd)
     temp_path = Path(raw_path)
     try:
-        with temp_path.open("wb") as output:
-            while chunk := await file.read(1024 * 1024):
-                output.write(chunk)
         async with operation_lock:
+            total_bytes = 0
+            with temp_path.open("wb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_UPLOAD_BYTES:
+                        raise HTTPException(status_code=413, detail="video exceeds SimpleMem upload limit")
+                    output.write(chunk)
             return await asyncio.to_thread(
                 _index_sync, video_id, temp_path, float(fps), int(max_frames), float(duration_seconds)
             )
@@ -678,7 +792,7 @@ async def index_video(
 
 
 @app.post("/videos/{video_id}/query")
-async def query_video(video_id: str, body: QueryBody) -> dict[str, Any]:
+async def query_video(video_id: str, body: QueryBody, _: None = Depends(_authorize_internal)) -> dict[str, Any]:
     _safe_video_id(video_id)
     async with operation_lock:
         try:
@@ -690,7 +804,7 @@ async def query_video(video_id: str, body: QueryBody) -> dict[str, Any]:
 
 
 @app.delete("/videos/{video_id}")
-async def delete_video(video_id: str) -> dict[str, bool]:
+async def delete_video(video_id: str, _: None = Depends(_authorize_internal)) -> dict[str, bool]:
     _safe_video_id(video_id)
     async with operation_lock:
         try:
