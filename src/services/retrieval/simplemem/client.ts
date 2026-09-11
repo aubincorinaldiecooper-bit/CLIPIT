@@ -59,6 +59,14 @@ function baseUrl(): string {
   return env.SIMPLEMEM_URL.replace(/\/+$/, '');
 }
 
+function internalToken(): string {
+  const value = process.env.SIMPLEMEM_INTERNAL_TOKEN?.trim();
+  if (!value || value.length < 32) {
+    throw new ExternalServiceError(SERVICE, 'SIMPLEMEM_INTERNAL_TOKEN is not configured', { retryable: false });
+  }
+  return value;
+}
+
 function finiteNumber(value: unknown, field: string): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     throw new ExternalServiceError(SERVICE, `Sidecar reply field "${field}" is not a finite number`, { retryable: false });
@@ -76,9 +84,11 @@ function nonEmptyString(value: unknown, field: string): string {
 async function request<T>(method: string, url: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), init.timeoutMs ?? env.SIMPLEMEM_REQUEST_TIMEOUT_MS);
+  const headers = new Headers(init.headers);
+  headers.set('X-Clipit-SimpleMem-Token', internalToken());
   let response: Response;
   try {
-    response = await fetch(url, { ...init, method, signal: controller.signal });
+    response = await fetch(url, { ...init, headers, method, signal: controller.signal });
   } catch (error) {
     const aborted = (error as Error).name === 'AbortError';
     throw new ExternalServiceError(
@@ -117,7 +127,9 @@ export function readHealthReply(raw: Record<string, unknown>): SimpleMemHealth {
 }
 
 export async function simplememHealth(): Promise<SimpleMemHealth> {
-  return readHealthReply(await request<Record<string, unknown>>('GET', `${baseUrl()}/health`, { timeoutMs: 15_000 }));
+  // /ready is intentionally protected. A startup check must prove not only
+  // that the process is alive but that Clipit's worker can authenticate to it.
+  return readHealthReply(await request<Record<string, unknown>>('GET', `${baseUrl()}/ready`, { timeoutMs: 15_000 }));
 }
 
 export function readIndexReply(raw: Record<string, unknown>): SimpleMemIndexReply {
