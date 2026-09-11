@@ -89,7 +89,15 @@ export class BraveVideoSearchProvider implements VideoSearchProvider {
       });
     }
 
-    const raw = await response.text();
+    let raw: string;
+    try {
+      raw = await response.text();
+    } catch (error) {
+      throw new ExternalServiceError('brave-video-search', 'Brave Video Search response could not be read', {
+        retryable: true,
+        cause: error,
+      });
+    }
     if (!response.ok) {
       throw new ExternalServiceError(
         'brave-video-search',
