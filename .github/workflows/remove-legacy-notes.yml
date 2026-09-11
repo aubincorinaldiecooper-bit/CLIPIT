@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   migrate:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,19 +22,24 @@ jobs:
           node-version: 22
           cache: npm
       - name: Apply removal
-        run: python scripts/remove-legacy-notes.py
+        run: |
+          python scripts/remove-legacy-notes.py
+          python scripts/finish-remove-legacy-notes.py
       - name: Install
         run: npm ci
       - name: Verify retired runtime is gone
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           for f in src/services/search/noteSearch.ts src/services/search/sceneIndex.ts src/worker/handlers/indexing.ts; do
             test ! -e "$f" || { echo "legacy file still exists: $f"; exit 1; }
           done
-          if rg -n "enqueueIndexing|handleIndexing|QUEUE_NAMES\.indexing|INDEXING_ENABLED|INDEX_WAIT_TIMEOUT_MS|INDEX_WAIT_POLL_MS|INDEX_ANSWER_MAX_TOKENS|NOTES_PER_LOOKUP|NOTES_ANSWER_MAX_TOKENS|searchNotes\(|answerFromNotes\(|INDEX_SYSTEM_PROMPT|NOTES_SYSTEM_PROMPT|buildIndexInstruction|buildNotesBlock" src .env.example; then
+          pattern='enqueueIndexing|handleIndexing|QUEUE_NAMES\.indexing|INDEXING_ENABLED|INDEX_WAIT_TIMEOUT_MS|INDEX_WAIT_POLL_MS|INDEX_ANSWER_MAX_TOKENS|NOTES_PER_LOOKUP|NOTES_ANSWER_MAX_TOKENS|searchNotes\(|answerFromNotes\(|INDEX_SYSTEM_PROMPT|NOTES_SYSTEM_PROMPT|buildIndexInstruction|buildNotesBlock'
+          if grep -R -nE "$pattern" src .env.example; then
             echo 'legacy notes runtime reference remains'
             exit 1
           fi
+          echo 'No legacy notes runtime references remain.'
       - name: Typecheck
         run: npm run typecheck
       - name: Test
