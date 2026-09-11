@@ -1,85 +1,63 @@
 # Getting smarter after each session
 
-Footage is deleted when the session that uploaded it ends. The question this
-document answers is what the system keeps instead, and how that turns into a
-product that reads video better next month than it does today.
+Clipit should improve from real usage without silently changing itself from unverified feedback.
 
-## What survives a session
+## What the current system measures
 
-Everything below is text, holds no video, and outlives the footage:
+The useful signals are now about the SimpleMem + footage-verification path:
 
-| kept | why it teaches us something |
-|---|---|
-| the question, as typed | what people actually ask of a video |
-| whether the notes could answer it | whether reading at upload was enough |
-| whether they then said "look again" | our answer was wrong and they knew it |
-| the moments found: time, description, confidence | what we claimed to see |
-| thumbs up or down on each | whether we were right |
-| the moments we discarded as uncertain | what we nearly missed, or nearly invented |
+- what people ask for;
+- whether SimpleMem produced useful candidate moments;
+- whether actual-footage verification confirmed those candidates;
+- when retrieval had to fall back to direct footage search;
+- whether a person later corrected the answer;
+- which moments were kept or rejected;
+- latency and model cost for memory retrieval versus footage work.
 
-What is deliberately **not** kept: the footage, the scene notes, and the
-transcript. Those describe someone's video rather than our reading of it, and
-once the footage is gone there is nothing left to check them against.
+The retired notes/scene-index system is not part of this learning loop.
 
-## The three things this can improve
+## What survives
 
-### 1. What the indexer writes down
+Persistent product signals may include the question text, retrieval path, grounded moment timestamps/descriptions, feedback, corrections, and performance/cost measurements.
 
-The single most actionable signal in the list is **questions the notes could
-not answer**. When someone asks about text on a sign and the notes never
-recorded any text, the failure is not in the search — it is that the indexer
-was not told to write signs down.
+Source footage and derived transient media remain governed by the retention system. A stored memory candidate is not treated as truth merely because it survived longer than the source media.
 
-So: gather the questions that fell through to the footage, and read them. A
-recurring subject in that list is a line missing from the indexing prompt.
+## What this can improve
 
-### 2. What "High" and "Likely" mean
+### 1. Retrieval quality
 
-Confidence is currently the model's opinion of its own answer, and it decides
-the label a person reads. Pair confidence with the thumbs verdict on the same
-match and the calibration falls out: if matches at 0.9 are voted down as often
-as matches at 0.5, the number is decoration and the label should be derived
-from something else — how long the thing is on screen, how directly it answers
-what was asked.
+Measure how often SimpleMem points Clipit to a moment that the actual-footage verifier confirms. Poor confirmation rates can indicate weak indexing, weak retrieval, overly broad candidate windows, or a query the memory layer cannot answer reliably.
 
-**This needs volume before it means anything.** A dozen verdicts is an anecdote.
+### 2. Fallback rate
 
-### 3. Where the confidence threshold sits
+A high direct-footage fallback rate means the memory layer is not saving enough work. The important question is why: memory unavailable, incomplete coverage, no useful candidates, or verification failure. These reasons should remain separate in reporting.
 
-`MIN_MATCH_CONFIDENCE` is 0.3, which was a guess. The uncertain moments we now
-record are the evidence for moving it: if the moments discarded just under the
-line get thumbs up when a person jumps to them, the line is too high.
+### 3. Confidence calibration
+
+Model confidence is not ground truth. Compare confidence with later evidence such as Keep/reject behavior, explicit feedback, corrections, and verifier agreement before changing user-facing labels or thresholds.
+
+### 4. Cost and latency
+
+Track what the person actually waits for and what each retrieval path costs. A change is useful only if it improves speed/cost without quietly reducing coverage or grounding quality.
 
 ## What this is not
 
-**It is not automatic tuning.** Nothing in this loop edits a prompt or moves a
-threshold on its own, and it should not until there is a set of known-good
-videos to test a change against. A system that rewrites its own prompts from
-user reactions, with no way to check whether the rewrite made things worse, is
-a system that gets quietly worse — and the failure is invisible, because the
-same signal that caused the change is the only thing measuring it.
+This is not automatic self-tuning. The system does not rewrite prompts, move confidence thresholds, or replace retrieval providers solely from user reactions.
 
-The loop is: **collect, read, decide, change one thing, watch the numbers.**
-The collecting and the reading are automated. The deciding is not.
+The loop is:
 
-## What is built
+```text
+collect evidence
+  → compare retrieval/verification outcomes
+  → identify a specific weakness
+  → test one change on known-good examples
+  → promote only if it improves the measured result
+```
 
-A daily line in the logs, carrying:
+## Grounding rule
 
-- how many questions were answered from memory versus the footage
-- how often people said "look again" after an answer
-- thumbs up against thumbs down, and the average confidence of each
-- the questions the notes could not answer, verbatim
+SimpleMem candidates are proposals. For visual claims, actual footage remains the grounding boundary. A missing memory result is not proof that an event is absent, and a search result or embedding match is never enough to tell the user that Clipit saw something in the video.
 
-The last one is the one to actually read. It is a list of things people wanted
-from their video that we had not thought to write down.
+## Privacy
 
-## Privacy note, stated rather than buried
-
-Questions are kept as typed, detached from the session and from any identifier,
-because the wording is the signal — "find where the sign says OPEN" and "find
-the shop front" fail differently. A question can still name a person ("where
-does Emma sing"), so the text is a person's words even when nothing links it
-back to them. If that becomes uncomfortable, the mitigation is to drop the
-question text and keep only the aggregate, at the cost of the one signal in
-this document that is directly actionable.
+Question text can itself contain personal information even when detached from an account identifier. Keep only what is necessary for product learning, and prefer aggregate measurements when the raw wording is not needed to diagnose retrieval behavior.
