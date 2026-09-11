@@ -1,0 +1,133 @@
+name: Apply vertical pipeline dormancy
+
+on:
+  push:
+    branches:
+      - cleanup/remove-final-legacy-residue
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[vertical-dormancy-done]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cleanup/remove-final-legacy-residue
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Make vertical clip production dormant for MVP
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected exactly one match, found {count}')
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              'src/config/env.ts',
+              "  VERTICAL_MIN_CROP_WIDTH: int(540, 64, 1080),",
+              "  /**\n   * Clip production is deliberately dormant for the current video-understanding MVP.\n   * The implementation stays in the repository so it can be re-enabled later, but\n   * production/local runtime defaults to off. Tests can explicitly enable it.\n   */\n  VERTICAL_CLIP_PIPELINE_ENABLED: bool(false),\n  VERTICAL_MIN_CROP_WIDTH: int(540, 64, 1080),",
+          )
+
+          replace_once(
+              'src/api/routes/clipRequests.ts',
+              "  app.post('/api/clip-requests/:requestId/generate', { preHandler: requireSession }, async (request, reply) => {\n    await enforceRateLimits",
+              "  app.post('/api/clip-requests/:requestId/generate', { preHandler: requireSession }, async (request, reply) => {\n    if (!env.VERTICAL_CLIP_PIPELINE_ENABLED) {\n      throw HttpError.notFound('Clip production is not part of the current MVP.');\n    }\n\n    await enforceRateLimits",
+          )
+
+          replace_once(
+              'src/api/routes/clipRequests.ts',
+              "    const clip = await getRootClipByMatchId(matchId);\n    if (clip && clip.status !== 'ready' && clip.status !== 'failed') {",
+              "    const clip = await getRootClipByMatchId(matchId);\n    if (clip && !env.VERTICAL_CLIP_PIPELINE_ENABLED) {\n      throw HttpError.notFound('Clip production is not part of the current MVP.');\n    }\n    if (clip && clip.status !== 'ready' && clip.status !== 'failed') {",
+          )
+
+          replace_once(
+              'src/api/routes/clips.ts',
+              "  app.post('/api/clips/:clipId/captions', { preHandler: requireSession }, async (request, reply) => {\n    await enforceRateLimits",
+              "  app.post('/api/clips/:clipId/captions', { preHandler: requireSession }, async (request, reply) => {\n    if (!env.VERTICAL_CLIP_PIPELINE_ENABLED) {\n      throw HttpError.notFound('Clip production is not part of the current MVP.');\n    }\n\n    await enforceRateLimits",
+          )
+
+          replace_once(
+              'src/queues/index.ts',
+              "export async function enqueueClipGeneration(data: ClipGenerationJob): Promise<void> {\n  await addWithStableId(getQueues().clipGeneration, 'generate', data, `generate-${data.clipId}`);\n}",
+              "export async function enqueueClipGeneration(data: ClipGenerationJob): Promise<void> {\n  if (!env.VERTICAL_CLIP_PIPELINE_ENABLED) {\n    throw new Error('Vertical clip production is disabled for the current MVP');\n  }\n  await addWithStableId(getQueues().clipGeneration, 'generate', data, `generate-${data.clipId}`);\n}",
+          )
+
+          replace_once(
+              '.env.example',
+              "VERTICAL_MIN_CROP_WIDTH=540",
+              "# Retained for later, but inactive in the current MVP.\nVERTICAL_CLIP_PIPELINE_ENABLED=false\nVERTICAL_MIN_CROP_WIDTH=540",
+          )
+
+          replace_once(
+              'CLAUDE.md',
+              "## Every delivered clip is vertical\n\nWhen clip production is enabled again, every clip Clipit makes is 9:16. This is a product rule, not a default and not something the person's wording can change.",
+              "## Clip production is dormant for the current MVP\n\nThe 9:16 production/rendering implementation is retained for later, but it is not part of the current video-understanding MVP. `VERTICAL_CLIP_PIPELINE_ENABLED` stays false unless the owner explicitly brings clip production back into scope. Do not enable it as a side effect of unrelated work.\n\n## Every delivered clip is vertical\n\nWhen clip production is enabled again, every clip Clipit makes is 9:16. This is a product rule, not a default and not something the person's wording can change.",
+          )
+
+          replace_once(
+              'README.md',
+              "## Clip production\n\nWhen a person keeps a moment, Clipit cuts from the original source and produces a 9:16 deliverable. The vertical pipeline may use the configured footage model for framing and FFmpeg for rendering.\n\nMiniCPM remains available here as well; keeping the provider does not force Clipit to use it.\n",
+              "## Clip production\n\nClip production is retained in the repository but **dormant for the current MVP**. `VERTICAL_CLIP_PIPELINE_ENABLED=false` prevents new Keep/generate and caption-render work from entering the production queue. Existing read-only clip/library behavior can remain available while the MVP focuses on video search and understanding.\n\nWhen deliberately re-enabled later, produced clips remain 9:16. MiniCPM stays available as an optional framing/video provider.\n",
+          )
+
+          # Make the top-level product description and architecture diagram match the MVP.
+          p = Path('README.md')
+          text = p.read_text()
+          text = text.replace(
+              "Clipit is a video-understanding and clipping backend. A person uploads a video, asks for a moment in plain language, and Clipit returns grounded moments that can be kept and rendered as vertical 9:16 clips.",
+              "Clipit is a video-understanding backend. A person uploads a video, asks about what happened in plain language, and Clipit returns grounded moments and answers. The clip-production system is retained but dormant for the current MVP.",
+          )
+          text = text.replace("  → Keep renders the selected moment as a vertical clip\n", "")
+          text = text.replace("6. renders selected clips when the person presses Keep.\n", "6. leaves clip production dormant unless it is explicitly re-enabled.\n")
+          text = text.replace("The worker handles media processing, transcription, SimpleMem indexing, footage verification, clipping, rendering, retention, and scheduled work.", "The worker handles media processing, transcription, SimpleMem indexing, footage verification, retention, and scheduled work. Clip rendering code is retained but dormant for the MVP.")
+          p.write_text(text)
+
+          # Confirm that the retained provider lane is untouched and the dormant guard exists.
+          checks = {
+              'src/config/env.ts': ['VIDEO_PROVIDER', 'minicpm', 'VERTICAL_CLIP_PIPELINE_ENABLED'],
+              'src/api/routes/clipRequests.ts': ['VERTICAL_CLIP_PIPELINE_ENABLED'],
+              'src/api/routes/clips.ts': ['VERTICAL_CLIP_PIPELINE_ENABLED'],
+              'src/queues/index.ts': ['VERTICAL_CLIP_PIPELINE_ENABLED'],
+          }
+          for path, needles in checks.items():
+              text = Path(path).read_text()
+              for needle in needles:
+                  if needle not in text:
+                      raise SystemExit(f'{path}: missing expected {needle}')
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        env:
+          VERTICAL_CLIP_PIPELINE_ENABLED: 'true'
+        run: npm test
+
+      - name: Commit validated dormancy changes and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "AubinCooper"
+          git config user.email "aubincorinaldiecooper@gmail.com"
+          git rm .github/workflows/dormant-vertical-pipeline.yml
+          git add src/config/env.ts src/api/routes/clipRequests.ts src/api/routes/clips.ts src/queues/index.ts .env.example CLAUDE.md README.md
+          git commit -m "Leave vertical clip production dormant for MVP [vertical-dormancy-done]"
+          git push origin HEAD:cleanup/remove-final-legacy-residue
