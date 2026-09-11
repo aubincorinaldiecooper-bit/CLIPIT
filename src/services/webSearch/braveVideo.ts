@@ -9,8 +9,8 @@ const braveVideoResultSchema = z.object({
   description: z.string().nullable().optional(),
   age: z.string().nullable().optional(),
   page_age: z.string().nullable().optional(),
-  thumbnail: z.object({ src: z.string().url().optional() }).optional(),
-  meta_url: z.object({ hostname: z.string().optional() }).optional(),
+  thumbnail: z.object({ src: z.string().url().optional() }).nullable().optional(),
+  meta_url: z.object({ hostname: z.string().optional() }).nullable().optional(),
   video: z
     .object({
       duration: z.string().nullable().optional(),
@@ -19,6 +19,7 @@ const braveVideoResultSchema = z.object({
       publisher: z.string().nullable().optional(),
       requires_subscription: z.boolean().nullable().optional(),
     })
+    .nullable()
     .optional(),
 });
 
@@ -42,6 +43,13 @@ function braveFreshness(value: VideoSearchRequest['freshness']): string | undefi
   }
 }
 
+/** Brave caps q at both 400 characters and 50 words. */
+function braveQuery(value: string): string {
+  const collapsed = value.replace(/\s+/g, ' ').trim();
+  const atMostFiftyWords = collapsed.split(' ').slice(0, 50).join(' ');
+  return atMostFiftyWords.slice(0, 400).trim();
+}
+
 function publishedAt(result: z.infer<typeof braveVideoResultSchema>): string | null {
   const value = result.page_age ?? null;
   if (!value) return null;
@@ -56,10 +64,10 @@ export class BraveVideoSearchProvider implements VideoSearchProvider {
     const config = getWebVideoSearchConfig();
     const apiKey = requireBraveSearchApiKey(config);
     const url = new URL(config.BRAVE_VIDEO_SEARCH_BASE_URL);
-    url.searchParams.set('q', request.query);
+    url.searchParams.set('q', braveQuery(request.query));
     url.searchParams.set('count', String(Math.max(1, Math.min(50, request.count))));
-    url.searchParams.set('country', request.country ?? config.WEB_VIDEO_DEFAULT_COUNTRY);
-    url.searchParams.set('search_lang', request.language ?? config.WEB_VIDEO_DEFAULT_LANGUAGE);
+    url.searchParams.set('country', (request.country ?? config.WEB_VIDEO_DEFAULT_COUNTRY).toUpperCase());
+    url.searchParams.set('search_lang', (request.language ?? config.WEB_VIDEO_DEFAULT_LANGUAGE).toLowerCase());
     url.searchParams.set('safesearch', request.safeSearch ?? config.WEB_VIDEO_DEFAULT_SAFESEARCH);
     const freshness = braveFreshness(request.freshness);
     if (freshness) url.searchParams.set('freshness', freshness);
