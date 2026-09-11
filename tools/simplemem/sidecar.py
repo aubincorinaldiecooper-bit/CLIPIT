@@ -1,15 +1,15 @@
 """Clipit's HTTP boundary around upstream Omni-SimpleMem.
 
-Upstream owns memory construction and retrieval. This service adds only the
-product contract it does not provide: one namespace per Clipit video, source-
-second coordinates for frame memories, stable HTTP reply shapes, and delete /
-replace semantics that follow Clipit's footage retention.
+Upstream owns memory construction and retrieval. This service adds the product
+contract it does not provide: one namespace per Clipit video, source-second
+coordinates for frame memories, stable HTTP reply shapes, delete/replace
+semantics that follow Clipit's footage retention, and durable object-storage
+archives so the local Railway volume can remain a disposable hot cache.
 
-Two upstream details are made explicit here because both are correctness
-boundaries for Clipit:
+Two upstream details are explicit correctness boundaries for Clipit:
 
-1. The video processor computes `timestamp = frame_index / fps` but persists
-   only `frame_index`. We persist that same coordinate beside the memory.
+1. The video processor computes ``timestamp = frame_index / fps`` but persists
+   only ``frame_index``. We persist that same coordinate beside the memory.
 2. Text questions and visual frames are separate vector spaces by default.
    Clipit deliberately points text, visual embedding, and the frame-change
    trigger at the SAME CLIP model and dimension. That makes a text question
@@ -21,14 +21,19 @@ against the actual source interval before it can become user-facing evidence.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
+import tarfile
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
@@ -40,15 +45,22 @@ from simplemem.multimodal.core.config import OmniMemoryConfig
 DATA_ROOT = Path(os.environ.get("SIMPLEMEM_DATA_DIR", "/data/simplemem")).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 TIMELINE_FILE = "clipit_timeline.json"
+ARCHIVE_MARKER_FILE = ".clipit_archived.json"
 SHARED_CLIP_MODEL = os.environ.get("SIMPLEMEM_CLIP_MODEL", "openai/clip-vit-base-patch32")
 SHARED_CLIP_DIM = int(os.environ.get("SIMPLEMEM_CLIP_DIM", "512"))
 PROCESS_AUDIO = os.environ.get("SIMPLEMEM_PROCESS_AUDIO", "false").lower() in {"1", "true", "yes", "on"}
+ARCHIVE_REQUIRED = os.environ.get("SIMPLEMEM_ARCHIVE_REQUIRED", "false").lower() in {"1", "true", "yes", "on"}
+ARCHIVE_PREFIX = os.environ.get("SIMPLEMEM_ARCHIVE_PREFIX", "simplemem/v1").strip("/") or "simplemem/v1"
+CACHE_HIGH_WATER_BYTES = int(os.environ.get("SIMPLEMEM_CACHE_HIGH_WATER_BYTES", str(4 * 1024**3)))
+CACHE_LOW_WATER_BYTES = int(os.environ.get("SIMPLEMEM_CACHE_LOW_WATER_BYTES", str(3 * 1024**3)))
+ARCHIVE_SCHEMA_VERSION = 1
 
 # Clipit's worker indexes one video at a time. Serializing sidecar operations
 # prevents an upstream store from being queried while its files are replaced
 # and bounds local model RAM to one active operation.
 operation_lock = asyncio.Lock()
-app = FastAPI(title="Clipit Omni-SimpleMem", version="1")
+app = FastAPI(title="Clipit Omni-SimpleMem", version="2")
+_s3: Any | None = None
 
 
 class QueryBody(BaseModel):
@@ -144,7 +156,274 @@ def _modality(item: dict[str, Any]) -> str:
     return value if value in {"text", "visual", "audio", "video", "multimodal"} else "text"
 
 
+def _env(name: str, fallback: str | None = None) -> str | None:
+    value = os.environ.get(name)
+    if value is not None and value.strip() != "":
+        return value.strip()
+    if fallback:
+        value = os.environ.get(fallback)
+        if value is not None and value.strip() != "":
+            return value.strip()
+    return None
+
+
+def _archive_bucket() -> str | None:
+    return _env("SIMPLEMEM_ARCHIVE_BUCKET", "BUCKET_NAME")
+
+
+def _archive_configured() -> bool:
+    return bool(
+        _archive_bucket()
+        and _env("SIMPLEMEM_ARCHIVE_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
+        and _env("SIMPLEMEM_ARCHIVE_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
+    )
+
+
+def _assert_archive_configuration() -> None:
+    if ARCHIVE_REQUIRED and not _archive_configured():
+        raise RuntimeError("durable SimpleMem archive is required but S3-compatible storage is not configured")
+    if CACHE_LOW_WATER_BYTES <= 0 or CACHE_HIGH_WATER_BYTES <= CACHE_LOW_WATER_BYTES:
+        raise RuntimeError("SimpleMem cache watermarks are invalid")
+
+
+def _s3_client():
+    global _s3
+    if _s3 is not None:
+        return _s3
+    _assert_archive_configuration()
+    if not _archive_configured():
+        return None
+    force_path = (_env("SIMPLEMEM_ARCHIVE_FORCE_PATH_STYLE", "S3_FORCE_PATH_STYLE") or "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    _s3 = boto3.client(
+        "s3",
+        endpoint_url=_env("SIMPLEMEM_ARCHIVE_ENDPOINT_URL", "AWS_ENDPOINT_URL"),
+        region_name=_env("SIMPLEMEM_ARCHIVE_REGION", "AWS_REGION") or "us-east-1",
+        aws_access_key_id=_env("SIMPLEMEM_ARCHIVE_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=_env("SIMPLEMEM_ARCHIVE_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+        config=BotoConfig(s3={"addressing_style": "path" if force_path else "auto"}),
+    )
+    return _s3
+
+
+def _archive_keys(video_id: str) -> tuple[str, str]:
+    safe = _safe_video_id(video_id)
+    base = f"{ARCHIVE_PREFIX}/{safe}"
+    return f"{base}/memory.tar.gz", f"{base}/manifest.json"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _archive_marker(video_dir: Path) -> Path:
+    return video_dir / ARCHIVE_MARKER_FILE
+
+
+def _mark_archived(video_dir: Path, manifest: dict[str, Any]) -> None:
+    marker = _archive_marker(video_dir)
+    marker.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
+
+
+def _has_archive_marker(video_dir: Path) -> bool:
+    return _archive_marker(video_dir).exists()
+
+
+def _archive_sync(video_id: str, video_dir: Path) -> dict[str, Any] | None:
+    client = _s3_client()
+    if client is None:
+        return None
+    bucket = _archive_bucket()
+    assert bucket is not None
+    archive_key, manifest_key = _archive_keys(video_id)
+
+    fd, raw_path = tempfile.mkstemp(prefix=f"clipit-simplemem-{video_id}-", suffix=".tar.gz")
+    os.close(fd)
+    archive_path = Path(raw_path)
+    try:
+        # The marker is cache-local metadata and must never recursively enter
+        # the durable archive it describes.
+        _archive_marker(video_dir).unlink(missing_ok=True)
+        with tarfile.open(archive_path, "w:gz") as tar:
+            tar.add(video_dir, arcname="memory")
+        digest = _sha256(archive_path)
+        size = archive_path.stat().st_size
+        client.upload_file(str(archive_path), bucket, archive_key)
+        manifest = {
+            "schemaVersion": ARCHIVE_SCHEMA_VERSION,
+            "videoId": video_id,
+            "archiveKey": archive_key,
+            "sha256": digest,
+            "sizeBytes": size,
+            "createdAtUnix": int(time.time()),
+        }
+        # Manifest is the commit marker and is intentionally written last.
+        client.put_object(
+            Bucket=bucket,
+            Key=manifest_key,
+            Body=json.dumps(manifest, separators=(",", ":")).encode("utf-8"),
+            ContentType="application/json",
+        )
+        _mark_archived(video_dir, manifest)
+        return manifest
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+
+def _load_manifest(video_id: str) -> dict[str, Any] | None:
+    client = _s3_client()
+    if client is None:
+        return None
+    bucket = _archive_bucket()
+    assert bucket is not None
+    _, manifest_key = _archive_keys(video_id)
+    try:
+        response = client.get_object(Bucket=bucket, Key=manifest_key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return None
+        raise
+    raw = response["Body"].read()
+    manifest = json.loads(raw.decode("utf-8"))
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schemaVersion") != ARCHIVE_SCHEMA_VERSION
+        or manifest.get("videoId") != video_id
+        or not isinstance(manifest.get("archiveKey"), str)
+        or not isinstance(manifest.get("sha256"), str)
+    ):
+        raise RuntimeError("SimpleMem archive manifest is invalid")
+    return manifest
+
+
+def _safe_extract(tar: tarfile.TarFile, destination: Path) -> None:
+    destination_resolved = destination.resolve()
+    for member in tar.getmembers():
+        target = (destination / member.name).resolve()
+        if destination_resolved != target and destination_resolved not in target.parents:
+            raise RuntimeError("SimpleMem archive contains an unsafe path")
+    tar.extractall(destination)
+
+
+def _restore_sync(video_id: str) -> bool:
+    client = _s3_client()
+    if client is None:
+        return False
+    manifest = _load_manifest(video_id)
+    if manifest is None:
+        return False
+    bucket = _archive_bucket()
+    assert bucket is not None
+
+    fd, raw_path = tempfile.mkstemp(prefix=f"clipit-simplemem-restore-{video_id}-", suffix=".tar.gz")
+    os.close(fd)
+    archive_path = Path(raw_path)
+    restore_root = Path(tempfile.mkdtemp(prefix=f".{video_id}.restoring-", dir=DATA_ROOT))
+    final_dir = _video_dir(video_id)
+    try:
+        client.download_file(bucket, manifest["archiveKey"], str(archive_path))
+        if _sha256(archive_path) != manifest["sha256"]:
+            raise RuntimeError("SimpleMem archive checksum mismatch")
+        with tarfile.open(archive_path, "r:gz") as tar:
+            _safe_extract(tar, restore_root)
+        extracted = restore_root / "memory"
+        if not extracted.is_dir() or not _timeline_path(extracted).exists():
+            raise RuntimeError("SimpleMem archive is missing required memory metadata")
+        if final_dir.exists():
+            shutil.rmtree(final_dir, ignore_errors=True)
+        extracted.replace(final_dir)
+        _mark_archived(final_dir, manifest)
+        _touch_cache_entry(final_dir)
+        return True
+    finally:
+        archive_path.unlink(missing_ok=True)
+        shutil.rmtree(restore_root, ignore_errors=True)
+
+
+def _delete_archive_sync(video_id: str) -> None:
+    client = _s3_client()
+    if client is None:
+        return
+    bucket = _archive_bucket()
+    assert bucket is not None
+    archive_key, manifest_key = _archive_keys(video_id)
+    # Manifest first: once it is gone no future cache miss may restore this
+    # memory even if deleting the larger archive object needs a retry.
+    client.delete_object(Bucket=bucket, Key=manifest_key)
+    client.delete_object(Bucket=bucket, Key=archive_key)
+
+
+def _directory_size(path: Path) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat().st_size
+            except FileNotFoundError:
+                pass
+    return total
+
+
+def _touch_cache_entry(video_dir: Path) -> None:
+    now = time.time()
+    try:
+        os.utime(video_dir, (now, now))
+    except FileNotFoundError:
+        pass
+
+
+def _cache_entries() -> list[Path]:
+    entries: list[Path] = []
+    for candidate in DATA_ROOT.iterdir():
+        if not candidate.is_dir() or candidate.name.startswith(".") or candidate.name.endswith(".previous"):
+            continue
+        entries.append(candidate)
+    return entries
+
+
+def _enforce_cache_budget(exclude_video_id: str | None = None) -> dict[str, int]:
+    if not _archive_configured():
+        return {"beforeBytes": _directory_size(DATA_ROOT), "afterBytes": _directory_size(DATA_ROOT), "evicted": 0}
+    before = _directory_size(DATA_ROOT)
+    if before <= CACHE_HIGH_WATER_BYTES:
+        return {"beforeBytes": before, "afterBytes": before, "evicted": 0}
+
+    candidates = []
+    for entry in _cache_entries():
+        if exclude_video_id and entry.name == exclude_video_id:
+            continue
+        if not _has_archive_marker(entry):
+            continue
+        try:
+            touched = entry.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        candidates.append((touched, entry))
+    candidates.sort(key=lambda pair: pair[0])
+
+    current = before
+    evicted = 0
+    for _, entry in candidates:
+        if current <= CACHE_LOW_WATER_BYTES:
+            break
+        size = _directory_size(entry)
+        shutil.rmtree(entry, ignore_errors=True)
+        current = max(0, current - size)
+        evicted += 1
+    return {"beforeBytes": before, "afterBytes": current, "evicted": evicted}
+
+
 def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, duration_seconds: float) -> dict[str, Any]:
+    _assert_archive_configuration()
     started = time.perf_counter()
     final_dir = _video_dir(video_id)
     backup_dir = final_dir.with_name(f"{final_dir.name}.previous")
@@ -202,11 +481,17 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
             },
         )
 
-        # close() flushes upstream vector stores. The sidecar does not report
-        # ready until the memory and Clipit coordinates are both durable.
+        # close() flushes upstream vector stores. A successful response means
+        # the local memory is closed and, when configured, its durable archive
+        # has also committed its manifest.
         memory.close()
         memory = None
+        archive = _archive_sync(video_id, final_dir)
+        if ARCHIVE_REQUIRED and archive is None:
+            raise RuntimeError("durable SimpleMem archive was required but was not written")
+        _touch_cache_entry(final_dir)
         shutil.rmtree(backup_dir, ignore_errors=True)
+        cache = _enforce_cache_budget(exclude_video_id=video_id)
 
         return {
             "videoMauId": str(result.mau.id),
@@ -216,6 +501,8 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
             "framesSkipped": skipped,
             "coveredThroughSeconds": covered,
             "audioTranscribed": metadata.get("audio_mau") is not None,
+            "durableArchive": archive is not None,
+            "cache": cache,
             "elapsedMs": round((time.perf_counter() - started) * 1000),
         }
     except Exception:
@@ -231,10 +518,14 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
 
 
 def _query_sync(video_id: str, question: str, top_k: int) -> dict[str, Any]:
+    _assert_archive_configuration()
     started = time.perf_counter()
     video_dir = _video_dir(video_id)
+    restored = False
     if not video_dir.exists():
-        raise HTTPException(status_code=404, detail="video memory not found")
+        restored = _restore_sync(video_id)
+        if not restored:
+            raise HTTPException(status_code=404, detail="video memory not found")
 
     frame_map = _read_timeline(video_dir)["frames"]
     memory = _open_memory(video_dir)
@@ -262,9 +553,13 @@ def _query_sync(video_id: str, question: str, top_k: int) -> dict[str, Any]:
                     "seconds": mapped.get("seconds") if isinstance(mapped, dict) else None,
                 }
             )
+        _touch_cache_entry(video_dir)
+        cache = _enforce_cache_budget(exclude_video_id=video_id)
         return {
             "items": items,
             "totalCandidates": int(getattr(result, "total_candidates", len(items)) or len(items)),
+            "restoredFromArchive": restored,
+            "cache": cache,
             "elapsedMs": round((time.perf_counter() - started) * 1000),
         }
     finally:
@@ -272,6 +567,8 @@ def _query_sync(video_id: str, question: str, top_k: int) -> dict[str, Any]:
 
 
 def _delete_sync(video_id: str) -> None:
+    _assert_archive_configuration()
+    _delete_archive_sync(video_id)
     video_dir = _video_dir(video_id)
     shutil.rmtree(video_dir, ignore_errors=True)
     shutil.rmtree(video_dir.with_name(f"{video_dir.name}.previous"), ignore_errors=True)
@@ -279,8 +576,22 @@ def _delete_sync(video_id: str) -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    _assert_archive_configuration()
     config = _config()
-    return {"ok": True, "models": _models(config), "version": simplemem.__version__}
+    return {
+        "ok": True,
+        "models": _models(config),
+        "version": simplemem.__version__,
+        "archive": {
+            "configured": _archive_configured(),
+            "required": ARCHIVE_REQUIRED,
+            "prefix": ARCHIVE_PREFIX,
+        },
+        "cache": {
+            "highWaterBytes": CACHE_HIGH_WATER_BYTES,
+            "lowWaterBytes": CACHE_LOW_WATER_BYTES,
+        },
+    }
 
 
 @app.put("/videos/{video_id}")
@@ -328,5 +639,8 @@ async def query_video(video_id: str, body: QueryBody) -> dict[str, Any]:
 async def delete_video(video_id: str) -> dict[str, bool]:
     _safe_video_id(video_id)
     async with operation_lock:
-        await asyncio.to_thread(_delete_sync, video_id)
+        try:
+            await asyncio.to_thread(_delete_sync, video_id)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"SimpleMem delete failed: {type(exc).__name__}") from exc
     return {"ok": True}
