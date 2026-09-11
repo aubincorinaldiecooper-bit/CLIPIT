@@ -23,12 +23,14 @@ jobs:
           cache: npm
       - run: npm ci
       - run: node scripts/cleanup-retired-retrieval.mjs
+      - run: node scripts/cleanup-retired-retrieval-followup.mjs
       - run: npm run typecheck
       - run: npm test
       - name: Verify retired runtime residue is gone
         run: |
-          ! grep -R "video_scenes\|getVideoWithReadProgress\|recordSearchApproach\|answeredFromNotes\|notesSilent\|questionsNotesCouldNotAnswer" src test --exclude-dir=migrations
+          ! grep -R "video_scenes\|getVideoWithReadProgress\|setIndexStatus\|recordSearchApproach\|answeredFromNotes\|notesSilent\|questionsNotesCouldNotAnswer" src test --exclude-dir=migrations
           ! grep -R "'media_index'\|\"media_index\"" src --exclude-dir=migrations
+          ! grep -R "indexStatus\|indexReadThroughSeconds\|sceneCount" src --exclude-dir=migrations
       - name: Commit validated cleanup
         run: |
           git config user.name "github-actions[bot]"
