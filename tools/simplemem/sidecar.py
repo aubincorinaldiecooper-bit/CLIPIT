@@ -6,6 +6,9 @@ only the product contract upstream does not provide:
 * one isolated memory namespace per Clipit video;
 * durable mapping from a frame memory back to source seconds (upstream computes
   the timestamp while extracting the frame, then drops it);
+* a text-retrievable alias for each kept visual frame. Upstream stores visual
+  vectors in a separate index while ordinary text questions search the text
+  index, so without this alias a question cannot retrieve the frame captions;
 * stable HTTP shapes that the TypeScript worker validates before trusting;
 * replace/delete semantics that line up with Clipit's footage retention.
 
@@ -73,16 +76,10 @@ def _config() -> OmniMemoryConfig:
     if api_base:
         config.llm.api_base_url = api_base
 
-    # Defaults remain upstream-compatible; deployment can point these at the
-    # same OpenAI-compatible provider Clipit already uses without code changes.
     config.llm.caption_model = os.environ.get("SIMPLEMEM_CAPTION_MODEL", config.llm.caption_model)
     config.llm.summary_model = os.environ.get("SIMPLEMEM_SUMMARY_MODEL", config.llm.summary_model)
     config.llm.query_model = os.environ.get("SIMPLEMEM_QUERY_MODEL", config.llm.query_model)
     config.llm.whisper_model = os.environ.get("SIMPLEMEM_TRANSCRIPTION_MODEL", config.llm.whisper_model)
-
-    # Keep the embedding model name in the upstream-supported form. The
-    # upstream EmbeddingService understands the bare OpenAI model identifiers
-    # and otherwise falls back to a local sentence-transformer.
     config.embedding.model_name = os.environ.get("SIMPLEMEM_TEXT_EMBED_MODEL", config.embedding.model_name)
     config.embedding.visual_embedding_model = os.environ.get(
         "SIMPLEMEM_VISUAL_MODEL", config.embedding.visual_embedding_model
@@ -165,21 +162,38 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
 
         metadata = result.metadata or {}
         frame_maus = metadata.get("frame_maus") or []
-        frames: dict[str, dict[str, float | int]] = {}
+        frames: dict[str, dict[str, Any]] = {}
 
         # Upstream currently saves frame_index but discards the `idx / fps`
-        # timestamp it computed during extraction. Recreate exactly that value,
-        # keyed by MAU id, and keep it beside the upstream store.
+        # timestamp it computed during extraction. Recreate exactly that value.
+        #
+        # It also files visual vectors separately from text vectors, while an
+        # ordinary question is embedded as text and therefore searches only
+        # the text store. Preserve the real visual MAU, but add its already-
+        # generated caption as a normal SimpleMem text memory. That text MAU is
+        # the retrievable pointer; the timeline map ties it back to the visual
+        # frame, and Clipit's footage verifier remains the truth gate.
         for frame in frame_maus:
             frame_id = str(getattr(frame, "id", "") or "")
             frame_meta = getattr(frame, "metadata", None)
             frame_index = getattr(frame_meta, "frame_index", None) if frame_meta is not None else None
+            summary = str(getattr(frame, "summary", "") or "").strip()
             if not frame_id or not isinstance(frame_index, int) or frame_index < 0:
                 continue
-            frames[frame_id] = {
-                "frameIndex": frame_index,
-                "seconds": frame_index / fps,
-            }
+
+            at = frame_index / fps
+            coordinate = {"frameIndex": frame_index, "seconds": at, "visualMauId": frame_id}
+            frames[frame_id] = coordinate
+
+            if summary:
+                alias = memory.add_text(
+                    summary,
+                    session_id=f"clipit:{video_id}",
+                    tags=[f"clipit_video:{video_id}", "clipit_visual_frame"],
+                    force=True,
+                )
+                if alias.success and alias.mau is not None:
+                    frames[str(alias.mau.id)] = coordinate
 
         processed = int(metadata.get("frames_processed") or len(frame_maus))
         skipped = int(metadata.get("frames_skipped") or 0)
@@ -189,7 +203,7 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
         _write_timeline(
             final_dir,
             {
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "videoId": video_id,
                 "fps": fps,
                 "durationSeconds": duration_seconds,
@@ -252,10 +266,16 @@ def _query_sync(video_id: str, question: str, top_k: int) -> dict[str, Any]:
                 score = float(score)
             except (TypeError, ValueError):
                 score = 0.0
+
+            # A mapped text alias represents a visual frame. Report the
+            # evidence it points to, not the implementation detail used to
+            # retrieve its caption. Unmapped text/audio/video memories keep
+            # their upstream modality and cannot become timestamped candidates.
+            modality = "visual" if isinstance(mapped, dict) else _modality(row)
             items.append(
                 {
                     "mauId": mau_id,
-                    "modality": _modality(row),
+                    "modality": modality,
                     "score": score,
                     "summary": str(row.get("summary") or "")[:500],
                     "frameIndex": mapped.get("frameIndex") if isinstance(mapped, dict) else None,
