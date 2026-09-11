@@ -1,4 +1,4 @@
-name: Validate completed SimpleMem migration
+name: Finish and validate SimpleMem migration
 
 on:
   push:
@@ -10,36 +10,33 @@ on:
       - package.json
       - package-lock.json
       - .env.example
+      - scripts/finish-simplemem-migration.mjs
       - .github/workflows/complete-simplemem-migration.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   validate:
+    if: github.event.head_commit.message != 'Finish SimpleMem migration cleanup'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: feat/simplemem-production
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+      - name: Apply remaining cleanup
+        run: node scripts/finish-simplemem-migration.mjs
       - run: npm ci
-      - name: Typecheck
-        id: typecheck
-        shell: bash
-        run: |
-          set +e
-          npm run typecheck 2>&1 | tee typecheck-output.txt
-          code=${PIPESTATUS[0]}
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          exit 0
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: simplemem-typecheck
-          path: typecheck-output.txt
-      - name: Fail on typecheck errors
-        if: steps.typecheck.outputs.exit_code != '0'
-        run: exit 1
+      - run: npm run typecheck
       - run: npm test
+      - name: Commit validated cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Finish SimpleMem migration cleanup"
+          git push origin HEAD:feat/simplemem-production
