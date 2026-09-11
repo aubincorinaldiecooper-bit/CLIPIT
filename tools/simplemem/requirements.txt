@@ -1,0 +1,5 @@
+# Pin upstream by commit: video-memory behavior is part of Clipit's retrieval contract.
+simplemem @ https://github.com/aiming-lab/SimpleMem/archive/db80b6a7c591e0ea730a058e9f5fc4eb06572299.zip
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+python-multipart==0.0.20
