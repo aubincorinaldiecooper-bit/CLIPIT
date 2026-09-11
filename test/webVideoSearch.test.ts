@@ -40,6 +40,14 @@ describe('web video URL normalization', () => {
     expect(classifyVideoPlatform('x.com')).toBe('x');
     expect(classifyVideoPlatform('example.com')).toBe('other');
   });
+
+  it('does not classify lookalike domains as a known video platform', () => {
+    expect(classifyVideoPlatform('notyoutube.com')).toBe('other');
+    expect(classifyVideoPlatform('eviltiktok.com')).toBe('other');
+    expect(classifyVideoPlatform('fakeinstagram.com')).toBe('other');
+    expect(classifyVideoPlatform('notfacebook.com')).toBe('other');
+    expect(classifyVideoPlatform('copyvimeo.com')).toBe('other');
+  });
 });
 
 describe('web video result merging', () => {
