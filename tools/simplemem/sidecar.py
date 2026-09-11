@@ -1,19 +1,22 @@
 """Clipit's HTTP boundary around upstream Omni-SimpleMem.
 
-The upstream library owns memory construction and retrieval. This service owns
-only the product contract upstream does not provide:
+Upstream owns memory construction and retrieval. This service adds only the
+product contract it does not provide: one namespace per Clipit video, source-
+second coordinates for frame memories, stable HTTP reply shapes, and delete /
+replace semantics that follow Clipit's footage retention.
 
-* one isolated memory namespace per Clipit video;
-* durable mapping from a frame memory back to source seconds (upstream computes
-  the timestamp while extracting the frame, then drops it);
-* a text-retrievable alias for each kept visual frame. Upstream stores visual
-  vectors in a separate index while ordinary text questions search the text
-  index, so without this alias a question cannot retrieve the frame captions;
-* stable HTTP shapes that the TypeScript worker validates before trusting;
-* replace/delete semantics that line up with Clipit's footage retention.
+Two upstream details are made explicit here because both are correctness
+boundaries for Clipit:
 
-A search result from this service is still only a candidate. Clipit verifies the
-candidate against actual footage before it can become user-facing evidence.
+1. The video processor computes `timestamp = frame_index / fps` but persists
+   only `frame_index`. We persist that same coordinate beside the memory.
+2. Text questions and visual frames are separate vector spaces by default.
+   Clipit deliberately points text, visual embedding, and the frame-change
+   trigger at the SAME CLIP model and dimension. That makes a text question
+   capable of retrieving a visual frame without inventing a second index.
+
+SimpleMem only proposes candidate moments. Clipit still verifies a candidate
+against the actual source interval before it can become user-facing evidence.
 """
 from __future__ import annotations
 
@@ -37,12 +40,14 @@ from simplemem.multimodal.core.config import OmniMemoryConfig
 DATA_ROOT = Path(os.environ.get("SIMPLEMEM_DATA_DIR", "/data/simplemem")).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 TIMELINE_FILE = "clipit_timeline.json"
+SHARED_CLIP_MODEL = os.environ.get("SIMPLEMEM_CLIP_MODEL", "openai/clip-vit-base-patch32")
+SHARED_CLIP_DIM = int(os.environ.get("SIMPLEMEM_CLIP_DIM", "512"))
+PROCESS_AUDIO = os.environ.get("SIMPLEMEM_PROCESS_AUDIO", "false").lower() in {"1", "true", "yes", "on"}
 
-# The worker intentionally indexes one video at a time. Serializing sidecar
-# operations keeps upstream model/store objects from competing for RAM and
-# prevents a query from opening a half-written per-video index.
+# Clipit's worker indexes one video at a time. Serializing sidecar operations
+# prevents an upstream store from being queried while its files are replaced
+# and bounds local model RAM to one active operation.
 operation_lock = asyncio.Lock()
-
 app = FastAPI(title="Clipit Omni-SimpleMem", version="1")
 
 
@@ -52,7 +57,6 @@ class QueryBody(BaseModel):
 
 
 def _safe_video_id(value: str) -> str:
-    """Allow opaque ids without allowing them to become filesystem paths."""
     cleaned = value.strip()
     if not cleaned or len(cleaned) > 128:
         raise HTTPException(status_code=400, detail="invalid video id")
@@ -66,7 +70,6 @@ def _video_dir(video_id: str) -> Path:
 
 
 def _config() -> OmniMemoryConfig:
-    """Build the upstream config explicitly so /health reports what will run."""
     config = OmniMemoryConfig()
 
     api_key = os.environ.get("SIMPLEMEM_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -80,11 +83,15 @@ def _config() -> OmniMemoryConfig:
     config.llm.summary_model = os.environ.get("SIMPLEMEM_SUMMARY_MODEL", config.llm.summary_model)
     config.llm.query_model = os.environ.get("SIMPLEMEM_QUERY_MODEL", config.llm.query_model)
     config.llm.whisper_model = os.environ.get("SIMPLEMEM_TRANSCRIPTION_MODEL", config.llm.whisper_model)
-    config.embedding.model_name = os.environ.get("SIMPLEMEM_TEXT_EMBED_MODEL", config.embedding.model_name)
-    config.embedding.visual_embedding_model = os.environ.get(
-        "SIMPLEMEM_VISUAL_MODEL", config.embedding.visual_embedding_model
-    )
-    config.entropy_trigger.visual_model_name = config.embedding.visual_embedding_model
+
+    # One cross-modal space. Upstream's HybridVectorStore puts a visual/video
+    # MAU into the text-searchable store when these dimensions are equal.
+    config.embedding.model_name = SHARED_CLIP_MODEL
+    config.embedding.embedding_dim = SHARED_CLIP_DIM
+    config.embedding.visual_embedding_model = SHARED_CLIP_MODEL
+    config.embedding.visual_embedding_dim = SHARED_CLIP_DIM
+    config.entropy_trigger.visual_encoder = "clip"
+    config.entropy_trigger.visual_model_name = SHARED_CLIP_MODEL
     return config
 
 
@@ -93,7 +100,7 @@ def _models(config: OmniMemoryConfig) -> dict[str, str]:
         "caption": config.llm.caption_model,
         "visual": config.embedding.visual_embedding_model,
         "text_embedding": config.embedding.model_name,
-        "transcription": config.llm.whisper_model,
+        "transcription": config.llm.whisper_model if PROCESS_AUDIO else "disabled-native-clipit-transcript",
     }
 
 
@@ -122,14 +129,19 @@ def _read_timeline(video_dir: Path) -> dict[str, Any]:
 
 
 def _open_memory(video_dir: Path):
-    return create(mode="omni", config=_config(), data_dir=str(video_dir))
+    memory = create(mode="omni", config=_config(), data_dir=str(video_dir))
+    # Clipit already has a timestamped transcript and routes transcript-only
+    # questions there. Upstream's video audio memory is one untimed transcript,
+    # so processing it by default would add cost without adding a usable moment.
+    if not PROCESS_AUDIO:
+        memory.video_processor.process_audio = False
+        memory.video_processor.audio_processor = None
+    return memory
 
 
 def _modality(item: dict[str, Any]) -> str:
-    value = item.get("modality_type") or item.get("modality") or "text"
-    value = str(value).lower()
-    allowed = {"text", "visual", "audio", "video", "multimodal"}
-    return value if value in allowed else "text"
+    value = str(item.get("modality_type") or item.get("modality") or "text").lower()
+    return value if value in {"text", "visual", "audio", "video", "multimodal"} else "text"
 
 
 def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, duration_seconds: float) -> dict[str, Any]:
@@ -146,10 +158,8 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
     memory = None
     try:
         memory = _open_memory(final_dir)
-        # add_video exposes max_frames but not fps; the processor's public fps
-        # setting is the sampling clock upstream itself uses to derive frame
-        # indices. Clipit persists the same clock below rather than inventing a
-        # second timeline.
+        # add_video exposes max_frames but not fps. This is the same sampling
+        # clock upstream uses internally when it computes idx/fps.
         memory.video_processor.fps = fps
         result = memory.add_video(
             str(source),
@@ -162,38 +172,14 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
 
         metadata = result.metadata or {}
         frame_maus = metadata.get("frame_maus") or []
-        frames: dict[str, dict[str, Any]] = {}
-
-        # Upstream currently saves frame_index but discards the `idx / fps`
-        # timestamp it computed during extraction. Recreate exactly that value.
-        #
-        # It also files visual vectors separately from text vectors, while an
-        # ordinary question is embedded as text and therefore searches only
-        # the text store. Preserve the real visual MAU, but add its already-
-        # generated caption as a normal SimpleMem text memory. That text MAU is
-        # the retrievable pointer; the timeline map ties it back to the visual
-        # frame, and Clipit's footage verifier remains the truth gate.
+        frames: dict[str, dict[str, float | int]] = {}
         for frame in frame_maus:
             frame_id = str(getattr(frame, "id", "") or "")
             frame_meta = getattr(frame, "metadata", None)
             frame_index = getattr(frame_meta, "frame_index", None) if frame_meta is not None else None
-            summary = str(getattr(frame, "summary", "") or "").strip()
             if not frame_id or not isinstance(frame_index, int) or frame_index < 0:
                 continue
-
-            at = frame_index / fps
-            coordinate = {"frameIndex": frame_index, "seconds": at, "visualMauId": frame_id}
-            frames[frame_id] = coordinate
-
-            if summary:
-                alias = memory.add_text(
-                    summary,
-                    session_id=f"clipit:{video_id}",
-                    tags=[f"clipit_video:{video_id}", "clipit_visual_frame"],
-                    force=True,
-                )
-                if alias.success and alias.mau is not None:
-                    frames[str(alias.mau.id)] = coordinate
+            frames[frame_id] = {"frameIndex": frame_index, "seconds": frame_index / fps}
 
         processed = int(metadata.get("frames_processed") or len(frame_maus))
         skipped = int(metadata.get("frames_skipped") or 0)
@@ -203,7 +189,7 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
         _write_timeline(
             final_dir,
             {
-                "schemaVersion": 2,
+                "schemaVersion": 1,
                 "videoId": video_id,
                 "fps": fps,
                 "durationSeconds": duration_seconds,
@@ -211,11 +197,13 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
                 "framesProcessed": processed,
                 "framesSkipped": skipped,
                 "frames": frames,
+                "crossModalModel": SHARED_CLIP_MODEL,
+                "crossModalDim": SHARED_CLIP_DIM,
             },
         )
 
-        # close() flushes upstream vector stores; the sidecar does not claim a
-        # video is ready until that durable write has completed.
+        # close() flushes upstream vector stores. The sidecar does not report
+        # ready until the memory and Clipit coordinates are both durable.
         memory.close()
         memory = None
         shutil.rmtree(backup_dir, ignore_errors=True)
@@ -248,8 +236,7 @@ def _query_sync(video_id: str, question: str, top_k: int) -> dict[str, Any]:
     if not video_dir.exists():
         raise HTTPException(status_code=404, detail="video memory not found")
 
-    timeline = _read_timeline(video_dir)
-    frame_map = timeline["frames"]
+    frame_map = _read_timeline(video_dir)["frames"]
     memory = _open_memory(video_dir)
     try:
         result = memory.query(question, top_k=top_k)
@@ -261,21 +248,14 @@ def _query_sync(video_id: str, question: str, top_k: int) -> dict[str, Any]:
             if not mau_id:
                 continue
             mapped = frame_map.get(mau_id)
-            score = row.get("score", 0.0)
             try:
-                score = float(score)
+                score = float(row.get("score", 0.0))
             except (TypeError, ValueError):
                 score = 0.0
-
-            # A mapped text alias represents a visual frame. Report the
-            # evidence it points to, not the implementation detail used to
-            # retrieve its caption. Unmapped text/audio/video memories keep
-            # their upstream modality and cannot become timestamped candidates.
-            modality = "visual" if isinstance(mapped, dict) else _modality(row)
             items.append(
                 {
                     "mauId": mau_id,
-                    "modality": modality,
+                    "modality": _modality(row),
                     "score": score,
                     "summary": str(row.get("summary") or "")[:500],
                     "frameIndex": mapped.get("frameIndex") if isinstance(mapped, dict) else None,
