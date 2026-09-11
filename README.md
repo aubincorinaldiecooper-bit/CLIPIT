@@ -1,6 +1,6 @@
 # CLIPIT — backend
 
-Clipit is a video-understanding and clipping backend. A person uploads a video, asks for a moment in plain language, and Clipit returns grounded moments that can be kept and rendered as vertical 9:16 clips.
+Clipit is a video-understanding backend. A person uploads a video, asks about what happened in plain language, and Clipit returns grounded moments and answers. The clip-production system is retained but dormant for the current MVP.
 
 ## Current architecture
 
@@ -15,7 +15,6 @@ upload
   → SimpleMem proposes timestamped candidate moments
   → Clipit verifies those candidates against the actual footage
   → final answer is written from grounded evidence
-  → Keep renders the selected moment as a vertical clip
 ```
 
 SimpleMem is memory and retrieval, not final evidence. A SimpleMem candidate must be verified against the actual footage before Clipit treats a visual claim as grounded.
@@ -76,11 +75,17 @@ Uploads go directly to S3-compatible storage through signed URLs. The worker the
 3. transcribes the audio;
 4. indexes the video into SimpleMem;
 5. answers retrieval jobs;
-6. renders selected clips when the person presses Keep.
+6. leaves clip production dormant unless it is explicitly re-enabled.
 
 Preprocessing prefers the single-decode path. A separate-pass FFmpeg path remains as a compatibility fallback when the optimized pass fails.
 
 All newly made or re-rendered deliverables are 9:16 vertical clips.
+
+## Clip production
+
+Clip production is retained in the repository but **dormant for the current MVP**. `VERTICAL_CLIP_PIPELINE_ENABLED=false` prevents new Keep/generate and caption-render work from entering the production queue. Existing read-only clip/library behavior can remain available while the MVP focuses on video search and understanding.
+
+When deliberately re-enabled later, produced clips remain 9:16. MiniCPM stays available as an optional framing/video provider.
 
 ## Processes
 
@@ -91,7 +96,7 @@ npm run start:api
 npm run start:worker
 ```
 
-The API handles HTTP, authentication, signed upload/playback URLs, and request state. The worker handles media processing, transcription, SimpleMem indexing, footage verification, clipping, rendering, retention, and scheduled work.
+The API handles HTTP, authentication, signed upload/playback URLs, and request state. The worker handles media processing, transcription, SimpleMem indexing, footage verification, retention, and scheduled work. Clip rendering code is retained but dormant for the MVP.
 
 The SimpleMem sidecar runs separately from `Dockerfile.simplemem`.
 

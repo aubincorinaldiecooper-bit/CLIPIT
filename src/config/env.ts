@@ -171,6 +171,12 @@ const envSchema = z.object({
    * 540 is half the 1080 delivery width: under it, more than half of every
    * horizontal pixel in the output is interpolated. A judgement, hence a knob.
    */
+  /**
+   * Clip production is deliberately dormant for the current video-understanding MVP.
+   * The implementation stays in the repository so it can be re-enabled later, but
+   * production/local runtime defaults to off. Tests can explicitly enable it.
+   */
+  VERTICAL_CLIP_PIPELINE_ENABLED: bool(false),
   VERTICAL_MIN_CROP_WIDTH: int(540, 64, 1080),
   /**
    * How many extra candidates to prepare per requested moment, so one media

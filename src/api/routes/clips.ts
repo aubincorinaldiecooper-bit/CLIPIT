@@ -133,6 +133,10 @@ export async function registerClipRoutes(app: FastifyInstance): Promise<void> {
    * captions come OFF a clip.
    */
   app.post('/api/clips/:clipId/captions', { preHandler: requireSession }, async (request, reply) => {
+    if (!env.VERTICAL_CLIP_PIPELINE_ENABLED) {
+      throw HttpError.notFound('Clip production is not part of the current MVP.');
+    }
+
     await enforceRateLimits(request, [
       { scope: 'generate', perSession: env.RATE_LIMIT_GENERATE_PER_SESSION_HOURLY, windowSeconds: 60 * 60 },
     ]);

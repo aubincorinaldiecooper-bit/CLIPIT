@@ -242,6 +242,9 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
     // A moment whose clip is mid-render cannot take new boundaries — say so
     // now, before any GPU time is spent finding boundaries it cannot apply.
     const clip = await getRootClipByMatchId(matchId);
+    if (clip && !env.VERTICAL_CLIP_PIPELINE_ENABLED) {
+      throw HttpError.notFound('Clip production is not part of the current MVP.');
+    }
     if (clip && clip.status !== 'ready' && clip.status !== 'failed') {
       throw HttpError.conflict('This clip is still rendering — try Re-clip when it finishes.');
     }
@@ -284,6 +287,10 @@ export async function registerClipRequestRoutes(app: FastifyInstance): Promise<v
    * this returns at once with clip records to poll.
    */
   app.post('/api/clip-requests/:requestId/generate', { preHandler: requireSession }, async (request, reply) => {
+    if (!env.VERTICAL_CLIP_PIPELINE_ENABLED) {
+      throw HttpError.notFound('Clip production is not part of the current MVP.');
+    }
+
     await enforceRateLimits(request, [
       {
         scope: 'generate',

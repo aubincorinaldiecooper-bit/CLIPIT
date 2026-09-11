@@ -21,9 +21,13 @@ Every summary, explanation, and status update is written for someone who is not 
 
 Commit messages, pull request descriptions, and code comments are where implementation precision belongs.
 
+## Clip production is dormant for the current MVP
+
+The 9:16 production/rendering implementation is retained for later, but it is not part of the current video-understanding MVP. `VERTICAL_CLIP_PIPELINE_ENABLED` stays false unless the owner explicitly brings clip production back into scope. Do not enable it as a side effect of unrelated work.
+
 ## Every delivered clip is vertical
 
-Every clip Clipit makes is 9:16. This is a product rule, not a default and not something the person's wording can change.
+When clip production is enabled again, every clip Clipit makes is 9:16. This is a product rule, not a default and not something the person's wording can change.
 
 The rule lives in `src/services/search/presentationTarget.ts`. Existing historical landscape files may still be described and played as they actually are, but any new or re-rendered deliverable is vertical.
 
