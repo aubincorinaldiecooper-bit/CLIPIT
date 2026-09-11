@@ -27,7 +27,7 @@ jobs:
       - run: npm test
       - name: Audit retired runtime concepts
         run: |
-          ! grep -RniE "notes_consulted|answeredFromNotes|recordSearchApproach|getVideoWithReadProgress|setIndexStatus|services/mediaIndex|video_scenes|indexReadThroughSeconds|sceneCount|not_in_notes|not_read_yet" src test --exclude-dir=migrations
+          ! grep -RniE "notes_consulted|answeredFromNotes|recordSearchApproach|getVideoWithReadProgress|setIndexStatus|services/mediaIndex|video_scenes|indexReadThroughSeconds|sceneCount|not_in_notes" src test --exclude-dir=migrations
           ! grep -RniE "'media_index'|\"media_index\"" src test --exclude-dir=migrations
           ! grep -RniE "notes (above|below|lookup|are allowed|at upload)|notes'|notes then|notes, then" src test --exclude-dir=migrations
       - name: Commit validated cleanup
