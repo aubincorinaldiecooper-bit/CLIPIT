@@ -81,6 +81,7 @@ export async function rerankSimpleMemCandidates(input: {
   videoUrl: string;
   videoKey: string;
   expectedBytes: number;
+  onUsage?: VideoUsageReporter;
 }): Promise<VerifiedSimpleMemCandidates> {
   const workDir = await mkdtemp(path.join(tmpdir(), 'clipit-simplemem-verify-'));
   const sourcePath = path.join(workDir, 'source.mp4');
@@ -110,7 +111,7 @@ export async function rerankSimpleMemCandidates(input: {
           videoPath: clipPath,
           videoStorageKey: storageKey,
           transcript: [],
-          onUsage: (row) => usage.push(row),
+          onUsage: (row) => { usage.push(row); input.onUsage?.(row); },
         });
         provider = result.provider;
         model = result.model;

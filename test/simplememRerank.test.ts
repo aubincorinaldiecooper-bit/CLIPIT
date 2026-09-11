@@ -1,49 +1,38 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
-const rerankVideoIntervals = vi.fn();
-vi.mock('../src/services/mediaIndex/qwen.js', () => ({ rerankVideoIntervals }));
+const run = vi.fn();
+const uploadFile = vi.fn();
+const remove = vi.fn();
+const searchVideoChunk = vi.fn();
+vi.mock('../src/lib/exec.js', () => ({ run }));
+vi.mock('../src/services/storage/s3.js', () => ({ getStorage: () => ({ uploadFile, remove }) }));
+vi.mock('../src/services/search/openrouterVideo.js', () => ({ searchVideoChunk }));
 
 const { rerankSimpleMemCandidates } = await import('../src/services/retrieval/simplemem/rerank.js');
-
 const candidates = [
   { startSeconds: 10, endSeconds: 15, score: 0.9, description: 'first', mauIds: ['a'], frames: 1 },
   { startSeconds: 30, endSeconds: 36, score: 0.8, description: 'second', mauIds: ['b'], frames: 1 },
 ];
 
 describe('Omni-SimpleMem candidate verification', () => {
-  it('uses the existing footage reranker and returns only candidates it verified', async () => {
-    rerankVideoIntervals.mockResolvedValue({
-      model: 'Qwen/Qwen3-VL-Reranker-2B', revision: 'r1',
-      ranked: [{ id: 'simplemem-1', score: 0.95 }],
-      failed: [{ id: 'simplemem-0', reason: 'interval unreadable' }], metrics: { gpu_ms: 20 },
-    });
-
-    const result = await rerankSimpleMemCandidates({
-      query: 'find the right sign', candidates, videoUrl: 'https://signed/video',
-      videoKey: 'proxy#etag', expectedBytes: 123,
-    });
-
-    expect(rerankVideoIntervals).toHaveBeenCalledWith({
-      query: 'find the right sign', videoUrl: 'https://signed/video', videoKey: 'proxy#etag', expectedBytes: 123,
-      candidates: [
-        { id: 'simplemem-0', start: 10, end: 15 },
-        { id: 'simplemem-1', start: 30, end: 36 },
-      ],
-    });
-    expect(result.candidates).toEqual([{ ...candidates[1], score: 0.95 }]);
-    expect(result.failed).toEqual([{ ...candidates[0], reason: 'interval unreadable' }]);
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]))));
+    run.mockResolvedValue({ stdout: '', stderr: '' });
+    uploadFile.mockResolvedValue(undefined);
+    remove.mockResolvedValue(undefined);
   });
+  afterEach(() => vi.unstubAllGlobals());
 
-  it('preserves the reranker order rather than SimpleMem similarity order', async () => {
-    rerankVideoIntervals.mockResolvedValue({
-      model: 'Qwen/Qwen3-VL-Reranker-2B', revision: 'r1',
-      ranked: [{ id: 'simplemem-1', score: 0.9 }, { id: 'simplemem-0', score: 0.7 }],
-      failed: [], metrics: {},
-    });
-
+  it('keeps only moments the normal footage watcher confirms', async () => {
+    searchVideoChunk
+      .mockResolvedValueOnce({ matches: [], warnings: [], rawResponse: '{"matches":[]}', provider: 'openrouter', model: 'qwen', promptVersion: 'p1' })
+      .mockResolvedValueOnce({ matches: [{ startSeconds: 0.5, endSeconds: 3, confidence: 0.95, description: 'confirmed' }], warnings: [], rawResponse: '{}', provider: 'openrouter', model: 'qwen', promptVersion: 'p1' });
     const result = await rerankSimpleMemCandidates({
-      query: 'x', candidates, videoUrl: 'u', videoKey: 'k', expectedBytes: 1,
+      query: 'find the right sign', candidates, videoUrl: 'https://signed/video', videoKey: 'proxy', expectedBytes: 123,
     });
-    expect(result.candidates.map((candidate: { description: string }) => candidate.description)).toEqual(['second', 'first']);
+    expect(result.candidates).toEqual([{ ...candidates[1], score: 0.95, description: 'confirmed' }]);
+    expect(result.failed[0]?.description).toBe('first');
+    expect(result.result.metrics.verifier).toBe('clipit-actual-footage');
+    expect(searchVideoChunk).toHaveBeenCalledTimes(2);
   });
 });

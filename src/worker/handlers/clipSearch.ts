@@ -97,19 +97,6 @@ function classifyChunkFailure(reason: unknown): ChunkFailureCode {
  * categories. Each chunk is searched independently, and a chunk that fails is
  * recorded and skipped rather than failing the whole request.
  */
-import { getMediaIndexStatus, listIndexedWindows } from '../../db/repositories/mediaIndex.js';
-import {
-  decideIndexAnswer,
-  footageWasReplaced,
-  IndexProvenanceChanged,
-  searchMediaIndex,
-  type IndexFallbackReason,
-  type IndexSearchCall,
-} from '../../services/mediaIndex/search.js';
-import { sourceIdentity } from '../../services/mediaIndex/sourceIdentity.js';
-import { unreadRanges } from '../../services/mediaIndex/coverage.js';
-import { planWindows, windowKey } from '../../services/mediaIndex/windows.js';
-import { estimateGpuCostUsd, gpuMsFrom } from '../../services/mediaIndex/cost.js';
 import { writeConversationalAnswer } from '../../services/search/conversationalAnswer.js';
 import { getSimpleMemIndex } from '../../db/repositories/simplememIndex.js';
 import { simplememQuery } from '../../services/retrieval/simplemem/client.js';
@@ -475,64 +462,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         primaryOutcome: fromSimpleMem.outcome,
       });
       log.info('Omni-SimpleMem handed the question on', { reason: fromSimpleMem.fallback });
-    }
-
-    const fromIndex = await answerFromMediaIndex({
-      clipRequestId,
-      deckAttemptId,
-      requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
-      video,
-      chunks,
-      instruction,
-      mode: resolved.mode,
-      correcting,
-      log,
-    });
-    if (fromIndex.matchCount > 0) {
-      await recordRetrievalOutcome(clipRequestId, {
-        primary: env.RETRIEVAL_PRIMARY === 'simplemem' ? 'simplemem' : 'media_index',
-        system: 'media_index',
-        fallbackReason: env.RETRIEVAL_PRIMARY === 'simplemem' ? fromSimpleMem.fallback : null,
-        primaryOutcome: env.RETRIEVAL_PRIMARY === 'simplemem' ? fromSimpleMem.outcome : fromIndex.outcome,
-      });
-      outcome = 'completed';
-      searchMode = resolved.mode;
-      chunkCount = 0;
-      return;
-    }
-    // Written to the row, not only the log. Every claim made for this design
-    // — how often the index answers, why it hands a question on, whether the
-    // fallback did better — can only be checked if the reason is durable. A
-    // reason that lives in a log line is not a record.
-    if (env.MEDIA_INDEX_ENABLED && env.RETRIEVAL_PRIMARY !== 'simplemem') {
-      // The reason and what the index produced, but NOT a claim about who
-      // answered: the fallback has not run yet, and it can still fail. A row
-      // saying Clipit answered a question nothing answered is worse than a
-      // row that says nothing. completeRequest fills the system in when a
-      // path actually succeeds.
-      await recordRetrievalOutcome(clipRequestId, {
-        primary: 'media_index',
-        system: null,
-        fallbackReason: fromIndex.fallback,
-        primaryOutcome: fromIndex.outcome,
-      });
-    } else if (env.MEDIA_INDEX_ENABLED && env.RETRIEVAL_PRIMARY === 'simplemem') {
-      // There is one primary/fallback column pair, so retain the nested media
-      // fallback inside the primary outcome instead of overwriting the reason
-      // SimpleMem handed off. This makes both decisions durable.
-      await recordRetrievalOutcome(clipRequestId, {
-        primary: 'simplemem',
-        system: null,
-        fallbackReason: fromSimpleMem.fallback,
-        primaryOutcome: {
-          ...(fromSimpleMem.outcome ?? {}),
-          mediaIndexFallback: fromIndex.fallback,
-          mediaIndexOutcome: fromIndex.outcome,
-        },
-      });
-    }
-    if (env.MEDIA_INDEX_ENABLED && fromIndex.fallback && fromIndex.fallback !== 'disabled') {
-      log.info('the media index handed the question on', { reason: fromIndex.fallback });
     }
 
     const notesAvailable = !correcting && video.indexStatus === 'ready';
@@ -1199,51 +1128,43 @@ async function answerFromSimpleMem(input: {
 
   let verified;
   try {
-    const source = await sourceIdentity(input.video.proxyStorageKey);
+    const object = await getStorage().head(input.video.proxyStorageKey);
     const videoUrl = await getStorage().createDownloadUrl(input.video.proxyStorageKey, {
-      expiresInSeconds: env.MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS,
+      expiresInSeconds: Math.max(60, Math.ceil(env.OPENROUTER_REQUEST_TIMEOUT_MS / 1000) + 60),
     });
-    const startedAt = new Date();
-    const began = performance.now();
     verified = await rerankSimpleMemCandidates({
       query: input.instruction,
       candidates: mapping.candidates,
       videoUrl,
-      videoKey: source.identity,
-      expectedBytes: source.sizeBytes,
+      videoKey: input.video.proxyStorageKey,
+      expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? 0,
+      onUsage: (usage) => {
+        void recordModelUsage({
+          ...usage,
+          stage: 'search',
+          videoId: input.video.id,
+          clipRequestId: input.clipRequestId,
+        });
+      },
     });
-    await recordModelUsage({
-      videoId: input.video.id,
-      clipRequestId: input.clipRequestId,
-      provider: 'modal',
-      model: verified.result.model,
-      stage: 'rerank',
-      promptTokens: 0,
-      completionTokens: 0,
-      totalTokens: 0,
-      costUsd: estimateGpuCostUsd(gpuMsFrom([verified.result.metrics])),
-      latencyMs: Math.round(performance.now() - began),
-      metrics: { ...verified.result.metrics, source: 'simplemem' },
-      startedAt,
-    }).catch(() => undefined);
   } catch (error) {
     const detail = errorMessage(error);
-    input.log.warn('Omni-SimpleMem candidates could not be verified; using fallback retrieval', { err: error });
+    input.log.warn('Omni-SimpleMem candidates could not be verified against the actual footage; using fallback retrieval', { err: error });
     return {
       matchCount: 0,
       released: false,
       fallback: 'primary_failed',
-      outcome: { ...baseOutcome, rerankError: detail },
+      outcome: { ...baseOutcome, verificationError: detail },
     };
   }
 
   const outcome = {
     ...baseOutcome,
     verifiedCandidates: verified.candidates.length,
-    rerankFailures: verified.failed.length,
-    rerankModel: verified.result.model,
-    rerankRevision: verified.result.revision,
-    rerankMetrics: verified.result.metrics,
+    verificationFailures: verified.failed.length,
+    verificationModel: verified.result.model,
+    verificationRevision: verified.result.revision,
+    verificationMetrics: verified.result.metrics,
   };
   if (verified.candidates.length === 0) {
     return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
@@ -1282,7 +1203,7 @@ async function answerFromSimpleMem(input: {
     const stillOwned = await recordChunkFailure(input.clipRequestId, {
       chunkIndex: chunk.chunkIndex,
       chunkId: chunk.id,
-      message: `Omni-SimpleMem found this candidate, but the reranker could not verify it: ${failure.reason}`,
+      message: `Omni-SimpleMem found this candidate, but the actual footage watcher could not verify it: ${failure.reason}`,
       code: 'not_read_yet',
       globalStartSeconds: failure.startSeconds,
       globalEndSeconds: failure.endSeconds,

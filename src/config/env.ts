@@ -41,20 +41,6 @@ const int = (defaultValue: number, min?: number, max?: number) =>
  * independently. A fixed number there is right only until somebody changes
  * the other one, and then it is silently wrong.
  */
-const optionalInt = (min?: number, max?: number) =>
-  z
-    .string()
-    .optional()
-    .transform((value) => (value === undefined || value === '' ? undefined : Number(value)))
-    .pipe(
-      (() => {
-        let schema = z.number().int();
-        if (min !== undefined) schema = schema.min(min);
-        if (max !== undefined) schema = schema.max(max);
-        return schema.optional();
-      })(),
-    );
-
 const num = (defaultValue: number, min?: number, max?: number) =>
   z
     .string()
@@ -243,155 +229,6 @@ const envSchema = z.object({
       const parsed = Number(value);
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
     }),
-  // --- Media Index: Qwen embeddings and reranking on Modal ---------------
-  /**
-   * The two deployed Qwen services. Separate apps from the video model, so
-   * each has its own name here rather than sharing MODAL_APP_NAME — one
-   * setting for three deployments is how the wrong class gets invoked.
-   */
-  MEDIA_INDEX_EMBED_APP: z.string().trim().default('clipit-embedding'),
-  MEDIA_INDEX_EMBED_CLASS: z.string().trim().default('QwenEmbeddingService'),
-  MEDIA_INDEX_RERANK_APP: z.string().trim().default('clipit-reranker'),
-  MEDIA_INDEX_RERANK_CLASS: z.string().trim().default('QwenRerankerService'),
-  /**
-   * Frozen onto every row. A vector is only comparable with another made by
-   * the same model at the same dimension, and a stored embedding that cannot
-   * say which model produced it is a vector nobody can ever safely use again.
-   */
-  MEDIA_INDEX_EMBED_MODEL: z.string().trim().default('Qwen/Qwen3-VL-Embedding-2B'),
-  MEDIA_INDEX_EMBED_DIMS: int(2048, 8, 16_000),
-  /** Same rule for the reranker: a misrouted deployment ranks confidently. */
-  MEDIA_INDEX_RERANK_MODEL: z.string().trim().default('Qwen/Qwen3-VL-Reranker-2B'),
-  /**
-   * Bumped by hand whenever anything that changes the MEANING of a vector
-   * changes: the model, the pooling, the frame sampling, the window grid.
-   * Retrieval only ever compares within one version, so an index built under
-   * the old rules is retired rather than quietly mixed with the new — which
-   * would look exactly like working search and would not be.
-   */
-  /**
-   * Read every uploaded video into vectors.
-   *
-   * On by default. It ships on because that is the decision that was made
-   * about this feature, and a default is where a decision like that lives.
-   *
-   * It shipped off once, guarded by the argument that turning it on starts a
-   * GPU call per batch of windows for every upload, and that the two Modal
-   * services must be deployed for it to do anything but fail — "neither is a
-   * thing this process can check for itself". The second half of that was
-   * simply untrue. `assertModalTargetAvailable` resolves a deployment without
-   * invoking it, and the worker now calls it at startup for both services
-   * (see worker/main.ts). So a missing deployment is one loud refusal to boot,
-   * not a silent failure on every upload, and the reason for the off default
-   * does not survive contact with the code that was already here.
-   *
-   * What remains true is the spending, and that is the point of the switch
-   * rather than an argument against its default: with this on, every upload
-   * costs GPU time, which is what reading every video into vectors is.
-   */
-  MEDIA_INDEX_ENABLED: bool(true),
-  MEDIA_INDEX_VERSION: z.string().trim().default('v1'),
-  /**
-   * The exact weights, when they are known. A model NAME is not an identity:
-   * the same name can serve different weights after a republish, and vectors
-   * from two sets of weights are no more comparable than vectors from two
-   * models. Left empty the revision is recorded on every reply but not
-   * demanded — the experiment has to run before anyone knows what to pin.
-   * Set it before the index becomes durable.
-   */
-  MEDIA_INDEX_EMBED_REVISION: z.string().trim().default(''),
-  /**
-   * The timeline grid. Experiment variables until the measurement settles
-   * them — but not independent ones: the three are checked against each other
-   * below, because two combinations inside these ranges leave parts of a
-   * video with no embedding at all.
-   */
-  MEDIA_INDEX_WINDOW_SECONDS: num(10, 1, 120),
-  MEDIA_INDEX_STRIDE_SECONDS: num(5, 0.5, 120),
-  MEDIA_INDEX_MIN_WINDOW_SECONDS: num(3, 0.5, 120),
-  /** How the model is shown a window. Part of a vector's identity. */
-  MEDIA_INDEX_SAMPLE_FPS: num(2, 0.1, 30),
-  MEDIA_INDEX_MAX_FRAMES: int(16, 1, 128),
-  MEDIA_INDEX_FRAME_SHORT_SIDE: int(256, 64, 1080),
-  /** How many windows ride in one Modal call. One fetch, many vectors. */
-  MEDIA_INDEX_BATCH_WINDOWS: int(32, 1, 512),
-  /**
-   * In-flight Modal calls. Every one can hold its own L4 and the bill is per
-   * GPU-second, so this stays low until measured — the same reasoning that
-   * keeps MINICPM_VIDEO_CONCURRENCY at one.
-   */
-  /**
-   * Below this a window is not a moment, whatever else it outscores.
-   *
-   * These are cosine similarities in Qwen's space and they are NOT
-   * calibrated: there is no measurement behind this number yet, and the right
-   * value has to come from real footage rather than intuition. It is a floor
-   * against the obviously-wrong (a negative or near-zero similarity is not a
-   * match under any reading), and the separation test below is what actually
-   * carries the decision.
-   */
-  MEDIA_INDEX_MIN_SCORE: num(0.05, 0, 1),
-  /**
-   * How far the best window must stand clear of a typical one, as a fraction
-   * of the spread across the whole video.
-   *
-   * This needs no calibration, which is why it does the real work. If every
-   * window scores about the same, the question distinguishes nothing in this
-   * video — that is what "not in here" looks like from the vectors, whatever
-   * the absolute numbers are. Zero disables it, and disabling it means the
-   * index answers every question with its closest guess.
-   */
-  MEDIA_INDEX_MIN_SEPARATION: num(0.35, 0, 1),
-  /** Windows shortlisted from the vectors before the reranker watches them. */
-  MEDIA_INDEX_TOP_K: int(20, 1, 200),
-  MEDIA_INDEX_CONCURRENCY: int(1, 1, 8),
-  MEDIA_INDEX_REQUEST_TIMEOUT_SECONDS: int(900, 30, 3600),
-  MEDIA_INDEX_MAX_RETRIES: int(2, 0, 5),
-  /**
-   * How often a worker that found Modal unreachable at startup asks again.
-   *
-   * The startup check retries over a few seconds, which covers a blip during a
-   * deploy but not an outage lasting minutes. Without this, such an outage
-   * leaves indexing off for the process's whole lifetime while uploads keep
-   * queueing work nothing consumes — and recovery needs a human to notice and
-   * restart a worker that looks entirely healthy.
-   *
-   * A minute: cheap enough to be invisible (resolving a deployment does not
-   * start a GPU) and short enough that recovery is measured in minutes rather
-   * than however long it takes somebody to look.
-   */
-  MEDIA_INDEX_RECHECK_INTERVAL_MS: int(60_000, 5_000, 3_600_000),
-  /**
-   * How often a run reading a video says it is still alive.
-   *
-   * Deliberately separate from progress. Progress lands when a batch of
-   * windows returns, and a batch waits for a Modal permit that searches
-   * compete for, then retries internally — so time-since-progress measures how
-   * busy the system is, not whether anything is still reading. The heartbeat
-   * ticks regardless of what the batch is waiting for, which is the only way
-   * silence can honestly mean "the process is gone".
-   *
-   * Half a minute: one small UPDATE per running video, invisible next to a GPU
-   * call, and frequent enough that a dead run is noticed in a couple of
-   * minutes.
-   */
-  MEDIA_INDEX_HEARTBEAT_SECONDS: int(30, 5, 600),
-  /**
-   * How long a run may say nothing before it is presumed to have stopped.
-   *
-   * Unset by default: it resolves to three missed heartbeats (see loadEnv),
-   * and an explicit value is refused if it falls at or under a single beat.
-   *
-   * This exists because of the one failure the indexing handler cannot report
-   * on its own: it records `failed` in its error path, but that record is
-   * itself a database write, and when THAT write fails the row keeps saying
-   * `running` with nothing left alive to correct it. Without this, such a
-   * video is described as "still being read" for as long as it exists, and
-   * every question about it quietly takes the slow, expensive path while the
-   * system says something reassuring and false.
-   */
-  MEDIA_INDEX_STALE_AFTER_SECONDS: optionalInt(10, 86_400),
-
   // --- Retrieval primary: Omni-SimpleMem tried first, Clipit's own search as the fallback
   /**
    * Which system a question goes to first. `clipit` is today's behaviour
@@ -549,10 +386,6 @@ const envSchema = z.object({
   TRANSCRIBE_SEGMENT_SECONDS: int(900, 60, 3_600),
   TRANSCRIBE_AUDIO_BITRATE: z.string().default('48k'),
   TRANSCRIBE_LANGUAGE: z.string().trim().optional(),
-  /** Prefer creator/auto captions from yt-dlp before paying for Whisper. */
-  YOUTUBE_PREFER_CAPTIONS: bool(true),
-  YOUTUBE_CAPTION_LANGS: z.string().default('en.*,en'),
-
   // --- Sessions & rate limiting ------------------------------------------
   /**
    * Shared secret between the frontend server and this API, for exchanging a
@@ -689,23 +522,7 @@ const envSchema = z.object({
   TRANSCRIPT_WAIT_POLL_MS: int(10_000, 1_000, 120_000),
   FFMPEG_PATH: z.string().default('ffmpeg'),
   FFPROBE_PATH: z.string().default('ffprobe'),
-  /**
-   * Whether a video may be created from a YouTube URL. Off: the route refuses
-   * one, the worker neither requires nor calls yt-dlp, and uploads are the
-   * only way in. Everything yt-dlp needs to work from a server is still here
-   * and is turned back on with one variable.
-   */
-  YOUTUBE_INGESTION_ENABLED: bool(false),
-  YTDLP_PATH: z.string().default('yt-dlp'),
-  YTDLP_FORMAT: z.string().default('bv*[height<=1080]+ba/b[height<=1080]/b'),
-  YTDLP_JS_RUNTIMES: z.string().trim().default('node'),
-  YTDLP_POT_BASE_URL: z.string().trim().optional(),
-  YTDLP_COOKIES_FILE: z.string().trim().optional(),
-  YTDLP_COOKIES_CONTENT: z.string().optional(),
-  YTDLP_PROXY: z.string().trim().optional(),
-  YTDLP_VERBOSE: bool(false),
-  YTDLP_EXTRACTOR_ARGS: z.string().trim().optional(),
-  /** Root for transient ffmpeg / yt-dlp scratch files. */
+  /** Root for transient ffmpeg scratch files. */
   WORK_DIR: z.string().default('/tmp/clipit'),
 
   // --- Workers ------------------------------------------------------------
@@ -718,36 +535,7 @@ const envSchema = z.object({
   JOB_BACKOFF_MS: int(5_000, 100, 600_000),
 });
 
-/**
- * MEDIA_INDEX_STALE_AFTER_SECONDS is optional in the schema and always present
- * here: loadEnv derives it from the request timeout when it is unset, so every
- * consumer gets a number and none of them has to know where it came from.
- */
-export type Env = Omit<z.infer<typeof envSchema>, 'MEDIA_INDEX_STALE_AFTER_SECONDS'> & {
-  MEDIA_INDEX_STALE_AFTER_SECONDS: number;
-};
-
-/**
- * How many heartbeats a run may miss before it is presumed gone.
- *
- * Three, so a single dropped write — a connection reset, a failover — is not a
- * verdict, while a process that actually died is noticed in a couple of
- * minutes rather than an hour.
- */
-const MISSED_HEARTBEATS_BEFORE_STOPPED = 3;
-
-/**
- * How long one heartbeat write may take before the database gives up on it.
- *
- * Exported because two places must agree on it and neither may guess: the
- * repository applies it as a statement timeout on the write, and the check
- * below has to allow for it. Beats are CHAINED — the next is scheduled only
- * once the current one settles — so the real gap between two beats is the
- * interval PLUS however long the write took, and a threshold that counts only
- * the interval will call a live run stopped while its heartbeat is still in
- * flight.
- */
-export const MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS = 10;
+export type Env = z.infer<typeof envSchema>;
 
 function loadEnv(): Env {
   const parsed = envSchema.safeParse(process.env);
@@ -767,21 +555,6 @@ function loadEnv(): Env {
   if (value.MAX_CLIP_SECONDS < value.MIN_CLIP_SECONDS) {
     problems.push('MAX_CLIP_SECONDS must be >= MIN_CLIP_SECONDS');
   }
-  // The Media Index grid has to be able to cover a timeline. Two combinations
-  // inside the individual ranges cannot: a stride longer than a window leaves
-  // a hole between every pair, and a minimum longer than a window disqualifies
-  // all of them. Caught at startup rather than at the first video, and again
-  // in planWindows for anything that builds a plan by hand.
-  if (value.MEDIA_INDEX_STRIDE_SECONDS > value.MEDIA_INDEX_WINDOW_SECONDS) {
-    problems.push(
-      'MEDIA_INDEX_STRIDE_SECONDS must be <= MEDIA_INDEX_WINDOW_SECONDS, or parts of every video go unindexed',
-    );
-  }
-  if (value.MEDIA_INDEX_MIN_WINDOW_SECONDS > value.MEDIA_INDEX_WINDOW_SECONDS) {
-    problems.push(
-      'MEDIA_INDEX_MIN_WINDOW_SECONDS must be <= MEDIA_INDEX_WINDOW_SECONDS, or no window ever qualifies',
-    );
-  }
   if (value.RETRIEVAL_PRIMARY === 'simplemem' && !value.SIMPLEMEM_URL) {
     problems.push('RETRIEVAL_PRIMARY=simplemem requires SIMPLEMEM_URL');
   }
@@ -793,49 +566,9 @@ function loadEnv(): Env {
   if (value.SIMPLEMEM_INDEX_ENABLED && !value.SIMPLEMEM_URL) {
     problems.push('SIMPLEMEM_INDEX_ENABLED=true requires SIMPLEMEM_URL');
   }
-  // MEDIA_INDEX_ENABLED's demand for Modal credentials is NOT checked here,
-  // and the reason is the difference between a degraded feature and an outage.
-  // This file is loaded by both processes, and only the worker ever calls
-  // Modal — the API reads MEDIA_INDEX_ENABLED nowhere. A check here fails the
-  // API for the absence of a credential it must never be given, which is the
-  // same rule the MiniCPM token already follows: "the API never receives
-  // infrastructure credentials it does not use" (worker/main.ts). Enforced
-  // there, on the process that actually spends the token.
   if (value.TRANSCRIPTION_ENABLED && !value.OPENROUTER_API_KEY) {
     problems.push(
       'OPENROUTER_API_KEY is required when TRANSCRIPTION_ENABLED=true (set TRANSCRIPTION_ENABLED=false to run visual-only search)',
-    );
-  }
-
-  // A run is judged gone by its silence, and what it is silent BETWEEN is the
-  // heartbeat, not the batches. That distinction is the whole design.
-  //
-  // Deriving this from batch timing was tried twice and is not fixable. A
-  // batch's duration is its permit wait plus its retries plus their backoff,
-  // and the permit wait — searches and indexing share the same permits — is
-  // bounded by nothing at all. Any multiplier over the request timeout is a
-  // guess about contention dressed as arithmetic, and every version of it
-  // eventually calls a healthy read dead.
-  //
-  // The heartbeat removes the guess: the worker says it is alive on a fixed
-  // timer whatever it is waiting for, so this only has to outlast a few missed
-  // beats.
-  const heartbeatSeconds = value.MEDIA_INDEX_HEARTBEAT_SECONDS;
-
-  // The gap between two beats is the interval PLUS the write, not the interval
-  // alone: beats are chained, so the next is scheduled only once the current
-  // one settles, and the write is allowed up to its statement timeout. A
-  // threshold above the interval but below their sum is accepted-looking and
-  // wrong — it expires while a perfectly healthy heartbeat is still in flight.
-  const slowestBeatSeconds = heartbeatSeconds + MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS;
-
-  if (value.MEDIA_INDEX_STALE_AFTER_SECONDS !== undefined
-      && value.MEDIA_INDEX_STALE_AFTER_SECONDS <= slowestBeatSeconds) {
-    problems.push(
-      `MEDIA_INDEX_STALE_AFTER_SECONDS (${value.MEDIA_INDEX_STALE_AFTER_SECONDS}) must be greater than ` +
-        `${slowestBeatSeconds} — MEDIA_INDEX_HEARTBEAT_SECONDS (${heartbeatSeconds}) plus the ` +
-        `${MEDIA_INDEX_HEARTBEAT_WRITE_TIMEOUT_SECONDS}s a beat's own write is allowed — or a run is ` +
-        'called stopped while its heartbeat is still in flight',
     );
   }
 
@@ -843,21 +576,7 @@ function loadEnv(): Env {
     console.error(`\nInvalid environment configuration:\n${problems.map((p) => `  - ${p}`).join('\n')}\n`);
     process.exit(1);
   }
-  return {
-    ...value,
-    // Three missed beats. The two errors are not symmetric: declaring a live
-    // read dead reports a failure that never happened, while noticing a dead
-    // one late only delays a fallback that already works — so the margin goes
-    // to never accusing, and one dropped write is never a verdict.
-    // Missed beats counted at their SLOWEST, not at the interval. Derived from
-    // the interval alone, a heartbeat of 5s gave 15s — exactly one slow beat
-    // (5s of waiting plus the 10s its write is allowed), so an entirely
-    // healthy run could be called stopped on its first slow write. The default
-    // has to clear the same bar the explicit check enforces, or the check is
-    // stricter than the value it hands out.
-    MEDIA_INDEX_STALE_AFTER_SECONDS:
-      value.MEDIA_INDEX_STALE_AFTER_SECONDS ?? slowestBeatSeconds * MISSED_HEARTBEATS_BEFORE_STOPPED,
-  };
+  return value;
 }
 
 export const env: Env = loadEnv();

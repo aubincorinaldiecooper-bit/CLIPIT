@@ -22,13 +22,11 @@ import { shouldDiscardOnUploadFailure } from '../../services/media/verticalPipel
 import { getVideo, replaceChunks, setIndexStatus, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
 import {
   enqueueIndexing,
-  enqueueMediaIndexing,
   enqueueSimpleMemIndexing,
   enqueueTranscription,
   type PreprocessingJob,
 } from '../../queues/index.js';
 import { setSimpleMemIndexStatus } from '../../db/repositories/simplememIndex.js';
-import { setMediaIndexStatus } from '../../db/repositories/mediaIndex.js';
 
 
 interface DerivedMedia {
@@ -486,35 +484,7 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
         }
       }
 
-      // 6. Read the video into vectors as well, when the Media Index is on.
-      //    Its own job, its own row, its own failure: the notes above are
-      //    untouched by it, so a video whose vectors fail is still searchable
-      //    exactly as it is today.
-      if (env.MEDIA_INDEX_ENABLED) {
-        try {
-          // Coverage is reset here, not when the run opens. Re-processing
-          // replaces the footage at the same key, and until the first
-          // embedding reply arrives the status still describes the PREVIOUS
-          // video — so a question asked in that window would be answered
-          // with moments chosen from footage that no longer exists. Zero
-          // coverage makes the index unsearchable until the new run has
-          // actually read something. A retry of the same footage loses
-          // nothing: the run recounts from the windows it retains.
-          await setMediaIndexStatus(videoId, 'queued', {
-            coveredThroughSeconds: 0,
-            windowsStored: 0,
-            windowsFailed: 0,
-          });
-          await enqueueMediaIndexing({ videoId });
-        } catch (error) {
-          log.error('could not queue media indexing', { err: error });
-          await setMediaIndexStatus(videoId, 'failed', {
-            error: `Could not queue media indexing: ${errorMessage(error)}`,
-          }).catch(() => undefined);
-        }
-      }
-
-      // 7. Send the video to Omni-SimpleMem as well, when it is being tried.
+      // 6. Send the video to Omni-SimpleMem after preprocessing.
       //    Its own read, its own row, its own failure: the notes above are
       //    untouched by it, which is what keeps the fallback whole.
       if (env.SIMPLEMEM_INDEX_ENABLED) {
