@@ -75,7 +75,7 @@ jobs:
 
           replace_once(
               'CLAUDE.md',
-              "## Every delivered clip is vertical\n\nWhen clip production is enabled again, every clip Clipit makes is 9:16. This is a product rule, not a default and not something the person's wording can change.",
+              "## Every delivered clip is vertical\n\nEvery clip Clipit makes is 9:16. This is a product rule, not a default and not something the person's wording can change.",
               "## Clip production is dormant for the current MVP\n\nThe 9:16 production/rendering implementation is retained for later, but it is not part of the current video-understanding MVP. `VERTICAL_CLIP_PIPELINE_ENABLED` stays false unless the owner explicitly brings clip production back into scope. Do not enable it as a side effect of unrelated work.\n\n## Every delivered clip is vertical\n\nWhen clip production is enabled again, every clip Clipit makes is 9:16. This is a product rule, not a default and not something the person's wording can change.",
           )
 
@@ -85,7 +85,6 @@ jobs:
               "## Clip production\n\nClip production is retained in the repository but **dormant for the current MVP**. `VERTICAL_CLIP_PIPELINE_ENABLED=false` prevents new Keep/generate and caption-render work from entering the production queue. Existing read-only clip/library behavior can remain available while the MVP focuses on video search and understanding.\n\nWhen deliberately re-enabled later, produced clips remain 9:16. MiniCPM stays available as an optional framing/video provider.\n",
           )
 
-          # Make the top-level product description and architecture diagram match the MVP.
           p = Path('README.md')
           text = p.read_text()
           text = text.replace(
@@ -97,7 +96,6 @@ jobs:
           text = text.replace("The worker handles media processing, transcription, SimpleMem indexing, footage verification, clipping, rendering, retention, and scheduled work.", "The worker handles media processing, transcription, SimpleMem indexing, footage verification, retention, and scheduled work. Clip rendering code is retained but dormant for the MVP.")
           p.write_text(text)
 
-          # Confirm that the retained provider lane is untouched and the dormant guard exists.
           checks = {
               'src/config/env.ts': ['VIDEO_PROVIDER', 'minicpm', 'VERTICAL_CLIP_PIPELINE_ENABLED'],
               'src/api/routes/clipRequests.ts': ['VERTICAL_CLIP_PIPELINE_ENABLED'],
