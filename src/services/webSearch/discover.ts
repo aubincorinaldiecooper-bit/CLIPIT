@@ -68,7 +68,8 @@ export async function discoverInternetVideos(
         return {
           ok: false as const,
           query,
-          error: error instanceof Error ? error.message : String(error),
+          error,
+          message: error instanceof Error ? error.message : String(error),
         };
       }
     }),
@@ -77,10 +78,11 @@ export async function discoverInternetVideos(
   const successful = settled.filter((entry): entry is Extract<(typeof settled)[number], { ok: true }> => entry.ok);
   const failures = settled.filter((entry): entry is Extract<(typeof settled)[number], { ok: false }> => !entry.ok);
 
-  // If every search failed, surface the first provider failure rather than
-  // disguising an outage as an honest zero-result search.
+  // Preserve the provider's typed dependency error. The API error handler can
+  // then return its normal upstream-unavailable response instead of turning a
+  // Brave outage into an unrelated generic 500.
   if (successful.length === 0 && failures.length > 0) {
-    throw new Error(`All video searches failed: ${failures[0]!.error}`);
+    throw failures[0]!.error;
   }
 
   const rawResults = successful.reduce((sum, entry) => sum + entry.results.length, 0);
@@ -104,7 +106,7 @@ export async function discoverInternetVideos(
       candidatesReturned: candidates.length,
       latencyMs: Math.round(performance.now() - started),
     },
-    searchFailures: failures.map((failure) => ({ query: failure.query, message: failure.error })),
+    searchFailures: failures.map((failure) => ({ query: failure.query, message: failure.message })),
     evidencePolicy: {
       searchResultsAreEvidence: false,
       analyzedCandidates: 0,
