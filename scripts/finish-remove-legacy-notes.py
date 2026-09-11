@@ -34,6 +34,12 @@ replacements = {
 }
 for old, new in replacements.items():
     s = s.replace(old, new)
+# Catch wording variants that survived because an adjacent comment changed over
+# time. These phrases describe only the retired architecture, never a schema
+# compatibility field.
+s = s.replace('notes path', 'retrieval path')
+s = s.replace('notes came up empty', 'memory could not settle the request')
+s = s.replace('the notes path', 'the retrieval path')
 write(p, s)
 
 # The preparation fencing test should continue proving that questions can be
