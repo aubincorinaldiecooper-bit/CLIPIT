@@ -17,7 +17,6 @@ import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVide
 import { handleIngestion } from './handlers/ingestion.js';
 import { handlePreprocessing } from './handlers/preprocess.js';
 import { handleTranscription } from './handlers/transcription.js';
-import { handleIndexing } from './handlers/indexing.js';
 import { handleSimpleMemIndexing } from './handlers/simplememIndexing.js';
 import { handleClipSearch } from './handlers/clipSearch.js';
 import { handleClipGeneration } from './handlers/clipGeneration.js';
@@ -114,10 +113,8 @@ async function main(): Promise<void> {
     nodeEnv: env.NODE_ENV,
     transcription: env.TRANSCRIPTION_ENABLED,
     videoModel: env.OPENROUTER_VIDEO_MODEL,
-    // One number, and it governs everything that sends video: reading a video
-    // at upload and searching its footage both pass through the same gate.
+    // The configured ceiling for actual-footage verification/search calls.
     videoCallConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
-    indexing: env.INDEXING_ENABLED,
     // On by default now, and it spends GPU time on every upload — an operator
     // reading one startup line should be able to see that without going
     // looking for it.
@@ -146,11 +143,6 @@ async function main(): Promise<void> {
   startWorker(QUEUE_NAMES.ingestion, handleIngestion, env.INGESTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.preprocessing, handlePreprocessing, env.PREPROCESS_CONCURRENCY);
   startWorker(QUEUE_NAMES.transcription, handleTranscription, env.TRANSCRIPTION_CONCURRENCY);
-  // One video at a time. Reading a video is many model calls, and the shared
-  // semaphore in the video client already bounds how many run at once — a
-  // second video indexing in parallel would only queue behind it while making
-  // a search someone is waiting on wait longer.
-  startWorker(QUEUE_NAMES.indexing, handleIndexing, 1);
   // One at a time as well: a SimpleMem read is a captioning call per kept
   // frame, and the sidecar is one process on one box.
   startWorker(QUEUE_NAMES.simplememIndexing, handleSimpleMemIndexing, 1);

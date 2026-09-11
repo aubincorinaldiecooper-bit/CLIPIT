@@ -19,9 +19,8 @@ import {
 } from '../../services/media/ffmpeg.js';
 import { mib, readContainerMemory } from '../../lib/containerMemory.js';
 import { shouldDiscardOnUploadFailure } from '../../services/media/verticalPipeline.js';
-import { getVideo, replaceChunks, setIndexStatus, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
+import { getVideo, replaceChunks, setTranscriptStatus, setVideoStatus, updateVideoMedia } from '../../db/repositories/videos.js';
 import {
-  enqueueIndexing,
   enqueueSimpleMemIndexing,
   enqueueTranscription,
   type PreprocessingJob,
@@ -464,29 +463,7 @@ export async function handlePreprocessing(job: Job<PreprocessingJob>): Promise<v
         firstChunkReadyMs: derived.firstChunkReadyMs,
       });
 
-      // 5. Read the video into notes, once, so questions can be answered from
-      //    text instead of re-reading the whole video every time one is asked.
-      //    Queued after the video is already searchable, so indexing never
-      //    delays the first question — it only makes the later ones cheap.
-      if (!env.INDEXING_ENABLED) {
-        await setIndexStatus(videoId, 'unavailable', { error: 'Indexing is disabled' });
-      } else {
-        try {
-          await setIndexStatus(videoId, 'queued');
-          await enqueueIndexing({ videoId });
-        } catch (error) {
-          // The video stays searchable; questions simply read the footage
-          // until something queues this again.
-          log.error('could not queue indexing', { err: error });
-          await setIndexStatus(videoId, 'failed', {
-            error: `Could not queue indexing: ${errorMessage(error)}`,
-          });
-        }
-      }
-
-      // 6. Send the video to Omni-SimpleMem after preprocessing.
-      //    Its own read, its own row, its own failure: the notes above are
-      //    untouched by it, which is what keeps the fallback whole.
+      // 5. Send the prepared video to Omni-SimpleMem, the upload-time memory index.
       if (env.SIMPLEMEM_INDEX_ENABLED) {
         try {
           await setSimpleMemIndexStatus(videoId, 'queued');

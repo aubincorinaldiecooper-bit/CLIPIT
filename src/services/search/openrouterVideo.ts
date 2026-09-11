@@ -14,8 +14,8 @@ export type ContentPart =
 /**
  * One call to the video model, whatever it is being asked.
  *
- * Search and indexing send the same kind of request — a system prompt, some
- * text, and a chunk of MP4 — and both need the timeout split, the usage
+ * Actual-footage searches send a system prompt, text, and a chunk of MP4,
+ * and need the timeout split, the usage
  * accounting, and above all the rule that an answer which ran out of room is
  * never read as an empty one. That rule is the reason this is shared rather
  * than copied: a second implementation would be a second place for a chunk to
@@ -27,17 +27,9 @@ export interface VideoModelRequest {
   systemPrompt: string;
   parts: ContentPart[];
   videoBytes: number;
-  /**
-   * Room for the answer. Describing everything in two minutes of video needs
-   * more of it than naming a few matching moments does.
-   */
+  /** Room for the model answer. */
   answerMaxTokens?: number;
-  /**
-   * What the call is for. Also picks the queue: a `notes` call carries no
-   * video and returns in seconds, so it must not wait behind an indexing run
-   * — the whole point of the notes is that answering from them is immediate.
-   */
-  purpose: 'search' | 'index' | 'notes';
+  purpose: 'search';
   onUsage?: VideoUsageReporter;
   /**
    * Where the chunk lives in storage. The MiniCPM provider hands Modal a
@@ -147,12 +139,6 @@ export interface VideoSearchResult {
 type ReasoningPolicy = 'budgeted' | 'off';
 
 const videoLimiter = new Semaphore(env.OPENROUTER_VIDEO_CONCURRENCY);
-/**
- * Text-only calls get their own lane. They cost a fraction of a video call and
- * finish in seconds; queueing them behind ten chunks of indexing would put the
- * fast path behind the slow one and undo the reason for having notes at all.
- */
-const textLimiter = new Semaphore(env.OPENROUTER_TEXT_CONCURRENCY);
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
 /**
@@ -201,11 +187,6 @@ export function videoCallStats(): { limit: number; inFlight: number; peak: numbe
 /** Starts a fresh high-water mark, so one job's peak belongs to that job. */
 export function resetVideoCallPeak(): void {
   videoLimiter.resetPeak();
-}
-
-/** The same, for the text lane that answers from notes. */
-export function textCallStats(): { limit: number; inFlight: number; peak: number } {
-  return textLimiter.snapshot();
 }
 
 function headers(): Record<string, string> {
@@ -515,18 +496,11 @@ async function completeOrAnswerWithoutThinking(input: VideoModelRequest): Promis
 /**
  * Asks the single configured Qwen model one question about one chunk; no
  * fallback and no escalation to another model. The semaphore is shared across
- * every caller, so indexing a video cannot crowd out a search someone is
- * waiting on beyond the configured concurrency.
+ * every caller, so actual-footage work stays within the configured concurrency.
  */
 export async function askVideoModel(input: VideoModelRequest): Promise<VideoModelAnswer> {
-  /**
-   * The provider seam. Notes lookups carry no video and stay on OpenRouter's
-   * text lane under either provider — the switch governs only calls that
-   * read actual footage. MiniCPM keeps its own queue, retries and cost
-   * accounting behind the same answer shape, so nothing above this line
-   * knows which service watched the video.
-   */
-  if (env.VIDEO_PROVIDER === 'minicpm' && input.purpose !== 'notes') {
+  /** Provider seam for actual-footage calls. */
+  if (env.VIDEO_PROVIDER === 'minicpm') {
     if (!input.videoStorageKey) {
       // A video call with no storage key cannot be sent by URL. Loud, not
       // quiet: falling back to OpenRouter here would silently unmake the
@@ -539,8 +513,7 @@ export async function askVideoModel(input: VideoModelRequest): Promise<VideoMode
     return askMiniCpmVideo({ ...input, videoStorageKey: input.videoStorageKey });
   }
 
-  const limiter = input.purpose === 'notes' ? textLimiter : videoLimiter;
-  return limiter.run(async () => {
+  return videoLimiter.run(async () => {
     let lastError: unknown;
     for (let attempt = 0; attempt <= env.OPENROUTER_MAX_RETRIES; attempt += 1) {
       try {

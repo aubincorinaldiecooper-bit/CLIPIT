@@ -15,21 +15,18 @@ import {
   searchVideoChunk,
   videoCallStats,
 } from '../../services/search/openrouterVideo.js';
-import { searchNotes } from '../../services/search/noteSearch.js';
 import { isCorrection } from '../../services/search/rescanPolicy.js';
 import { assertVideoInputSupported } from '../../services/search/modelCapabilities.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
 import { aggregateMatches } from '../../services/search/aggregateMatches.js';
-import type { NoteLine, TranscriptLine } from '../../services/search/prompt.js';
+import type { TranscriptLine } from '../../services/search/prompt.js';
 import {
-  findUncoveredRanges,
   mapGlobalRangeToChunk,
   mapLocalRangeToGlobal,
   mergeOverlappingRanges,
 } from '../../services/timestamps.js';
 import { getVideo, listChunks } from '../../db/repositories/videos.js';
-import { listTranscriptSegments, listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
-import { listScenes, sceneProgress } from '../../db/repositories/scenes.js';
+import { listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
 import {
   claimClipRequestAttempt,
   finishClipRequest,
@@ -155,7 +152,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   let intent = resolvePlatformIntent(request.instruction, env.MAX_CLIP_SECONDS, {
     maxCount: env.VERTICAL_CANDIDATE_CEILING,
   });
-  /** Milliseconds this question has already spent parked for the notes or the transcript, across every re-queue. */
+  /** Milliseconds this question has already spent parked for the transcript, across every re-queue. */
   const waitedMs = job.data.waitedMs ?? 0;
   /**
    * Milliseconds spent parked for the video's preparation, counted apart
@@ -202,8 +199,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
      * "Are you sure?" describes no moment, so searching it literally can only
      * fail — and the failure is indistinguishable from the app ignoring the
      * user. What it means is: your last answer was wrong. So the previous
-     * question is re-run, and it goes straight to the footage, because the
-     * notes have already had their turn and did not settle it.
+     * question is re-run and goes straight to actual footage rather than
+     * trusting a previous retrieval result.
      */
     let instruction = request.instruction;
     let correcting = false;
@@ -257,7 +254,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // handed one finished card — the progressive reveal the whole rule forbids,
     // appearing only under timing nobody tests for.
     //
-    // It sits above the notes path deliberately. Answering from memory is a
+    // It sits above the retrieval path deliberately. Answering from memory is a
     // real answer and reaches finishClipRequest on its own; if the plan were
     // recorded further down, a question answered from the notes would never be
     // marked as owing a deck at all.
@@ -292,84 +289,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       requested: request.mode,
       transcriptAvailable: transcriptReady || transcriptPending,
     });
-
-    /**
-     * Waiting for the video to finish being read.
-     *
-     * A question asked while indexing is still running used to fall straight
-     * through to the footage: ten calls carrying MP4 bytes, two minutes, and
-     * fifty times the cost of the same question asked ninety seconds later.
-     * Nobody chose that — it was just what happened when the notes were not
-     * ready yet, and the screen told the user we would wait.
-     *
-     * So we wait, which is what it already said. The wall clock is no worse —
-     * reading the footage takes about as long as finishing the notes — and it
-     * costs a fraction. A correction skips this: it is going to the footage
-     * anyway, so the notes finishing changes nothing for it.
-     */
-    const indexPending =
-      video.indexStatus === 'pending' || video.indexStatus === 'queued' || video.indexStatus === 'running';
-
-    /**
-     * Notes are written chunk by chunk, so a read in progress still has some.
-     * Try them: a question about the first five minutes can be answered while
-     * the last five are still being read, and the part not yet read is named
-     * in the answer rather than passed off as searched.
-     *
-     * Only if that finds nothing do we wait — and waiting beats falling
-     * through to the footage, which costs about the same time and fifty times
-     * the money for an answer the notes are about to be able to give.
-     */
-    if (!correcting && indexPending && waitedMs < env.INDEX_WAIT_TIMEOUT_MS) {
-      const readSoFar = await sceneProgress(video.id);
-
-      if (readSoFar.count > 0) {
-        const answered = await answerFromNotes({
-          clipRequestId,
-          deckAttemptId,
-          requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
-          video,
-          chunks,
-          instruction,
-          mode: desired.mode,
-          tally,
-          log,
-          readComplete: false,
-        });
-
-        if (answered.matchCount > 0) {
-          if (answered.released) {
-            log.info('answered from the part read so far', {
-              matches: answered.matchCount,
-              readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
-              ofSeconds: Math.round(video.durationSeconds ?? 0),
-            });
-          } else {
-            log.warn('answered from the part read so far, but the answer was superseded', {
-              matches: answered.matchCount,
-              readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
-              ofSeconds: Math.round(video.durationSeconds ?? 0),
-            });
-          }
-          outcome = 'completed';
-          searchMode = desired.mode;
-          chunkCount = 0;
-          return;
-        }
-      }
-
-      log.info('waiting for the video to finish being read', {
-        waitedMs,
-        indexStatus: video.indexStatus,
-        readThroughSeconds: Math.round(readSoFar.readThroughSeconds),
-        scenesSoFar: readSoFar.count,
-      });
-      await enqueueClipSearch(
-        { clipRequestId, waitedMs: waitedMs + env.INDEX_WAIT_POLL_MS },
-        { delay: env.INDEX_WAIT_POLL_MS },
-      );
-      return;
-    }
 
     if (desired.mode !== 'visual' && transcriptPending && waitedMs < env.TRANSCRIPT_WAIT_TIMEOUT_MS) {
       log.info('waiting for transcript before searching', {
@@ -422,14 +341,10 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // upload is not covering what people ask, while no notes at all says
     // nothing about the reading and everything about the video's age.
     /**
-     * Omni-SimpleMem first once upload-time reading has settled.
-     *
-     * Another memory, asked before the notes because it holds a different
-     * thing: the notes say what a model thought worth writing down, while its
-     * timestamped visual memories describe selected frames. Anything but
-     * a confident hit hands the question straight on to the notes below, with
-     * the reason recorded — the index is never allowed to end a search by
-     * finding nothing.
+     * Omni-SimpleMem is the memory/retrieval layer. A confident candidate is
+     * verified against actual footage before it can become evidence. A miss or
+     * unavailable index falls through to the full actual-footage search; memory
+     * is never allowed to prove absence by itself.
      */
     const fromSimpleMem = await answerFromSimpleMem({
       clipRequestId,
@@ -464,31 +379,6 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       log.info('Omni-SimpleMem handed the question on', { reason: fromSimpleMem.fallback });
     }
 
-    const notesAvailable = !correcting && video.indexStatus === 'ready';
-    if (!correcting) await recordSearchApproach(clipRequestId, { notesConsulted: notesAvailable });
-
-    if (notesAvailable) {
-      const answered = await answerFromNotes({
-        clipRequestId,
-        deckAttemptId,
-        requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
-        video,
-        chunks,
-        instruction,
-        mode: resolved.mode,
-        tally,
-        log,
-        readComplete: true,
-      });
-
-      if (answered.matchCount > 0) {
-        outcome = 'completed';
-        searchMode = resolved.mode;
-        chunkCount = 0;
-        return;
-      }
-    }
-
     // One cheap check before uploading megabytes per chunk: a model without
     // video endpoints refuses every chunk identically, and finding that out
     // once is worth more than finding it out N times.
@@ -498,12 +388,12 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // So the peak reported at the end belongs to this search.
     resetVideoCallPeak();
     // Reading the footage is the only path that can report a real absence, so
-    // it is the only one that runs when the notes came up empty.
+    // it is the only one that runs when the memory could not settle the request.
     // Clear anything from a previous attempt so a retry cannot double-insert,
     // taking its rendered media with it rather than orphaning it.
     await clearPreviousAttempt(clipRequestId, log, deckAttemptId);
 
-    // (the deck plan is declared earlier — see above, before the notes path)
+    // (the deck plan is declared earlier — see above, before the retrieval path)
 
     chunkCount = chunks.length;
     searchMode = resolved.mode;
@@ -849,8 +739,8 @@ async function clearPreviousAttempt(
 /**
  * Finish a request the same way whichever path answered it.
  *
- * Two paths reach a completed request: the notes, and the footage. Both owe
- * the creator the same thing: the moments they found, with their pictures,
+ * Retrieval and actual-footage paths can both reach completion. Both owe
+ * the creator the same thing: verified moments, with their pictures,
  * as soon as they exist. Exported for focused tests of the boundary.
  *
  * Nothing is rendered here. That is the change this function carries, and it
@@ -1050,13 +940,6 @@ interface SearchSingleChunkInput {
    */
   log: Logger;
 }
-
-/**
- * A hole in the notes shorter than this is not worth telling anyone about —
- * it is the rounding between one scene ending and the next beginning, not a
- * stretch of video nobody described.
- */
-const NOTES_GAP_TOLERANCE_SECONDS = 5;
 
 const MATCH_SOURCE: Record<ResolvedSearchMode, MatchSource> = {
   visual: 'visual',
@@ -1262,224 +1145,6 @@ async function answerFromSimpleMem(input: {
   return { matchCount: finalCount, released, fallback: null, outcome };
 }
 
-
-/**
- * Answers from what was written down at upload, or reports that it cannot.
- *
- * Returns the number of moments found. Zero means the notes do not mention it
- * — NOT that the video lacks it — and the caller must go to the footage before
- * telling anyone otherwise.
- */
-async function answerFromNotes(input: {
-  clipRequestId: string;
-  /** The planning token, so the release stays fenced on this path too. */
-  deckAttemptId: string | null;
-  /** A number the person wrote, or null. */
-  requestedResultCount: number | null;
-  video: Video;
-  chunks: VideoChunk[];
-  instruction: string;
-  mode: ResolvedSearchMode;
-  tally: UsageTally;
-  log: Logger;
-  /**
-   * False while the video is still being read. What is missing from the notes
-   * is then a stretch not reached yet, not a stretch that failed — and the two
-   * must not be reported in the same words.
-   */
-  readComplete: boolean;
-}): Promise<{ matchCount: number; released: boolean }> {
-  const { clipRequestId, video, chunks, instruction, mode, tally, log, readComplete } = input;
-  const startedAt = performance.now();
-
-  // Memory is both halves: what was seen, and what was said. A spoken question
-  // answered only from scene descriptions would be answered from the wrong
-  // evidence, so the transcript joins the notes whenever the question involves
-  // speech at all.
-  const scenes = await listScenes(video.id);
-  const speech = mode === 'visual' ? [] : await listTranscriptSegments(video.id);
-
-  const notes: NoteLine[] = [
-    ...scenes.map((scene) => ({
-      startSeconds: scene.startSeconds,
-      endSeconds: scene.endSeconds,
-      description: scene.description,
-      kind: 'seen' as const,
-    })),
-    ...speech.map((segment) => ({
-      startSeconds: segment.startSeconds,
-      endSeconds: segment.endSeconds,
-      description: `"${segment.text}"`,
-      kind: 'said' as const,
-    })),
-  ].sort((a, b) => a.startSeconds - b.startSeconds);
-
-  if (notes.length === 0) return { matchCount: 0, released: false };
-
-  await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: mode });
-  await clearPreviousAttempt(clipRequestId, log, input.deckAttemptId);
-
-  const result = await searchNotes({
-    instruction,
-    notes,
-    onUsage: (usage) => {
-      tally.add(usage);
-      void recordModelUsage({ ...usage, stage: 'search', videoId: video.id, clipRequestId });
-    },
-  });
-
-  if (result.warnings.length > 0) {
-    log.warn('notes lookup warnings', { warnings: result.warnings.slice(0, 5) });
-  }
-
-  // Notes carry source timestamps, so a match has to be placed back on the
-  // chunk grid the rest of the system stores matches against.
-  const found: NewClipMatch[] = [];
-  const uncertain: UncertainMatch[] = [];
-
-  for (const match of result.matches) {
-    const chunk = chunks.find(
-      (candidate) => match.startSeconds >= candidate.globalStartSeconds && match.startSeconds < candidate.globalEndSeconds,
-    ) ?? chunks.at(-1);
-    if (!chunk) continue;
-
-    // Every timestamp the model reports goes through the same validation,
-    // whether it becomes a result or a maybe. A reversed, negative or
-    // past-the-end range is not a moment, and showing one as "I saw something
-    // at -00:12" is worse than not mentioning it at all.
-    const local = mapGlobalRangeToChunk(
-      chunk,
-      { startSeconds: match.startSeconds, endSeconds: match.endSeconds },
-      { minDurationSeconds: env.MIN_CLIP_SECONDS, maxDurationSeconds: env.MAX_CLIP_SECONDS },
-    );
-    if (!local) continue;
-
-    if (match.confidence < env.MIN_MATCH_CONFIDENCE) {
-      // Same rule as the footage path: a moment we found and discarded is
-      // mentioned, never silently turned into an absence.
-      uncertain.push({
-        globalStartSeconds: local.globalStartSeconds,
-        globalEndSeconds: local.globalEndSeconds,
-        confidence: match.confidence,
-        description: match.description,
-      });
-      continue;
-    }
-
-    found.push({
-      chunkId: chunk.id,
-      localStartSeconds: local.localStartSeconds,
-      localEndSeconds: local.localEndSeconds,
-      globalStartSeconds: local.globalStartSeconds,
-      globalEndSeconds: local.globalEndSeconds,
-      description: match.description,
-      confidence: match.confidence,
-      source: MATCH_SOURCE[mode],
-      quote: match.quote,
-      // Attribution names the notes lane that actually answered, not the
-      // configured video provider — a thumbs-down on a notes answer is
-      // evidence about the notes lookup, and must not land on MiniCPM.
-      provider: result.provider,
-      model: result.model,
-      promptVersion: result.promptVersion || null,
-    });
-  }
-
-  if (uncertain.length > 0) await recordUncertainMatches(clipRequestId, uncertain);
-
-  log.info('notes consulted', {
-    notes: notes.length,
-    scenes: scenes.length,
-    speech: speech.length,
-    lookups: result.lookups,
-    reported: result.matches.length,
-    kept: found.length,
-    elapsedMs: Math.round(performance.now() - startedAt),
-  });
-
-  // Nothing remembered. Left unfinished on purpose: the caller reads the video
-  // itself before anyone is told this video does not contain what they asked
-  // for.
-  if (found.length === 0) return { matchCount: 0, released: false };
-
-  /**
-   * Name the stretches the notes never covered.
-   *
-   * A scene list can be perfectly valid and still leave a chunk half
-   * described, and a chunk that failed at index time leaves its whole window
-   * missing. Answering from notes with holes in them, and presenting the
-   * result as the complete set of moments, is the same untruth as reporting an
-   * unsearched chunk as searched — the user cannot tell a stretch nobody read
-   * from a stretch containing nothing.
-   *
-   * These are reported through the existing coverage channel, so they appear
-   * on screen exactly like any other unexamined window, and "look again"
-   * escalates to reading the footage.
-   */
-  const duration = video.durationSeconds ?? chunks.at(-1)?.globalEndSeconds ?? 0;
-  const unread = findUncoveredRanges(
-    scenes.map((scene) => ({ startSeconds: scene.startSeconds, endSeconds: scene.endSeconds })),
-    duration,
-    NOTES_GAP_TOLERANCE_SECONDS,
-  );
-
-  for (const gap of unread) {
-    // The chunk the gap starts in, only so the record has the same shape as a
-    // failed chunk. A gap can span several; the window is what matters, and it
-    // is carried whole.
-    const where =
-      chunks.find((chunk) => gap.startSeconds >= chunk.globalStartSeconds && gap.startSeconds < chunk.globalEndSeconds)
-      ?? chunks.at(-1)!;
-
-    await recordChunkFailure(clipRequestId, {
-      chunkIndex: where.chunkIndex,
-      chunkId: where.id,
-      message: readComplete
-        ? 'This stretch is not described in the notes taken at upload'
-        : 'This stretch had not been watched yet when the question was asked',
-      code: readComplete ? 'not_in_notes' : 'not_read_yet',
-      globalStartSeconds: gap.startSeconds,
-      globalEndSeconds: gap.endSeconds,
-    }, input.deckAttemptId!);
-  }
-
-  if (unread.length > 0) {
-    log.warn('answered from notes that do not cover the whole video', {
-      gaps: unread.length,
-      unreadSeconds: Number(unread.reduce((sum, gap) => sum + (gap.endSeconds - gap.startSeconds), 0).toFixed(1)),
-    });
-  }
-
-  await insertMatches(clipRequestId, found);
-  const finalCount = await aggregateStoredMatches(clipRequestId, chunks, input.deckAttemptId);
-
-  await withWorkDir(`notes-${clipRequestId}`, async (dir) => {
-    await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
-  });
-
-  // The notes decided WHICH moments, exactly as they always have; the request
-  // is completed by the same helper the footage path uses so the two can
-  // never drift apart on what a creator is owed.
-  const released = await completeRequest({
-    clipRequestId, answeredFrom: 'notes', deckAttemptId: input.deckAttemptId, log,
-    requestedResultCount: input.requestedResultCount,
-    question: input.instruction,
-  });
-
-  const answerLog = {
-    matches: finalCount,
-    released,
-    elapsedMs: Math.round(performance.now() - startedAt),
-    ...tally.summary(),
-  };
-  if (released) {
-    log.info('answered from memory', answerLog);
-  } else {
-    log.warn('answered from memory but the answer was superseded before release', answerLog);
-  }
-
-  return { matchCount: finalCount, released };
-}
 
 async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClipMatch[]> {
   const { chunk } = input;
