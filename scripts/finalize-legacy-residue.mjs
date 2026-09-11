@@ -26,6 +26,8 @@ await edit('src/domain/types.ts', (s) => s.replace(
   | 'not_read_yet'
   | 'provider_content_filter'`,
 `export type ChunkFailureCode =
+  /** SimpleMem or its verifier did not cover this source window yet. */
+  | 'not_read_yet'
   | 'provider_content_filter'`));
 
 await edit('src/services/search/readiness.ts', (s) => s.replace(
@@ -59,5 +61,11 @@ await edit('test/clipSearchCompletion.test.ts', (s) => s
 
 await edit('test/platformReports.test.ts', (s) => s.replaceAll("answeredFrom: 'notes'", "answeredFrom: 'simplemem'"));
 
-await unlink('scripts/finalize-legacy-residue.mjs');
-await unlink('.github/workflows/finalize-legacy-residue.yml');
+for (const path of [
+  'scripts/finalize-legacy-residue.mjs',
+  'scripts/finalize-legacy-cleanup.mjs',
+  '.github/workflows/finalize-legacy-residue.yml',
+  '.github/workflows/finalize-legacy-cleanup.yml',
+]) {
+  await unlink(path).catch(() => undefined);
+}
