@@ -34,6 +34,30 @@ const write = (path, content) => writeFile(at(path), content, 'utf8');
 await rm(at('src/services/modal/invoke.ts'), { force: true });
 await rm(at('test/modalHandleReset.test.ts'), { force: true });
 
+// Retention tests must describe the new durable memory, not a deleted index.
+{
+  const path = 'test/footageExpiry.test.ts';
+  let s = await read(path);
+  s = s.replace('  deleteMediaIndex: vi.fn(),\n', '');
+  s = s.replace(/vi\.mock\('\.\.\/src\/db\/repositories\/mediaIndex\.js',[\s\S]*?\}\)\);\n/, '');
+  s = s.replace("    expect(clears.deleteMediaIndex).toHaveBeenCalledWith('v1');\n", '');
+  s = s.replace('    // transcript, the vectors, and a SimpleMem memory that is frames of the\n', '    // transcript and a SimpleMem memory that is frames of the\n');
+  await write(path, s);
+}
+
+// These tests are specifically OpenRouter routing tests. Make that provider
+// explicit before importing the singleton env module so unrelated MiniCPM tests
+// cannot leak provider state into this file when Vitest reuses a worker.
+{
+  const path = 'test/modelCapabilities.test.ts';
+  let s = await read(path);
+  s = s.replace(
+    "import { assertVideoInputSupported, resetVideoModelCapabilityCache } from '../src/services/search/modelCapabilities.js';\n",
+    "process.env.VIDEO_PROVIDER = 'openrouter';\nconst { assertVideoInputSupported, resetVideoModelCapabilityCache } = await import('../src/services/search/modelCapabilities.js');\n",
+  );
+  await write(path, s);
+}
+
 // Remove stale comments left behind after the yt-dlp variables themselves were
 // removed; examples must describe the system that can actually run.
 {
