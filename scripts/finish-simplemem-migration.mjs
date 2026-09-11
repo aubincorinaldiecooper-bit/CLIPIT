@@ -46,15 +46,23 @@ await rm(at('test/modalHandleReset.test.ts'), { force: true });
 }
 
 // These tests are specifically OpenRouter routing tests. Make that provider
-// explicit before importing the singleton env module so unrelated MiniCPM tests
-// cannot leak provider state into this file when Vitest reuses a worker.
+// explicit before importing the singleton env module, and stub the generated
+// probe MP4 so CI does not depend on the runner's ffmpeg build to exercise a
+// pure routing test.
 {
   const path = 'test/modelCapabilities.test.ts';
   let s = await read(path);
   s = s.replace(
     "import { assertVideoInputSupported, resetVideoModelCapabilityCache } from '../src/services/search/modelCapabilities.js';\n",
-    "process.env.VIDEO_PROVIDER = 'openrouter';\nconst { assertVideoInputSupported, resetVideoModelCapabilityCache } = await import('../src/services/search/modelCapabilities.js');\n",
+    "process.env.VIDEO_PROVIDER = 'openrouter';\nvi.mock('../src/services/media/ffmpeg.js', () => ({\n  createProbeClip: async (file: string) => {\n    const { writeFile } = await import('node:fs/promises');\n    const ftyp = Buffer.alloc(24);\n    ftyp.writeUInt32BE(24, 0);\n    ftyp.write('ftyp', 4, 'ascii');\n    ftyp.write('isom', 8, 'ascii');\n    const mdat = Buffer.alloc(10_000);\n    mdat.writeUInt32BE(10_000, 0);\n    mdat.write('mdat', 4, 'ascii');\n    await writeFile(file, Buffer.concat([ftyp, mdat]));\n  },\n}));\nconst { assertVideoInputSupported, resetVideoModelCapabilityCache } = await import('../src/services/search/modelCapabilities.js');\n",
   );
+  // Idempotence when the previous cleanup already converted the import.
+  if (!s.includes("vi.mock('../src/services/media/ffmpeg.js'")) {
+    s = s.replace(
+      "process.env.VIDEO_PROVIDER = 'openrouter';\nconst { assertVideoInputSupported, resetVideoModelCapabilityCache } = await import('../src/services/search/modelCapabilities.js');\n",
+      "process.env.VIDEO_PROVIDER = 'openrouter';\nvi.mock('../src/services/media/ffmpeg.js', () => ({\n  createProbeClip: async (file: string) => {\n    const { writeFile } = await import('node:fs/promises');\n    const ftyp = Buffer.alloc(24);\n    ftyp.writeUInt32BE(24, 0);\n    ftyp.write('ftyp', 4, 'ascii');\n    ftyp.write('isom', 8, 'ascii');\n    const mdat = Buffer.alloc(10_000);\n    mdat.writeUInt32BE(10_000, 0);\n    mdat.write('mdat', 4, 'ascii');\n    await writeFile(file, Buffer.concat([ftyp, mdat]));\n  },\n}));\nconst { assertVideoInputSupported, resetVideoModelCapabilityCache } = await import('../src/services/search/modelCapabilities.js');\n",
+    );
+  }
   await write(path, s);
 }
 
