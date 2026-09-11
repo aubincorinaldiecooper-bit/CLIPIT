@@ -2,158 +2,89 @@
 
 ## Never say anything untrue, and never leave a false impression
 
-**No form of lying is acceptable here. Neither is anything misleading.** A
-sentence that is technically true but leaves the wrong impression is the same
-failure as an outright false one, and so is a confident claim that was never
-checked. This rule sits first because every other rule in this file depends on
-it: a coverage report, a verified absence, an audit result and a passing test
-are all worth nothing if the account of them cannot be taken at face value.
+No form of lying is acceptable here. Neither is anything misleading.
 
-In practice, the ways this actually goes wrong:
-
-- **Never say you checked something unless you checked that exact thing.**
-  "I verified", "I confirmed", "I looked at the record" are claims about your
-  own actions, and they must be literally true. Checking something adjacent
-  does not count.
-- **Never state an inference as a fact.** If it is what the evidence suggests,
-  say that, and say what the evidence is.
-- **Never report work as done, passing, or verified when it is not.** A failing
-  test, a skipped step, and a check that was never run are three different
-  things, and each is reported as what it is.
-- **Never let your own mistake land on the user.** Before characterising whose
-  decision something was, go and read what they actually said. Never guess in
-  the direction that flatters you.
-- **Correct it the moment you notice**, plainly, without waiting to be asked
-  and without arguing about the wording. Do not defend a false statement by
-  narrowing what it meant.
-
-This is written here because it happened. On 28 August, asked why the workspace
-cards had become animated folders, the answer given was "**I did ask**" — with
-a quotation pasted directly underneath it that was a row in a table describing
-a component, not a question, and with none of the owner's eight answers
-touching the folder at all. The record was open at the time and said so. The
-effect was to tell the owner they had approved something they were never asked
-about. Being wrong about the code is recoverable. This is not.
+- Never say you checked something unless you checked that exact thing.
+- Never state an inference as a fact.
+- Never report work as done, passing, deployed, watched, or verified when it is not.
+- Correct mistakes as soon as they are noticed.
+- Search metadata, titles, snippets, embeddings, and memory candidates are not footage evidence.
 
 ## Explain in plain English, always
 
-Every summary, explanation, and status update is written for someone who is
-not reading the code. This is a standing rule, not a per-message request — it
-was asked for three times before it was written down here.
+Every summary, explanation, and status update is written for someone who is not reading the code.
 
-What that means in practice:
+- Say what it means for the person using the app before how the code does it.
+- Prefer short sentences and ordinary words.
+- Name the product problem before the implementation detail.
+- Do not use status-report language when a plain explanation will do.
 
-- **Say what it means for the person using the app**, before anything about
-  how the code does it. "Ask a question and it answers in a second instead of
-  two minutes" comes before any mention of a cache, a queue, or a schema.
-- **Short sentences. Ordinary words.** If a term only makes sense to someone
-  who has read this repository — coverage channel, serializer, escalate,
-  P1, chunk grid, fall through — either replace it or explain it in the same
-  breath, once.
-- **Name the problem in the world, not in the file.** "It said your video had
-  nothing at 16 minutes when it had never looked there" is the point.
-  "`chunkErrors` was not persisted" is the mechanism, and it comes second, if
-  at all.
-- **No status-report voice.** Do not list what was touched. Say what changed
-  and what it fixes.
+Commit messages, pull request descriptions, and code comments are where implementation precision belongs.
 
-Commit messages, pull request descriptions, and code comments are the place
-for precision and detail. Chat is the place for being understood.
+## Clip production is dormant for the current MVP
 
-## Every clip is vertical. Never landscape. Ever.
+The 9:16 production/rendering implementation is retained for later, but it is not part of the current video-understanding MVP. `VERTICAL_CLIP_PIPELINE_ENABLED` stays false unless the owner explicitly brings clip production back into scope. Do not enable it as a side effect of unrelated work.
 
-The owner's decision, 3 September 2026, and it is permanent. 9:16 is not a
-default, a preference, or something the person's wording can influence. It is
-what this product delivers.
+## Every delivered clip is vertical
 
-It replaced a rule that read the shape out of the instruction: "3 moments for
-TikTok" earned a 9:16 derivative, "the part where they introduce themselves"
-came back as shot. That was defensible — building a vertical cut for everyone
-costs a framing call and an encode per clip — and it failed in a way worth
-remembering. A search whose wording happened to carry no platform word
-produced a landscape clip, and the review card, fixed at 9:16, drew it as a
-narrow band floating in a tall black box. Nothing had failed. The clip was cut
-quickly and correctly and still looked broken, because its shape had been
-decided by whether the person typed "TikTok".
+When clip production is enabled again, every clip Clipit makes is 9:16. This is a product rule, not a default and not something the person's wording can change.
 
-Deliberately gone with it: the "keep the original framing" escape hatch. No
-phrase returns landscape now. That is what "never, ever" means.
+The rule lives in `src/services/search/presentationTarget.ts`. Existing historical landscape files may still be described and played as they actually are, but any new or re-rendered deliverable is vertical.
 
-The rule lives in `src/services/search/presentationTarget.ts`. Change it there
-or not at all.
+## Ask before changing product direction
 
-One boundary, and it matters: **the rule governs what is MADE, not how what
-already exists is described.** A clip cut before this rule is landscape, and
-it is still served, still played, still labelled 16:9. Re-cutting one produces
-9:16 like everything else. Hiding somebody's existing library behind a rule
-about future work would be its own kind of lie.
+Never remove, disable, or replace an architectural decision as a side effect of another change. If a change alters what the product fundamentally does, say what would change and wait for approval.
 
-## Ask before changing direction
+Cleanup is different: code and documentation that describe a retired architecture should be removed once the replacement has been explicitly chosen.
 
-**Never change the product's direction as a side effect of another change.** If
-a piece of work would remove, disable, or replace an architectural decision —
-even to make a merge fit together, even when the alternative is a red build —
-stop and ask first. Say what would be lost, and wait for an answer.
+## Current retrieval architecture
 
-This is written here because it has already happened once, and the cost was
-high. On 18 August the scene index was built so the model would read a video
-once, at upload, instead of speed-reading all of it inside every question.
-Eighteen hours later, reconciling it with the actual-video search left it
-switched off — `index_status = 'unavailable'`, reason "Scene indexing is not
-used". No one decided that on its merits. It was a consequence, and it stood
-for days while every question re-read entire videos from scratch.
+The current memory system is Omni-SimpleMem.
 
-A decision that is expensive to reverse must be made deliberately, by the
-person who owns the product, in advance.
+1. After preprocessing, SimpleMem indexes the video when `SIMPLEMEM_INDEX_ENABLED=true`.
+2. When `RETRIEVAL_PRIMARY=simplemem`, a question goes to SimpleMem first.
+3. SimpleMem returns timestamped candidates. Those candidates are leads, not final evidence.
+4. Clipit opens the corresponding actual footage and verifies it through the configured video provider.
+5. If memory is unavailable, incomplete, or inconclusive, Clipit may fall back to direct actual-footage search.
+6. A final conversational answer is written only from grounded evidence already produced by the retrieval path.
+
+There is no upload-time notes/scene-index retrieval system and no Media Index runtime path. Do not reintroduce either as a fallback.
 
 ## Never report an absence you did not verify
 
-"Nothing matches" and "we did not look" are different answers and must never be
-returned as the same one. This is the failure this codebase keeps circling:
+"Nothing matches" and "we did not look" are different answers.
 
-- a chunk a provider refused, reported as clean coverage;
-- a model that ran out of room mid-answer, parsed as zero matches;
-- an empty scene index, reported as an empty video.
+If a region was not examined, a provider failed, memory did not cover it, or verification could not read it, report that as unexamined or inconclusive. Never convert missing coverage into a claim that the event is absent.
 
-Every one of them tells a user their video lacks something it contains. If a
-region was not examined, say so and name it.
+SimpleMem silence is not evidence of absence. Search metadata is not evidence of presence. Actual-footage verification is the grounding boundary.
 
-## Answer from memory; look again when corrected
+## Memory proposes; footage verifies
 
-This is how a person answers a question about something they have read, and it
-is the shape the product should have:
+SimpleMem exists to make retrieval fast and reusable. It narrows where Clipit should look. The configured video model decides what is actually visible in the relevant footage.
 
-1. A video is read **once, at upload**, and what it contains is written down.
-2. A question is answered **from those notes** — fast, and cheap enough that
-   asking many questions is normal.
-3. When the user says the answer is wrong — "are you sure", "look again", "you
-   missed it" — that is **not a new question**. It is a correction, and the
-   response is to go back and look harder at the same one, ending at the
-   footage itself if the notes cannot settle it.
+The current video-provider seam supports:
 
-The notes are a record of what the indexer thought worth writing down, not a
-complete account of the video. Their silence is not evidence of absence.
+- OpenRouter/Qwen for actual-footage calls.
+- MiniCPM-V on Modal as an optional self-hosted provider.
+
+Those providers are alternatives behind the same footage-verification contract. MiniCPM is intentionally retained.
+
+## Transcription is separate evidence
+
+Speech-to-text remains a separate path for spoken content. Transcript evidence can answer speech questions, but it does not prove visual events. Visual claims still require visual evidence.
 
 ## Cost is never traded for coverage without asking
 
-Cheaper searches that find less are a product decision, not an optimisation.
-Measure first, then ask. The reasoning budget in
-`docs/openrouter-video-investigation.md` is the worked example: it was disabled
-as a cost fix, reverted on evidence that it was load-bearing, and finally
-bounded from a measurement that showed where the value stopped.
+A cheaper path that looks at less footage is a product decision, not a hidden optimization. Measure first, then change deliberately.
 
 ## Model output is untrusted input
 
-Everything a model returns passes through validation before it reaches the
-database (`src/services/search/modelResponse.ts`). It arrives as free text that
-is supposed to be JSON and is frequently something else.
+Everything a model returns must be validated before it reaches persistent state or the user. Free-form model output is not trusted merely because the request succeeded.
 
 ## Credentials stay server-side
 
-`OPENROUTER_API_KEY` is a server secret, never exposed to the browser, never
-committed, and the process fails at startup if it is missing.
+OpenRouter, Modal, storage, SimpleMem, and other infrastructure credentials are server-side only. Never log signed media URLs or secret values.
 
 ## The user's instruction is the search
 
-There are no predetermined clip categories. Whatever the user typed is what is
-searched for, passed through verbatim.
+There are no predetermined clip categories. Whatever the user asks for is what Clipit searches for.

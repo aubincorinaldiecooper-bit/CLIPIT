@@ -276,6 +276,9 @@ export async function enqueueClipSearch(data: ClipSearchJob, options: JobsOption
 }
 
 export async function enqueueClipGeneration(data: ClipGenerationJob): Promise<void> {
+  if (!env.VERTICAL_CLIP_PIPELINE_ENABLED) {
+    throw new Error('Vertical clip production is disabled for the current MVP');
+  }
   await addWithStableId(getQueues().clipGeneration, 'generate', data, `generate-${data.clipId}`);
 }
 
