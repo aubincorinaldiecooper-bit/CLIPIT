@@ -76,7 +76,7 @@ export async function watchWithVideoChat3(input: {
     {
       video_url: input.videoUrl,
       query: input.query,
-      expect_bytes: input.expectedBytes ?? null,
+      expected_bytes: input.expectedBytes ?? null,
       target_fps: input.targetFps ?? 1,
       max_rounds: input.maxRounds ?? 32,
       max_events: input.maxEvents ?? 64,
@@ -128,7 +128,7 @@ export async function verifyWithVideoChat3(input: {
       video_url: input.videoUrl,
       query: input.query,
       candidates: input.candidates,
-      expect_bytes: input.expectedBytes ?? null,
+      expected_bytes: input.expectedBytes ?? null,
     },
     { context: { mode: 'verify', candidates: input.candidates.length } },
   );
