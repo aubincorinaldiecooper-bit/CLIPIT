@@ -25,7 +25,10 @@ interface SearxReply {
   results?: unknown;
 }
 
-const MEDIA_SUFFIXES = ['.mp4', '.webm', '.mov', '.m4v', '.m3u8', '.mpd'];
+// The current Modal watch/Qwen transports fetch one media file. HLS/DASH
+// manifests are intentionally excluded until the transport can resolve and
+// fetch their segments rather than downloading the manifest as if it were MP4.
+const MEDIA_SUFFIXES = ['.mp4', '.webm', '.mov', '.m4v'];
 
 function configured(name: string): string {
   const value = process.env[name]?.trim();
@@ -161,6 +164,7 @@ async function resolveWithPlaywright(candidate: InternetVideoCandidate): Promise
   if (!response.ok) return candidate;
   const body = await response.json() as { mediaUrl?: unknown };
   if (typeof body.mediaUrl !== 'string' || !body.mediaUrl.trim()) return candidate;
+  if (!looksLikePlayableMedia(body.mediaUrl.trim())) return candidate;
   const mediaUrl = await assertPublicInternetUrl(body.mediaUrl.trim());
   return { ...candidate, mediaUrl, resolvedBy: 'playwright' };
 }
