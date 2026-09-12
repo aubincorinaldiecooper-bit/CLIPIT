@@ -15,6 +15,7 @@ import { registerSocialRoutes } from './routes/social.js';
 import { registerZernioWebhookRoutes } from './routes/zernioWebhook.js';
 import { registerWorkspaceRoutes } from './routes/workspace.js';
 import { registerReportRoutes } from './routes/reports.js';
+import { registerInternetVideoSearchRoutes } from './routes/internetVideoSearch.js';
 
 export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -91,6 +92,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await registerVideoRoutes(app);
   await registerClipRequestRoutes(app);
   await registerClipRoutes(app);
+  await registerInternetVideoSearchRoutes(app);
   await registerStatsRoutes(app);
   await registerEvaluationRoutes(app);
   await registerSocialRoutes(app);

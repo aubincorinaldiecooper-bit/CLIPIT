@@ -132,7 +132,7 @@ export async function embedQuery(text: string): Promise<QwenEmbedResult> {
 export async function embedVideoIntervals(input: {
   videoUrl: string;
   videoKey: string;
-  expectedBytes: number;
+  expectedBytes?: number;
   intervals: QwenInterval[];
 }): Promise<QwenEmbedResult> {
   const asked = uniqueIds(input.intervals, 'qwen-embedding');
@@ -141,7 +141,7 @@ export async function embedVideoIntervals(input: {
     {
       video_url: input.videoUrl,
       video_key: input.videoKey,
-      expect_bytes: input.expectedBytes,
+      expect_bytes: input.expectedBytes ?? null,
       intervals: input.intervals,
       fps: 2,
       max_frames: 16,
@@ -161,7 +161,7 @@ export async function rerankVideoIntervals(input: {
   query: string;
   videoUrl: string;
   videoKey: string;
-  expectedBytes: number;
+  expectedBytes?: number;
   candidates: QwenInterval[];
 }): Promise<{ model: string; revision: string; ranked: QwenRanked[]; failed: QwenFailure[]; metrics: Record<string, unknown> }> {
   const asked = uniqueIds(input.candidates, 'qwen-reranker');
@@ -171,7 +171,7 @@ export async function rerankVideoIntervals(input: {
       query: input.query,
       video_url: input.videoUrl,
       video_key: input.videoKey,
-      expect_bytes: input.expectedBytes,
+      expect_bytes: input.expectedBytes ?? null,
       candidates: input.candidates,
       fps: 2,
       max_frames: 16,

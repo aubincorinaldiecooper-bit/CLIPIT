@@ -1,0 +1,9 @@
+FROM mcr.microsoft.com/playwright:v1.58.2-noble
+
+WORKDIR /app
+RUN npm init -y >/dev/null 2>&1 && npm install --omit=dev playwright@1.58.2
+COPY tools/webaccess/server.mjs ./server.mjs
+
+ENV NODE_ENV=production PORT=8080
+EXPOSE 8080
+CMD ["node", "server.mjs"]
