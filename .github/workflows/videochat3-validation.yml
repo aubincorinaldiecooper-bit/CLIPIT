@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/videochat3-search-stack
+      - feat/videochat3-search-stack-audit
   pull_request:
     branches:
       - main
