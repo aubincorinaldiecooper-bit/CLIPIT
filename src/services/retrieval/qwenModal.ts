@@ -206,6 +206,8 @@ export async function rerankVideoIntervals(input: {
 export function cosineSimilarity(left: Float32Array, right: Float32Array): number {
   if (left.length !== right.length) throw new Error('cannot compare embeddings with different dimensions');
   let dot = 0;
-  for (let index = 0; index < left.length; index += 1) dot += left[index] * right[index];
+  for (let index = 0; index < left.length; index += 1) {
+    dot += (left[index] ?? 0) * (right[index] ?? 0);
+  }
   return dot;
 }
