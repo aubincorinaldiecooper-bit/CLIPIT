@@ -36,7 +36,10 @@ function mediaLike(url) {
   try {
     const parsed = new URL(url);
     const path = parsed.pathname.toLowerCase();
-    return ['.mp4', '.webm', '.mov', '.m4v', '.m3u8', '.mpd'].some((suffix) => path.endsWith(suffix));
+    // Current Modal transports fetch one media file. Streaming manifests are
+    // observed but deliberately not returned until HLS/DASH segment handling
+    // is implemented end to end.
+    return ['.mp4', '.webm', '.mov', '.m4v'].some((suffix) => path.endsWith(suffix));
   } catch {
     return false;
   }
@@ -93,7 +96,7 @@ async function resolveMedia(pageUrl) {
         // Ignore one bad candidate and continue looking.
       }
     }
-    return { pageUrl: safePageUrl, mediaUrl: null, resolvedBy: 'playwright', reason: 'no public playable media URL observed' };
+    return { pageUrl: safePageUrl, mediaUrl: null, resolvedBy: 'playwright', reason: 'no public file-backed media URL observed' };
   } finally {
     await browser.close();
   }
