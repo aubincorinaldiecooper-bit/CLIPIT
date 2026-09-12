@@ -1,18 +1,16 @@
-import { createWriteStream } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
-import { Readable } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
 import { env } from '../../../config/env.js';
-import { run } from '../../../lib/exec.js';
-import { getStorage } from '../../storage/s3.js';
-import { searchVideoChunk, type VideoUsageReporter } from '../../search/openrouterVideo.js';
+import {
+  cosineSimilarity,
+  embedQuery,
+  embedVideoIntervals,
+  rerankVideoIntervals,
+} from '../qwenModal.js';
+import { verifyWithVideoChat3 } from '../../videochat3/client.js';
 import type { Candidate } from './candidates.js';
 
 interface FootageVerificationResult {
   model: string;
-  revision: null;
+  revision: string;
   metrics: Record<string, unknown>;
 }
 
@@ -22,58 +20,34 @@ export interface VerifiedSimpleMemCandidates {
   result: FootageVerificationResult;
 }
 
-async function download(url: string, destination: string): Promise<void> {
-  const response = await fetch(url);
-  if (!response.ok || !response.body) {
-    throw new Error(`Could not download SimpleMem verification source (${response.status})`);
-  }
-  await pipeline(Readable.fromWeb(response.body as never), createWriteStream(destination));
+interface IdentifiedCandidate {
+  id: string;
+  candidate: Candidate;
 }
 
-async function cutInterval(sourcePath: string, outputPath: string, startSeconds: number, endSeconds: number): Promise<void> {
-  const duration = Math.max(0.05, endSeconds - startSeconds);
-  await run(
-    env.FFMPEG_PATH,
-    [
-      '-hide_banner',
-      '-loglevel',
-      'error',
-      '-y',
-      '-ss',
-      startSeconds.toFixed(3),
-      '-i',
-      sourcePath,
-      '-t',
-      duration.toFixed(3),
-      '-map',
-      '0:v:0',
-      '-map',
-      '0:a?',
-      '-c:v',
-      'libx264',
-      '-preset',
-      'veryfast',
-      '-crf',
-      '28',
-      '-c:a',
-      'aac',
-      '-movflags',
-      '+faststart',
-      outputPath,
-    ],
-    { timeoutMs: Math.max(120_000, Math.ceil(duration * 4_000)) },
-  );
+function identify(candidates: readonly Candidate[]): IdentifiedCandidate[] {
+  return candidates.map((candidate, index) => ({ id: `candidate-${index}`, candidate }));
+}
+
+function failureFor(
+  identified: readonly IdentifiedCandidate[],
+  id: string,
+  reason: string,
+): (Candidate & { reason: string }) | null {
+  const row = identified.find((item) => item.id === id);
+  return row ? { ...row.candidate, reason } : null;
 }
 
 /**
- * Verifies Omni-SimpleMem's candidate windows with Clipit's normal footage
- * watcher. SimpleMem tells us where to look; this function re-opens those
- * exact source intervals and only keeps candidates the configured video model
- * actually confirms.
+ * Turns SimpleMem's broad memory hits into verified visual evidence.
  *
- * This deliberately does not use the retired Media Index/Qwen reranker. The
- * evidence boundary is the same one as the full fallback search: a visual
- * claim becomes evidence only after a model has been given the actual MP4.
+ * The stages deliberately have different jobs:
+ *   1. Qwen embeddings score every candidate interval against the query.
+ *   2. Qwen reranker re-orders the surviving intervals by looking at footage.
+ *   3. VideoChat3 re-watches the exact intervals and is the evidence boundary.
+ *
+ * SimpleMem and the Qwen stages can suggest where to look, but only a
+ * VideoChat3 verdict with match=true is returned as a verified candidate.
  */
 export async function rerankSimpleMemCandidates(input: {
   query: string;
@@ -81,89 +55,164 @@ export async function rerankSimpleMemCandidates(input: {
   videoUrl: string;
   videoKey: string;
   expectedBytes: number;
-  onUsage?: VideoUsageReporter;
 }): Promise<VerifiedSimpleMemCandidates> {
-  const workDir = await mkdtemp(path.join(tmpdir(), 'clipit-simplemem-verify-'));
-  const sourcePath = path.join(workDir, 'source.mp4');
-  const verified: Candidate[] = [];
-  const failed: Array<Candidate & { reason: string }> = [];
-  const usage: Parameters<VideoUsageReporter>[0][] = [];
-  let provider = 'clipit-footage';
-  let model = env.OPENROUTER_VIDEO_MODEL;
-  let promptVersion: string | null = null;
-
-  try {
-    await download(input.videoUrl, sourcePath);
-
-    for (const [index, candidate] of input.candidates.entries()) {
-      const clipPath = path.join(workDir, `candidate-${index}.mp4`);
-      const storageKey = `verification/simplemem/${encodeURIComponent(input.videoKey)}/${Date.now()}-${index}.mp4`;
-      try {
-        await cutInterval(sourcePath, clipPath, candidate.startSeconds, candidate.endSeconds);
-        await getStorage().uploadFile(storageKey, clipPath, 'video/mp4');
-
-        const result = await searchVideoChunk({
-          instruction: input.query,
-          mode: 'visual',
-          chunkIndex: index,
-          chunkCount: input.candidates.length,
-          chunkDurationSeconds: Math.max(0.05, candidate.endSeconds - candidate.startSeconds),
-          videoPath: clipPath,
-          videoStorageKey: storageKey,
-          transcript: [],
-          onUsage: (row) => { usage.push(row); input.onUsage?.(row); },
-        });
-        provider = result.provider;
-        model = result.model;
-        promptVersion = result.promptVersion || promptVersion;
-
-        const match = [...result.matches]
-          .filter((item) => item.confidence >= env.MIN_MATCH_CONFIDENCE)
-          .sort((a, b) => b.confidence - a.confidence)[0];
-        if (!match) {
-          failed.push({ ...candidate, reason: 'actual footage watcher found no matching moment in this interval' });
-          continue;
-        }
-
-        verified.push({
-          ...candidate,
-          score: Math.max(0, Math.min(1, match.confidence)),
-          description: match.description || candidate.description,
-        });
-      } catch (error) {
-        failed.push({
-          ...candidate,
-          reason: error instanceof Error ? error.message : 'actual footage verification failed',
-        });
-      } finally {
-        await getStorage().remove(storageKey).catch(() => undefined);
-        await rm(clipPath, { force: true }).catch(() => undefined);
-      }
-    }
-
-    const totalCostUsd = usage.reduce((sum, row) => sum + (row.costUsd ?? 0), 0);
-    const totalTokens = usage.reduce((sum, row) => sum + row.totalTokens, 0);
-    const totalLatencyMs = usage.reduce((sum, row) => sum + row.latencyMs, 0);
-
+  if (input.candidates.length === 0) {
     return {
-      candidates: verified.sort((a, b) => b.score - a.score),
-      failed,
+      candidates: [],
+      failed: [],
+      result: { model: 'MCG-NJU/VideoChat3-4B', revision: 'not asked', metrics: {} },
+    };
+  }
+
+  const identified = identify(input.candidates);
+  const intervals = identified.map(({ id, candidate }) => ({
+    id,
+    start: candidate.startSeconds,
+    end: candidate.endSeconds,
+  }));
+
+  const [queryEmbedding, videoEmbeddings] = await Promise.all([
+    embedQuery(input.query),
+    embedVideoIntervals({
+      videoUrl: input.videoUrl,
+      videoKey: input.videoKey,
+      expectedBytes: input.expectedBytes,
+      intervals,
+    }),
+  ]);
+
+  const queryVector = queryEmbedding.embedded.find((row) => row.id === 'query')?.embedding;
+  if (!queryVector) throw new Error('Qwen embedding service returned no query vector');
+
+  const embeddingFailures: Array<Candidate & { reason: string }> = [];
+  for (const failure of videoEmbeddings.failed) {
+    const mapped = failureFor(identified, failure.id, `embedding failed: ${failure.reason}`);
+    if (mapped) embeddingFailures.push(mapped);
+  }
+
+  const embeddedById = new Map(videoEmbeddings.embedded.map((row) => [row.id, row.embedding]));
+  const embeddingRanked = identified
+    .filter((row) => embeddedById.has(row.id))
+    .map((row) => ({
+      ...row,
+      embeddingScore: cosineSimilarity(queryVector, embeddedById.get(row.id)!),
+    }))
+    .sort((a, b) => b.embeddingScore - a.embeddingScore);
+
+  if (embeddingRanked.length === 0) {
+    return {
+      candidates: [],
+      failed: embeddingFailures,
       result: {
-        model,
-        revision: null,
+        model: 'MCG-NJU/VideoChat3-4B',
+        revision: 'not asked',
         metrics: {
-          verifier: 'clipit-actual-footage',
-          provider,
-          prompt_version: promptVersion,
-          calls: usage.length,
-          total_cost_usd: totalCostUsd,
-          total_tokens: totalTokens,
-          total_latency_ms: totalLatencyMs,
-          source_bytes: input.expectedBytes,
+          qwen_embedding_model: videoEmbeddings.model,
+          qwen_embedding_revision: videoEmbeddings.revision,
+          qwen_embedding_metrics: videoEmbeddings.metrics,
         },
       },
     };
-  } finally {
-    await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
+
+  const reranked = await rerankVideoIntervals({
+    query: input.query,
+    videoUrl: input.videoUrl,
+    videoKey: input.videoKey,
+    expectedBytes: input.expectedBytes,
+    candidates: embeddingRanked.map(({ id, candidate }) => ({
+      id,
+      start: candidate.startSeconds,
+      end: candidate.endSeconds,
+    })),
+  });
+
+  const rerankFailures: Array<Candidate & { reason: string }> = [];
+  for (const failure of reranked.failed) {
+    const mapped = failureFor(identified, failure.id, `reranker failed: ${failure.reason}`);
+    if (mapped) rerankFailures.push(mapped);
+  }
+
+  const rerankScoreById = new Map(reranked.ranked.map((row) => [row.id, row.score]));
+  const ordered = reranked.ranked
+    .map((row) => identified.find((item) => item.id === row.id))
+    .filter((row): row is IdentifiedCandidate => row !== undefined);
+
+  if (ordered.length === 0) {
+    return {
+      candidates: [],
+      failed: [...embeddingFailures, ...rerankFailures],
+      result: {
+        model: 'MCG-NJU/VideoChat3-4B',
+        revision: 'not asked',
+        metrics: {
+          qwen_embedding_model: videoEmbeddings.model,
+          qwen_embedding_revision: videoEmbeddings.revision,
+          qwen_embedding_metrics: videoEmbeddings.metrics,
+          qwen_rerank_model: reranked.model,
+          qwen_rerank_revision: reranked.revision,
+          qwen_rerank_metrics: reranked.metrics,
+        },
+      },
+    };
+  }
+
+  const verified = await verifyWithVideoChat3({
+    videoUrl: input.videoUrl,
+    query: input.query,
+    expectedBytes: input.expectedBytes,
+    candidates: ordered.map(({ id, candidate }) => ({
+      id,
+      start: candidate.startSeconds,
+      end: candidate.endSeconds,
+    })),
+  });
+
+  const verifiedCandidates: Candidate[] = [];
+  const verificationFailures: Array<Candidate & { reason: string }> = [];
+
+  for (const verdict of verified.results) {
+    const row = identified.find((item) => item.id === verdict.id);
+    if (!row) continue;
+    if (!verdict.match || verdict.confidence < env.MIN_MATCH_CONFIDENCE) {
+      verificationFailures.push({
+        ...row.candidate,
+        reason: 'VideoChat3 did not verify this interval as a matching moment',
+      });
+      continue;
+    }
+    verifiedCandidates.push({
+      ...row.candidate,
+      score: verdict.confidence,
+      description: verdict.description || row.candidate.description,
+    });
+  }
+
+  for (const failure of verified.failed) {
+    const mapped = failureFor(identified, failure.id, `VideoChat3 verification failed: ${failure.reason}`);
+    if (mapped) verificationFailures.push(mapped);
+  }
+
+  verifiedCandidates.sort((left, right) => right.score - left.score);
+
+  return {
+    candidates: verifiedCandidates,
+    failed: [...embeddingFailures, ...rerankFailures, ...verificationFailures],
+    result: {
+      model: verified.model,
+      revision: verified.revision,
+      metrics: {
+        qwen_embedding_model: videoEmbeddings.model,
+        qwen_embedding_revision: videoEmbeddings.revision,
+        qwen_embedding_metrics: videoEmbeddings.metrics,
+        qwen_rerank_model: reranked.model,
+        qwen_rerank_revision: reranked.revision,
+        qwen_rerank_metrics: reranked.metrics,
+        videochat3_metrics: verified.metrics,
+        embedding_scores: embeddingRanked.map((row) => ({ id: row.id, score: row.embeddingScore })),
+        rerank_scores: ordered.map((row) => ({ id: row.id, score: rerankScoreById.get(row.id) ?? null })),
+        source_bytes: input.expectedBytes,
+      },
+    },
+  };
 }
