@@ -6,6 +6,7 @@ import {
   rerankVideoIntervals,
 } from '../qwenModal.js';
 import { verifyWithVideoChat3 } from '../../videochat3/client.js';
+import type { VideoUsageReporter } from '../../search/openrouterVideo.js';
 import type { Candidate } from './candidates.js';
 
 interface FootageVerificationResult {
@@ -44,7 +45,7 @@ export async function rerankSimpleMemCandidates(input: {
   videoUrl: string;
   videoKey: string;
   expectedBytes: number;
-  onUsage?: unknown;
+  onUsage?: VideoUsageReporter;
 }): Promise<VerifiedSimpleMemCandidates> {
   if (input.candidates.length === 0) {
     return {
