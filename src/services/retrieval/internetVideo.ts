@@ -68,7 +68,7 @@ export async function analyzeInternetVideo(input: {
     embedVideoIntervals({
       videoUrl: input.videoUrl,
       videoKey: input.videoKey,
-      expectedBytes: input.expectedBytes ?? 0,
+      expectedBytes: input.expectedBytes,
       intervals: intervals.map(({ id, start, end }) => ({ id, start, end })),
     }),
   ]);
@@ -110,7 +110,7 @@ export async function analyzeInternetVideo(input: {
     query: input.query,
     videoUrl: input.videoUrl,
     videoKey: input.videoKey,
-    expectedBytes: input.expectedBytes ?? 0,
+    expectedBytes: input.expectedBytes,
     candidates: embeddingRanked.map(({ id, start, end }) => ({ id, start, end })),
   });
 
