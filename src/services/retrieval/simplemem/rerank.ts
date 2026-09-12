@@ -38,23 +38,13 @@ function failureFor(
   return row ? { ...row.candidate, reason } : null;
 }
 
-/**
- * Turns SimpleMem's broad memory hits into verified visual evidence.
- *
- * The stages deliberately have different jobs:
- *   1. Qwen embeddings score every candidate interval against the query.
- *   2. Qwen reranker re-orders the surviving intervals by looking at footage.
- *   3. VideoChat3 re-watches the exact intervals and is the evidence boundary.
- *
- * SimpleMem and the Qwen stages can suggest where to look, but only a
- * VideoChat3 verdict with match=true is returned as a verified candidate.
- */
 export async function rerankSimpleMemCandidates(input: {
   query: string;
   candidates: readonly Candidate[];
   videoUrl: string;
   videoKey: string;
   expectedBytes: number;
+  onUsage?: unknown;
 }): Promise<VerifiedSimpleMemCandidates> {
   if (input.candidates.length === 0) {
     return {
