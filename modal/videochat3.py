@@ -44,6 +44,7 @@ image = (
     .apt_install("ffmpeg", "curl", "libgl1", "libglib2.0-0")
     .uv_pip_install(
         "torch==2.6.0",
+        "torchvision==0.21.0",
         "transformers>=4.57.0,<4.58",
         "accelerate",
         "huggingface-hub",
