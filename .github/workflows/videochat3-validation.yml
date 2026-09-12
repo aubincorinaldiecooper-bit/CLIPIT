@@ -8,6 +8,7 @@ on:
   pull_request:
     branches:
       - main
+      - feat/videochat3-search-stack
 
 jobs:
   validate:
