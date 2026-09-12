@@ -1,0 +1,26 @@
+use_default_settings:
+  engines:
+    remove:
+      - brave.videos
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "${SEARXNG_SECRET}"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true
+
+# SearXNG is discovery only. Clipit does not treat snippets as evidence;
+# candidate footage must still be watched and verified by Clipit's video stack.
+# Brave Videos is intentionally removed; this path is not allowed to depend on
+# Brave's API or web search engine.

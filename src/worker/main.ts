@@ -12,6 +12,7 @@ import {
   enqueueThumbnailBackfill,
   QUEUE_NAMES,
 } from '../queues/index.js';
+import { INTERNET_VIDEO_SEARCH_QUEUE } from '../queues/internetVideoSearch.js';
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVideo.js';
 import { handleIngestion } from './handlers/ingestion.js';
@@ -26,6 +27,7 @@ import { handleThumbnailBackfill } from './handlers/thumbnailBackfill.js';
 import { handleRetention } from './handlers/retention.js';
 import { handleScheduledPublish } from './handlers/scheduledPublish.js';
 import { handleLearningReport } from './handlers/learningReport.js';
+import { handleInternetVideoSearch } from './handlers/internetVideoSearch.js';
 
 /**
  * Worker entrypoint. All long-running work — downloading, transcoding,
@@ -82,10 +84,9 @@ function startWorker<T>(name: string, processor: Processor<T>, concurrency: numb
 }
 
 /**
- * Only the worker invokes MiniCPM, so only the worker demands the Modal
- * token — the API never receives infrastructure credentials it does not use.
- * Same rule as the binary checks below: fail at startup, loudly, not at the
- * first video someone uploads.
+ * Only the worker invokes MiniCPM and the internet-video Modal stack, so only
+ * the worker demands the Modal token — the API never receives infrastructure
+ * credentials it does not use.
  */
 function checkVideoProviderConfig(): void {
   if (env.VIDEO_PROVIDER === 'minicpm' && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
@@ -101,7 +102,6 @@ async function checkBinaries(): Promise<void> {
       await check();
       logger.info('dependency available', { dependency: label });
     } catch (error) {
-      // Fail loudly at startup rather than at the first job.
       logger.error('required binary is missing', { dependency: label, err: error });
       throw new Error(`Required dependency "${label}" is not available: ${(error as Error).message}`);
     }
@@ -113,11 +113,7 @@ async function main(): Promise<void> {
     nodeEnv: env.NODE_ENV,
     transcription: env.TRANSCRIPTION_ENABLED,
     videoModel: env.OPENROUTER_VIDEO_MODEL,
-    // The configured ceiling for actual-footage verification/search calls.
     videoCallConcurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
-    // On by default now, and it spends GPU time on every upload — an operator
-    // reading one startup line should be able to see that without going
-    // looking for it.
     retrievalPrimary: env.RETRIEVAL_PRIMARY,
     simplememIndexing: env.SIMPLEMEM_INDEX_ENABLED,
   });
@@ -127,8 +123,6 @@ async function main(): Promise<void> {
   await checkBinaries();
   await runMigrations();
 
-  // Metadata handles only: no `remote`, no inference, and no L4 wake-up.
-  // This must pass before queue consumers exist or the worker says it is ready.
   if (env.VIDEO_PROVIDER === 'minicpm') {
     await assertMiniCpmDeploymentAvailable();
     logger.info('MiniCPM deployment available', {
@@ -143,45 +137,27 @@ async function main(): Promise<void> {
   startWorker(QUEUE_NAMES.ingestion, handleIngestion, env.INGESTION_CONCURRENCY);
   startWorker(QUEUE_NAMES.preprocessing, handlePreprocessing, env.PREPROCESS_CONCURRENCY);
   startWorker(QUEUE_NAMES.transcription, handleTranscription, env.TRANSCRIPTION_CONCURRENCY);
-  // One at a time as well: a SimpleMem read is a captioning call per kept
-  // frame, and the sidecar is one process on one box.
   startWorker(QUEUE_NAMES.simplememIndexing, handleSimpleMemIndexing, 1);
   startWorker(QUEUE_NAMES.clipSearch, handleClipSearch, env.CLIP_SEARCH_CONCURRENCY);
   startWorker(QUEUE_NAMES.clipGeneration, handleClipGeneration, env.CLIP_GENERATION_CONCURRENCY);
-  // Reframes share the clip renderer's budget: both are ffmpeg encodes of
-  // the same source, and letting them compete for the same slots is what
-  // keeps a burst of publishes from starving the cuts people are waiting on.
   startWorker(QUEUE_NAMES.clipVariant, handleClipVariant, env.CLIP_GENERATION_CONCURRENCY);
-  // One at a time on purpose: each Re-clip is a GPU call, and this worker
-  // must never be able to out-fan the MiniCPM concurrency budget on its own.
   startWorker(QUEUE_NAMES.reclip, handleReclip, 1);
-  // One at a time: the sweep is background work and must never take a slot
-  // from a search or a clip someone is waiting on.
   startWorker(QUEUE_NAMES.thumbnailBackfill, handleThumbnailBackfill, 1);
   startWorker(QUEUE_NAMES.retention, handleRetention, 1);
-  // Promised publishes: one at a time is plenty — the alarm density is human.
   startWorker(QUEUE_NAMES.scheduledPublish, handleScheduledPublish, 1);
   startWorker(QUEUE_NAMES.learningReport, handleLearningReport, 1);
+  // Internet search can fan into several GPU-backed video reads; keep one
+  // user search active per worker until production measurements justify more.
+  startWorker(INTERNET_VIDEO_SEARCH_QUEUE, handleInternetVideoSearch, 1);
 
-  logger.info('worker ready', { queues: Object.values(QUEUE_NAMES) });
+  logger.info('worker ready', { queues: [...Object.values(QUEUE_NAMES), INTERNET_VIDEO_SEARCH_QUEUE] });
 
-  // Queued rather than run inline: the sweep goes through the same retention,
-  // logging and shutdown handling as everything else, and a fixed job id keeps
-  // a redeploy or a second replica from sweeping twice. Failing to queue it is
-  // not a reason to fail the worker — nothing else depends on it.
   if (env.THUMBNAIL_BACKFILL_ON_START) {
     await enqueueThumbnailBackfill(new Date().toISOString()).catch((error: unknown) => {
       logger.warn('could not queue the thumbnail backfill', { err: error });
     });
   }
 
-  /**
-   * Footage whose session has ended is swept hourly. Deliberately a timer
-   * rather than a repeatable job: the queue de-duplicates by the hour in the
-   * job id, so several workers or several restarts still produce one sweep an
-   * hour, and there is no schedule stored anywhere to drift out of sync with
-   * this code.
-   */
   if (env.RETENTION_SWEEP_ENABLED) {
     const sweep = () => {
       void enqueueRetentionSweep(new Date().toISOString()).catch((error: unknown) => {
@@ -190,14 +166,9 @@ async function main(): Promise<void> {
     };
     sweep();
     const timer = setInterval(sweep, env.RETENTION_SWEEP_INTERVAL_MS);
-    // Never hold the process open for a sweep that can run after a restart.
     timer.unref();
   }
 
-  /**
-   * What the last day taught us, once a day. Footage is deleted when a session
-   * ends, so this is the form the learning takes — see docs/learning-loop.md.
-   */
   if (env.LEARNING_REPORT_ENABLED) {
     const report = () => {
       void enqueueLearningReport(new Date().toISOString()).catch((error: unknown) => {
