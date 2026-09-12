@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { looksLikePlayableMedia, normalizeSearxResults } from '../src/services/retrieval/webDiscovery.js';
 
 describe('web video discovery', () => {
-  it('recognizes direct media without treating ordinary pages as playable', () => {
+  it('recognizes file-backed media without pretending streaming manifests are directly fetchable', () => {
     expect(looksLikePlayableMedia('https://cdn.example.com/video.mp4?token=abc')).toBe(true);
-    expect(looksLikePlayableMedia('https://cdn.example.com/master.m3u8')).toBe(true);
+    expect(looksLikePlayableMedia('https://cdn.example.com/master.m3u8')).toBe(false);
+    expect(looksLikePlayableMedia('https://cdn.example.com/manifest.mpd')).toBe(false);
     expect(looksLikePlayableMedia('https://example.com/watch/123')).toBe(false);
   });
 
