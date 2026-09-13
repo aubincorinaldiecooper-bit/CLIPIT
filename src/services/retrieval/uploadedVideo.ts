@@ -29,18 +29,40 @@ export async function analyzeUploadedVideo(input: {
   expectedBytes?: number;
   durationSeconds: number | null;
 }): Promise<UploadedVideoAnalysis> {
-  const analysis = await analyzeInternetVideo({
-    query: input.query,
-    videoUrl: input.videoUrl,
-    videoKey: input.videoKey,
-    expectedBytes: input.expectedBytes,
-    maxEvents: WATCH_MAX_EVENTS,
-  });
-  const durationSeconds = input.durationSeconds ?? analysis.durationSeconds;
-  return {
-    ...analysis,
-    unwatched: unwatchedTail({ watchedThroughSeconds: analysis.watchedThroughSeconds, durationSeconds }),
-  };
+  try {
+    const analysis = await analyzeInternetVideo({
+      query: input.query,
+      videoUrl: input.videoUrl,
+      videoKey: input.videoKey,
+      expectedBytes: input.expectedBytes,
+      maxEvents: WATCH_MAX_EVENTS,
+    });
+    const durationSeconds = input.durationSeconds ?? analysis.durationSeconds;
+    return {
+      ...analysis,
+      unwatched: unwatchedTail({ watchedThroughSeconds: analysis.watchedThroughSeconds, durationSeconds }),
+    };
+  } catch (error) {
+    // Uploaded-video retrieval no longer falls back to the retired per-chunk
+    // video model when the whole-video stack fails. Preserve the failure as
+    // an explicit coverage gap so the caller can finish honestly rather than
+    // silently re-reading every two-minute chunk through another model.
+    const durationSeconds = input.durationSeconds ?? 0;
+    const reason = error instanceof Error ? error.message : 'whole-video analysis failed';
+    return {
+      model: 'MCG-NJU/VideoChat3-4B',
+      revision: 'unavailable',
+      durationSeconds,
+      watchedEvents: 0,
+      watchedThroughSeconds: 0,
+      verified: [],
+      failures: durationSeconds > 0
+        ? [{ id: 'whole-video-read', reason, startSeconds: 0, endSeconds: durationSeconds }]
+        : [{ id: 'whole-video-read', reason }],
+      metrics: { failed: true, reason },
+      unwatched: durationSeconds > 0 ? { startSeconds: 0, endSeconds: durationSeconds } : null,
+    };
+  }
 }
 
 export interface PlaceableMoment {
