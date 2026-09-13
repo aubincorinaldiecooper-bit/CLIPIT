@@ -64,6 +64,7 @@ import type {
   AnsweredFrom,
   FallbackReason,
   ResolvedSearchMode,
+  RetrievalSystem,
   UncertainMatch,
   Video,
   VideoChunk,
@@ -99,6 +100,12 @@ import { getSimpleMemIndex, setSimpleMemIndexStatus } from '../../db/repositorie
 import { SimpleMemReindexRequired, simplememQuery } from '../../services/retrieval/simplemem/client.js';
 import { decideFallback, mapCandidates } from '../../services/retrieval/simplemem/candidates.js';
 import { rerankSimpleMemCandidates } from '../../services/retrieval/simplemem/rerank.js';
+import {
+  WATCH_MAX_EVENTS,
+  analyzeUploadedVideo,
+  placeMomentsOnChunks,
+  type UploadedVideoAnalysis,
+} from '../../services/retrieval/uploadedVideo.js';
 
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   const { clipRequestId } = job.data;
@@ -338,7 +345,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     });
     if (fromSimpleMem.matchCount > 0) {
       await recordRetrievalOutcome(clipRequestId, {
-        primary: 'simplemem',
+        primary: env.RETRIEVAL_PRIMARY === 'videochat3' ? 'videochat3' : 'simplemem',
         system: 'simplemem',
         fallbackReason: null,
         primaryOutcome: fromSimpleMem.outcome,
@@ -348,7 +355,49 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       chunkCount = 0;
       return;
     }
-    if (env.RETRIEVAL_PRIMARY === 'simplemem') {
+    if (env.RETRIEVAL_PRIMARY === 'videochat3') {
+      if (fromSimpleMem.fallback !== 'disabled') {
+        log.info('Omni-SimpleMem handed the question on; watching the footage', { reason: fromSimpleMem.fallback });
+      }
+      // The footage is read the way an internet video is read: VideoChat3
+      // watches, Qwen embeds and reranks, VideoChat3 verifies. A miss in
+      // memory was never an answer; this is the read that can be one.
+      const fromVideoChat3 = await answerFromVideoChat3({
+        clipRequestId,
+        deckAttemptId,
+        requestedResultCount: intent.countExplicit ? intent.requestedCount : null,
+        video,
+        chunks,
+        instruction,
+        mode: resolved.mode,
+        log,
+      });
+      const primaryOutcome = {
+        simplemem: fromSimpleMem.fallback === 'disabled'
+          ? null
+          : { fallback: fromSimpleMem.fallback, ...(fromSimpleMem.outcome ?? {}) },
+        videochat3: fromVideoChat3.outcome,
+      };
+      if (fromVideoChat3.answered) {
+        await recordRetrievalOutcome(clipRequestId, {
+          primary: 'videochat3',
+          system: 'videochat3',
+          fallbackReason: null,
+          primaryOutcome,
+        });
+        outcome = 'completed';
+        searchMode = resolved.mode;
+        chunkCount = 0;
+        return;
+      }
+      await recordRetrievalOutcome(clipRequestId, {
+        primary: 'videochat3',
+        system: null,
+        fallbackReason: fromVideoChat3.fallback,
+        primaryOutcome,
+      });
+      log.info('VideoChat3 handed the question on to the direct footage search', { reason: fromVideoChat3.fallback });
+    } else if (env.RETRIEVAL_PRIMARY === 'simplemem') {
       await recordRetrievalOutcome(clipRequestId, {
         primary: 'simplemem',
         system: null,
@@ -742,6 +791,12 @@ async function clearPreviousAttempt(
 export async function completeRequest(input: {
   clipRequestId: string;
   answeredFrom: AnsweredFrom;
+  /**
+   * Which system answered, when the kind of evidence does not say. A
+   * VideoChat3 answer is from the footage, like the per-chunk search's; the
+   * row still records which of the two read it.
+   */
+  retrievalSystem?: RetrievalSystem;
   /** The token from recordDeckPlan — the release is fenced to it. */
   deckAttemptId: string | null;
   /** A number the person wrote, or null: the only cap there is. */
@@ -841,7 +896,7 @@ export async function completeRequest(input: {
         clipRequestId,
         input.deckAttemptId,
         input.answeredFrom,
-        input.answeredFrom === 'simplemem' ? 'simplemem' : 'clipit',
+        input.retrievalSystem ?? (input.answeredFrom === 'simplemem' ? 'simplemem' : 'clipit'),
       )
     : false;
   if (!released) {
@@ -939,7 +994,13 @@ async function answerFromSimpleMem(input: {
   fallback: FallbackReason | null;
   outcome: Record<string, unknown> | null;
 }> {
-  if (env.RETRIEVAL_PRIMARY !== 'simplemem') {
+  // Memory is consulted when it is the primary, and when VideoChat3 is the
+  // primary but a memory is being built for every upload: a hit there is
+  // verified against the footage and saves a full watch; a miss is not an
+  // answer, and the footage is watched.
+  const consultMemory = env.RETRIEVAL_PRIMARY === 'simplemem'
+    || (env.RETRIEVAL_PRIMARY === 'videochat3' && env.SIMPLEMEM_INDEX_ENABLED);
+  if (!consultMemory) {
     return { matchCount: 0, released: false, fallback: 'disabled', outcome: null };
   }
   const index = await getSimpleMemIndex(input.video.id);
@@ -1084,27 +1145,20 @@ async function answerFromSimpleMem(input: {
     }
   }
   const wanted = input.requestedResultCount ?? verified.candidates.length;
-  const found: NewClipMatch[] = [];
-  for (const candidate of verified.candidates.slice(0, wanted)) {
-    const chunk = input.chunks.find((item) =>
-      candidate.startSeconds >= item.globalStartSeconds && candidate.startSeconds < item.globalEndSeconds,
-    ) ?? input.chunks.at(-1);
-    if (!chunk) continue;
-    const local = mapGlobalRangeToChunk(chunk, candidate);
-    if (!local) continue;
-    found.push({
-      chunkId: chunk.id,
-      localStartSeconds: local.localStartSeconds,
-      localEndSeconds: local.localEndSeconds,
-      globalStartSeconds: local.globalStartSeconds,
-      globalEndSeconds: local.globalEndSeconds,
-      description: candidate.description || `A moment matching "${input.instruction}"`,
-      confidence: Math.max(0, Math.min(1, candidate.score)),
-      source: 'visual',
+  const found = placeMomentsOnChunks(
+    verified.candidates.slice(0, wanted).map((candidate) => ({
+      startSeconds: candidate.startSeconds,
+      endSeconds: candidate.endSeconds,
+      confidence: candidate.score,
+      description: candidate.description,
+    })),
+    input.chunks,
+    {
+      instruction: input.instruction,
       provider: 'omni-simplemem',
       model: typeof index?.config?.visual === 'string' ? index.config.visual : 'Omni-SimpleMem',
-    });
-  }
+    },
+  );
   if (found.length === 0) return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
   await insertMatches(input.clipRequestId, found);
   const finalCount = await aggregateStoredMatches(input.clipRequestId, input.chunks, input.deckAttemptId);
@@ -1130,6 +1184,166 @@ async function answerFromSimpleMem(input: {
   });
   input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, ...outcome });
   return { matchCount: finalCount, released, fallback: null, outcome };
+}
+
+
+/**
+ * How long the footage's signed URL stays valid for the VideoChat3 pipeline.
+ *
+ * Every stage downloads the proxy again — watch, embed, rerank and verify are
+ * separate Modal calls — and a long watch runs up to its 1800 s function
+ * timeout before the rest begin. A URL scoped to one call's timeout would
+ * expire under the later stages, which would then fail as a download error.
+ */
+const VIDEOCHAT3_SOURCE_URL_SECONDS = 2 * 60 * 60;
+
+/**
+ * Read the footage the way an internet video is read.
+ *
+ * VideoChat3 watches the analysis proxy for the question, Qwen embeddings and
+ * the Qwen reranker order what it flagged, and VideoChat3 re-opens each
+ * candidate before it becomes evidence. The whole video is read at one frame
+ * a second, so "nothing verified" is a finding about the footage rather than a
+ * memory's silence, and it completes the request. Two things hand on to the
+ * direct per-chunk search instead: a question about speech, which this
+ * watcher cannot hear, and the pipeline itself failing.
+ */
+async function answerFromVideoChat3(input: {
+  clipRequestId: string;
+  deckAttemptId: string | null;
+  requestedResultCount: number | null;
+  video: Video;
+  chunks: VideoChunk[];
+  instruction: string;
+  mode: ResolvedSearchMode;
+  log: Logger;
+}): Promise<{
+  /** True when this path finished the request — with moments, or with an honest none. */
+  answered: boolean;
+  matchCount: number;
+  fallback: FallbackReason | null;
+  outcome: Record<string, unknown> | null;
+}> {
+  if (input.mode === 'transcript') {
+    return {
+      answered: false,
+      matchCount: 0,
+      fallback: 'unsupported_mode',
+      outcome: { detail: 'the question is about speech, and VideoChat3 watches without sound' },
+    };
+  }
+  if (!input.video.proxyStorageKey) {
+    return {
+      answered: false,
+      matchCount: 0,
+      fallback: 'primary_failed',
+      outcome: { error: 'Video has no analysis proxy to watch' },
+    };
+  }
+
+  await startClipRequest(input.clipRequestId, { chunksTotal: 0, resolvedMode: input.mode });
+  let analysis: UploadedVideoAnalysis;
+  try {
+    const object = await getStorage().head(input.video.proxyStorageKey);
+    const videoUrl = await getStorage().createDownloadUrl(input.video.proxyStorageKey, {
+      expiresInSeconds: VIDEOCHAT3_SOURCE_URL_SECONDS,
+    });
+    analysis = await analyzeUploadedVideo({
+      query: input.instruction,
+      videoUrl,
+      videoKey: input.video.proxyStorageKey,
+      expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? undefined,
+      durationSeconds: input.video.durationSeconds,
+    });
+  } catch (error) {
+    const detail = errorMessage(error);
+    input.log.warn('the VideoChat3 pipeline could not read the footage; using the direct footage search', { err: error });
+    return { answered: false, matchCount: 0, fallback: 'primary_failed', outcome: { error: detail } };
+  }
+
+  const outcome = {
+    watchedEvents: analysis.watchedEvents,
+    watchedThroughSeconds: analysis.watchedThroughSeconds,
+    unwatched: analysis.unwatched,
+    verifiedMoments: analysis.verified.length,
+    failures: analysis.failures.length,
+    model: analysis.model,
+    revision: analysis.revision,
+    metrics: analysis.metrics,
+  };
+
+  // A retry must not keep a previous attempt's moments beside this one's.
+  await clearPreviousAttempt(input.clipRequestId, input.log, input.deckAttemptId);
+
+  // Coverage is written before the answer, so the record never says "nothing
+  // there" about seconds the watcher did not reach or could not verify.
+  const chunkAt = (seconds: number) =>
+    input.chunks.find((item) => seconds >= item.globalStartSeconds && seconds < item.globalEndSeconds)
+      ?? input.chunks.at(-1);
+  const gaps: Array<{ startSeconds: number; endSeconds: number; message: string }> = [];
+  if (analysis.unwatched) {
+    gaps.push({
+      ...analysis.unwatched,
+      message: `VideoChat3 stopped watching at ${Math.round(analysis.unwatched.startSeconds)}s: it had flagged ${WATCH_MAX_EVENTS} moments, the most one read may hold.`,
+    });
+  }
+  for (const failure of analysis.failures) {
+    if (failure.startSeconds === undefined || failure.endSeconds === undefined) continue;
+    gaps.push({
+      startSeconds: failure.startSeconds,
+      endSeconds: failure.endSeconds,
+      message: `VideoChat3 flagged this stretch, but it could not be verified: ${failure.reason}`,
+    });
+  }
+  for (const gap of gaps) {
+    const chunk = chunkAt(gap.startSeconds);
+    if (!chunk) continue;
+    const stillOwned = await recordChunkFailure(input.clipRequestId, {
+      chunkIndex: chunk.chunkIndex,
+      chunkId: chunk.id,
+      message: gap.message,
+      code: 'not_read_yet',
+      globalStartSeconds: gap.startSeconds,
+      globalEndSeconds: gap.endSeconds,
+    }, input.deckAttemptId!);
+    if (!stillOwned) {
+      input.log.info('another delivery owns this request; discarding stale VideoChat3 coverage');
+      return { answered: true, matchCount: 0, fallback: null, outcome };
+    }
+  }
+
+  const wanted = input.requestedResultCount ?? analysis.verified.length;
+  const found = placeMomentsOnChunks(analysis.verified.slice(0, wanted), input.chunks, {
+    instruction: input.instruction,
+    provider: 'modal',
+    model: analysis.model,
+  });
+  let finalCount = 0;
+  if (found.length > 0) {
+    await insertMatches(input.clipRequestId, found);
+    finalCount = await aggregateStoredMatches(input.clipRequestId, input.chunks, input.deckAttemptId);
+    await withWorkDir(`videochat3-${input.clipRequestId}`, async (dir) => {
+      await attachSearchThumbnails({ clipRequestId: input.clipRequestId, video: input.video, workDir: dir, log: input.log });
+    });
+  }
+  const durationSeconds = input.video.durationSeconds ?? analysis.durationSeconds;
+  const released = await completeRequest({
+    clipRequestId: input.clipRequestId,
+    answeredFrom: 'footage',
+    retrievalSystem: 'videochat3',
+    deckAttemptId: input.deckAttemptId,
+    requestedResultCount: input.requestedResultCount,
+    question: input.instruction,
+    coverageNote: analysis.unwatched
+      ? `VideoChat3 only watched the first ${Math.round(analysis.unwatched.startSeconds)} of ${Math.round(durationSeconds)} seconds.`
+      : null,
+    // The unwatched tail is persisted above for the structured API and has
+    // its precise prose note here; verification failures keep their warning.
+    coverageFailuresDescribed: analysis.unwatched ? 1 : 0,
+    log: input.log,
+  });
+  input.log.info('answered from VideoChat3', { matches: finalCount, released, ...outcome });
+  return { answered: true, matchCount: finalCount, fallback: null, outcome };
 }
 
 

@@ -92,6 +92,11 @@ function checkVideoProviderConfig(): void {
   if (env.VIDEO_PROVIDER === 'minicpm' && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
     throw new Error('VIDEO_PROVIDER=minicpm requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker');
   }
+  if (env.RETRIEVAL_PRIMARY === 'videochat3' && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
+    throw new Error(
+      'RETRIEVAL_PRIMARY=videochat3 requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker: VideoChat3 and the Qwen services run on Modal',
+    );
+  }
 }
 
 async function checkBinaries(): Promise<void> {

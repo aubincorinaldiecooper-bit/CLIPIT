@@ -31,6 +31,20 @@ export interface SimpleMemHealth {
   version: string;
 }
 
+/**
+ * How captioning the kept frames went. Upstream used to store "Image
+ * captured" for a frame whose caption never arrived and count it as a
+ * success; the sidecar now counts it (tools/simplemem/captions.py). Null
+ * from a sidecar that predates the counts.
+ */
+export interface SimpleMemCaptionStats {
+  attempted: number;
+  captioned: number;
+  retried: number;
+  failed: number;
+  lastError: string | null;
+}
+
 export interface SimpleMemIndexReply {
   videoMauId: string;
   fps: number;
@@ -40,6 +54,7 @@ export interface SimpleMemIndexReply {
   /** How far into the video SimpleMem looked. Bounded by max_frames / fps. */
   coveredThroughSeconds: number;
   audioTranscribed: boolean;
+  captions: SimpleMemCaptionStats | null;
   elapsedMs: number;
 }
 
@@ -145,6 +160,21 @@ export async function simplememHealth(): Promise<SimpleMemHealth> {
   return readHealthReply(await request<Record<string, unknown>>('GET', `${baseUrl()}/ready`, { timeoutMs: 15_000 }));
 }
 
+function readCaptionStats(raw: unknown): SimpleMemCaptionStats | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== 'object') {
+    throw new ExternalServiceError(SERVICE, 'Sidecar reply has a malformed "captions" field', { retryable: false });
+  }
+  const row = raw as Record<string, unknown>;
+  return {
+    attempted: finiteNumber(row.attempted, 'captions.attempted'),
+    captioned: finiteNumber(row.captioned, 'captions.captioned'),
+    retried: finiteNumber(row.retried, 'captions.retried'),
+    failed: finiteNumber(row.failed, 'captions.failed'),
+    lastError: typeof row.lastError === 'string' && row.lastError.trim() ? row.lastError.trim().slice(0, 300) : null,
+  };
+}
+
 export function readIndexReply(raw: Record<string, unknown>): SimpleMemIndexReply {
   return {
     videoMauId: nonEmptyString(raw.videoMauId, 'videoMauId'),
@@ -154,6 +184,7 @@ export function readIndexReply(raw: Record<string, unknown>): SimpleMemIndexRepl
     framesSkipped: finiteNumber(raw.framesSkipped, 'framesSkipped'),
     coveredThroughSeconds: finiteNumber(raw.coveredThroughSeconds, 'coveredThroughSeconds'),
     audioTranscribed: raw.audioTranscribed === true,
+    captions: readCaptionStats(raw.captions),
     elapsedMs: finiteNumber(raw.elapsedMs, 'elapsedMs'),
   };
 }
