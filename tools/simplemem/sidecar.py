@@ -36,7 +36,7 @@ from simplemem import create
 from simplemem.multimodal.core.config import OmniMemoryConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from captions import CaptionWriter  # noqa: E402
+from captions import UNCAPTIONED, CaptionWriter  # noqa: E402
 
 
 DATA_ROOT = Path(os.environ.get("SIMPLEMEM_DATA_DIR", "/data/simplemem")).resolve()
@@ -622,6 +622,7 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
         metadata = result.metadata or {}
         frame_maus = metadata.get("frame_maus") or []
         frames: dict[str, dict[str, float | int]] = {}
+        uncaptioned: set[int] = set()
         for frame in frame_maus:
             frame_id = str(getattr(frame, "id", "") or "")
             frame_meta = getattr(frame, "metadata", None)
@@ -629,6 +630,12 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
             if not frame_id or not isinstance(frame_index, int) or frame_index < 0:
                 continue
             frames[frame_id] = {"frameIndex": frame_index, "seconds": frame_index / fps}
+            # A frame kept with the placeholder is remembered by what it looks
+            # like only. Its index travels back so the search can say which
+            # seconds were never described, instead of implying they were.
+            if str(getattr(frame, "summary", "") or "") == UNCAPTIONED:
+                uncaptioned.add(frame_index)
+        captions["uncaptionedFrames"] = sorted(uncaptioned)
 
         processed = int(metadata.get("frames_processed") or len(frame_maus))
         skipped = int(metadata.get("frames_skipped") or 0)

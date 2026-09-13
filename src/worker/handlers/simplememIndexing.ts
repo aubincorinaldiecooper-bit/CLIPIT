@@ -79,6 +79,7 @@ export async function handleSimpleMemIndexing(job: Job<SimpleMemIndexingJob>): P
       // what they look like; they just cannot be found by what they show.
       log.warn('SimpleMem remembered some frames without a caption', {
         framesWithoutCaption: reply.captions.failed,
+        undescribedFrames: reply.captions.uncaptionedFrames.length,
         framesCaptioned: reply.captions.captioned,
         retried: reply.captions.retried,
         lastError: reply.captions.lastError,

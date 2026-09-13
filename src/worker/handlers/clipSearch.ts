@@ -97,7 +97,7 @@ function classifyChunkFailure(reason: unknown): ChunkFailureCode {
 import { writeConversationalAnswer } from '../../services/search/conversationalAnswer.js';
 import { getSimpleMemIndex } from '../../db/repositories/simplememIndex.js';
 import { simplememQuery } from '../../services/retrieval/simplemem/client.js';
-import { decideFallback, mapCandidates } from '../../services/retrieval/simplemem/candidates.js';
+import { decideFallback, mapCandidates, uncaptionedRanges } from '../../services/retrieval/simplemem/candidates.js';
 import { rerankSimpleMemCandidates } from '../../services/retrieval/simplemem/rerank.js';
 
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
@@ -1071,6 +1071,31 @@ async function answerFromSimpleMem(input: {
       return { matchCount: verified.candidates.length, released: false, fallback: null, outcome };
     }
   }
+  // Frames whose caption never arrived are remembered by what they look
+  // like only. Each such stretch is recorded as unexamined, so an answer
+  // from memory never implies those seconds were read in full.
+  const undescribed = uncaptionedRanges(index?.config, {
+    fps: index?.fps ?? env.SIMPLEMEM_FRAME_FPS,
+    durationSeconds: input.video.durationSeconds,
+  });
+  for (const range of undescribed) {
+    const chunk = input.chunks.find((item) =>
+      range.startSeconds >= item.globalStartSeconds && range.startSeconds < item.globalEndSeconds,
+    ) ?? input.chunks.at(-1);
+    if (!chunk) continue;
+    const stillOwned = await recordChunkFailure(input.clipRequestId, {
+      chunkIndex: chunk.chunkIndex,
+      chunkId: chunk.id,
+      message: `Omni-SimpleMem remembered this stretch (${range.frames} frame${range.frames === 1 ? '' : 's'}) without a description: the caption model returned no text, so it could only be found by what it looks like.`,
+      code: 'not_read_yet',
+      globalStartSeconds: range.startSeconds,
+      globalEndSeconds: range.endSeconds,
+    }, input.deckAttemptId!);
+    if (!stillOwned) {
+      input.log.info('another delivery owns this request; discarding stale SimpleMem coverage');
+      return { matchCount: verified.candidates.length, released: false, fallback: null, outcome };
+    }
+  }
   const wanted = input.requestedResultCount ?? verified.candidates.length;
   const found: NewClipMatch[] = [];
   for (const candidate of verified.candidates.slice(0, wanted)) {
@@ -1105,18 +1130,21 @@ async function answerFromSimpleMem(input: {
     deckAttemptId: input.deckAttemptId,
     requestedResultCount: input.requestedResultCount,
     question: input.instruction,
-    coverageNote: input.video.durationSeconds !== null
-      && index?.coveredThroughSeconds !== null && index?.coveredThroughSeconds !== undefined
-      && index.coveredThroughSeconds + 0.001 < input.video.durationSeconds
-      ? `Omni-SimpleMem only examined the first ${Math.round(index.coveredThroughSeconds)} of ${Math.round(input.video.durationSeconds)} seconds.`
-      : null,
-    // The unread tail is also persisted above for the structured API. Tell
-    // completion that this one failure already has the precise prose note;
-    // reranker failures remain undescribed and therefore retain their warning.
-    coverageFailuresDescribed: unreadTail ? 1 : 0,
+    coverageNote: [
+      unreadTail
+        ? `Omni-SimpleMem only examined the first ${Math.round(unreadTail.startSeconds)} of ${Math.round(unreadTail.endSeconds)} seconds.`
+        : null,
+      undescribed.length > 0
+        ? `${undescribed.length} stretch${undescribed.length === 1 ? '' : 'es'} of the video ${undescribed.length === 1 ? 'was' : 'were'} remembered without a description and could only be matched by appearance.`
+        : null,
+    ].filter(Boolean).join(' ') || null,
+    // The unread tail and the undescribed stretches are persisted above for
+    // the structured API and have their precise prose notes here; reranker
+    // failures remain undescribed and therefore retain their warning.
+    coverageFailuresDescribed: (unreadTail ? 1 : 0) + undescribed.length,
     log: input.log,
   });
-  input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, ...outcome });
+  input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, undescribedStretches: undescribed.length, ...outcome });
   return { matchCount: finalCount, released, fallback: null, outcome };
 }
 

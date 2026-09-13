@@ -46,6 +46,55 @@ export interface Candidate {
   frames: number;
 }
 
+export interface UncaptionedRange {
+  startSeconds: number;
+  endSeconds: number;
+  /** How many kept frames the stretch is made of. */
+  frames: number;
+}
+
+/**
+ * The stretches of a video SimpleMem remembered without a description.
+ *
+ * The sidecar lists the extracted frame indexes whose caption never
+ * arrived (captions.py); the index row keeps that list in its config.
+ * Those frames still carry a picture vector, so they can be found by what
+ * they look like, but not by what they show — and an answer from memory
+ * must not imply they were read in full. Neighbouring frames fold into
+ * one stretch; one frame covers 1/fps seconds.
+ *
+ * Anything malformed is treated as "no such list", never as "no such
+ * frames": a row written before the counts existed has nothing to say.
+ */
+export function uncaptionedRanges(
+  config: Record<string, unknown> | null | undefined,
+  options: { fps: number; durationSeconds: number | null },
+): UncaptionedRange[] {
+  const captions = config && typeof config === 'object' ? (config as Record<string, unknown>).captions : null;
+  const raw = captions && typeof captions === 'object' ? (captions as Record<string, unknown>).uncaptionedFrames : null;
+  if (!Array.isArray(raw) || !(options.fps > 0)) return [];
+  const frames = [...new Set(raw.filter((value): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 0))]
+    .sort((left, right) => left - right);
+  const runs: Array<{ first: number; last: number; frames: number }> = [];
+  for (const frame of frames) {
+    const run = runs.at(-1);
+    if (run && frame === run.last + 1) {
+      run.last = frame;
+      run.frames += 1;
+    } else {
+      runs.push({ first: frame, last: frame, frames: 1 });
+    }
+  }
+  const limit = options.durationSeconds ?? Number.POSITIVE_INFINITY;
+  return runs
+    .map((run) => ({
+      startSeconds: Math.min(run.first / options.fps, limit),
+      endSeconds: Math.min((run.last + 1) / options.fps, limit),
+      frames: run.frames,
+    }))
+    .filter((range) => range.endSeconds > range.startSeconds);
+}
+
 export interface MappingOptions {
   /** Frames per second SimpleMem sampled at; one frame covers 1/fps seconds. */
   fps: number;

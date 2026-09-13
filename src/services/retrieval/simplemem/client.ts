@@ -43,6 +43,8 @@ export interface SimpleMemCaptionStats {
   retried: number;
   failed: number;
   lastError: string | null;
+  /** Frames remembered without a description, by extracted frame index. */
+  uncaptionedFrames: number[];
 }
 
 export interface SimpleMemIndexReply {
@@ -147,18 +149,39 @@ export async function simplememHealth(): Promise<SimpleMemHealth> {
   return readHealthReply(await request<Record<string, unknown>>('GET', `${baseUrl()}/ready`, { timeoutMs: 15_000 }));
 }
 
+/** A count: a non-negative whole number. A negative or fractional one would silence the warning it exists for. */
+function count(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new ExternalServiceError(SERVICE, `Sidecar reply has an invalid ${field}: ${String(value)}`, { retryable: false });
+  }
+  return value;
+}
+
 function readCaptionStats(raw: unknown): SimpleMemCaptionStats | null {
   if (raw === null || raw === undefined) return null;
   if (typeof raw !== 'object') {
     throw new ExternalServiceError(SERVICE, 'Sidecar reply has a malformed "captions" field', { retryable: false });
   }
   const row = raw as Record<string, unknown>;
+  const stats = {
+    attempted: count(row.attempted, 'captions.attempted'),
+    captioned: count(row.captioned, 'captions.captioned'),
+    retried: count(row.retried, 'captions.retried'),
+    failed: count(row.failed, 'captions.failed'),
+  };
+  // Every attempt ends captioned or failed, and a retry is one attempt asked twice.
+  if (stats.captioned + stats.failed !== stats.attempted || stats.retried > stats.attempted) {
+    throw new ExternalServiceError(
+      SERVICE,
+      `Sidecar reply has inconsistent caption counts (attempted ${stats.attempted}, captioned ${stats.captioned}, failed ${stats.failed}, retried ${stats.retried})`,
+      { retryable: false },
+    );
+  }
+  const frames = Array.isArray(row.uncaptionedFrames) ? row.uncaptionedFrames : [];
   return {
-    attempted: finiteNumber(row.attempted, 'captions.attempted'),
-    captioned: finiteNumber(row.captioned, 'captions.captioned'),
-    retried: finiteNumber(row.retried, 'captions.retried'),
-    failed: finiteNumber(row.failed, 'captions.failed'),
+    ...stats,
     lastError: typeof row.lastError === 'string' && row.lastError.trim() ? row.lastError.trim().slice(0, 300) : null,
+    uncaptionedFrames: frames.map((value, index) => count(value, `captions.uncaptionedFrames[${index}]`)),
   };
 }
 
