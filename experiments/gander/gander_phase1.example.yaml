@@ -1,0 +1,31 @@
+server:
+  mode: lean
+  host: 0.0.0.0
+  port: 7975
+  runtime_dir: var/gander
+
+asr:
+  mode: external
+  url: http://127.0.0.1:8995
+  request_timeout_sec: 120
+
+duplex:
+  checkpoint: REPLACE_GANDER_THINKER
+  talker_checkpoint: REPLACE_GANDER_TALKER
+  allow_client_video: true
+  media_mode: omni
+  client_video_mode: omni
+  generate_audio: true
+
+worker:
+  provider: ornith
+  cwd: .
+  profile: task_scoped
+  settings:
+    base_url: http://127.0.0.1:8000/v1
+    model: Ornith-1.5-9B
+    api_key_env: ORNITH_API_KEY
+    request_timeout_sec: 300
+    max_parallel_projects: 1
+    temperature: 0.2
+    max_tokens: 4096
