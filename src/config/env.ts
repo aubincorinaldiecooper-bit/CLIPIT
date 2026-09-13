@@ -232,15 +232,25 @@ const envSchema = z.object({
       const parsed = Number(value);
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
     }),
-  // --- Retrieval primary: Omni-SimpleMem first, direct footage search as fallback
+  // --- Retrieval primary: which engine reads an uploaded video first
   /**
-   * Which retrieval system a question goes to first. `clipit` means direct
-   * actual-footage search. `simplemem` asks Omni-SimpleMem first, verifies
-   * candidates against the actual footage, and falls back to direct footage
-   * when memory is not ready, cannot place the question in time, or finds
-   * nothing. Each handoff reason is recorded so the paths stay measurable.
+   * Which retrieval system a question goes to first.
+   *
+   * `videochat3` (the default): VideoChat3 watches the analysis proxy for
+   * the question, Qwen embeddings and the Qwen reranker order what it
+   * flagged, and VideoChat3 re-opens each candidate before it becomes
+   * evidence — the pipeline internet videos already get. When SimpleMem
+   * indexing is on, the memory is asked first and its candidates go through
+   * the same verification; a miss there is not an answer, so the footage is
+   * watched. The direct per-chunk footage search (`clipit`) remains for
+   * questions about speech, which VideoChat3 cannot hear, and as the
+   * fallback when the VideoChat3 pipeline itself fails.
+   *
+   * `simplemem` asks Omni-SimpleMem first and falls back to the direct
+   * footage search. `clipit` is the direct per-chunk footage search alone.
+   * Each hand-off reason is recorded so the paths stay measurable.
    */
-  RETRIEVAL_PRIMARY: z.enum(['clipit', 'simplemem']).default('clipit'),
+  RETRIEVAL_PRIMARY: z.enum(['clipit', 'simplemem', 'videochat3']).default('videochat3'),
   /** The sidecar (tools/simplemem/sidecar.py). Required when SimpleMem is primary or indexing. */
   SIMPLEMEM_URL: z.string().trim().url().optional(),
   /** Shared internal credential required whenever this process can call the sidecar. */
