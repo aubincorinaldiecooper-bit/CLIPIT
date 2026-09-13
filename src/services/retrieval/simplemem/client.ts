@@ -4,24 +4,8 @@ import { env } from '../../../config/env.js';
 import { ExternalServiceError } from '../../../lib/errors.js';
 import type { SimpleMemItem, SimpleMemModality } from './candidates.js';
 
-/**
- * Clipit's side of the Omni-SimpleMem sidecar.
- *
- * The sidecar (tools/simplemem/sidecar.py) is a thin wrapper over the
- * library's own orchestrator: one memory per video, the frame rate chosen
- * by Clipit, each returned frame carrying the second of the video it was
- * taken from, and a delete. Nothing in it re-implements SimpleMem; it only
- * calls the library's public API and hands the answers back with the one
- * fact SimpleMem drops on the way in — where in the video a frame came from.
- *
- * Everything the sidecar returns is untrusted input and is checked before it
- * is believed, on the same rule the Media Index applies to a vector: a wrong
- * number here does not fail loudly, it becomes a moment at the wrong second.
- */
-
 export interface SimpleMemHealth {
   ok: boolean;
-  /** What the library will run, as it reported them. */
   models: {
     caption: string;
     visual: string;
@@ -29,14 +13,10 @@ export interface SimpleMemHealth {
     transcription: string;
   };
   version: string;
+  embeddingVersion: string;
+  transformersVersion: string;
 }
 
-/**
- * How captioning the kept frames went. Upstream used to store "Image
- * captured" for a frame whose caption never arrived and count it as a
- * success; the sidecar now counts it (tools/simplemem/captions.py). Null
- * from a sidecar that predates the counts.
- */
 export interface SimpleMemCaptionStats {
   attempted: number;
   captioned: number;
@@ -51,7 +31,6 @@ export interface SimpleMemIndexReply {
   framesExtracted: number;
   framesProcessed: number;
   framesSkipped: number;
-  /** How far into the video SimpleMem looked. Bounded by max_frames / fps. */
   coveredThroughSeconds: number;
   audioTranscribed: boolean;
   captions: SimpleMemCaptionStats | null;
@@ -87,6 +66,14 @@ function finiteNumber(value: unknown, field: string): number {
     throw new ExternalServiceError(SERVICE, `Sidecar reply field "${field}" is not a finite number`, { retryable: false });
   }
   return value;
+}
+
+function nonNegativeInteger(value: unknown, field: string): number {
+  const parsed = finiteNumber(value, field);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new ExternalServiceError(SERVICE, `Sidecar reply field "${field}" is not a non-negative integer`, { retryable: false });
+  }
+  return parsed;
 }
 
 function nonEmptyString(value: unknown, field: string): string {
@@ -129,6 +116,7 @@ async function request<T>(method: string, url: string, init: RequestInit & { tim
 
 export function readHealthReply(raw: Record<string, unknown>): SimpleMemHealth {
   const models = (raw.models ?? {}) as Record<string, unknown>;
+  const libraries = (raw.libraries ?? {}) as Record<string, unknown>;
   return {
     ok: raw.ok === true,
     models: {
@@ -138,12 +126,12 @@ export function readHealthReply(raw: Record<string, unknown>): SimpleMemHealth {
       transcription: nonEmptyString(models.transcription, 'models.transcription'),
     },
     version: typeof raw.version === 'string' ? raw.version : 'unknown',
+    embeddingVersion: nonEmptyString(raw.embeddingVersion, 'embeddingVersion'),
+    transformersVersion: nonEmptyString(libraries.transformers, 'libraries.transformers'),
   };
 }
 
 export async function simplememHealth(): Promise<SimpleMemHealth> {
-  // /ready is intentionally protected. A startup check must prove not only
-  // that the process is alive but that Clipit's worker can authenticate to it.
   return readHealthReply(await request<Record<string, unknown>>('GET', `${baseUrl()}/ready`, { timeoutMs: 15_000 }));
 }
 
@@ -153,11 +141,18 @@ function readCaptionStats(raw: unknown): SimpleMemCaptionStats | null {
     throw new ExternalServiceError(SERVICE, 'Sidecar reply has a malformed "captions" field', { retryable: false });
   }
   const row = raw as Record<string, unknown>;
+  const attempted = nonNegativeInteger(row.attempted, 'captions.attempted');
+  const captioned = nonNegativeInteger(row.captioned, 'captions.captioned');
+  const retried = nonNegativeInteger(row.retried, 'captions.retried');
+  const failed = nonNegativeInteger(row.failed, 'captions.failed');
+  if (captioned + failed !== attempted || retried > attempted) {
+    throw new ExternalServiceError(SERVICE, 'Sidecar reply has inconsistent caption counts', { retryable: false });
+  }
   return {
-    attempted: finiteNumber(row.attempted, 'captions.attempted'),
-    captioned: finiteNumber(row.captioned, 'captions.captioned'),
-    retried: finiteNumber(row.retried, 'captions.retried'),
-    failed: finiteNumber(row.failed, 'captions.failed'),
+    attempted,
+    captioned,
+    retried,
+    failed,
     lastError: typeof row.lastError === 'string' && row.lastError.trim() ? row.lastError.trim().slice(0, 300) : null,
   };
 }
@@ -176,15 +171,6 @@ export function readIndexReply(raw: Record<string, unknown>): SimpleMemIndexRepl
   };
 }
 
-/**
- * Sends a video to be remembered.
- *
- * `maxFrames` is the one setting that decides how much of the video
- * SimpleMem looks at: its default of 100 reads the first hundred seconds of
- * any video at one frame a second. Clipit always passes enough for the whole
- * length, and records what came back, so a short read is a fact on the row
- * rather than a surprise in an answer.
- */
 export async function simplememIndexVideo(input: {
   videoId: string;
   filePath: string;
@@ -196,9 +182,6 @@ export async function simplememIndexVideo(input: {
   form.set('fps', String(input.fps));
   form.set('max_frames', String(input.maxFrames));
   form.set('duration_seconds', String(input.durationSeconds));
-  // The analysis proxy, not the original: 360p at two frames a second is
-  // every pixel SimpleMem's one-frame-a-second read can use, at a fraction of
-  // the bytes.
   const bytes = await readFile(input.filePath);
   form.set('file', new File([bytes], path.basename(input.filePath), { type: 'video/mp4' }));
 
@@ -209,7 +192,6 @@ export async function simplememIndexVideo(input: {
   return readIndexReply(raw);
 }
 
-/** What SimpleMem remembers about a question, validated item by item. */
 export function readQueryReply(raw: Record<string, unknown>): SimpleMemQueryReply {
   const rows = Array.isArray(raw.items) ? raw.items : null;
   if (!rows) {
@@ -229,8 +211,7 @@ export function readQueryReply(raw: Record<string, unknown>): SimpleMemQueryRepl
         retryable: false,
       });
     }
-    const frameIndex =
-      row.frameIndex === null || row.frameIndex === undefined ? null : finiteNumber(row.frameIndex, 'items[].frameIndex');
+    const frameIndex = row.frameIndex === null || row.frameIndex === undefined ? null : finiteNumber(row.frameIndex, 'items[].frameIndex');
     const seconds = row.seconds === null || row.seconds === undefined ? null : finiteNumber(row.seconds, 'items[].seconds');
     if (seconds !== null && seconds < 0) {
       throw new ExternalServiceError(SERVICE, `Sidecar placed "${mauId}" at a negative second`, { retryable: false });
@@ -246,8 +227,7 @@ export function readQueryReply(raw: Record<string, unknown>): SimpleMemQueryRepl
   }
   return {
     items,
-    totalCandidates:
-      typeof raw.totalCandidates === 'number' && Number.isFinite(raw.totalCandidates) ? raw.totalCandidates : items.length,
+    totalCandidates: typeof raw.totalCandidates === 'number' && Number.isFinite(raw.totalCandidates) ? raw.totalCandidates : items.length,
     elapsedMs: typeof raw.elapsedMs === 'number' && Number.isFinite(raw.elapsedMs) ? raw.elapsedMs : 0,
   };
 }
@@ -260,9 +240,6 @@ export async function simplememQuery(input: { videoId: string; query: string; to
   return readQueryReply(raw);
 }
 
-/** Forgets a video. Footage lives as long as its session, and so does the memory of it. */
 export async function simplememDeleteVideo(videoId: string): Promise<void> {
-  await request<Record<string, unknown>>('DELETE', `${baseUrl()}/videos/${encodeURIComponent(videoId)}`, {
-    timeoutMs: 60_000,
-  });
+  await request<Record<string, unknown>>('DELETE', `${baseUrl()}/videos/${encodeURIComponent(videoId)}`, { timeoutMs: 60_000 });
 }

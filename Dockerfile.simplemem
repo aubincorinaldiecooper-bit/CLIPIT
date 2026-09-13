@@ -3,7 +3,8 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    SIMPLEMEM_DATA_DIR=/data/simplemem
+    SIMPLEMEM_DATA_DIR=/data/simplemem \
+    SIMPLEMEM_EMBEDDING_VERSION=v2-transformers457
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates \

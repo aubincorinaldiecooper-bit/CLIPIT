@@ -4,11 +4,13 @@ import { ExternalServiceError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { closePool } from '../db/pool.js';
 import { runMigrations } from '../db/migrate.js';
+import { listSimpleMemReindexVideoIds } from '../db/repositories/simplememIndex.js';
 import { closeRedis, getWorkerConnection } from '../queues/connection.js';
 import {
   closeQueues,
   enqueueLearningReport,
   enqueueRetentionSweep,
+  enqueueSimpleMemIndexing,
   enqueueThumbnailBackfill,
   QUEUE_NAMES,
 } from '../queues/index.js';
@@ -29,19 +31,8 @@ import { handleScheduledPublish } from './handlers/scheduledPublish.js';
 import { handleLearningReport } from './handlers/learningReport.js';
 import { handleInternetVideoSearch } from './handlers/internetVideoSearch.js';
 
-/**
- * Worker entrypoint. All long-running work — downloading, transcoding,
- * transcription, model calls, clip cutting — happens in this process, never in
- * the API.
- */
-
 const workers: Worker[] = [];
 
-/**
- * Honours `ExternalServiceError.retryable`. Some dependency failures — YouTube's
- * bot check, a rejected API key — will fail identically on every attempt, and
- * retrying them only delays the error the user is waiting on.
- */
 function withTerminalFailures<T>(processor: Processor<T>): Processor<T> {
   return async (job, token) => {
     try {
@@ -59,35 +50,18 @@ function startWorker<T>(name: string, processor: Processor<T>, concurrency: numb
   const worker = new Worker<T>(name, withTerminalFailures(processor), {
     connection: getWorkerConnection(),
     concurrency,
-    // Media jobs are long; give them room before BullMQ considers them stalled.
     lockDuration: 5 * 60 * 1000,
     stalledInterval: 60 * 1000,
   });
-
   worker.on('failed', (job: Job<T> | undefined, error: Error) => {
-    logger.error('job failed', {
-      queue: name,
-      jobId: job?.id,
-      attempts: job?.attemptsMade,
-      err: error.message,
-    });
+    logger.error('job failed', { queue: name, jobId: job?.id, attempts: job?.attemptsMade, err: error.message });
   });
-
-  worker.on('completed', (job: Job<T>) => {
-    logger.info('job completed', { queue: name, jobId: job.id });
-  });
-
+  worker.on('completed', (job: Job<T>) => logger.info('job completed', { queue: name, jobId: job.id }));
   worker.on('error', (error) => logger.error('worker error', { queue: name, err: error.message }));
-
   workers.push(worker as Worker);
   return worker;
 }
 
-/**
- * Only the worker invokes MiniCPM and the internet-video Modal stack, so only
- * the worker demands the Modal token — the API never receives infrastructure
- * credentials it does not use.
- */
 function checkVideoProviderConfig(): void {
   if (env.VIDEO_PROVIDER === 'minicpm' && (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET)) {
     throw new Error('VIDEO_PROVIDER=minicpm requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET on the worker');
@@ -101,7 +75,6 @@ function checkVideoProviderConfig(): void {
 
 async function checkBinaries(): Promise<void> {
   const checks: Array<[string, () => Promise<unknown>]> = [['ffmpeg/ffprobe', assertFfmpegAvailable]];
-
   for (const [label, check] of checks) {
     try {
       await check();
@@ -110,6 +83,17 @@ async function checkBinaries(): Promise<void> {
       logger.error('required binary is missing', { dependency: label, err: error });
       throw new Error(`Required dependency "${label}" is not available: ${(error as Error).message}`);
     }
+  }
+}
+
+async function enqueueSimpleMemRebuilds(): Promise<void> {
+  if (!env.SIMPLEMEM_INDEX_ENABLED) return;
+  const videoIds = await listSimpleMemReindexVideoIds(100);
+  for (const videoId of videoIds) {
+    await enqueueSimpleMemIndexing({ videoId });
+  }
+  if (videoIds.length > 0) {
+    logger.info('queued invalidated SimpleMem memories for rebuild', { videos: videoIds.length });
   }
 }
 
@@ -124,7 +108,6 @@ async function main(): Promise<void> {
   });
 
   checkVideoProviderConfig();
-
   await checkBinaries();
   await runMigrations();
 
@@ -151,9 +134,11 @@ async function main(): Promise<void> {
   startWorker(QUEUE_NAMES.retention, handleRetention, 1);
   startWorker(QUEUE_NAMES.scheduledPublish, handleScheduledPublish, 1);
   startWorker(QUEUE_NAMES.learningReport, handleLearningReport, 1);
-  // Internet search can fan into several GPU-backed video reads; keep one
-  // user search active per worker until production measurements justify more.
   startWorker(INTERNET_VIDEO_SEARCH_QUEUE, handleInternetVideoSearch, 1);
+
+  await enqueueSimpleMemRebuilds().catch((error: unknown) => {
+    logger.warn('could not queue invalidated SimpleMem memories for rebuild', { err: error });
+  });
 
   logger.info('worker ready', { queues: [...Object.values(QUEUE_NAMES), INTERNET_VIDEO_SEARCH_QUEUE] });
 

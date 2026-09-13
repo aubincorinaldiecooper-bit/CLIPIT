@@ -10,18 +10,14 @@ import { recordSimpleMemIndex, setSimpleMemIndexStatus } from '../../db/reposito
 import { simplememHealth, simplememIndexVideo } from '../../services/retrieval/simplemem/client.js';
 import type { SimpleMemIndexingJob } from '../../queues/index.js';
 
+const EXPECTED_EMBEDDING_VERSION = 'v2-transformers457';
+
 /**
  * Sends one video to Omni-SimpleMem to be remembered.
  *
- * SimpleMem's read is its own: it samples frames, keeps the ones whose
- * picture changed, captions each kept frame with a vision model, transcribes
- * the sound track in one piece, and writes a memory per frame. Clipit only
- * hands it the analysis proxy and records what came back — above all how far
- * into the video it looked, because SimpleMem stops at `max_frames` and a
- * question about the part past that must be told so.
- *
- * Nothing here touches the notes. A SimpleMem read that fails leaves the
- * Clipit search exactly as it was; that is what makes it a fallback.
+ * A memory is only published as ready when the embedding contract is the one
+ * Clipit expects and every kept frame that needed a caption received one.
+ * Partial memories are useful diagnostics, not authoritative retrieval.
  */
 export async function handleSimpleMemIndexing(job: Job<SimpleMemIndexingJob>): Promise<void> {
   const { videoId } = job.data;
@@ -41,11 +37,18 @@ export async function handleSimpleMemIndexing(job: Job<SimpleMemIndexingJob>): P
   await setSimpleMemIndexStatus(videoId, 'running');
 
   try {
-    // Whole length, up to the ceiling. Recorded either way: the row's
-    // covered_through_seconds is what the search names as unread.
     const fps = env.SIMPLEMEM_FRAME_FPS;
     const maxFrames = Math.min(env.SIMPLEMEM_MAX_FRAMES, Math.ceil(video.durationSeconds * fps) + 1);
     const health = await simplememHealth();
+
+    if (health.embeddingVersion !== EXPECTED_EMBEDDING_VERSION) {
+      throw new Error(
+        `SimpleMem embedding contract is ${health.embeddingVersion}; expected ${EXPECTED_EMBEDDING_VERSION}`,
+      );
+    }
+    if (!health.transformersVersion.startsWith('4.57.')) {
+      throw new Error(`SimpleMem is running transformers ${health.transformersVersion}; expected 4.57.x`);
+    }
 
     const reply = await withWorkDir(`simplemem-${videoId}`, async (dir) => {
       const proxyPath = path.join(dir, 'proxy.mp4');
@@ -59,6 +62,15 @@ export async function handleSimpleMemIndexing(job: Job<SimpleMemIndexingJob>): P
       });
     });
 
+    if (!reply.captions) {
+      throw new Error('SimpleMem did not report caption coverage; refusing to publish an unverifiable memory');
+    }
+    if (reply.captions.failed > 0) {
+      throw new Error(
+        `SimpleMem left ${reply.captions.failed} of ${reply.captions.attempted} kept frame(s) without captions; refusing partial memory`,
+      );
+    }
+
     const indexMs = Math.round(performance.now() - startedAt);
     await recordSimpleMemIndex(videoId, {
       videoMauId: reply.videoMauId,
@@ -69,21 +81,16 @@ export async function handleSimpleMemIndexing(job: Job<SimpleMemIndexingJob>): P
       coveredThroughSeconds: reply.coveredThroughSeconds,
       audioTranscribed: reply.audioTranscribed,
       indexMs,
-      // The caption counts ride on the row's config so a memory whose frames
-      // went undescribed can be told apart from one that was read in full.
-      config: { models: health.models, version: health.version, fps, maxFrames, captions: reply.captions },
+      config: {
+        models: health.models,
+        version: health.version,
+        embeddingVersion: health.embeddingVersion,
+        transformersVersion: health.transformersVersion,
+        fps,
+        maxFrames,
+        captions: reply.captions,
+      },
     });
-
-    if (reply.captions && reply.captions.failed > 0) {
-      // Those frames still carry a picture vector, so they are findable by
-      // what they look like; they just cannot be found by what they show.
-      log.warn('SimpleMem remembered some frames without a caption', {
-        framesWithoutCaption: reply.captions.failed,
-        framesCaptioned: reply.captions.captioned,
-        retried: reply.captions.retried,
-        lastError: reply.captions.lastError,
-      });
-    }
 
     log.info('video remembered by SimpleMem', {
       framesExtracted: reply.framesExtracted,
@@ -93,10 +100,10 @@ export async function handleSimpleMemIndexing(job: Job<SimpleMemIndexingJob>): P
       ofSeconds: Number(video.durationSeconds.toFixed(1)),
       audioTranscribed: reply.audioTranscribed,
       captions: reply.captions,
+      embeddingVersion: health.embeddingVersion,
+      transformersVersion: health.transformersVersion,
       sidecarMs: reply.elapsedMs,
       elapsedMs: indexMs,
-      // Seconds of video remembered per second of waiting: the one number
-      // that says how this read compares with reading the notes.
       secondsOfVideoPerSecond: Number((reply.coveredThroughSeconds / (indexMs / 1000)).toFixed(2)),
       models: health.models,
     });

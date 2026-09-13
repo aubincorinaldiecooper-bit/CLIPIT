@@ -1,12 +1,6 @@
-import { queryOne } from '../pool.js';
+import { queryOne, queryRows } from '../pool.js';
 
-/**
- * Clipit's record of what Omni-SimpleMem holds for a video. The memory
- * itself lives on the sidecar's disk; this row says whether it exists, how
- * far into the video it reaches, and under which models it was made. See
- * migration 043.
- */
-
+/** Clipit's durable record of what Omni-SimpleMem holds for a video. */
 export type SimpleMemIndexStatus = 'queued' | 'running' | 'ready' | 'failed' | 'unavailable';
 
 export interface SimpleMemIndexRow {
@@ -17,7 +11,6 @@ export interface SimpleMemIndexRow {
   framesExtracted: number | null;
   framesProcessed: number | null;
   framesSkipped: number | null;
-  /** How far into the video SimpleMem looked; null until the read finishes. */
   coveredThroughSeconds: number | null;
   audioTranscribed: boolean | null;
   indexMs: number | null;
@@ -67,6 +60,28 @@ function map(row: Row): SimpleMemIndexRow {
 export async function getSimpleMemIndex(videoId: string): Promise<SimpleMemIndexRow | null> {
   const row = await queryOne<Row>('SELECT * FROM simplemem_index WHERE video_id = $1', [videoId]);
   return row ? map(row) : null;
+}
+
+/**
+ * Videos invalidated by the v2 embedding-contract migration that can still be
+ * rebuilt from their retained analysis proxy. Returned in small batches so a
+ * deploy never floods the one-at-a-time memory worker.
+ */
+export async function listSimpleMemReindexVideoIds(limit = 100): Promise<string[]> {
+  const rows = await queryRows<{ video_id: string }>(
+    `SELECT s.video_id
+       FROM simplemem_index s
+       JOIN videos v ON v.id = s.video_id
+      WHERE s.status = 'failed'
+        AND s.error LIKE 'reindex required:%'
+        AND v.proxy_storage_key IS NOT NULL
+        AND v.duration_seconds IS NOT NULL
+        AND v.status = 'ready'
+      ORDER BY s.updated_at ASC
+      LIMIT $1`,
+    [limit],
+  );
+  return rows.map((row) => row.video_id);
 }
 
 /** Creates or resets the row for a read that is about to start, or that could not. */
