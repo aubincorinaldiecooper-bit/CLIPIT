@@ -233,8 +233,11 @@ export async function rerankSimpleMemCandidates(input: {
       ...row.candidate,
       score: verdict.confidence,
       description: verdict.description || row.candidate.description,
-      // What established it: footage judged with its transcript, or footage alone.
-      source: withTranscript.has(verdict.id) ? 'multimodal' : 'visual',
+      // Under 'required' the question needs the speech and the joint verdict
+      // says it held: established by both. Under 'when_present' the footage
+      // established it and the transcript was consulted; the verdict does not
+      // say whether the speech mattered, so the row does not claim it did.
+      source: policy === 'required' ? 'multimodal' : 'visual',
     });
   }
 

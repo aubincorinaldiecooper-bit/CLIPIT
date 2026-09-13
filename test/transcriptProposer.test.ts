@@ -16,7 +16,7 @@ vi.mock('../src/services/videochat3/client.js', () => ({ verifyWithVideoChat3 })
 
 const { env } = await import('../src/config/env.js');
 const {
-  MAX_SPOKEN_PROPOSALS, describeSpokenFailure, findPhraseWindows, proposalsFromTextSearch, proposeSpokenMoments, quotedPhrases, rankProposals,
+  SPOKEN_VERIFY_BATCH, describeSpokenFailure, findPhraseWindows, proposalsFromTextSearch, proposeSpokenMoments, quotedPhrases, rankProposals,
   speechTokens, speechUnsearched,
 } = await import('../src/services/retrieval/transcriptProposer.js');
 const { MISSING_TRANSCRIPT_REASON } = await import('../src/services/retrieval/mixedEvidence.js');
@@ -66,6 +66,19 @@ describe('where the transcript says the phrase', () => {
     expect(findPhraseWindows([segment(0, 0.1, 0.4, 'hi')], 'hi', 300)).toEqual([{ startSeconds: 0, endSeconds: 3, text: 'hi' }]);
   });
 
+  it('does not join the last word of one line to the first of the next across a silence', () => {
+    const apart = [segment(0, 0, 5, 'we are shutting'), segment(1, 200, 204, 'down for good')];
+    expect(findPhraseWindows(apart, 'shutting down', 300)).toEqual([]);
+    // A short pause between two lines is still one utterance.
+    const close = [segment(0, 0, 5, 'we are shutting'), segment(1, 7, 9, 'down for good')];
+    expect(findPhraseWindows(close, 'shutting down', 300)).toEqual([{ startSeconds: 0, endSeconds: 10.5, text: 'we are shutting down for good' }]);
+  });
+
+  it('ignores a line stamped past the end of the video', () => {
+    expect(findPhraseWindows([segment(0, 310, 312, 'bye')], 'bye', 300)).toEqual([]);
+    expect(findPhraseWindows([segment(0, 310, 312, 'bye')], 'bye', null)).toEqual([{ startSeconds: 308.5, endSeconds: 313.5, text: 'bye' }]);
+  });
+
   it('finds nothing when the words are not there in that order', () => {
     expect(findPhraseWindows(transcript, 'down shutting we', 300)).toEqual([]);
     expect(findPhraseWindows(transcript, '', 300)).toEqual([]);
@@ -73,14 +86,14 @@ describe('where the transcript says the phrase', () => {
 });
 
 describe('ranking proposals', () => {
-  it('puts direct phrase hits ahead of the text search, strongest first, and caps the count', () => {
-    const many = Array.from({ length: MAX_SPOKEN_PROPOSALS + 5 }, (_, index) => ({
+  it('puts direct phrase hits ahead of the text search, strongest first, and drops nothing', () => {
+    const many = Array.from({ length: SPOKEN_VERIFY_BATCH + 5 }, (_, index) => ({
       id: `spoken-text-${index}`, startSeconds: index * 10, endSeconds: index * 10 + 5, text: 't', confidence: index / 100, origin: 'text_search' as const,
     }));
     const ranked = rankProposals([...many, { id: 'spoken-phrase-0', startSeconds: 1, endSeconds: 4, text: 'p', confidence: null, origin: 'quoted_phrase' }]);
-    expect(ranked).toHaveLength(MAX_SPOKEN_PROPOSALS);
+    expect(ranked).toHaveLength(SPOKEN_VERIFY_BATCH + 6);
     expect(ranked[0]?.origin).toBe('quoted_phrase');
-    expect(ranked[1]?.confidence).toBe((MAX_SPOKEN_PROPOSALS + 4) / 100);
+    expect(ranked[1]?.confidence).toBe((SPOKEN_VERIFY_BATCH + 4) / 100);
   });
 
   it('turns the text search\'s matches into proposals that keep the spoken words', () => {
@@ -141,6 +154,19 @@ describe('proposeSpokenMoments', () => {
     expect(verifyWithVideoChat3.mock.calls[0]?.[0].candidates).toHaveLength(1);
     expect(result.moments.map((moment) => [moment.startSeconds, moment.quote])).toEqual([[198, 'we are shutting it down']]);
     expect(result.metrics).toMatchObject({ origin: 'text_search', chunks: 3, silentChunks: 1, proposals: 1, verified: 1 });
+  });
+
+  it('a phrase said many times is judged every time, in bounded batches', async () => {
+    const often = Array.from({ length: 45 }, (_, index) => segment(index, index * 6 + 2, index * 6 + 2.6, 'bye'));
+    listTranscriptSegments.mockResolvedValue(often);
+    listTranscriptSegmentsInRange.mockImplementation(async (_id: string, start: number, end: number) =>
+      often.filter((row) => row.endSeconds > start && row.startSeconds < end),
+    );
+    const result = await propose('find "bye"');
+    expect(verifyWithVideoChat3).toHaveBeenCalledTimes(3);
+    expect(verifyWithVideoChat3.mock.calls.map((call) => call[0].candidates.length)).toEqual([20, 20, 5]);
+    expect(result.moments).toHaveLength(45);
+    expect(result.metrics).toMatchObject({ proposals: 45, verified: 45, verifyCalls: 3 });
   });
 
   it('a verdict under the floor, or no match, is not a moment', async () => {

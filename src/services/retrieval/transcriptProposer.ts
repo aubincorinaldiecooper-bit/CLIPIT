@@ -70,7 +70,14 @@ export interface SpokenProposals {
 }
 
 /** The most proposals speech may hand to the verifier for one question. */
-export const MAX_SPOKEN_PROPOSALS = 20;
+/** The verifier is asked in batches of this many; every proposal is asked about. */
+export const SPOKEN_VERIFY_BATCH = 20;
+/**
+ * A phrase spans two transcript segments only when they are continuous
+ * speech. Across a longer silence, the last word of one line and the first
+ * of the next were never said as one phrase.
+ */
+export const PHRASE_CONTINUITY_SECONDS = 3;
 /** Seconds added either side of a phrase, so the clip shows the line being said. */
 export const PHRASE_PADDING_SECONDS = 1.5;
 /** A proposal shorter than this is widened around its middle: a two-word clip proves nothing. */
@@ -134,8 +141,21 @@ export function findPhraseWindows(
       }
     }
     if (!matched) continue;
-    const first = segments[stream[start]!.segment]!;
-    const last = segments[stream[start + wanted.length - 1]!.segment]!;
+    const firstIndex = stream[start]!.segment;
+    const lastIndex = stream[start + wanted.length - 1]!.segment;
+    let continuous = true;
+    for (let index = firstIndex; index < lastIndex; index += 1) {
+      if (segments[index + 1]!.startSeconds - segments[index]!.endSeconds > PHRASE_CONTINUITY_SECONDS) {
+        continuous = false;
+        break;
+      }
+    }
+    if (!continuous) continue;
+    const first = segments[firstIndex]!;
+    const last = segments[lastIndex]!;
+    // A line stamped past the end of the video points at footage that does
+    // not exist; nothing can verify it.
+    if (durationSeconds !== null && Number.isFinite(durationSeconds) && first.startSeconds >= durationSeconds) continue;
     windows.push(widen({
       startSeconds: first.startSeconds,
       endSeconds: last.endSeconds,
@@ -197,8 +217,7 @@ export function rankProposals(proposals: readonly SpokenProposal[]): SpokenPropo
     .sort((left, right) => {
       if (left.origin !== right.origin) return left.origin === 'quoted_phrase' ? -1 : 1;
       return (right.confidence ?? 1) - (left.confidence ?? 1);
-    })
-    .slice(0, MAX_SPOKEN_PROPOSALS);
+    });
 }
 
 /** The coverage record's sentence for a stretch speech could not establish. */
@@ -294,48 +313,57 @@ export async function proposeSpokenMoments(input: {
   }
   if (verifiable.length === 0) return { proposals, moments: [], failures, metrics: { ...metrics, verified: 0 } };
 
-  const verdicts = await verifyWithVideoChat3({
-    videoUrl: input.videoUrl,
-    query: input.instruction,
-    expectedBytes: input.expectedBytes,
-    candidates: verifiable,
-  });
   const byId = new Map(proposals.map((proposal) => [proposal.id, proposal]));
   const moments: SpokenMoment[] = [];
   let rejected = 0;
-  for (const result of verdicts.results) {
-    const proposal = byId.get(result.id);
-    if (!proposal) continue;
-    if (!passesEvidenceGate(result)) {
-      rejected += 1;
-      continue;
+  const verifyMetrics: unknown[] = [];
+  // Every proposal is asked about. The verifier is asked in bounded batches
+  // rather than told about only the first few: a proposal speech made and
+  // nobody judged would be neither evidence nor a recorded gap.
+  for (let offset = 0; offset < verifiable.length; offset += SPOKEN_VERIFY_BATCH) {
+    const verdicts = await verifyWithVideoChat3({
+      videoUrl: input.videoUrl,
+      query: input.instruction,
+      expectedBytes: input.expectedBytes,
+      candidates: verifiable.slice(offset, offset + SPOKEN_VERIFY_BATCH),
+    });
+    verifyMetrics.push(verdicts.metrics);
+    for (const result of verdicts.results) {
+      const proposal = byId.get(result.id);
+      if (!proposal) continue;
+      if (!passesEvidenceGate(result)) {
+        rejected += 1;
+        continue;
+      }
+      moments.push({
+        startSeconds: result.startSeconds,
+        endSeconds: result.endSeconds,
+        confidence: result.confidence,
+        description: result.description || proposal.text,
+        // The transcript holds the words and the footage verdict passed:
+        // this moment was established by both.
+        source: 'multimodal',
+        quote: proposal.text,
+        provider: 'modal',
+        model: verdicts.model,
+      });
     }
-    moments.push({
-      startSeconds: result.startSeconds,
-      endSeconds: result.endSeconds,
-      confidence: result.confidence,
-      description: result.description || proposal.text,
-      source: 'multimodal',
-      quote: proposal.text,
-      provider: 'modal',
-      model: verdicts.model,
-    });
-  }
-  for (const failure of verdicts.failed) {
-    const proposal = byId.get(failure.id);
-    if (!proposal) continue;
-    failures.push({
-      kind: 'unverified',
-      startSeconds: proposal.startSeconds,
-      endSeconds: proposal.endSeconds,
-      reason: `VideoChat3 verification failed: ${failure.reason}`,
-    });
+    for (const failure of verdicts.failed) {
+      const proposal = byId.get(failure.id);
+      if (!proposal) continue;
+      failures.push({
+        kind: 'unverified',
+        startSeconds: proposal.startSeconds,
+        endSeconds: proposal.endSeconds,
+        reason: `VideoChat3 verification failed: ${failure.reason}`,
+      });
+    }
   }
   moments.sort((left, right) => right.confidence - left.confidence);
   return {
     proposals,
     moments,
     failures,
-    metrics: { ...metrics, verified: moments.length, rejected, verify: verdicts.metrics },
+    metrics: { ...metrics, verified: moments.length, rejected, verifyCalls: verifyMetrics.length, verify: verifyMetrics },
   };
 }

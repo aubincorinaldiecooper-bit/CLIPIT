@@ -541,7 +541,8 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
     expect(verifyWithVideoChat3.mock.calls[1]?.[0].candidates).toEqual([
       { id: 'mixed-0', start: 30, end: 35, transcript: '[30.2-33.8] okay, goodbye everyone' },
     ]);
-    expect(analysis.verified.map((moment) => [moment.startSeconds, moment.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
+    // Under any the footage established both; the spoken one was judged with its transcript, and the row does not claim the speech mattered.
+    expect(analysis.verified.map((moment) => [moment.startSeconds, moment.source])).toEqual([[30, 'visual'], [10, 'visual']]);
     expect(analysis.failures.filter((failure) => failure.reason === MISSING_TRANSCRIPT_REASON)).toEqual([]);
   });
 
@@ -571,7 +572,7 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
       { id: 'candidate-0', start: 30, end: 36, transcript: '[30.2-33.8] okay, goodbye everyone' },
       { id: 'candidate-1', start: 10, end: 15 },
     ]);
-    expect(result.candidates.map((candidate) => [candidate.startSeconds, candidate.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
+    expect(result.candidates.map((candidate) => [candidate.startSeconds, candidate.source])).toEqual([[30, 'visual'], [10, 'visual']]);
     expect(result.failed).toEqual([]);
   });
 
@@ -602,7 +603,7 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
     const { startClipRequest } = await import('../src/db/repositories/clipRequests.js');
     expect(startClipRequest).toHaveBeenCalledWith('request-1', { chunksTotal: 0, resolvedMode: 'both', resolvedEvidence: 'any' });
     const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
-    expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
+    expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'visual'], [10, 'visual']]);
     // Speech proposed too, through the transcript-only search: words in, never a chunk of video,
     // and only for the chunk in which someone speaks.
     expect(searchVideoChunk).toHaveBeenCalledTimes(1);
@@ -653,7 +654,7 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
     await handleClipSearch(job as never);
 
     const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
-    expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
+    expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'visual'], [10, 'visual']]);
     const gaps = recordChunkFailure.mock.calls.map((call) => call[1] as Record<string, unknown>);
     expect(gaps).toEqual([expect.objectContaining({
       message: 'Speech was not searched here: transcript store unavailable', globalStartSeconds: 0, globalEndSeconds: 300, code: 'not_read_yet',

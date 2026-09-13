@@ -184,8 +184,12 @@ async function verifyMixedEvidence(input: {
       endSeconds: result.endSeconds,
       confidence: result.confidence,
       description: result.description || momentById.get(result.id)?.description || '',
-      // Footage judged together with its transcript.
-      source: 'multimodal',
+      // Under 'required' the question itself needs the speech, and a passing
+      // joint verdict says it held: established by both. Under 'when_present'
+      // the footage established the candidate and the transcript was
+      // consulted; the verdict does not say whether the speech mattered, so
+      // the row does not claim it did.
+      source: policy === 'required' ? 'multimodal' : 'visual',
     });
   }
   verified.sort((left, right) => right.confidence - left.confidence);
