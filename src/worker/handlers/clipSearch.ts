@@ -107,6 +107,7 @@ import {
   placeMomentsOnChunks,
   type UploadedVideoAnalysis,
 } from '../../services/retrieval/uploadedVideo.js';
+import { proposeSpokenMoments, type SpokenProposals } from '../../services/retrieval/transcriptProposer.js';
 
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   const { clipRequestId } = job.data;
@@ -329,6 +330,48 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     });
 
     /**
+     * Speech proposes too. Under a `both` question where either source may
+     * establish a moment, the picture alone would propose: VideoChat3's
+     * watch has no sound and SimpleMem remembers frames. So the transcript
+     * names its own candidates first — a quoted phrase looked up directly,
+     * or the retained transcript-only per-chunk search, which sends words
+     * and never video — and VideoChat3 re-opens each with its footage and
+     * its aligned transcript. Whichever path completes the request stores
+     * what survived beside its own moments.
+     */
+    let spoken: SpokenProposals | null = null;
+    if (resolved.mode === 'both' && resolved.evidence === 'any' && video.proxyStorageKey) {
+      await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: resolved.mode, resolvedEvidence: resolved.evidence });
+      const proxyKey = video.proxyStorageKey;
+      const object = await getStorage().head(proxyKey);
+      const videoUrl = await getStorage().createDownloadUrl(proxyKey, { expiresInSeconds: VIDEOCHAT3_SOURCE_URL_SECONDS });
+      spoken = await withWorkDir(`spoken-${clipRequestId}`, (dir) => proposeSpokenMoments({
+        videoId: video.id,
+        instruction,
+        chunks,
+        durationSeconds: video.durationSeconds,
+        videoUrl,
+        expectedBytes: object?.sizeBytes ?? video.sizeBytes ?? undefined,
+        concurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
+        textSearch: (chunk) => searchSingleChunk({
+          chunk,
+          chunkCount: chunks.length,
+          instruction,
+          // Transcript text only: this mode never downloads or uploads a chunk.
+          mode: 'transcript',
+          videoId: video.id,
+          clipRequestId,
+          workDir: dir,
+          tally,
+          log,
+          onAnsweredWithoutThinking: () => undefined,
+          onDegraded: async () => undefined,
+        }),
+      }));
+      log.info('speech proposed moments', spoken.metrics);
+    }
+
+    /**
      * Omni-SimpleMem is the memory/retrieval layer. A confident candidate is
      * verified against actual footage before it can become evidence. A miss or
      * unavailable index falls through to the full actual-footage search; memory
@@ -344,6 +387,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       mode: resolved.mode,
       evidence: resolved.evidence,
       correcting,
+      spoken,
       log,
     });
     if (fromSimpleMem.matchCount > 0) {
@@ -374,6 +418,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         instruction,
         mode: resolved.mode,
         evidence: resolved.evidence,
+        spoken,
         log,
       });
       const primaryOutcome = {
@@ -1008,6 +1053,8 @@ async function answerFromSimpleMem(input: {
   mode: ResolvedSearchMode;
   evidence: EvidenceRequirement;
   correcting: boolean;
+  /** What speech proposed and VideoChat3 confirmed, when either source may establish a moment. */
+  spoken: SpokenProposals | null;
   log: Logger;
 }): Promise<{
   matchCount: number;
@@ -1160,9 +1207,26 @@ async function answerFromSimpleMem(input: {
       return { matchCount: verified.candidates.length, released: false, fallback: null, outcome };
     }
   }
-  const wanted = input.requestedResultCount ?? verified.candidates.length;
-  const found = placeMomentsOnChunks(
-    verified.candidates.slice(0, wanted).map((candidate) => ({
+  for (const failure of input.spoken?.failures ?? []) {
+    const chunk = input.chunks.find((item) =>
+      failure.startSeconds >= item.globalStartSeconds && failure.startSeconds < item.globalEndSeconds,
+    ) ?? input.chunks.at(-1);
+    if (!chunk) continue;
+    const stillOwned = await recordChunkFailure(input.clipRequestId, {
+      chunkIndex: chunk.chunkIndex,
+      chunkId: chunk.id,
+      message: `Speech proposed this stretch, but it could not be verified against the footage: ${failure.reason}`,
+      code: 'not_read_yet',
+      globalStartSeconds: failure.startSeconds,
+      globalEndSeconds: failure.endSeconds,
+    }, input.deckAttemptId!);
+    if (!stillOwned) {
+      input.log.info('another delivery owns this request; discarding stale SimpleMem coverage');
+      return { matchCount: verified.candidates.length, released: false, fallback: null, outcome };
+    }
+  }
+  const moments = [
+    ...verified.candidates.map((candidate) => ({
       startSeconds: candidate.startSeconds,
       endSeconds: candidate.endSeconds,
       confidence: candidate.score,
@@ -1171,6 +1235,11 @@ async function answerFromSimpleMem(input: {
       // together with its transcript. The row must say which.
       source: candidate.source ?? MATCH_SOURCE[input.mode],
     })),
+    ...(input.spoken?.moments ?? []),
+  ].sort((left, right) => right.confidence - left.confidence);
+  const wanted = input.requestedResultCount ?? moments.length;
+  const found = placeMomentsOnChunks(
+    moments.slice(0, wanted),
     input.chunks,
     {
       instruction: input.instruction,
@@ -1201,7 +1270,7 @@ async function answerFromSimpleMem(input: {
     coverageFailuresDescribed: unreadTail ? 1 : 0,
     log: input.log,
   });
-  input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, ...outcome });
+  input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, spoken: input.spoken?.metrics ?? null, ...outcome });
   return { matchCount: finalCount, released, fallback: null, outcome };
 }
 
@@ -1236,6 +1305,8 @@ async function answerFromVideoChat3(input: {
   instruction: string;
   mode: ResolvedSearchMode;
   evidence: EvidenceRequirement;
+  /** What speech proposed and VideoChat3 confirmed, when either source may establish a moment. */
+  spoken: SpokenProposals | null;
   log: Logger;
 }): Promise<{
   /** True when this path finished the request — with moments, or with an honest none. */
@@ -1329,6 +1400,13 @@ async function answerFromVideoChat3(input: {
       });
     }
   }
+  for (const failure of input.spoken?.failures ?? []) {
+    gaps.push({
+      startSeconds: failure.startSeconds,
+      endSeconds: failure.endSeconds,
+      message: `Speech proposed this stretch, but it could not be verified against the footage: ${failure.reason}`,
+    });
+  }
   for (const gap of gaps) {
     const chunk = chunkAt(gap.startSeconds);
     if (!chunk) continue;
@@ -1346,9 +1424,13 @@ async function answerFromVideoChat3(input: {
     }
   }
 
-  const wanted = input.requestedResultCount ?? analysis.verified.length;
+  const moments = [
+    ...analysis.verified.map((moment) => ({ ...moment, source: moment.source ?? MATCH_SOURCE[input.mode] })),
+    ...(input.spoken?.moments ?? []),
+  ].sort((left, right) => right.confidence - left.confidence);
+  const wanted = input.requestedResultCount ?? moments.length;
   const found = placeMomentsOnChunks(
-    analysis.verified.slice(0, wanted).map((moment) => ({ ...moment, source: moment.source ?? MATCH_SOURCE[input.mode] })),
+    moments.slice(0, wanted),
     input.chunks,
     {
     instruction: input.instruction,
@@ -1383,7 +1465,7 @@ async function answerFromVideoChat3(input: {
     coverageFailuresDescribed: unread || analysis.unwatched ? 1 : 0,
     log: input.log,
   });
-  input.log.info('answered from VideoChat3', { matches: finalCount, released, ...outcome });
+  input.log.info('answered from VideoChat3', { matches: finalCount, released, spoken: input.spoken?.metrics ?? null, ...outcome });
   return { answered: true, matchCount: finalCount, fallback: null, outcome };
 }
 

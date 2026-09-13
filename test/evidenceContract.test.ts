@@ -21,6 +21,7 @@ const embedQuery = vi.fn();
 const embedVideoIntervals = vi.fn();
 const rerankVideoIntervals = vi.fn();
 const listTranscriptSegmentsInRange = vi.fn();
+const listTranscriptSegments = vi.fn(async () => []);
 
 vi.mock('../src/services/videochat3/client.js', () => ({ watchWithVideoChat3, verifyWithVideoChat3 }));
 vi.mock('../src/services/retrieval/qwenModal.js', () => ({
@@ -30,10 +31,12 @@ vi.mock('../src/services/retrieval/qwenModal.js', () => ({
   cosineSimilarity: (left: Float32Array, right: Float32Array) =>
     left.reduce((sum, value, index) => sum + value * (right[index] ?? 0), 0),
 }));
-vi.mock('../src/db/repositories/transcripts.js', () => ({ listTranscriptSegmentsInRange }));
+vi.mock('../src/db/repositories/transcripts.js', () => ({ listTranscriptSegmentsInRange, listTranscriptSegments }));
 
 // --- The handler-level harness: the retired per-chunk watcher is a spy that must stay silent.
-const searchVideoChunk = vi.fn();
+const searchVideoChunk = vi.fn(async () => ({
+  matches: [], warnings: [], rawResponse: '', provider: 'openrouter', model: 'text-model', promptVersion: 'v', reasoningDisabled: false,
+}));
 const assertVideoInputSupported = vi.fn();
 const releaseDeckAndComplete = vi.fn(async () => true);
 const recordChunkFailure = vi.fn(async () => true);
@@ -172,6 +175,10 @@ const upload = (mode: 'visual' | 'both', query = 'show where she says goodbye wh
 beforeEach(() => {
   vi.clearAllMocks();
   listTranscriptSegmentsInRange.mockResolvedValue([]);
+  listTranscriptSegments.mockResolvedValue([]);
+  searchVideoChunk.mockResolvedValue({
+    matches: [], warnings: [], rawResponse: '', provider: 'openrouter', model: 'text-model', promptVersion: 'v', reasoningDisabled: false,
+  });
 });
 
 describe('1. an automatic mixed request needs footage and speech together', () => {
@@ -595,6 +602,56 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
     expect(startClipRequest).toHaveBeenCalledWith('request-1', { chunksTotal: 0, resolvedMode: 'both', resolvedEvidence: 'any' });
     const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
     expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
+    // Speech proposed too, through the transcript-only search: words in, never a chunk of video.
+    expect(searchVideoChunk).toHaveBeenCalledTimes(3);
+    for (const call of searchVideoChunk.mock.calls) {
+      expect(call[0]).toMatchObject({ mode: 'transcript', videoPath: undefined });
+    }
+  });
+
+  it('end to end: a quoted phrase spoken over an unchanging shot is found by the transcript and confirmed by the footage', async () => {
+    getClipRequest.mockResolvedValue({ ...request, instruction: 'find "we are shutting it down"' });
+    // Speech proposes first, so its verdict is the first verify call; the watch's own verification follows.
+    verifyWithVideoChat3.mockResolvedValueOnce({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'spoken-phrase-0', startSeconds: 198.5, endSeconds: 205.5, match: true, confidence: 0.91, description: 'he announces it' }],
+    });
+    // The watcher sees nothing at 200 s: the shot does not change while the line is said.
+    wholeVideoPipeline();
+    listTranscriptSegments.mockResolvedValue([
+      { id: 's1', videoId: 'video-1', segmentIndex: 0, startSeconds: 200, endSeconds: 204, text: 'and yes, we are shutting it down.', source: 'openrouter_stt' },
+    ]);
+    listTranscriptSegmentsInRange.mockImplementation(async (_videoId: string, start: number, end: number) =>
+      end > 199 && start < 205 ? [{ id: 's1', videoId: 'video-1', segmentIndex: 0, startSeconds: 200, endSeconds: 204, text: 'and yes, we are shutting it down.', source: 'openrouter_stt' }] : [],
+    );
+    const job = { data: { clipRequestId: 'request-1' }, processedOn: Date.now(), timestamp: Date.now(), attemptsMade: 0, updateProgress: vi.fn() };
+
+    await handleClipSearch(job as never);
+
+    expect(searchVideoChunk).not.toHaveBeenCalled();
+    const spokenCall = verifyWithVideoChat3.mock.calls[0]?.[0];
+    expect(spokenCall.candidates).toEqual([
+      { id: 'spoken-phrase-0', start: 198.5, end: 205.5, transcript: '[200.0-204.0] and yes, we are shutting it down.' },
+    ]);
+    const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
+    expect(rows.find((row) => row.globalStartSeconds === 198.5)).toMatchObject({
+      globalEndSeconds: 205.5, source: 'multimodal', quote: 'and yes, we are shutting it down.', provider: 'modal', model: 'MCG-NJU/VideoChat3-4B',
+    });
+  });
+
+  it('under all, speech does not propose: the transcript is consulted only for the candidates the picture found', async () => {
+    getClipRequest.mockResolvedValue({ ...request });
+    wholeVideoPipeline();
+    transcriptOnlyAtGoodbye();
+    verifyWithVideoChat3.mockResolvedValueOnce({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'mixed-0', startSeconds: 30, endSeconds: 35, match: true, confidence: 0.9, description: 'says goodbye while leaving' }],
+    });
+    const job = { data: { clipRequestId: 'request-1' }, processedOn: Date.now(), timestamp: Date.now(), attemptsMade: 0, updateProgress: vi.fn() };
+
+    await handleClipSearch(job as never);
+
+    expect(listTranscriptSegments).not.toHaveBeenCalled();
     expect(searchVideoChunk).not.toHaveBeenCalled();
   });
 });
