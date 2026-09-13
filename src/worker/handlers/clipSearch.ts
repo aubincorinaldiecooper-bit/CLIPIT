@@ -1153,6 +1153,9 @@ async function answerFromSimpleMem(input: {
       endSeconds: candidate.endSeconds,
       confidence: candidate.score,
       description: candidate.description,
+      // What established the moment: footage alone, or footage judged
+      // together with its transcript. The row must say which.
+      source: MATCH_SOURCE[input.mode],
     })),
     input.chunks,
     {
@@ -1324,11 +1327,15 @@ async function answerFromVideoChat3(input: {
   }
 
   const wanted = input.requestedResultCount ?? analysis.verified.length;
-  const found = placeMomentsOnChunks(analysis.verified.slice(0, wanted), input.chunks, {
+  const found = placeMomentsOnChunks(
+    analysis.verified.slice(0, wanted).map((moment) => ({ ...moment, source: MATCH_SOURCE[input.mode] })),
+    input.chunks,
+    {
     instruction: input.instruction,
     provider: 'modal',
     model: analysis.model,
-  });
+  },
+  );
   let finalCount = 0;
   if (found.length > 0) {
     await insertMatches(input.clipRequestId, found);

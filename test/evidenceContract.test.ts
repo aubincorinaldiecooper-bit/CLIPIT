@@ -465,3 +465,44 @@ describe('the Modal contract carries the transcript exactly as the client sends 
     expect(modal).toContain('def verify_intervals(\n        self,\n        video_url: str,\n        query: str,\n        candidates: list[dict[str, Any]],\n        expected_bytes: int | None = None,');
   });
 });
+
+describe('a moment says which evidence established it', () => {
+  const job = { data: { clipRequestId: 'request-1' }, processedOn: Date.now(), timestamp: Date.now(), attemptsMade: 0, updateProgress: vi.fn() };
+
+  it('both: footage judged with its transcript is stored as multimodal', async () => {
+    getClipRequest.mockResolvedValue({ ...request });
+    wholeVideoPipeline();
+    transcriptOnlyAtGoodbye();
+    verifyWithVideoChat3.mockResolvedValueOnce({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'mixed-0', startSeconds: 30, endSeconds: 35, match: true, confidence: 0.9, description: 'says goodbye while leaving' }],
+    });
+
+    await handleClipSearch(job as never);
+
+    expect(insertMatches).toHaveBeenCalledOnce();
+    const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
+    expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'multimodal']]);
+    expect(searchVideoChunk).not.toHaveBeenCalled();
+  });
+
+  it('visual: footage alone is stored as visual', async () => {
+    getClipRequest.mockResolvedValue({ ...request, instruction: 'show her leaving the room' });
+    wholeVideoPipeline();
+
+    await handleClipSearch(job as never);
+
+    const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
+    expect(rows.every((row) => row.source === 'visual')).toBe(true);
+    expect(rows).toHaveLength(2);
+    expect(listTranscriptSegmentsInRange).not.toHaveBeenCalled();
+  });
+
+  it('the memory path labels its moments the same way', async () => {
+    const handler = await read('src/worker/handlers/clipSearch.ts');
+    const memory = handler.slice(handler.indexOf('async function answerFromSimpleMem'), handler.indexOf('async function answerFromVideoChat3'));
+    expect(memory).toContain('source: MATCH_SOURCE[input.mode],');
+    const watcher = handler.slice(handler.indexOf('async function answerFromVideoChat3'), handler.indexOf('async function searchSingleChunk'));
+    expect(watcher).toContain('source: MATCH_SOURCE[input.mode]');
+  });
+});
