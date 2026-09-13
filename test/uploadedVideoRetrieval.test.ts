@@ -50,7 +50,7 @@ function events(count: number, secondsEach = 2) {
 }
 
 describe('placing verified moments on the chunk grid', () => {
-  it('writes chunk-local and global seconds the way the per-chunk search does', () => {
+  it('writes chunk-local and global seconds the way the stored-match contract expects', () => {
     const found = placeMomentsOnChunks(
       [{ startSeconds: 130, endSeconds: 141, confidence: 0.93, description: 'the dunk' }],
       chunks,
@@ -70,6 +70,19 @@ describe('placing verified moments on the chunk grid', () => {
     }]);
   });
 
+  it('keeps the whole interval when a verified moment crosses an analysis-chunk boundary', () => {
+    const [found] = placeMomentsOnChunks(
+      [{ startSeconds: 118, endSeconds: 128, confidence: 0.91, description: 'crosses the boundary' }],
+      chunks,
+      { instruction: 'q', provider: 'modal', model: 'm' },
+    );
+    expect(found?.chunkId).toBe('chunk-0');
+    expect(found?.globalStartSeconds).toBe(118);
+    expect(found?.globalEndSeconds).toBe(128);
+    expect(found?.localStartSeconds).toBe(118);
+    expect(found?.localEndSeconds).toBe(128);
+  });
+
   it('falls back to a description that names the question, and clamps confidence', () => {
     const [found] = placeMomentsOnChunks(
       [{ startSeconds: 5, endSeconds: 9, confidence: 1.4, description: '' }],
@@ -81,8 +94,6 @@ describe('placing verified moments on the chunk grid', () => {
   });
 
   it('keeps a moment that runs past the end of the last chunk, clamped to the footage', () => {
-    // The proxy can run a frame or two longer than the source, so the watcher
-    // may report a moment ending just past the grid. The part that exists is kept.
     const [found] = placeMomentsOnChunks(
       [{ startSeconds: 295, endSeconds: 302, confidence: 0.8, description: 'tail' }],
       chunks,
@@ -153,8 +164,6 @@ describe('analyzeUploadedVideo', () => {
   });
 
   it('reports the tail after the cap as unwatched, never as empty', async () => {
-    // The watch stops the moment it has flagged WATCH_MAX_EVENTS moments; at
-    // two seconds each, that is 128 s into a 300 s video.
     watchWithVideoChat3.mockResolvedValue({
       model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', durationSeconds: 300, events: events(WATCH_MAX_EVENTS), metrics: {},
     });
