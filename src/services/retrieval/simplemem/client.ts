@@ -50,6 +50,18 @@ export interface SimpleMemQueryReply {
 }
 
 const SERVICE = 'simplemem';
+
+/**
+ * The sidecar holds a memory of this video written under a different
+ * embedding contract (its models, dimensions or embedding version changed),
+ * and refuses to answer from it. Not retryable: only re-indexing changes it.
+ */
+export class SimpleMemReindexRequired extends ExternalServiceError {
+  constructor(detail: string) {
+    super(SERVICE, `SimpleMem needs this video re-indexed: ${detail}`, { retryable: false });
+    this.name = 'SimpleMemReindexRequired';
+  }
+}
 const MODALITIES: ReadonlySet<string> = new Set(['text', 'visual', 'audio', 'video', 'multimodal']);
 
 function baseUrl(): string {
@@ -100,6 +112,7 @@ async function request<T>(method: string, url: string, init: RequestInit & { tim
     clearTimeout(timeout);
   }
   const text = await response.text();
+  if (response.status === 409) throw new SimpleMemReindexRequired(text.slice(0, 300));
   if (!response.ok) {
     throw new ExternalServiceError(SERVICE, `SimpleMem answered ${response.status}: ${text.slice(0, 300)}`, {
       retryable: response.status >= 500,

@@ -95,8 +95,8 @@ function classifyChunkFailure(reason: unknown): ChunkFailureCode {
  * recorded and skipped rather than failing the whole request.
  */
 import { writeConversationalAnswer } from '../../services/search/conversationalAnswer.js';
-import { getSimpleMemIndex } from '../../db/repositories/simplememIndex.js';
-import { simplememQuery } from '../../services/retrieval/simplemem/client.js';
+import { getSimpleMemIndex, setSimpleMemIndexStatus } from '../../db/repositories/simplememIndex.js';
+import { SimpleMemReindexRequired, simplememQuery } from '../../services/retrieval/simplemem/client.js';
 import { decideFallback, mapCandidates } from '../../services/retrieval/simplemem/candidates.js';
 import { rerankSimpleMemCandidates } from '../../services/retrieval/simplemem/rerank.js';
 
@@ -954,6 +954,18 @@ async function answerFromSimpleMem(input: {
     reply = await simplememQuery({ videoId: input.video.id, query: input.instruction, topK: env.SIMPLEMEM_TOP_K });
   } catch (error) {
     const detail = errorMessage(error);
+    if (error instanceof SimpleMemReindexRequired) {
+      // The memory was written under an older embedding contract (for
+      // instance while transformers 5.x left every frame without a CLIP
+      // vector). It is not a memory of this video any more. The row says so,
+      // so the next question does not ask the sidecar again; re-indexing is
+      // a paid run and stays a deliberate action.
+      await setSimpleMemIndexStatus(input.video.id, 'unavailable', { error: detail });
+      input.log.warn('Omni-SimpleMem holds an outdated memory of this video; marked unavailable until it is re-indexed', {
+        err: error,
+      });
+      return { matchCount: 0, released: false, fallback: 'index_unavailable', outcome: { error: detail } };
+    }
     input.log.warn('Omni-SimpleMem query failed; using Clipit retrieval', { err: error });
     return { matchCount: 0, released: false, fallback: 'primary_failed', outcome: { error: detail } };
   }

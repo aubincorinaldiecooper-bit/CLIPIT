@@ -74,7 +74,12 @@ ARCHIVE_PREFIX = os.environ.get("SIMPLEMEM_ARCHIVE_PREFIX", "simplemem/v1").stri
 CACHE_HIGH_WATER_BYTES = int(os.environ.get("SIMPLEMEM_CACHE_HIGH_WATER_BYTES", str(4 * 1024**3)))
 CACHE_LOW_WATER_BYTES = int(os.environ.get("SIMPLEMEM_CACHE_LOW_WATER_BYTES", str(3 * 1024**3)))
 ARCHIVE_SCHEMA_VERSION = 1
-EMBEDDING_VERSION = os.environ.get("SIMPLEMEM_EMBEDDING_VERSION", "v1").strip() or "v1"
+# The embedding contract a memory was written under. Bumped to v2 with the
+# transformers pin: memories written while transformers 5.x was installed
+# carry no CLIP vectors (see _assert_transformers_contract), and a query
+# against one finds nothing. Refusing them (409, "reindex required") is
+# what turns that silence into a visible "re-index me".
+EMBEDDING_VERSION = os.environ.get("SIMPLEMEM_EMBEDDING_VERSION", "v2").strip() or "v2"
 MAX_UPLOAD_BYTES = int(os.environ.get("SIMPLEMEM_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
 INTERNAL_TOKEN = os.environ.get("SIMPLEMEM_INTERNAL_TOKEN", "").strip()
 
