@@ -317,6 +317,10 @@ export async function serializeClipRequest(
     instruction: request.instruction,
     mode: request.mode,
     resolvedMode: request.resolvedMode,
+    // What the resolved mode demanded of each moment: 'all' (a mixed
+    // question needed footage and its transcript together) or 'any'
+    // (either source could establish it). Null before the search began.
+    resolvedEvidence: request.resolvedEvidence,
     status: request.status,
     error: request.errorMessage,
     /**

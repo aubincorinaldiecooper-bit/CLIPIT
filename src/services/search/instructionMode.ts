@@ -1,4 +1,4 @@
-import type { ResolvedSearchMode, SearchMode } from '../../domain/types.js';
+import type { EvidenceRequirement, ResolvedSearchMode, SearchMode } from '../../domain/types.js';
 
 /**
  * Decides whether an instruction is about what is *said*, what is *seen*, or
@@ -78,6 +78,14 @@ const VISUAL_PATTERNS: RegExp[] = [
 
 export interface ModeClassification {
   mode: ResolvedSearchMode;
+  /**
+   * `both` is returned for two different reasons, and they must not be
+   * confused downstream: a question that mixes spoken and visual signals
+   * needs both ('all'); a question with no signal, or a quoted phrase that
+   * may be spoken or on screen, is searched in both sources and either may
+   * satisfy it ('any').
+   */
+  evidence: EvidenceRequirement;
   spokenScore: number;
   visualScore: number;
   /** Human-readable justification, echoed back on the clip request for debugging. */
@@ -92,6 +100,7 @@ export function classifyInstruction(instruction: string): ModeClassification {
   if (spokenScore === 0 && visualScore === 0) {
     return {
       mode: 'both',
+      evidence: 'any',
       spokenScore,
       visualScore,
       rationale: 'no strong spoken or visual signal; searching frames and transcript',
@@ -106,20 +115,22 @@ export function classifyInstruction(instruction: string): ModeClassification {
     if (QUOTATION.test(text)) {
       return {
         mode: 'both',
+        evidence: 'any',
         spokenScore,
         visualScore,
         rationale: 'quoted phrase may be spoken or visible on screen; searching video and transcript',
       };
     }
-    return { mode: 'transcript', spokenScore, visualScore, rationale: 'instruction refers to spoken content' };
+    return { mode: 'transcript', evidence: 'all', spokenScore, visualScore, rationale: 'instruction refers to spoken content' };
   }
 
   if (visualScore > 0 && spokenScore === 0) {
-    return { mode: 'visual', spokenScore, visualScore, rationale: 'instruction refers to on-screen content' };
+    return { mode: 'visual', evidence: 'all', spokenScore, visualScore, rationale: 'instruction refers to on-screen content' };
   }
 
   return {
     mode: 'both',
+    evidence: 'all',
     spokenScore,
     visualScore,
     rationale: 'instruction mixes spoken and visual signals',
@@ -135,6 +146,8 @@ export interface ResolveModeInput {
 
 export interface ResolvedMode {
   mode: ResolvedSearchMode;
+  /** See ModeClassification.evidence. An explicitly requested `both` is 'all'. */
+  evidence: EvidenceRequirement;
   rationale: string;
 }
 
@@ -146,23 +159,28 @@ export function resolveSearchMode(input: ResolveModeInput): ResolvedMode {
   const requested = input.requested;
 
   let candidate: ResolvedSearchMode;
+  let evidence: EvidenceRequirement;
   let rationale: string;
 
   if (requested === 'auto') {
     const classification = classifyInstruction(input.instruction);
     candidate = classification.mode;
+    evidence = classification.evidence;
     rationale = `auto: ${classification.rationale}`;
   } else {
+    // A caller who asks for both sources by name means both.
     candidate = requested;
+    evidence = 'all';
     rationale = `explicitly requested: ${requested}`;
   }
 
   if (!input.transcriptAvailable && candidate !== 'visual') {
     return {
       mode: 'visual',
+      evidence: 'all',
       rationale: `${rationale}; no transcript available, falling back to visual search`,
     };
   }
 
-  return { mode: candidate, rationale };
+  return { mode: candidate, evidence, rationale };
 }

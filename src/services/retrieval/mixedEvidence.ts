@@ -1,6 +1,6 @@
 import { env } from '../../config/env.js';
 import { listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
-import type { ResolvedSearchMode } from '../../domain/types.js';
+import type { EvidenceRequirement, ResolvedSearchMode } from '../../domain/types.js';
 import type { VideoChat3Candidate, VideoChat3Verified } from '../videochat3/client.js';
 
 /**
@@ -14,12 +14,18 @@ import type { VideoChat3Candidate, VideoChat3Verified } from '../videochat3/clie
  *
  *   visual      footage required; transcript not consulted
  *   transcript  transcript evidence required; the per-chunk speech search
- *   both        footage AND the timestamp-aligned transcript, judged together
+ *   both, all   footage AND the timestamp-aligned transcript, judged together
+ *   both, any   both sources searched; a candidate with speech in its
+ *               interval is judged with it, one without is judged on the
+ *               footage, and each is labelled by what established it
  *
- * For `both`, a candidate whose interval has no transcript is not verified
- * visually instead: it is rejected with a reason that reaches the coverage
- * record. A verdict is evidence only when it says match AND clears the one
- * canonical confidence floor.
+ * The resolver alone says whether a `both` is 'all' (the question mixes
+ * spoken and visual conditions, or the caller asked for both by name) or
+ * 'any' (an undetermined question, or a quoted phrase that may be spoken
+ * or on screen). Under 'all', a candidate whose interval has no transcript
+ * is not verified visually instead: it is rejected with a reason that
+ * reaches the coverage record. A verdict is evidence only when it says
+ * match AND clears the one canonical confidence floor.
  */
 
 /** Seconds of transcript context kept either side of a candidate interval. */
@@ -28,8 +34,17 @@ export const TRANSCRIPT_PADDING_SECONDS = 1.5;
 export const TRANSCRIPT_MAX_CHARS = 12_000;
 export const MISSING_TRANSCRIPT_REASON = 'mixed question requires transcript evidence, but this interval has no transcript';
 
-export function requiresTranscript(mode: ResolvedSearchMode): boolean {
-  return mode === 'both';
+export type TranscriptPolicy =
+  /** Footage only; the transcript is not consulted. */
+  | 'none'
+  /** Every candidate needs its aligned transcript; a silent one is rejected. */
+  | 'required'
+  /** A candidate with speech is judged with it; a silent one on the footage alone. */
+  | 'when_present';
+
+export function transcriptPolicy(mode: ResolvedSearchMode, evidence: EvidenceRequirement): TranscriptPolicy {
+  if (mode !== 'both') return 'none';
+  return evidence === 'all' ? 'required' : 'when_present';
 }
 
 /**

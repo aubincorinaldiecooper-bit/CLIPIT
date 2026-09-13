@@ -163,10 +163,10 @@ function wholeVideoPipeline() {
   });
 }
 
-const upload = (mode: 'visual' | 'both', query = 'show where she says goodbye while leaving the room') =>
+const upload = (mode: 'visual' | 'both', query = 'show where she says goodbye while leaving the room', evidence: 'all' | 'any' = 'all') =>
   analyzeUploadedVideo({
     query, videoId: 'video-1', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/video-1/proxy.mp4',
-    expectedBytes: 1000, durationSeconds: 300, mode,
+    expectedBytes: 1000, durationSeconds: 300, mode, evidence,
   });
 
 beforeEach(() => {
@@ -189,7 +189,8 @@ describe('1. an automatic mixed request needs footage and speech together', () =
       results: [{ id: 'mixed-0', startSeconds: 30, endSeconds: 35, match: true, confidence: 0.9, description: 'says goodbye while leaving' }],
     });
 
-    const analysis = await upload(resolved.mode as 'both');
+    expect(resolved.evidence).toBe('all');
+    const analysis = await upload(resolved.mode as 'both', undefined, resolved.evidence);
 
     expect(verifyWithVideoChat3).toHaveBeenCalledTimes(2);
     const mixedCall = verifyWithVideoChat3.mock.calls[1]?.[0];
@@ -197,7 +198,7 @@ describe('1. an automatic mixed request needs footage and speech together', () =
       { id: 'mixed-0', start: 30, end: 35, transcript: '[30.2-33.8] okay, goodbye everyone' },
     ]);
     // The silent 10–14 s stretch, though visually verified, is not evidence.
-    expect(analysis.verified).toEqual([{ startSeconds: 30, endSeconds: 35, confidence: 0.9, description: 'says goodbye while leaving' }]);
+    expect(analysis.verified).toEqual([{ startSeconds: 30, endSeconds: 35, confidence: 0.9, description: 'says goodbye while leaving', source: 'multimodal' }]);
     expect(analysis.failures).toContainEqual({ id: 'mixed-1', reason: MISSING_TRANSCRIPT_REASON, startSeconds: 10, endSeconds: 14 });
   });
 });
@@ -207,6 +208,7 @@ describe('2. an explicit both stays both, however visual the wording', () => {
     expect(classifyInstruction('show her leaving the room').mode).toBe('visual');
     const resolved = resolveSearchMode({ instruction: 'show her leaving the room', requested: 'both', transcriptAvailable: true });
     expect(resolved.mode).toBe('both');
+    expect(resolved.evidence).toBe('all');
 
     wholeVideoPipeline();
     // No speech anywhere: every visually verified moment is rejected for want of a transcript.
@@ -260,9 +262,9 @@ function memoryPipeline() {
   });
 }
 
-const memory = (mode: 'visual' | 'both') => rerankSimpleMemCandidates({
+const memory = (mode: 'visual' | 'both', evidence: 'all' | 'any' = 'all') => rerankSimpleMemCandidates({
   query: 'show where she says goodbye while leaving the room', candidates: memoryCandidates, videoId: 'video-1',
-  videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/video-1/proxy.mp4', expectedBytes: 1000, mode,
+  videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/video-1/proxy.mp4', expectedBytes: 1000, mode, evidence,
 });
 
 describe('3. a memory candidate in both mode is verified with its own transcript', () => {
@@ -349,7 +351,7 @@ describe('5 and 6. the one confidence gate applies to mixed verdicts', () => {
       results: [{ id: 'mixed-0', startSeconds: 30, endSeconds: 35, match: true, confidence: MIN, description: 'says goodbye while leaving' }],
     });
     const analysis = await upload('both');
-    expect(analysis.verified).toEqual([{ startSeconds: 30, endSeconds: 35, confidence: MIN, description: 'says goodbye while leaving' }]);
+    expect(analysis.verified).toEqual([{ startSeconds: 30, endSeconds: 35, confidence: MIN, description: 'says goodbye while leaving', source: 'multimodal' }]);
   });
 });
 
@@ -501,8 +503,97 @@ describe('a moment says which evidence established it', () => {
   it('the memory path labels its moments the same way', async () => {
     const handler = await read('src/worker/handlers/clipSearch.ts');
     const memory = handler.slice(handler.indexOf('async function answerFromSimpleMem'), handler.indexOf('async function answerFromVideoChat3'));
-    expect(memory).toContain('source: MATCH_SOURCE[input.mode],');
+    expect(memory).toContain('source: candidate.source ?? MATCH_SOURCE[input.mode],');
     const watcher = handler.slice(handler.indexOf('async function answerFromVideoChat3'), handler.indexOf('async function searchSingleChunk'));
-    expect(watcher).toContain('source: MATCH_SOURCE[input.mode]');
+    expect(watcher).toContain('source: moment.source ?? MATCH_SOURCE[input.mode]');
+  });
+});
+
+describe('11. an undetermined both keeps either modality; a mixed one needs both', () => {
+  it('the resolver says which: no signal or a quoted phrase is any, mixed signals or an explicit both is all', () => {
+    expect(resolveSearchMode({ instruction: 'the good bit', requested: 'auto', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(resolveSearchMode({ instruction: 'Find "we are shutting it down"', requested: 'auto', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(resolveSearchMode({ instruction: 'show where she says goodbye while leaving the room', requested: 'auto', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(resolveSearchMode({ instruction: 'the good bit', requested: 'auto', transcriptAvailable: false })).toMatchObject({ mode: 'visual', evidence: 'all' });
+    expect(classifyInstruction('the good bit').evidence).toBe('any');
+    expect(classifyInstruction('show where she says goodbye while leaving the room').evidence).toBe('all');
+  });
+
+  it('whole video, any: a silent stretch stays on its footage verdict as visual; a spoken one is judged with its transcript as multimodal', async () => {
+    wholeVideoPipeline();
+    transcriptOnlyAtGoodbye();
+    verifyWithVideoChat3.mockResolvedValueOnce({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'mixed-0', startSeconds: 30, endSeconds: 35, match: true, confidence: 0.9, description: 'says goodbye while leaving' }],
+    });
+    const analysis = await upload('both', 'the good bit', 'any');
+    expect(verifyWithVideoChat3).toHaveBeenCalledTimes(2);
+    expect(verifyWithVideoChat3.mock.calls[1]?.[0].candidates).toEqual([
+      { id: 'mixed-0', start: 30, end: 35, transcript: '[30.2-33.8] okay, goodbye everyone' },
+    ]);
+    expect(analysis.verified.map((moment) => [moment.startSeconds, moment.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
+    expect(analysis.failures.filter((failure) => failure.reason === MISSING_TRANSCRIPT_REASON)).toEqual([]);
+  });
+
+  it('whole video, any: a spoken stretch whose joint verdict fails is still gone', async () => {
+    wholeVideoPipeline();
+    transcriptOnlyAtGoodbye();
+    verifyWithVideoChat3.mockResolvedValueOnce({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'mixed-0', startSeconds: 30, endSeconds: 35, match: true, confidence: MIN - 0.001, description: 'weak' }],
+    });
+    const analysis = await upload('both', 'the good bit', 'any');
+    expect(analysis.verified.map((moment) => [moment.startSeconds, moment.source])).toEqual([[10, 'visual']]);
+  });
+
+  it('memory, any: every candidate is verified, the ones with speech carry it, and each is labelled by what established it', async () => {
+    memoryPipeline();
+    transcriptOnlyAtGoodbye();
+    verifyWithVideoChat3.mockResolvedValue({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [
+        { id: 'candidate-0', startSeconds: 30, endSeconds: 36, match: true, confidence: 0.92, description: 'goodbye at the door' },
+        { id: 'candidate-1', startSeconds: 10, endSeconds: 15, match: true, confidence: 0.85, description: 'walks out' },
+      ],
+    });
+    const result = await memory('both', 'any');
+    expect(verifyWithVideoChat3.mock.calls[0]?.[0].candidates).toEqual([
+      { id: 'candidate-0', start: 30, end: 36, transcript: '[30.2-33.8] okay, goodbye everyone' },
+      { id: 'candidate-1', start: 10, end: 15 },
+    ]);
+    expect(result.candidates.map((candidate) => [candidate.startSeconds, candidate.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
+    expect(result.failed).toEqual([]);
+  });
+
+  it('memory, all: the same silent candidate is rejected', async () => {
+    memoryPipeline();
+    transcriptOnlyAtGoodbye();
+    verifyWithVideoChat3.mockResolvedValue({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'candidate-0', startSeconds: 30, endSeconds: 36, match: true, confidence: 0.92, description: 'goodbye at the door' }],
+    });
+    const result = await memory('both', 'all');
+    expect(result.candidates.map((candidate) => [candidate.startSeconds, candidate.source])).toEqual([[30, 'multimodal']]);
+    expect(result.failed).toContainEqual({ ...memoryCandidates[1], reason: MISSING_TRANSCRIPT_REASON });
+  });
+
+  it('end to end: an undetermined question records evidence any and stores each moment by what established it', async () => {
+    getClipRequest.mockResolvedValue({ ...request, instruction: 'the good bit' });
+    wholeVideoPipeline();
+    transcriptOnlyAtGoodbye();
+    verifyWithVideoChat3.mockResolvedValueOnce({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'mixed-0', startSeconds: 30, endSeconds: 35, match: true, confidence: 0.9, description: 'goodbye' }],
+    });
+    const job = { data: { clipRequestId: 'request-1' }, processedOn: Date.now(), timestamp: Date.now(), attemptsMade: 0, updateProgress: vi.fn() };
+
+    await handleClipSearch(job as never);
+
+    const { startClipRequest } = await import('../src/db/repositories/clipRequests.js');
+    expect(startClipRequest).toHaveBeenCalledWith('request-1', { chunksTotal: 0, resolvedMode: 'both', resolvedEvidence: 'any' });
+    const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
+    expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
+    expect(searchVideoChunk).not.toHaveBeenCalled();
   });
 });

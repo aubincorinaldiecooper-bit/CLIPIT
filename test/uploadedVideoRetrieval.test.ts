@@ -157,7 +157,7 @@ describe('analyzeUploadedVideo', () => {
       model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', durationSeconds: 300, events: events(3), metrics: {},
     });
     const analysis = await analyzeUploadedVideo({
-      query: 'q', videoId: 'video-1', mode: 'visual', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', expectedBytes: 10, durationSeconds: 300,
+      query: 'q', videoId: 'video-1', mode: 'visual', evidence: 'all', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', expectedBytes: 10, durationSeconds: 300,
     });
     expect(watchWithVideoChat3.mock.calls[0]?.[0].maxEvents).toBe(WATCH_MAX_EVENTS);
     expect(analysis.watchedThroughSeconds).toBe(300);
@@ -170,7 +170,7 @@ describe('analyzeUploadedVideo', () => {
       model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', durationSeconds: 300, events: events(WATCH_MAX_EVENTS), metrics: {},
     });
     const analysis = await analyzeUploadedVideo({
-      query: 'q', videoId: 'video-1', mode: 'visual', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: 300,
+      query: 'q', videoId: 'video-1', mode: 'visual', evidence: 'all', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: 300,
     });
     expect(analysis.watchedThroughSeconds).toBe(WATCH_MAX_EVENTS * 2);
     expect(analysis.unwatched).toEqual({ startSeconds: WATCH_MAX_EVENTS * 2, endSeconds: 300 });
@@ -181,7 +181,7 @@ describe('analyzeUploadedVideo', () => {
       model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', durationSeconds: 90, events: [], metrics: {},
     });
     const analysis = await analyzeUploadedVideo({
-      query: 'q', videoId: 'video-1', mode: 'visual', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: null,
+      query: 'q', videoId: 'video-1', mode: 'visual', evidence: 'all', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: null,
     });
     expect(analysis.unwatched).toBeNull();
     expect(analysis.verified).toEqual([]);
@@ -198,7 +198,7 @@ describe('analyzeUploadedVideo', () => {
       failed: [{ id: 'watch-1', reason: 'ffmpeg exited 1' }],
     });
     const analysis = await analyzeUploadedVideo({
-      query: 'q', videoId: 'video-1', mode: 'visual', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: 300,
+      query: 'q', videoId: 'video-1', mode: 'visual', evidence: 'all', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: 300,
     });
     expect(analysis.failures).toEqual([
       { id: 'watch-1', reason: 'VideoChat3 verification failed: ffmpeg exited 1', startSeconds: 10, endSeconds: 20 },

@@ -190,3 +190,16 @@ describe('resolveSearchMode', () => {
     expect(result.mode).toBe('transcript');
   });
 });
+
+describe('which both the resolver means', () => {
+  it('names the requirement next to the mode, so nothing downstream has to guess', () => {
+    expect(classifyInstruction('the good bit')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('Find "we are shutting it down"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('Clip where he explains the boss fight strategy')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('Clip the boss fight')).toMatchObject({ mode: 'visual', evidence: 'all' });
+    expect(classifyInstruction('Where do they discuss the merger?')).toMatchObject({ mode: 'transcript', evidence: 'all' });
+    expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true }).evidence).toBe('all');
+    expect(resolveSearchMode({ instruction: 'the good bit', requested: 'auto', transcriptAvailable: true }).evidence).toBe('any');
+    expect(resolveSearchMode({ instruction: 'the good bit', requested: 'auto', transcriptAvailable: false })).toMatchObject({ mode: 'visual', evidence: 'all' });
+  });
+});

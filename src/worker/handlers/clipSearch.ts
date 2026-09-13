@@ -62,6 +62,7 @@ import type {
   ChunkFailureCode,
   MatchSource,
   AnsweredFrom,
+  EvidenceRequirement,
   FallbackReason,
   ResolvedSearchMode,
   RetrievalSystem,
@@ -315,6 +316,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
     log.info('starting clip search', {
       mode: resolved.mode,
+      evidence: resolved.evidence,
       rationale: resolved.rationale,
       chunks: chunks.length,
       instruction,
@@ -340,6 +342,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       chunks,
       instruction,
       mode: resolved.mode,
+      evidence: resolved.evidence,
       correcting,
       log,
     });
@@ -370,6 +373,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         chunks,
         instruction,
         mode: resolved.mode,
+        evidence: resolved.evidence,
         log,
       });
       const primaryOutcome = {
@@ -424,7 +428,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // once is worth more than finding it out N times.
     if (resolved.mode !== 'transcript') await assertVideoInputSupported();
 
-    await startClipRequest(clipRequestId, { chunksTotal: chunks.length, resolvedMode: resolved.mode });
+    await startClipRequest(clipRequestId, {
+      chunksTotal: chunks.length,
+      resolvedMode: resolved.mode,
+      resolvedEvidence: resolved.evidence,
+    });
     // So the peak reported at the end belongs to this search.
     resetVideoCallPeak();
     // Reading the footage is the only path that can report a real absence, so
@@ -998,6 +1006,7 @@ async function answerFromSimpleMem(input: {
   chunks: VideoChunk[];
   instruction: string;
   mode: ResolvedSearchMode;
+  evidence: EvidenceRequirement;
   correcting: boolean;
   log: Logger;
 }): Promise<{
@@ -1021,7 +1030,11 @@ async function answerFromSimpleMem(input: {
   if (before.use === 'fallback') {
     return { matchCount: 0, released: false, fallback: before.reason, outcome: null };
   }
-  await startClipRequest(input.clipRequestId, { chunksTotal: 0, resolvedMode: input.mode });
+  await startClipRequest(input.clipRequestId, {
+    chunksTotal: 0,
+    resolvedMode: input.mode,
+    resolvedEvidence: input.evidence,
+  });
   let reply;
   try {
     reply = await simplememQuery({ videoId: input.video.id, query: input.instruction, topK: env.SIMPLEMEM_TOP_K });
@@ -1071,6 +1084,7 @@ async function answerFromSimpleMem(input: {
       videoKey: input.video.proxyStorageKey,
       expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? 0,
       mode: input.mode,
+      evidence: input.evidence,
       onUsage: (usage) => {
         void recordModelUsage({
           ...usage,
@@ -1155,7 +1169,7 @@ async function answerFromSimpleMem(input: {
       description: candidate.description,
       // What established the moment: footage alone, or footage judged
       // together with its transcript. The row must say which.
-      source: MATCH_SOURCE[input.mode],
+      source: candidate.source ?? MATCH_SOURCE[input.mode],
     })),
     input.chunks,
     {
@@ -1221,6 +1235,7 @@ async function answerFromVideoChat3(input: {
   chunks: VideoChunk[];
   instruction: string;
   mode: ResolvedSearchMode;
+  evidence: EvidenceRequirement;
   log: Logger;
 }): Promise<{
   /** True when this path finished the request — with moments, or with an honest none. */
@@ -1244,7 +1259,11 @@ async function answerFromVideoChat3(input: {
     throw new Error('Video has no analysis proxy to watch');
   }
 
-  await startClipRequest(input.clipRequestId, { chunksTotal: 0, resolvedMode: input.mode });
+  await startClipRequest(input.clipRequestId, {
+    chunksTotal: 0,
+    resolvedMode: input.mode,
+    resolvedEvidence: input.evidence,
+  });
   // Signing the proxy can fail (storage down); that is a failure of this
   // delivery, retried by the queue, never a reason to read the video some
   // other way. analyzeUploadedVideo itself does not throw: a watch or
@@ -1261,6 +1280,7 @@ async function answerFromVideoChat3(input: {
     expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? undefined,
     durationSeconds: input.video.durationSeconds,
     mode: input.mode,
+    evidence: input.evidence,
   });
 
   const outcome = {
@@ -1328,7 +1348,7 @@ async function answerFromVideoChat3(input: {
 
   const wanted = input.requestedResultCount ?? analysis.verified.length;
   const found = placeMomentsOnChunks(
-    analysis.verified.slice(0, wanted).map((moment) => ({ ...moment, source: MATCH_SOURCE[input.mode] })),
+    analysis.verified.slice(0, wanted).map((moment) => ({ ...moment, source: moment.source ?? MATCH_SOURCE[input.mode] })),
     input.chunks,
     {
     instruction: input.instruction,

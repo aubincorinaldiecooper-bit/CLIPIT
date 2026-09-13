@@ -15,6 +15,15 @@ export type SearchMode = 'auto' | 'visual' | 'transcript' | 'both';
 
 /** What the search actually ran, after classification and availability checks. */
 export type ResolvedSearchMode = 'visual' | 'transcript' | 'both';
+/**
+ * What a resolved mode demands of each candidate. 'all': every one of the
+ * mode's sources (a mixed question needs footage AND its aligned
+ * transcript). 'any': the sources are searched together and either may
+ * establish a moment — an undetermined question, or a quoted phrase that
+ * may be spoken or on screen. Decided once, with the mode, by the
+ * request-level resolver; only meaningful for 'both'.
+ */
+export type EvidenceRequirement = 'all' | 'any';
 
 export type MatchSource = 'visual' | 'transcript' | 'multimodal';
 
@@ -194,6 +203,7 @@ export interface ClipRequest {
   instruction: string;
   mode: SearchMode;
   resolvedMode: ResolvedSearchMode | null;
+  resolvedEvidence: EvidenceRequirement | null;
   status: ClipRequestStatus;
   errorMessage: string | null;
   chunksTotal: number;

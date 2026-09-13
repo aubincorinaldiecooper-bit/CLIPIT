@@ -5,9 +5,9 @@ import {
   rerankVideoIntervals,
 } from '../qwenModal.js';
 import { verifyWithVideoChat3, type VideoChat3Candidate } from '../../videochat3/client.js';
-import { MISSING_TRANSCRIPT_REASON, attachTranscripts, passesEvidenceGate, requiresTranscript } from '../mixedEvidence.js';
+import { MISSING_TRANSCRIPT_REASON, attachTranscripts, passesEvidenceGate, transcriptPolicy } from '../mixedEvidence.js';
 import type { VideoUsageReporter } from '../../search/openrouterVideo.js';
-import type { ResolvedSearchMode } from '../../../domain/types.js';
+import type { EvidenceRequirement, ResolvedSearchMode } from '../../../domain/types.js';
 import type { Candidate } from './candidates.js';
 
 interface FootageVerificationResult {
@@ -43,10 +43,13 @@ function failureFor(
 /**
  * Memory proposes; footage verifies. Qwen embeds and reranks the remembered
  * intervals, and VideoChat3 re-opens the exact footage before any of them
- * is evidence. `mode` is the request's ResolvedSearchMode, decided once in
- * handleClipSearch: for `both`, each candidate is verified together with
- * the transcript of its own interval, and one without any is rejected
- * here rather than verified visually instead.
+ * is evidence. `mode` and `evidence` are the request's decision, made once
+ * in handleClipSearch: for a `both` that needs 'all', each candidate is
+ * verified together with the transcript of its own interval and one
+ * without any is rejected here rather than verified visually instead; for
+ * a `both` where 'any' source may establish a moment, a candidate with
+ * speech is judged with it and a silent one on the footage, each labelled
+ * by what established it.
  */
 export async function rerankSimpleMemCandidates(input: {
   query: string;
@@ -56,6 +59,7 @@ export async function rerankSimpleMemCandidates(input: {
   videoKey: string;
   expectedBytes: number;
   mode: ResolvedSearchMode;
+  evidence: EvidenceRequirement;
   onUsage?: VideoUsageReporter;
 }): Promise<VerifiedSimpleMemCandidates> {
   if (input.candidates.length === 0) {
@@ -165,13 +169,24 @@ export async function rerankSimpleMemCandidates(input: {
     end: candidate.endSeconds,
   }));
   const transcriptFailures: Array<Candidate & { reason: string }> = [];
-  if (requiresTranscript(input.mode)) {
+  const policy = transcriptPolicy(input.mode, input.evidence);
+  const withTranscript = new Set<string>();
+  let withoutTranscript = 0;
+  if (policy !== 'none') {
     const attached = await attachTranscripts(input.videoId, toVerify);
-    for (const candidate of attached.missing) {
-      const mapped = failureFor(identified, candidate.id, MISSING_TRANSCRIPT_REASON);
-      if (mapped) transcriptFailures.push(mapped);
+    for (const candidate of attached.verifiable) withTranscript.add(candidate.id);
+    withoutTranscript = attached.missing.length;
+    if (policy === 'when_present') {
+      // Every candidate is verified; the ones with speech carry it.
+      const spoken = new Map(attached.verifiable.map((candidate) => [candidate.id, candidate]));
+      toVerify = toVerify.map((candidate) => spoken.get(candidate.id) ?? candidate);
+    } else {
+      for (const candidate of attached.missing) {
+        const mapped = failureFor(identified, candidate.id, MISSING_TRANSCRIPT_REASON);
+        if (mapped) transcriptFailures.push(mapped);
+      }
+      toVerify = attached.verifiable;
     }
-    toVerify = attached.verifiable;
     if (toVerify.length === 0) {
       return {
         candidates: [],
@@ -186,8 +201,8 @@ export async function rerankSimpleMemCandidates(input: {
             qwen_rerank_model: reranked.model,
             qwen_rerank_revision: reranked.revision,
             qwen_rerank_metrics: reranked.metrics,
-            mixed_mode: true,
-            without_transcript: attached.missing.length,
+            transcript_policy: policy,
+            without_transcript: withoutTranscript,
           },
         },
       };
@@ -218,6 +233,8 @@ export async function rerankSimpleMemCandidates(input: {
       ...row.candidate,
       score: verdict.confidence,
       description: verdict.description || row.candidate.description,
+      // What established it: footage judged with its transcript, or footage alone.
+      source: withTranscript.has(verdict.id) ? 'multimodal' : 'visual',
     });
   }
 
@@ -245,8 +262,8 @@ export async function rerankSimpleMemCandidates(input: {
         embedding_scores: embeddingRanked.map((row) => ({ id: row.id, score: row.embeddingScore })),
         rerank_scores: ordered.map((row) => ({ id: row.id, score: rerankScoreById.get(row.id) ?? null })),
         source_bytes: input.expectedBytes,
-        mixed_mode: requiresTranscript(input.mode),
-        without_transcript: transcriptFailures.length,
+        transcript_policy: policy,
+        without_transcript: withoutTranscript,
       },
     },
   };

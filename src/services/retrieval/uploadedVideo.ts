@@ -4,10 +4,10 @@ import {
   type InternetVideoAnalysis,
   type InternetVideoMoment,
 } from './internetVideo.js';
-import { MISSING_TRANSCRIPT_REASON, attachTranscripts, passesEvidenceGate, requiresTranscript } from './mixedEvidence.js';
+import { MISSING_TRANSCRIPT_REASON, attachTranscripts, passesEvidenceGate, transcriptPolicy } from './mixedEvidence.js';
 import { verifyWithVideoChat3 } from '../videochat3/client.js';
 import type { NewClipMatch } from '../../db/repositories/clipRequests.js';
-import type { ResolvedSearchMode, VideoChunk } from '../../domain/types.js';
+import type { EvidenceRequirement, ResolvedSearchMode, VideoChunk } from '../../domain/types.js';
 
 export const WATCH_MAX_EVENTS = DEFAULT_WATCH_MAX_EVENTS;
 
@@ -35,14 +35,17 @@ export function unwatchedTail(input: {
  * aligned to that clip, so a spoken condition cannot be satisfied by the
  * picture alone.
  *
- * Which questions are mixed is not decided here. The request's resolved mode
- * arrives from handleClipSearch, which already weighed the explicit mode,
- * the wording, and whether the video has a usable transcript: a `both` that
- * was downgraded to `visual` upstream arrives as `visual` and gets no
- * transcript work, and an explicit `both` stays `both` however visual its
- * wording. A candidate whose interval has no transcript is rejected with a
- * reason, never verified visually instead; and a verdict is evidence only
- * through the same gate as every other verification (passesEvidenceGate).
+ * Which questions are mixed, and what a mixed one demands, is not decided
+ * here. The request's resolved mode and evidence requirement arrive from
+ * handleClipSearch, which already weighed the explicit mode, the wording,
+ * and whether the video has a usable transcript: a `both` downgraded to
+ * `visual` upstream arrives as `visual` and gets no transcript work; an
+ * explicit `both` stays `both` however visual its wording. Under 'all', a
+ * candidate whose interval has no transcript is rejected with a reason,
+ * never verified visually instead. Under 'any', it keeps its visual verdict
+ * and is labelled visual, while a candidate with speech is judged again
+ * with it and labelled multimodal. Every verdict is evidence only through
+ * the same gate as every other verification (passesEvidenceGate).
  */
 async function verifyMixedEvidence(input: {
   analysis: InternetVideoAnalysis;
@@ -52,28 +55,43 @@ async function verifyMixedEvidence(input: {
   videoKey: string;
   expectedBytes?: number;
   mode: ResolvedSearchMode;
+  evidence: EvidenceRequirement;
 }): Promise<InternetVideoAnalysis> {
-  if (!requiresTranscript(input.mode) || input.analysis.verified.length === 0) return input.analysis;
+  const policy = transcriptPolicy(input.mode, input.evidence);
+  if (policy === 'none' || input.analysis.verified.length === 0) return input.analysis;
 
   const moments = input.analysis.verified;
+  const momentById = new Map(moments.map((moment, index) => [`mixed-${index}`, moment]));
   const { verifiable, missing } = await attachTranscripts(
     input.videoId,
     moments.map((moment, index) => ({ id: `mixed-${index}`, start: moment.startSeconds, end: moment.endSeconds })),
   );
-  const missingFailures = missing.map((candidate) => ({
-    id: candidate.id,
-    reason: MISSING_TRANSCRIPT_REASON,
-    startSeconds: candidate.start,
-    endSeconds: candidate.end,
-  }));
+  const missingFailures = policy === 'required'
+    ? missing.map((candidate) => ({
+      id: candidate.id,
+      reason: MISSING_TRANSCRIPT_REASON,
+      startSeconds: candidate.start,
+      endSeconds: candidate.end,
+    }))
+    : [];
+  // Under 'any', a silent stretch already passed the visual verification
+  // and the gate; it stays, and says it was established by footage alone.
+  const keptOnFootage: InternetVideoMoment[] = policy === 'when_present'
+    ? missing.flatMap((candidate) => {
+      const moment = momentById.get(candidate.id);
+      return moment ? [{ ...moment, source: 'visual' as const }] : [];
+    })
+    : [];
   if (verifiable.length === 0) {
     return {
       ...input.analysis,
-      verified: [],
+      verified: keptOnFootage,
       failures: [...input.analysis.failures, ...missingFailures],
       metrics: {
         ...input.analysis.metrics,
-        mixedVerification: { candidates: 0, withoutTranscript: missing.length, verified: 0, rejected: 0 },
+        mixedVerification: {
+          policy, candidates: 0, withoutTranscript: missing.length, verified: keptOnFootage.length, rejected: 0,
+        },
       },
     };
   }
@@ -84,10 +102,9 @@ async function verifyMixedEvidence(input: {
     expectedBytes: input.expectedBytes,
     candidates: verifiable,
   });
-  const momentById = new Map(moments.map((moment, index) => [`mixed-${index}`, moment]));
   const candidateById = new Map(verifiable.map((candidate) => [candidate.id, candidate]));
   let rejected = 0;
-  const verified: InternetVideoMoment[] = [];
+  const verified: InternetVideoMoment[] = [...keptOnFootage];
   for (const result of verdicts.results) {
     if (!passesEvidenceGate(result)) {
       rejected += 1;
@@ -98,6 +115,8 @@ async function verifyMixedEvidence(input: {
       endSeconds: result.endSeconds,
       confidence: result.confidence,
       description: result.description || momentById.get(result.id)?.description || '',
+      // Footage judged together with its transcript.
+      source: 'multimodal',
     });
   }
   verified.sort((left, right) => right.confidence - left.confidence);
@@ -123,6 +142,7 @@ async function verifyMixedEvidence(input: {
       ...input.analysis.metrics,
       mixedVerification: {
         ...verdicts.metrics,
+        policy,
         candidates: verifiable.length,
         withoutTranscript: missing.length,
         verified: verified.length,
@@ -134,8 +154,9 @@ async function verifyMixedEvidence(input: {
 
 /**
  * Read an uploaded video the way an internet video is read, then hold the
- * result to the request's evidence contract. `mode` is the ResolvedSearchMode
- * decided once in handleClipSearch; it is passed down, never re-derived.
+ * result to the request's evidence contract. `mode` and `evidence` are the
+ * request-level decision from handleClipSearch; they are passed down, never
+ * re-derived.
  */
 export async function analyzeUploadedVideo(input: {
   query: string;
@@ -145,6 +166,7 @@ export async function analyzeUploadedVideo(input: {
   expectedBytes?: number;
   durationSeconds: number | null;
   mode: ResolvedSearchMode;
+  evidence: EvidenceRequirement;
 }): Promise<UploadedVideoAnalysis> {
   try {
     const firstAnalysis = await analyzeInternetVideo({
@@ -162,6 +184,7 @@ export async function analyzeUploadedVideo(input: {
       videoKey: input.videoKey,
       expectedBytes: input.expectedBytes,
       mode: input.mode,
+      evidence: input.evidence,
     });
     const durationSeconds = input.durationSeconds ?? analysis.durationSeconds;
     return {

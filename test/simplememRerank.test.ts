@@ -90,7 +90,7 @@ describe('Omni-SimpleMem candidate verification', () => {
       query: 'find the right sign',
       candidates,
       videoId: 'video-1',
-      mode: 'visual',
+      mode: 'visual', evidence: 'all',
       videoUrl: 'https://signed/video',
       videoKey: 'proxy',
       expectedBytes: 123,
@@ -107,7 +107,7 @@ describe('Omni-SimpleMem candidate verification', () => {
       'candidate-0',
     ]);
     expect(result.candidates).toEqual([
-      { ...candidates[1], score: 0.95, description: 'confirmed by footage' },
+      { ...candidates[1], score: 0.95, description: 'confirmed by footage', source: 'visual' },
     ]);
     expect(result.failed).toContainEqual(expect.objectContaining({
       description: 'first',
@@ -144,7 +144,7 @@ describe('Omni-SimpleMem candidate verification', () => {
     });
 
     const result = await rerankSimpleMemCandidates({
-      query: 'find it', candidates, videoId: 'video-1', mode: 'visual', videoUrl: 'https://signed/video', videoKey: 'proxy', expectedBytes: 123,
+      query: 'find it', candidates, videoId: 'video-1', mode: 'visual', evidence: 'all', videoUrl: 'https://signed/video', videoKey: 'proxy', expectedBytes: 123,
     });
 
     expect(rerankVideoIntervals.mock.calls[0]?.[0].candidates).toHaveLength(1);

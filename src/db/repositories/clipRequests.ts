@@ -6,6 +6,7 @@ import type {
   ClipMatch,
   ClipRequest,
   ClipRequestStatus,
+  EvidenceRequirement,
   FallbackReason,
   MatchFeedback,
   MatchFeedbackReason,
@@ -25,6 +26,7 @@ interface ClipRequestRow {
   instruction: string;
   mode: SearchMode;
   resolved_mode: ResolvedSearchMode | null;
+  resolved_evidence: EvidenceRequirement | null;
   status: ClipRequestStatus;
   error_message: string | null;
   chunks_total: number;
@@ -62,6 +64,7 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     instruction: row.instruction,
     mode: row.mode,
     resolvedMode: row.resolved_mode,
+    resolvedEvidence: row.resolved_evidence ?? null,
     status: row.status,
     errorMessage: row.error_message,
     chunksTotal: row.chunks_total,
@@ -136,12 +139,13 @@ export async function listClipRequestsForVideo(videoId: string): Promise<ClipReq
 
 export async function startClipRequest(
   requestId: string,
-  input: { chunksTotal: number; resolvedMode: ResolvedSearchMode },
+  input: { chunksTotal: number; resolvedMode: ResolvedSearchMode; resolvedEvidence: EvidenceRequirement },
 ): Promise<void> {
   await queryOne(
     `UPDATE clip_requests
         SET status = 'searching',
             resolved_mode = $2,
+            resolved_evidence = $4,
             chunks_total = $3,
             chunks_completed = 0,
             chunks_failed = 0,
@@ -154,7 +158,7 @@ export async function startClipRequest(
             error_message = NULL,
             updated_at = now()
       WHERE id = $1`,
-    [requestId, input.resolvedMode, input.chunksTotal],
+    [requestId, input.resolvedMode, input.chunksTotal, input.resolvedEvidence],
   );
 }
 

@@ -12,6 +12,8 @@ export interface InternetVideoMoment {
   endSeconds: number;
   confidence: number;
   description: string;
+  /** What established it, when a later stage judged it with its transcript. Absent: footage alone. */
+  source?: 'visual' | 'multimodal';
 }
 
 /**
