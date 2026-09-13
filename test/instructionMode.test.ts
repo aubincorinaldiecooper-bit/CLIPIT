@@ -232,6 +232,11 @@ describe('which both the resolver means', () => {
     expect(classifyInstruction("the sign says “James' car”")).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction("James' sign says \"EXIT\" while she talks")).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('show where she says "goodbye while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
+    // A word-final apostrophe inside a single-quoted phrase does not end it, and an inch mark is not a quote.
+    expect(classifyInstruction("she says ‘James' car is on the screen’ while leaving")).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction("she says 'James' car is on the screen' while leaving")).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('show the sign measuring 12" while he talks')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('the 12" sign that says "EXIT"')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('Clip the boss fight')).toMatchObject({ mode: 'visual', evidence: 'all' });
     expect(classifyInstruction('Where do they discuss the merger?')).toMatchObject({ mode: 'transcript', evidence: 'all' });
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true }).evidence).toBe('all');
