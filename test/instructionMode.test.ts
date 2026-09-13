@@ -220,6 +220,11 @@ describe('which both the resolver means', () => {
     expect(classifyInstruction('the banner displaying the words "SALE" that she talks about')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('she says the sign reads "EXIT" written across the door')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('the screen fades to black and she says "goodbye"')).toMatchObject({ mode: 'both', evidence: 'all' });
+    // A surface word inside the quote is part of what is said, not where it is written.
+    expect(classifyInstruction('she says “look at the screen” while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('he says "read the sign" and walks in')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('the sign that says "look here"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction("the shirt that says 'I'm the boss' while he talks")).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('Clip the boss fight')).toMatchObject({ mode: 'visual', evidence: 'all' });
     expect(classifyInstruction('Where do they discuss the merger?')).toMatchObject({ mode: 'transcript', evidence: 'all' });
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true }).evidence).toBe('all');

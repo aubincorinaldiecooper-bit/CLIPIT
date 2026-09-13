@@ -71,8 +71,8 @@ const TEXT_SURFACES = 'sign|signs|label|labels|banner|poster|billboard|placard'
   + '|hood|bumper|windshield|title card|lower third|whiteboard|slide|chart|graph|screen|scoreboard'
   + '|text|writing';
 const SURFACE_WORD = new RegExp(String.raw`\b(?:${TEXT_SURFACES})\b`, 'giu');
-/** Any quote mark; an apostrophe counts only when it is not inside a word. */
-const QUOTE_MARK = /["“”‘’]|(?<![\p{L}\p{N}])'|'(?![\p{L}\p{N}])/gu;
+/** Any quote mark; an apostrophe (straight or curly) counts only when it is not inside a word. */
+const QUOTE_MARK = /["“”‘]|(?<![\p{L}\p{N}])['’]|['’](?![\p{L}\p{N}])/gu;
 /** How many words may sit between a surface and its quote. */
 const BRIDGE_WORDS = 4;
 /**
@@ -90,30 +90,63 @@ function bridgeWords(text: string): string[] {
   return text.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? [];
 }
 
+/** The quoted spans of the sentence, as [opening mark, closing mark] offsets. */
+function quoteSpans(text: string): Array<{ start: number; end: number }> {
+  const spans: Array<{ start: number; end: number }> = [];
+  let open: { index: number; mark: string } | null = null;
+  for (const match of text.matchAll(QUOTE_MARK)) {
+    const mark = match[0];
+    const index = match.index ?? 0;
+    if (open === null) {
+      open = { index, mark };
+      continue;
+    }
+    const closes = (open.mark === '“' && mark === '”')
+      || (open.mark === '‘' && mark === '’')
+      || (open.mark === '"' && mark === '"')
+      || (open.mark === "'" && (mark === "'" || mark === '’'));
+    if (closes) {
+      spans.push({ start: open.index, end: index });
+      open = null;
+    } else if (mark === '“' || mark === '‘' || mark === '"' || mark === "'") {
+      // The previous mark never closed; this one opens afresh.
+      open = { index, mark };
+    }
+  }
+  return spans;
+}
+
 /**
  * Whether the quoted phrase is written on a named surface. The surface word
- * and the quote must be near each other with nothing between them that starts
+ * must sit outside the quote, near it, with nothing between them that starts
  * a new clause or names a speaker: `the sign that clearly says "EXIT"`, `the
  * sign says, "EXIT"`, `the banner displaying the words "SALE"`, `a shirt with
  * "BOSS"`, or, the other way round with a placing preposition, `says "we are
  * live" on the banner`. A surface word elsewhere in the sentence (`she says
  * "goodbye" while the screen fades`, `the banner while he says "..."`) is a
- * separate visual condition, not where the phrase is written.
+ * separate visual condition, and a surface word inside the quote (`she says
+ * "look at the screen"`) is part of what is said, not where it is written.
  */
 export function quoteOnSurface(text: string): boolean {
-  const quotes = [...text.matchAll(QUOTE_MARK)].map((mark) => mark.index ?? 0);
-  if (quotes.length === 0) return false;
-  for (const surface of text.matchAll(SURFACE_WORD)) {
-    const from = surface.index ?? 0;
-    const to = from + surface[0].length;
-    const nextQuote = quotes.find((index) => index >= to);
-    if (nextQuote !== undefined) {
-      const between = bridgeWords(text.slice(to, nextQuote));
+  const spans = quoteSpans(text);
+  if (spans.length === 0) return false;
+  // Blank out the quoted text so a surface word inside a quote is never seen.
+  const outside = text.split('');
+  for (const span of spans) {
+    for (let index = span.start + 1; index < span.end; index += 1) outside[index] = ' ';
+  }
+  const visible = outside.join('');
+  for (const span of spans) {
+    const before = visible.slice(0, span.start);
+    const lastSurface = [...before.matchAll(SURFACE_WORD)].at(-1);
+    if (lastSurface) {
+      const between = bridgeWords(before.slice((lastSurface.index ?? 0) + lastSurface[0].length));
       if (between.length <= BRIDGE_WORDS && !between.some((word) => BRIDGE_BREAKERS.has(word))) return true;
     }
-    const previousQuote = [...quotes].reverse().find((index) => index < from);
-    if (previousQuote !== undefined) {
-      const between = bridgeWords(text.slice(previousQuote + 1, from));
+    const after = visible.slice(span.end + 1);
+    const firstSurface = [...after.matchAll(SURFACE_WORD)][0];
+    if (firstSurface) {
+      const between = bridgeWords(after.slice(0, firstSurface.index ?? 0));
       if (
         between.length <= BRIDGE_WORDS
         && between.some((word) => PLACING_PREPOSITIONS.has(word))
