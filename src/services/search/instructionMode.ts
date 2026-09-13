@@ -90,29 +90,42 @@ function bridgeWords(text: string): string[] {
   return text.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? [];
 }
 
-/** The quoted spans of the sentence, as [opening mark, closing mark] offsets. */
+const WORD_CHARACTER = /[\p{L}\p{N}]/u;
+
+function closesSpan(opener: string, mark: string): boolean {
+  return (opener === '“' && mark === '”')
+    || (opener === '‘' && (mark === '’' || mark === "'"))
+    || (opener === '"' && mark === '"')
+    || (opener === "'" && (mark === "'" || mark === '’'));
+}
+
+/**
+ * The quoted spans of the sentence, as [opening mark, closing mark] offsets.
+ * While a span is open only its own closer ends it: an apostrophe or a
+ * differently styled mark inside (`"James' car"`) is part of the quoted
+ * text. A span left open runs to the end of the sentence, as the QUOTATION
+ * test above already accepts a single opening mark. A closing-style mark
+ * with nothing open, or a straight apostrophe not followed by a word
+ * (`James' car`), is punctuation, not a quote.
+ */
 function quoteSpans(text: string): Array<{ start: number; end: number }> {
   const spans: Array<{ start: number; end: number }> = [];
   let open: { index: number; mark: string } | null = null;
   for (const match of text.matchAll(QUOTE_MARK)) {
     const mark = match[0];
     const index = match.index ?? 0;
-    if (open === null) {
-      open = { index, mark };
+    if (open !== null) {
+      if (closesSpan(open.mark, mark)) {
+        spans.push({ start: open.index, end: index });
+        open = null;
+      }
       continue;
     }
-    const closes = (open.mark === '“' && mark === '”')
-      || (open.mark === '‘' && mark === '’')
-      || (open.mark === '"' && mark === '"')
-      || (open.mark === "'" && (mark === "'" || mark === '’'));
-    if (closes) {
-      spans.push({ start: open.index, end: index });
-      open = null;
-    } else if (mark === '“' || mark === '‘' || mark === '"' || mark === "'") {
-      // The previous mark never closed; this one opens afresh.
-      open = { index, mark };
-    }
+    if (mark === '”' || mark === '’') continue;
+    if (mark === "'" && !WORD_CHARACTER.test(text.charAt(index + 1))) continue;
+    open = { index, mark };
   }
+  if (open !== null) spans.push({ start: open.index, end: text.length });
   return spans;
 }
 

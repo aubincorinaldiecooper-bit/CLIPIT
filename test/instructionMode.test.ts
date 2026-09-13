@@ -225,6 +225,13 @@ describe('which both the resolver means', () => {
     expect(classifyInstruction('he says "read the sign" and walks in')).toMatchObject({ mode: 'both', evidence: 'all' });
     expect(classifyInstruction('the sign that says "look here"')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction("the shirt that says 'I'm the boss' while he talks")).toMatchObject({ mode: 'both', evidence: 'any' });
+    // An unmatched opening mark, a word-final apostrophe inside the quote, or mixed marks do not lose the quote.
+    expect(classifyInstruction('the sign says "EXIT')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction("the sign says \"James' car\"")).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the sign says "James’ car"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction("the sign says “James' car”")).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction("James' sign says \"EXIT\" while she talks")).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('show where she says "goodbye while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
     expect(classifyInstruction('Clip the boss fight')).toMatchObject({ mode: 'visual', evidence: 'all' });
     expect(classifyInstruction('Where do they discuss the merger?')).toMatchObject({ mode: 'transcript', evidence: 'all' });
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true }).evidence).toBe('all');
