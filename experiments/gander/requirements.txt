@@ -1,0 +1,6 @@
+# Gander runtime is installed from its upstream repository/commit in the environment.
+# Keep this file limited to the Clipit-specific adapters.
+crisperwhisper[ct2]
+fastapi>=0.110
+numpy
+uvicorn[standard]>=0.29
