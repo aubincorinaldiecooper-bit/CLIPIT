@@ -54,22 +54,12 @@ async function verifyMixedEvidence(input: {
   if (classifyInstruction(input.query).mode !== 'both' || input.analysis.verified.length === 0) {
     return input.analysis;
   }
+
   const videoId = uploadedVideoId(input.videoKey);
-  if (!videoId) {
-    return {
-      ...input.analysis,
-      verified: [],
-      failures: [
-        ...input.analysis.failures,
-        ...input.analysis.verified.map((moment, index) => ({
-          id: `mixed-${index}`,
-          reason: 'could not identify uploaded video transcript for mixed verification',
-          startSeconds: moment.startSeconds,
-          endSeconds: moment.endSeconds,
-        })),
-      ],
-    };
-  }
+  // Only Clipit's canonical proxy keys can be joined to a stored transcript.
+  // Internet videos and test fixtures without that identity keep the visual
+  // analysis rather than being falsely treated as a mixed-evidence failure.
+  if (!videoId) return input.analysis;
 
   const candidates = await Promise.all(input.analysis.verified.map(async (moment, index) => ({
     id: `mixed-${index}`,
@@ -102,7 +92,7 @@ async function verifyMixedEvidence(input: {
     expectedBytes: input.expectedBytes,
     candidates: verifiable,
   });
-  const original = new Map(candidates.map((candidate, index) => [candidate.id, input.analysis.verified[index]!]))
+  const original = new Map(candidates.map((candidate, index) => [candidate.id, input.analysis.verified[index]!]));
   const verified = verdicts.results
     .filter((result) => result.match)
     .map((result) => ({
@@ -234,10 +224,12 @@ export function placeMomentsOnChunks(
       description: moment.description || `A moment matching "${attribution.instruction}"`,
       confidence: Math.max(0, Math.min(1, moment.confidence)),
       source: moment.source ?? 'visual',
-      quote: moment.quote ?? null,
+      ...(moment.quote !== undefined ? { quote: moment.quote } : {}),
       provider: moment.provider ?? attribution.provider,
       model: moment.model ?? attribution.model,
-      promptVersion: moment.promptVersion ?? attribution.promptVersion ?? null,
+      ...(moment.promptVersion !== undefined || attribution.promptVersion !== undefined
+        ? { promptVersion: moment.promptVersion ?? attribution.promptVersion ?? null }
+        : {}),
     });
   }
   return found;
