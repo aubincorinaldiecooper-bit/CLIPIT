@@ -1,5 +1,6 @@
 import { DEFAULT_WATCH_MAX_EVENTS, analyzeInternetVideo, type InternetVideoAnalysis } from './internetVideo.js';
 import { classifyInstruction } from '../search/instructionMode.js';
+import { getVideo } from '../../db/repositories/videos.js';
 import { listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
 import { verifyWithVideoChat3 } from '../videochat3/client.js';
 import type { NewClipMatch } from '../../db/repositories/clipRequests.js';
@@ -43,6 +44,11 @@ async function transcriptForInterval(videoId: string, start: number, end: number
  * A mixed visual+spoken question gets one more exact-interval verification
  * after visual retrieval. The verifier sees the clip and only the transcript
  * aligned to that clip, so spoken conditions cannot be silently dropped.
+ *
+ * The request-level resolver deliberately downgrades `both` to `visual` when
+ * no usable transcript exists. This helper mirrors that fact from the stored
+ * video row, rather than re-classifying an ambiguous sentence and demanding a
+ * transcript the request already established was unavailable.
  */
 async function verifyMixedEvidence(input: {
   analysis: InternetVideoAnalysis;
@@ -57,9 +63,12 @@ async function verifyMixedEvidence(input: {
 
   const videoId = uploadedVideoId(input.videoKey);
   // Only Clipit's canonical proxy keys can be joined to a stored transcript.
-  // Internet videos and test fixtures without that identity keep the visual
-  // analysis rather than being falsely treated as a mixed-evidence failure.
   if (!videoId) return input.analysis;
+
+  const video = await getVideo(videoId);
+  if (!video || video.transcriptStatus !== 'ready' || video.transcriptSegmentCount <= 0) {
+    return input.analysis;
+  }
 
   const candidates = await Promise.all(input.analysis.verified.map(async (moment, index) => ({
     id: `mixed-${index}`,
