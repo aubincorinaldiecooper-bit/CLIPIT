@@ -23,3 +23,5 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test -- --run
+      # The SimpleMem sidecar's caption writer has no Node counterpart; its tests are plain unittest.
+      - run: python3 -m unittest discover -s tools/simplemem -p 'test_*.py' -v
