@@ -128,6 +128,20 @@ export function classifyInstruction(instruction: string): ModeClassification {
     return { mode: 'visual', evidence: 'all', spokenScore, visualScore, rationale: 'instruction refers to on-screen content' };
   }
 
+  // A quoted phrase is modality-ambiguous even when the sentence around it
+  // scores on both sides: `the sign that says "EXIT"` names a sign and "says",
+  // and the sign satisfies it with nobody speaking. Either source may
+  // establish it. Without a quote, a sentence that mixes spoken and visual
+  // conditions needs both.
+  if (QUOTATION.test(text)) {
+    return {
+      mode: 'both',
+      evidence: 'any',
+      spokenScore,
+      visualScore,
+      rationale: 'quoted phrase beside spoken and visual signals; either source may establish it',
+    };
+  }
   return {
     mode: 'both',
     evidence: 'all',

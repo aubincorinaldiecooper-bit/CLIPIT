@@ -196,6 +196,11 @@ describe('which both the resolver means', () => {
     expect(classifyInstruction('the good bit')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('Find "we are shutting it down"')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('Clip where he explains the boss fight strategy')).toMatchObject({ mode: 'both', evidence: 'all' });
+    // A quoted phrase stays either-or even beside spoken and visual words: the
+    // sign satisfies `the sign that says "EXIT"` with nobody speaking.
+    expect(classifyInstruction('Find the sign that says "EXIT"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the part where she says “we are live” on the banner')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('show where she says goodbye while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
     expect(classifyInstruction('Clip the boss fight')).toMatchObject({ mode: 'visual', evidence: 'all' });
     expect(classifyInstruction('Where do they discuss the merger?')).toMatchObject({ mode: 'transcript', evidence: 'all' });
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true }).evidence).toBe('all');

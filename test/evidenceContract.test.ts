@@ -513,6 +513,7 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
   it('the resolver says which: no signal or a quoted phrase is any, mixed signals or an explicit both is all', () => {
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'auto', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(resolveSearchMode({ instruction: 'Find "we are shutting it down"', requested: 'auto', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(resolveSearchMode({ instruction: 'Find the sign that says "EXIT"', requested: 'auto', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(resolveSearchMode({ instruction: 'show where she says goodbye while leaving the room', requested: 'auto', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'all' });
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'all' });
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'auto', transcriptAvailable: false })).toMatchObject({ mode: 'visual', evidence: 'all' });
