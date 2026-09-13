@@ -209,6 +209,11 @@ describe('which both the resolver means', () => {
     expect(classifyInstruction('the slide that says "Q3 results"')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('Find "SALE"')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('the part where he says "no way"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    // A surface word elsewhere in the sentence is a separate visual condition, not where the phrase is written.
+    expect(classifyInstruction('show where she says "goodbye" while the screen fades to black')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('show the banner while he says "we are live"')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('the part where she says “we are live” on the banner')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('a shirt with "BOSS" that he says he hates')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('Clip the boss fight')).toMatchObject({ mode: 'visual', evidence: 'all' });
     expect(classifyInstruction('Where do they discuss the merger?')).toMatchObject({ mode: 'transcript', evidence: 'all' });
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true }).evidence).toBe('all');

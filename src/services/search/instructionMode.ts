@@ -65,6 +65,35 @@ const TEXT_SURFACE_PATTERNS: RegExp[] = [
   /\b(text|writing|written|printed|says on|reads)\b/i,
 ];
 
+const TEXT_SURFACES = 'sign|signs|label|labels|banner|poster|billboard|placard'
+  + '|shirt|jersey|hoodie|cap|hat|badge|name ?tag|sticker|decal'
+  + '|caption|captions|subtitle|subtitles|headline|logo|licen[cs]e plate'
+  + '|hood|bumper|windshield|title card|lower third|whiteboard|slide|chart|graph|screen|scoreboard'
+  + '|text|writing';
+const OPENING_QUOTE = String.raw`(?:["“‘]|(?<![\p{L}\p{N}])')`;
+const CLOSING_QUOTE = String.raw`(?:["”’]|'(?![\p{L}\p{N}]))`;
+/** `the sign that says "EXIT"`, `a shirt with "BOSS"`, `the slide: "Q3"`. */
+const QUOTE_ON_SURFACE = new RegExp(
+  String.raw`\b(?:${TEXT_SURFACES})\b\s*:?\s*(?:(?:that|which)\s+)?(?:(?:says|said|saying|reads|reading|shows|showing|displaying|with)\s+)?${OPENING_QUOTE}`,
+  'iu',
+);
+/** `says "we are live" on the banner`. */
+const SURFACE_AFTER_QUOTE = new RegExp(
+  String.raw`${CLOSING_QUOTE}\s*(?:on|across|over|in|at)\s+(?:(?:the|a|an|his|her|their|its)\s+)?(?:${TEXT_SURFACES})\b`,
+  'iu',
+);
+
+/**
+ * Whether the quoted phrase is written on a named surface: the surface word
+ * sits right before the quote (`the sign that says "EXIT"`) or right after it
+ * with a preposition (`says "we are live" on the banner`). A surface word
+ * elsewhere in the sentence (`she says "goodbye" while the screen fades`) is
+ * a separate visual condition, not where the phrase is written.
+ */
+export function quoteOnSurface(text: string): boolean {
+  return QUOTE_ON_SURFACE.test(text) || SURFACE_AFTER_QUOTE.test(text);
+}
+
 const VISUAL_PATTERNS: RegExp[] = [
   /\b(show|shows|showed|showing|shown)\b/i,
   /\b(see|sees|saw|seen|visible|on screen|onscreen)\b/i,
@@ -137,13 +166,14 @@ export function classifyInstruction(instruction: string): ModeClassification {
     return { mode: 'visual', evidence: 'all', spokenScore, visualScore, rationale: 'instruction refers to on-screen content' };
   }
 
-  // A quoted phrase is modality-ambiguous when the sentence names a surface
-  // text is written on: `the sign that says "EXIT"` names a sign and "says",
-  // and the sign satisfies it with nobody speaking, so either source may
-  // establish it. Without such a surface, "says" beside a visual condition is
-  // speech beside that condition (`she says "goodbye" while leaving the
-  // room`), and a sentence that mixes spoken and visual conditions needs both.
-  if (QUOTATION.test(text) && TEXT_SURFACE_PATTERNS.some((pattern) => pattern.test(text))) {
+  // A quoted phrase is modality-ambiguous when the sentence writes it on a
+  // surface: `the sign that says "EXIT"` names a sign and "says", and the
+  // sign satisfies it with nobody speaking, so either source may establish
+  // it. Otherwise "says" beside a visual condition is speech beside that
+  // condition (`she says "goodbye" while leaving the room`, `she says
+  // "goodbye" while the screen fades`), and a sentence that mixes spoken and
+  // visual conditions needs both.
+  if (QUOTATION.test(text) && quoteOnSurface(text)) {
     return {
       mode: 'both',
       evidence: 'any',
