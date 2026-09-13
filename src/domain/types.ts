@@ -22,7 +22,7 @@ export type MatchSource = 'visual' | 'transcript' | 'multimodal';
 export type AnsweredFrom = 'footage' | 'simplemem';
 
 /** Which retrieval system produced the moments. */
-export type RetrievalSystem = 'clipit' | 'simplemem';
+export type RetrievalSystem = 'clipit' | 'simplemem' | 'videochat3';
 
 /**
  * Why the primary did not answer.

@@ -63,6 +63,14 @@ export async function videoChat3Health(): Promise<{ model: string; revision: str
 }
 
 /** Progressive, query-aware first watch. Returned events are retrieval leads, never final evidence. */
+/**
+ * modal/videochat3.py runs `watch` under an 1800 s function timeout: one
+ * generation per frame at one frame a second, so a twenty-minute video is
+ * about 1200 generations. The client's default 900 s deadline cut a long
+ * watch off while the GPU was still reading; it now matches the function.
+ */
+const WATCH_TIMEOUT_SECONDS = 1800;
+
 export async function watchWithVideoChat3(input: {
   videoUrl: string;
   query: string;
@@ -81,7 +89,7 @@ export async function watchWithVideoChat3(input: {
       max_rounds: input.maxRounds ?? 32,
       max_events: input.maxEvents ?? 64,
     },
-    { context: { mode: 'watch' } },
+    { context: { mode: 'watch' }, timeoutSeconds: WATCH_TIMEOUT_SECONDS },
   );
   const id = identity(raw);
   const rows = Array.isArray(raw.events) ? raw.events as Array<Record<string, unknown>> : [];

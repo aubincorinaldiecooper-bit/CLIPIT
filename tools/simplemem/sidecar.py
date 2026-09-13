@@ -34,6 +34,33 @@ from pydantic import BaseModel, Field
 import simplemem
 from simplemem import create
 from simplemem.multimodal.core.config import OmniMemoryConfig
+import transformers
+
+
+def _assert_transformers_contract() -> None:
+    """Refuse to serve on a transformers release whose CLIP API upstream cannot read.
+
+    Upstream calls ``CLIPModel.get_image_features(...)`` and then ``.cpu()`` on the
+    result (utils/embedding.py, triggers/visual_trigger.py). On transformers 4.57
+    that is a tensor. From 5.0 it is a ``BaseModelOutputWithPooling``: ``.cpu()``
+    raises inside upstream's ``try``, which logs the error and returns an EMPTY
+    embedding. Every frame is then remembered without a vector, every query finds
+    nothing, and indexing reports success throughout. A failed boot is the honest
+    version of that: the worker sees the sidecar as down and says so, instead of
+    the memory quietly answering "nothing" to every question.
+    """
+    version = str(getattr(transformers, "__version__", "0"))
+    head = version.split(".")[0]
+    major = int(head) if head.isdigit() else 0
+    if major >= 5:
+        raise RuntimeError(
+            f"transformers {version} is installed, but upstream Omni-SimpleMem's CLIP path needs 4.57.x "
+            "(get_image_features must return a tensor, not BaseModelOutputWithPooling). "
+            "Pin it in tools/simplemem/requirements.txt and rebuild the image."
+        )
+
+
+_assert_transformers_contract()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from captions import UNCAPTIONED, CaptionWriter  # noqa: E402
@@ -804,6 +831,8 @@ async def health() -> dict[str, Any]:
         "ok": True,
         "models": _models(config),
         "version": simplemem.__version__,
+        # Visible here so a deploy can be checked without a shell into the container.
+        "libraries": {"transformers": str(getattr(transformers, "__version__", "unknown"))},
         "archive": {
             "configured": _archive_configured(),
             "required": ARCHIVE_REQUIRED,
