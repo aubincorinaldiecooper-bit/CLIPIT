@@ -1,5 +1,15 @@
 # Pin upstream by commit: video-memory behavior is part of Clipit's retrieval contract.
 simplemem @ https://github.com/aiming-lab/SimpleMem/archive/db80b6a7c591e0ea730a058e9f5fc4eb06572299.zip
+# Upstream's setup.py only asks for transformers>=4.30, which pip resolves to the
+# newest major. transformers 5.x changed CLIPModel.get_image_features() to return a
+# BaseModelOutputWithPooling instead of a tensor; upstream calls .cpu() on it inside
+# a try/except, logs the error, and stores an EMPTY embedding for the frame while the
+# indexing still reports success — every query then finds nothing. These are the
+# versions upstream froze in its own requirements.txt at the pinned commit
+# (transformers==4.57.0, sentence-transformers==5.1.1); sentence-transformers 5.1.1
+# itself declares transformers<5. sidecar.py refuses to boot on a 5.x install.
+transformers>=4.57.0,<4.58
+sentence-transformers==5.1.1
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 python-multipart==0.0.20
