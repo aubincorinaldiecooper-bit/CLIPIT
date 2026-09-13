@@ -155,7 +155,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   // failure path too, where neither is in scope.
   let chunkCount = 0;
   let searchMode: ResolvedSearchMode | null = null;
-  let outcome: 'completed' | 'failed' = 'failed';
+  let outcome: 'completed' | 'failed' | 'superseded' = 'failed';
   // What the request asked for, read once. Both the search and the render
   // must never form separate opinions about whether this is a TikTok ask.
   let intent = resolvePlatformIntent(request.instruction, env.MAX_CLIP_SECONDS, {
@@ -343,7 +343,14 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // Only where VideoChat3 is the engine: under the legacy primaries the
     // per-chunk search reads the transcript beside each chunk itself.
     if (env.RETRIEVAL_PRIMARY === 'videochat3' && resolved.mode === 'both' && resolved.evidence === 'any' && video.proxyStorageKey) {
-      await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: resolved.mode, resolvedEvidence: resolved.evidence });
+      const started = await startClipRequest(clipRequestId, {
+        chunksTotal: 0, resolvedMode: resolved.mode, resolvedEvidence: resolved.evidence, deckAttemptId,
+      });
+      if (!started) {
+        log.info('another delivery owns this request; stopping before the speech lane');
+        outcome = 'superseded';
+        return;
+      }
       const proxyKey = video.proxyStorageKey;
       try {
         const object = await getStorage().head(proxyKey);
@@ -401,6 +408,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       spoken,
       log,
     });
+    if (fromSimpleMem.superseded) {
+      log.info('another delivery owns this request; stopping before memory is consulted');
+      outcome = 'superseded';
+      return;
+    }
     if (fromSimpleMem.matchCount > 0) {
       await recordRetrievalOutcome(clipRequestId, {
         primary: env.RETRIEVAL_PRIMARY === 'videochat3' ? 'videochat3' : 'simplemem',
@@ -432,6 +444,11 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         spoken,
         log,
       });
+      if (fromVideoChat3.superseded) {
+        log.info('another delivery owns this request; stopping before the footage is watched');
+        outcome = 'superseded';
+        return;
+      }
       const primaryOutcome = {
         simplemem: fromSimpleMem.fallback === 'disabled'
           ? null
@@ -484,11 +501,17 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
     // once is worth more than finding it out N times.
     if (resolved.mode !== 'transcript') await assertVideoInputSupported();
 
-    await startClipRequest(clipRequestId, {
+    const started = await startClipRequest(clipRequestId, {
       chunksTotal: chunks.length,
       resolvedMode: resolved.mode,
       resolvedEvidence: resolved.evidence,
+      deckAttemptId,
     });
+    if (!started) {
+      log.info('another delivery owns this request; stopping before the footage search');
+      outcome = 'superseded';
+      return;
+    }
     // So the peak reported at the end belongs to this search.
     resetVideoCallPeak();
     // Reading the footage is the only path that can report a real absence, so
@@ -1094,6 +1117,8 @@ async function answerFromSimpleMem(input: {
   released: boolean;
   fallback: FallbackReason | null;
   outcome: Record<string, unknown> | null;
+  /** True when this delivery no longer owns the request; nothing here was written, and the caller stops. */
+  superseded?: boolean;
 }> {
   // Memory is consulted when it is the primary, and when VideoChat3 is the
   // primary but a memory is being built for every upload: a hit there is
@@ -1110,11 +1135,13 @@ async function answerFromSimpleMem(input: {
   if (before.use === 'fallback') {
     return { matchCount: 0, released: false, fallback: before.reason, outcome: null };
   }
-  await startClipRequest(input.clipRequestId, {
+  const started = await startClipRequest(input.clipRequestId, {
     chunksTotal: 0,
     resolvedMode: input.mode,
     resolvedEvidence: input.evidence,
+    deckAttemptId: input.deckAttemptId!,
   });
+  if (!started) return { matchCount: 0, released: false, fallback: null, outcome: null, superseded: true };
   let reply;
   try {
     reply = await simplememQuery({ videoId: input.video.id, query: input.instruction, topK: env.SIMPLEMEM_TOP_K });
@@ -1346,6 +1373,8 @@ async function answerFromVideoChat3(input: {
   matchCount: number;
   fallback: FallbackReason | null;
   outcome: Record<string, unknown> | null;
+  /** True when this delivery no longer owns the request; nothing here was written, and the caller stops. */
+  superseded?: boolean;
 }> {
   if (input.mode === 'transcript') {
     return {
@@ -1362,11 +1391,13 @@ async function answerFromVideoChat3(input: {
     throw new Error('Video has no analysis proxy to watch');
   }
 
-  await startClipRequest(input.clipRequestId, {
+  const started = await startClipRequest(input.clipRequestId, {
     chunksTotal: 0,
     resolvedMode: input.mode,
     resolvedEvidence: input.evidence,
+    deckAttemptId: input.deckAttemptId!,
   });
+  if (!started) return { answered: true, matchCount: 0, fallback: null, outcome: null, superseded: true };
   // Signing the proxy can fail (storage down); that is a failure of this
   // delivery, retried by the queue, never a reason to read the video some
   // other way. analyzeUploadedVideo itself does not throw: a watch or

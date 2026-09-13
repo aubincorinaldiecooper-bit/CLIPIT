@@ -108,6 +108,19 @@ describe('ranking proposals', () => {
 
 describe('proposeSpokenMoments', () => {
   const textSearch = vi.fn();
+  const passAll = async (input: { candidates: Array<{ id: string; start: number; end: number }> }) => ({
+    model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: { verify: true },
+    results: input.candidates.map((candidate) => ({
+      id: candidate.id, startSeconds: candidate.start, endSeconds: candidate.end, match: true, confidence: 0.88, description: 'he says it',
+    })),
+  });
+  const saidOften = () => {
+    const often = Array.from({ length: 45 }, (_, index) => segment(index, index * 6 + 2, index * 6 + 2.6, 'bye'));
+    listTranscriptSegments.mockResolvedValue(often);
+    listTranscriptSegmentsInRange.mockImplementation(async (_id: string, start: number, end: number) =>
+      often.filter((row) => row.endSeconds > start && row.startSeconds < end),
+    );
+  };
   const propose = (instruction: string) => proposeSpokenMoments({
     videoId: 'video-1', instruction, chunks, durationSeconds: 300, videoUrl: 'https://signed/proxy.mp4', expectedBytes: 10,
     textSearch, concurrency: 2,
@@ -119,12 +132,7 @@ describe('proposeSpokenMoments', () => {
     listTranscriptSegmentsInRange.mockImplementation(async (_id: string, start: number, end: number) =>
       transcript.filter((row) => row.endSeconds > start && row.startSeconds < end),
     );
-    verifyWithVideoChat3.mockImplementation(async (input: { candidates: Array<{ id: string; start: number; end: number }> }) => ({
-      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: { verify: true },
-      results: input.candidates.map((candidate) => ({
-        id: candidate.id, startSeconds: candidate.start, endSeconds: candidate.end, match: true, confidence: 0.88, description: 'he says it',
-      })),
-    }));
+    verifyWithVideoChat3.mockImplementation(passAll);
   });
 
   it('a quoted phrase is looked up directly, never sent to a model, and each hit is judged with its footage and transcript', async () => {
@@ -157,16 +165,24 @@ describe('proposeSpokenMoments', () => {
   });
 
   it('a phrase said many times is judged every time, in bounded batches', async () => {
-    const often = Array.from({ length: 45 }, (_, index) => segment(index, index * 6 + 2, index * 6 + 2.6, 'bye'));
-    listTranscriptSegments.mockResolvedValue(often);
-    listTranscriptSegmentsInRange.mockImplementation(async (_id: string, start: number, end: number) =>
-      often.filter((row) => row.endSeconds > start && row.startSeconds < end),
-    );
+    saidOften();
     const result = await propose('find "bye"');
     expect(verifyWithVideoChat3).toHaveBeenCalledTimes(3);
     expect(verifyWithVideoChat3.mock.calls.map((call) => call[0].candidates.length)).toEqual([20, 20, 5]);
     expect(result.moments).toHaveLength(45);
-    expect(result.metrics).toMatchObject({ proposals: 45, verified: 45, verifyCalls: 3 });
+    expect(result.metrics).toMatchObject({ proposals: 45, verified: 45, verifyCalls: 3, failedBatches: 0 });
+  });
+
+  it('a batch the verifier cannot judge names its proposals and does not unsay the other batches', async () => {
+    saidOften();
+    verifyWithVideoChat3.mockImplementationOnce(passAll).mockRejectedValueOnce(new Error('Modal timed out after 1800s'));
+    const result = await propose('find "bye"');
+    expect(verifyWithVideoChat3).toHaveBeenCalledTimes(3);
+    expect(result.moments).toHaveLength(25);
+    expect(result.failures).toHaveLength(20);
+    expect(result.failures.every((failure) => failure.kind === 'unverified' && failure.reason === 'VideoChat3 verification failed: Modal timed out after 1800s')).toBe(true);
+    expect(result.failures.map((failure) => failure.startSeconds)).toEqual(result.proposals.slice(20, 40).map((proposal) => proposal.startSeconds));
+    expect(result.metrics).toMatchObject({ verified: 25, verifyCalls: 3, failedBatches: 1 });
   });
 
   it('a verdict under the floor, or no match, is not a moment', async () => {

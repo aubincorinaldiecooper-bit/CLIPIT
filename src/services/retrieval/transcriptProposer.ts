@@ -317,16 +317,31 @@ export async function proposeSpokenMoments(input: {
   const moments: SpokenMoment[] = [];
   let rejected = 0;
   const verifyMetrics: unknown[] = [];
+  let failedBatches = 0;
   // Every proposal is asked about. The verifier is asked in bounded batches
   // rather than told about only the first few: a proposal speech made and
   // nobody judged would be neither evidence nor a recorded gap.
   for (let offset = 0; offset < verifiable.length; offset += SPOKEN_VERIFY_BATCH) {
-    const verdicts = await verifyWithVideoChat3({
-      videoUrl: input.videoUrl,
-      query: input.instruction,
-      expectedBytes: input.expectedBytes,
-      candidates: verifiable.slice(offset, offset + SPOKEN_VERIFY_BATCH),
-    });
+    const batch = verifiable.slice(offset, offset + SPOKEN_VERIFY_BATCH);
+    let verdicts: Awaited<ReturnType<typeof verifyWithVideoChat3>>;
+    try {
+      verdicts = await verifyWithVideoChat3({
+        videoUrl: input.videoUrl,
+        query: input.instruction,
+        expectedBytes: input.expectedBytes,
+        candidates: batch,
+      });
+    } catch (error) {
+      // A batch the verifier could not judge does not unsay the batches it
+      // did: those stay evidence, and each proposal in this one is named.
+      const reason = `VideoChat3 verification failed: ${errorMessage(error)}`;
+      for (const candidate of batch) {
+        const proposal = byId.get(candidate.id);
+        if (proposal) failures.push({ kind: 'unverified', startSeconds: proposal.startSeconds, endSeconds: proposal.endSeconds, reason });
+      }
+      failedBatches += 1;
+      continue;
+    }
     verifyMetrics.push(verdicts.metrics);
     for (const result of verdicts.results) {
       const proposal = byId.get(result.id);
@@ -364,6 +379,8 @@ export async function proposeSpokenMoments(input: {
     proposals,
     moments,
     failures,
-    metrics: { ...metrics, verified: moments.length, rejected, verifyCalls: verifyMetrics.length, verify: verifyMetrics },
+    metrics: {
+      ...metrics, verified: moments.length, rejected, verifyCalls: verifyMetrics.length + failedBatches, failedBatches, verify: verifyMetrics,
+    },
   };
 }

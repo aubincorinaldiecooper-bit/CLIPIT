@@ -137,11 +137,20 @@ export async function listClipRequestsForVideo(videoId: string): Promise<ClipReq
   return rows.map(mapRequest);
 }
 
+/**
+ * Reopens the request for this delivery's search. Fenced like every other
+ * write of a delivery: only the run that holds the claim may do it, and never
+ * over a deck already released. Without that, an older run resuming after its
+ * replacement had finished set a finished answer back to 'searching', cleared
+ * the replacement's coverage, and left a request nobody could claim again.
+ * Returns false when this delivery no longer owns the request; the caller
+ * stops there.
+ */
 export async function startClipRequest(
   requestId: string,
-  input: { chunksTotal: number; resolvedMode: ResolvedSearchMode; resolvedEvidence: EvidenceRequirement },
-): Promise<void> {
-  await queryOne(
+  input: { chunksTotal: number; resolvedMode: ResolvedSearchMode; resolvedEvidence: EvidenceRequirement; deckAttemptId: string },
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET status = 'searching',
             resolved_mode = $2,
@@ -157,9 +166,13 @@ export async function startClipRequest(
             uncertain_matches = '[]'::jsonb,
             error_message = NULL,
             updated_at = now()
-      WHERE id = $1`,
-    [requestId, input.resolvedMode, input.chunksTotal, input.resolvedEvidence],
+      WHERE id = $1
+        AND deck_attempt_id = $5::uuid
+        AND deck_completed_at IS NULL
+      RETURNING id`,
+    [requestId, input.resolvedMode, input.chunksTotal, input.resolvedEvidence, input.deckAttemptId],
   );
+  return Boolean(row);
 }
 
 export async function recordChunkCompleted(requestId: string): Promise<void> {

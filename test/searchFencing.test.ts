@@ -41,6 +41,16 @@ describe('a retry must never reach into the library', () => {
 });
 
 describe('a superseded attempt must not release an answer', () => {
+  it('cannot reopen a request it no longer owns, nor one already released', () => {
+    const start = between(repo, 'export async function startClipRequest', 'export async function recordChunkCompleted');
+    expect(start).toContain('deck_attempt_id = $5::uuid');
+    expect(start).toContain('deck_completed_at IS NULL');
+    expect(start).toContain('RETURNING id');
+    // And every caller reads the answer and stops when the write did not happen.
+    expect((handler.match(/await startClipRequest\(/g) ?? []).length).toBe(4);
+    expect((handler.match(/const started = await startClipRequest\(/g) ?? []).length).toBe(4);
+  });
+
   it('cannot add stale coverage gaps after a newer delivery takes ownership', () => {
     const failure = between(repo, 'export async function recordChunkFailure', '/**\n * Records that a chunk was searched');
     expect(failure).toContain('deck_attempt_id = $3::uuid');

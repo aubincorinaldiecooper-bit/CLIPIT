@@ -37,7 +37,7 @@ vi.mock('../src/db/repositories/clipRequests.js', () => ({
   recordCorrection: vi.fn(),
   recordUncertainMatches: vi.fn(),
   releaseDeckAndComplete,
-  startClipRequest: vi.fn(),
+  startClipRequest: vi.fn(async () => true),
 }));
 
 const writeConversationalAnswer = vi.fn(async () => ({

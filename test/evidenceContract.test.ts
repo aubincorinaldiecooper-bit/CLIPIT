@@ -72,7 +72,7 @@ vi.mock('../src/db/repositories/clipRequests.js', () => ({
   recordCorrection: vi.fn(),
   recordUncertainMatches: vi.fn(),
   releaseDeckAndComplete,
-  startClipRequest: vi.fn(async () => undefined),
+  startClipRequest: vi.fn(async () => true),
 }));
 const chunk = (index: number, start: number, end: number) => ({
   id: `chunk-${index}`, videoId: 'video-1', chunkIndex: index, globalStartSeconds: start, globalEndSeconds: end,
@@ -601,7 +601,7 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
     await handleClipSearch(job as never);
 
     const { startClipRequest } = await import('../src/db/repositories/clipRequests.js');
-    expect(startClipRequest).toHaveBeenCalledWith('request-1', { chunksTotal: 0, resolvedMode: 'both', resolvedEvidence: 'any' });
+    expect(startClipRequest).toHaveBeenCalledWith('request-1', expect.objectContaining({ chunksTotal: 0, resolvedMode: 'both', resolvedEvidence: 'any' }));
     const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
     expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'visual'], [10, 'visual']]);
     // Speech proposed too, through the transcript-only search: words in, never a chunk of video,
@@ -686,6 +686,25 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({ globalStartSeconds: 28.7, globalEndSeconds: 35.3, source: 'multimodal', quote: 'okay, goodbye everyone', provider: 'modal' });
     expect(rows[1]).toMatchObject({ globalStartSeconds: 10, source: 'visual' });
+  });
+
+  it('end to end: a delivery whose claim is no longer honoured stops at the first fenced write, touching nothing', async () => {
+    getClipRequest.mockResolvedValue({ ...request, instruction: 'the good bit' });
+    wholeVideoPipeline();
+    transcriptOnlyAtGoodbye();
+    const { startClipRequest } = await import('../src/db/repositories/clipRequests.js');
+    (startClipRequest as unknown as { mockResolvedValueOnce: (value: boolean) => void }).mockResolvedValueOnce(false);
+    const job = { data: { clipRequestId: 'request-1' }, processedOn: Date.now(), timestamp: Date.now(), attemptsMade: 0, updateProgress: vi.fn() };
+
+    await handleClipSearch(job as never);
+
+    expect(startClipRequest).toHaveBeenCalledWith('request-1', expect.objectContaining({ deckAttemptId: expect.any(String) }));
+    expect(listTranscriptSegments).not.toHaveBeenCalled();
+    expect(watchWithVideoChat3).not.toHaveBeenCalled();
+    expect(insertMatches).not.toHaveBeenCalled();
+    expect(recordChunkFailure).not.toHaveBeenCalled();
+    expect(recordRetrievalOutcome).not.toHaveBeenCalled();
+    expect(releaseDeckAndComplete).not.toHaveBeenCalled();
   });
 
   it('speech proposes only where VideoChat3 is the engine', async () => {
