@@ -214,6 +214,12 @@ describe('which both the resolver means', () => {
     expect(classifyInstruction('show the banner while he says "we are live"')).toMatchObject({ mode: 'both', evidence: 'all' });
     expect(classifyInstruction('the part where she says “we are live” on the banner')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('a shirt with "BOSS" that he says he hates')).toMatchObject({ mode: 'both', evidence: 'any' });
+    // Ordinary wording between the surface and its quote still binds them.
+    expect(classifyInstruction('find the sign that clearly says "EXIT"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the sign says, "EXIT"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the banner displaying the words "SALE" that she talks about')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('she says the sign reads "EXIT" written across the door')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the screen fades to black and she says "goodbye"')).toMatchObject({ mode: 'both', evidence: 'all' });
     expect(classifyInstruction('Clip the boss fight')).toMatchObject({ mode: 'visual', evidence: 'all' });
     expect(classifyInstruction('Where do they discuss the merger?')).toMatchObject({ mode: 'transcript', evidence: 'all' });
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true }).evidence).toBe('all');

@@ -70,28 +70,58 @@ const TEXT_SURFACES = 'sign|signs|label|labels|banner|poster|billboard|placard'
   + '|caption|captions|subtitle|subtitles|headline|logo|licen[cs]e plate'
   + '|hood|bumper|windshield|title card|lower third|whiteboard|slide|chart|graph|screen|scoreboard'
   + '|text|writing';
-const OPENING_QUOTE = String.raw`(?:["“‘]|(?<![\p{L}\p{N}])')`;
-const CLOSING_QUOTE = String.raw`(?:["”’]|'(?![\p{L}\p{N}]))`;
-/** `the sign that says "EXIT"`, `a shirt with "BOSS"`, `the slide: "Q3"`. */
-const QUOTE_ON_SURFACE = new RegExp(
-  String.raw`\b(?:${TEXT_SURFACES})\b\s*:?\s*(?:(?:that|which)\s+)?(?:(?:says|said|saying|reads|reading|shows|showing|displaying|with)\s+)?${OPENING_QUOTE}`,
-  'iu',
-);
-/** `says "we are live" on the banner`. */
-const SURFACE_AFTER_QUOTE = new RegExp(
-  String.raw`${CLOSING_QUOTE}\s*(?:on|across|over|in|at)\s+(?:(?:the|a|an|his|her|their|its)\s+)?(?:${TEXT_SURFACES})\b`,
-  'iu',
-);
+const SURFACE_WORD = new RegExp(String.raw`\b(?:${TEXT_SURFACES})\b`, 'giu');
+/** Any quote mark; an apostrophe counts only when it is not inside a word. */
+const QUOTE_MARK = /["“”‘’]|(?<![\p{L}\p{N}])'|'(?![\p{L}\p{N}])/gu;
+/** How many words may sit between a surface and its quote. */
+const BRIDGE_WORDS = 4;
+/**
+ * A word that starts a new clause or names a speaker: the surface and the
+ * quote are then two things, not one (`the banner while he says "..."`).
+ */
+const BRIDGE_BREAKERS = new Set([
+  'while', 'when', 'as', 'and', 'but', 'then', 'before', 'after', 'because', 'until', 'where', 'if', 'who', 'whom',
+  'i', 'we', 'you', 'he', 'she', 'they', 'him', 'her', 'them', 'someone', 'somebody', 'everyone', 'people', 'man', 'woman', 'guy', 'girl',
+]);
+/** `"we are live" on the banner`: the quote is placed on the surface. */
+const PLACING_PREPOSITIONS = new Set(['on', 'onto', 'upon', 'across', 'over', 'in', 'at', 'of']);
+
+function bridgeWords(text: string): string[] {
+  return text.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? [];
+}
 
 /**
- * Whether the quoted phrase is written on a named surface: the surface word
- * sits right before the quote (`the sign that says "EXIT"`) or right after it
- * with a preposition (`says "we are live" on the banner`). A surface word
- * elsewhere in the sentence (`she says "goodbye" while the screen fades`) is
- * a separate visual condition, not where the phrase is written.
+ * Whether the quoted phrase is written on a named surface. The surface word
+ * and the quote must be near each other with nothing between them that starts
+ * a new clause or names a speaker: `the sign that clearly says "EXIT"`, `the
+ * sign says, "EXIT"`, `the banner displaying the words "SALE"`, `a shirt with
+ * "BOSS"`, or, the other way round with a placing preposition, `says "we are
+ * live" on the banner`. A surface word elsewhere in the sentence (`she says
+ * "goodbye" while the screen fades`, `the banner while he says "..."`) is a
+ * separate visual condition, not where the phrase is written.
  */
 export function quoteOnSurface(text: string): boolean {
-  return QUOTE_ON_SURFACE.test(text) || SURFACE_AFTER_QUOTE.test(text);
+  const quotes = [...text.matchAll(QUOTE_MARK)].map((mark) => mark.index ?? 0);
+  if (quotes.length === 0) return false;
+  for (const surface of text.matchAll(SURFACE_WORD)) {
+    const from = surface.index ?? 0;
+    const to = from + surface[0].length;
+    const nextQuote = quotes.find((index) => index >= to);
+    if (nextQuote !== undefined) {
+      const between = bridgeWords(text.slice(to, nextQuote));
+      if (between.length <= BRIDGE_WORDS && !between.some((word) => BRIDGE_BREAKERS.has(word))) return true;
+    }
+    const previousQuote = [...quotes].reverse().find((index) => index < from);
+    if (previousQuote !== undefined) {
+      const between = bridgeWords(text.slice(previousQuote + 1, from));
+      if (
+        between.length <= BRIDGE_WORDS
+        && between.some((word) => PLACING_PREPOSITIONS.has(word))
+        && !between.some((word) => BRIDGE_BREAKERS.has(word))
+      ) return true;
+    }
+  }
+  return false;
 }
 
 const VISUAL_PATTERNS: RegExp[] = [
