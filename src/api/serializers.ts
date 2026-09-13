@@ -212,6 +212,28 @@ export interface SearchCoverage {
   }>;
 }
 
+/**
+ * Seconds covered by at least one gap. Two failures over the same stretch
+ * (speech and footage, say) are one stretch of video that was not searched,
+ * not twice the video. Expects gaps sorted by start.
+ */
+function unionSeconds(gaps: ReadonlyArray<{ startSeconds: number; endSeconds: number }>): number {
+  let total = 0;
+  let start: number | null = null;
+  let end = 0;
+  for (const gap of gaps) {
+    if (start === null || gap.startSeconds > end) {
+      if (start !== null) total += end - start;
+      start = gap.startSeconds;
+      end = gap.endSeconds;
+    } else {
+      end = Math.max(end, gap.endSeconds);
+    }
+  }
+  if (start !== null) total += end - start;
+  return total;
+}
+
 export function searchCoverage(request: ClipRequest): SearchCoverage {
   const gaps = request.chunkErrors
     // Rows written before failures carried a source window cannot describe
@@ -250,7 +272,7 @@ export function searchCoverage(request: ClipRequest): SearchCoverage {
     // it just cannot say where. Callers must not read unsearchedSeconds: 0 as
     // "nothing was missed".
     locatable: gaps.length === request.chunksFailed,
-    unsearchedSeconds: Number(gaps.reduce((sum, gap) => sum + (gap.endSeconds - gap.startSeconds), 0).toFixed(3)),
+    unsearchedSeconds: Number(unionSeconds(gaps).toFixed(3)),
     gaps,
     degraded,
   };
@@ -317,6 +339,10 @@ export async function serializeClipRequest(
     instruction: request.instruction,
     mode: request.mode,
     resolvedMode: request.resolvedMode,
+    // What the resolved mode demanded of each moment: 'all' (a mixed
+    // question needed footage and its transcript together) or 'any'
+    // (either source could establish it). Null before the search began.
+    resolvedEvidence: request.resolvedEvidence,
     status: request.status,
     error: request.errorMessage,
     /**

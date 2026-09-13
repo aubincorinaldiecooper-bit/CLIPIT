@@ -44,6 +44,8 @@ export interface Candidate {
   /** Every frame memory this candidate was built from, for provenance. */
   mauIds: string[];
   frames: number;
+  /** What established it after verification: footage alone, or footage with its transcript. */
+  source?: 'visual' | 'multimodal';
 }
 
 export interface MappingOptions {

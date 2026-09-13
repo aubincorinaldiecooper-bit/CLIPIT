@@ -190,3 +190,57 @@ describe('resolveSearchMode', () => {
     expect(result.mode).toBe('transcript');
   });
 });
+
+describe('which both the resolver means', () => {
+  it('names the requirement next to the mode, so nothing downstream has to guess', () => {
+    expect(classifyInstruction('the good bit')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('Find "we are shutting it down"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('Clip where he explains the boss fight strategy')).toMatchObject({ mode: 'both', evidence: 'all' });
+    // A quoted phrase stays either-or even beside spoken and visual words: the
+    // sign satisfies `the sign that says "EXIT"` with nobody speaking.
+    expect(classifyInstruction('Find the sign that says "EXIT"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the part where she says “we are live” on the banner')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('show where she says goodbye while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
+    // A quote beside a named surface may be what is written there. Beside a
+    // speech verb and a separate visual condition it is speech, and the
+    // condition still has to hold: quoting "goodbye" does not waive the leaving.
+    expect(classifyInstruction('show where she says "goodbye" while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('he announces "we are live" and the crowd celebrates')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('the slide that says "Q3 results"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('Find "SALE"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the part where he says "no way"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    // A surface word elsewhere in the sentence is a separate visual condition, not where the phrase is written.
+    expect(classifyInstruction('show where she says "goodbye" while the screen fades to black')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('show the banner while he says "we are live"')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('the part where she says “we are live” on the banner')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('a shirt with "BOSS" that he says he hates')).toMatchObject({ mode: 'both', evidence: 'any' });
+    // Ordinary wording between the surface and its quote still binds them.
+    expect(classifyInstruction('find the sign that clearly says "EXIT"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the sign says, "EXIT"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the banner displaying the words "SALE" that she talks about')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('she says the sign reads "EXIT" written across the door')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the screen fades to black and she says "goodbye"')).toMatchObject({ mode: 'both', evidence: 'all' });
+    // A surface word inside the quote is part of what is said, not where it is written.
+    expect(classifyInstruction('she says “look at the screen” while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('he says "read the sign" and walks in')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('the sign that says "look here"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction("the shirt that says 'I'm the boss' while he talks")).toMatchObject({ mode: 'both', evidence: 'any' });
+    // An unmatched opening mark, a word-final apostrophe inside the quote, or mixed marks do not lose the quote.
+    expect(classifyInstruction('the sign says "EXIT')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction("the sign says \"James' car\"")).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the sign says "James’ car"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction("the sign says “James' car”")).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction("James' sign says \"EXIT\" while she talks")).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('show where she says "goodbye while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
+    // A word-final apostrophe inside a single-quoted phrase does not end it, and an inch mark is not a quote.
+    expect(classifyInstruction("she says ‘James' car is on the screen’ while leaving")).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction("she says 'James' car is on the screen' while leaving")).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('show the sign measuring 12" while he talks')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('the 12" sign that says "EXIT"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('Clip the boss fight')).toMatchObject({ mode: 'visual', evidence: 'all' });
+    expect(classifyInstruction('Where do they discuss the merger?')).toMatchObject({ mode: 'transcript', evidence: 'all' });
+    expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true }).evidence).toBe('all');
+    expect(resolveSearchMode({ instruction: 'the good bit', requested: 'auto', transcriptAvailable: true }).evidence).toBe('any');
+    expect(resolveSearchMode({ instruction: 'the good bit', requested: 'auto', transcriptAvailable: false })).toMatchObject({ mode: 'visual', evidence: 'all' });
+  });
+});

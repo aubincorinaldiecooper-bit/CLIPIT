@@ -41,6 +41,27 @@ const filtered: ChunkError = {
 };
 
 describe('search coverage', () => {
+  it('counts a stretch two failures both cover once, not twice', () => {
+    const speech: ChunkError = {
+      chunkIndex: 0, chunkId: 'chunk-0', code: 'not_read_yet', globalStartSeconds: 0, globalEndSeconds: 300,
+      message: 'Speech was not searched here: transcript store unavailable',
+    };
+    const footage: ChunkError = {
+      chunkIndex: 0, chunkId: 'chunk-0', code: 'not_read_yet', globalStartSeconds: 0, globalEndSeconds: 300,
+      message: 'VideoChat3 could not read the video, so nothing in it was examined: Modal timed out',
+    };
+    const whole = searchCoverage(request({ chunksCompleted: 0, chunksFailed: 2, chunkErrors: [speech, footage] }));
+    // Both gaps are listed with their reasons; the seconds are the video's, once.
+    expect(whole.gaps).toHaveLength(2);
+    expect(whole.unsearchedSeconds).toBe(300);
+
+    const partly = searchCoverage(request({
+      chunksCompleted: 8, chunksFailed: 2,
+      chunkErrors: [{ ...speech, globalEndSeconds: 100 }, { ...footage, globalStartSeconds: 50, globalEndSeconds: 150 }],
+    }));
+    expect(partly.unsearchedSeconds).toBe(150);
+  });
+
   it('reports a fully searched video as complete', () => {
     const coverage = searchCoverage(request());
 

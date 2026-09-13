@@ -78,7 +78,22 @@ ARCHIVE_PREFIX = os.environ.get("SIMPLEMEM_ARCHIVE_PREFIX", "simplemem/v1").stri
 CACHE_HIGH_WATER_BYTES = int(os.environ.get("SIMPLEMEM_CACHE_HIGH_WATER_BYTES", str(4 * 1024**3)))
 CACHE_LOW_WATER_BYTES = int(os.environ.get("SIMPLEMEM_CACHE_LOW_WATER_BYTES", str(3 * 1024**3)))
 ARCHIVE_SCHEMA_VERSION = 1
-EMBEDDING_VERSION = os.environ.get("SIMPLEMEM_EMBEDDING_VERSION", "v1").strip() or "v1"
+# The embedding contract every memory is written and read under. It is bumped
+# when what a stored vector means changes; v2 marks the transformers 4.57 pin,
+# because memories written under transformers 5.x carried no CLIP vectors at
+# all. The Docker image sets SIMPLEMEM_EMBEDDING_VERSION to this value. A
+# deployment that overrides it does not get a quietly different memory store:
+# the sidecar refuses to start, so a pre-v2 memory can never be served again.
+EXPECTED_EMBEDDING_VERSION = "v2-transformers457"
+EMBEDDING_VERSION = (
+    os.environ.get("SIMPLEMEM_EMBEDDING_VERSION", EXPECTED_EMBEDDING_VERSION).strip() or EXPECTED_EMBEDDING_VERSION
+)
+if EMBEDDING_VERSION != EXPECTED_EMBEDDING_VERSION:
+    raise RuntimeError(
+        f"SIMPLEMEM_EMBEDDING_VERSION={EMBEDDING_VERSION!r}, but this sidecar writes and reads memories under "
+        f"{EXPECTED_EMBEDDING_VERSION!r}. A different value would let it serve memories written under another "
+        "contract (v1 memories have no CLIP vectors). Unset the variable or set it to the expected contract."
+    )
 MAX_UPLOAD_BYTES = int(os.environ.get("SIMPLEMEM_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
 INTERNAL_TOKEN = os.environ.get("SIMPLEMEM_INTERNAL_TOKEN", "").strip()
 

@@ -6,6 +6,7 @@ import type {
   ClipMatch,
   ClipRequest,
   ClipRequestStatus,
+  EvidenceRequirement,
   FallbackReason,
   MatchFeedback,
   MatchFeedbackReason,
@@ -25,6 +26,7 @@ interface ClipRequestRow {
   instruction: string;
   mode: SearchMode;
   resolved_mode: ResolvedSearchMode | null;
+  resolved_evidence: EvidenceRequirement | null;
   status: ClipRequestStatus;
   error_message: string | null;
   chunks_total: number;
@@ -62,6 +64,7 @@ function mapRequest(row: ClipRequestRow): ClipRequest {
     instruction: row.instruction,
     mode: row.mode,
     resolvedMode: row.resolved_mode,
+    resolvedEvidence: row.resolved_evidence ?? null,
     status: row.status,
     errorMessage: row.error_message,
     chunksTotal: row.chunks_total,
@@ -134,14 +137,24 @@ export async function listClipRequestsForVideo(videoId: string): Promise<ClipReq
   return rows.map(mapRequest);
 }
 
+/**
+ * Reopens the request for this delivery's search. Fenced like every other
+ * write of a delivery: only the run that holds the claim may do it, and never
+ * over a deck already released. Without that, an older run resuming after its
+ * replacement had finished set a finished answer back to 'searching', cleared
+ * the replacement's coverage, and left a request nobody could claim again.
+ * Returns false when this delivery no longer owns the request; the caller
+ * stops there.
+ */
 export async function startClipRequest(
   requestId: string,
-  input: { chunksTotal: number; resolvedMode: ResolvedSearchMode },
-): Promise<void> {
-  await queryOne(
+  input: { chunksTotal: number; resolvedMode: ResolvedSearchMode; resolvedEvidence: EvidenceRequirement; deckAttemptId: string },
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET status = 'searching',
             resolved_mode = $2,
+            resolved_evidence = $4,
             chunks_total = $3,
             chunks_completed = 0,
             chunks_failed = 0,
@@ -153,9 +166,13 @@ export async function startClipRequest(
             uncertain_matches = '[]'::jsonb,
             error_message = NULL,
             updated_at = now()
-      WHERE id = $1`,
-    [requestId, input.resolvedMode, input.chunksTotal],
+      WHERE id = $1
+        AND deck_attempt_id = $5::uuid
+        AND deck_completed_at IS NULL
+      RETURNING id`,
+    [requestId, input.resolvedMode, input.chunksTotal, input.resolvedEvidence, input.deckAttemptId],
   );
+  return Boolean(row);
 }
 
 export async function recordChunkCompleted(requestId: string): Promise<void> {
