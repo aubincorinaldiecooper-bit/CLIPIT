@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tarfile
 import tempfile
 import time
@@ -60,6 +61,9 @@ def _assert_transformers_contract() -> None:
 
 
 _assert_transformers_contract()
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from captions import CaptionWriter  # noqa: E402
 
 
 DATA_ROOT = Path(os.environ.get("SIMPLEMEM_DATA_DIR", "/data/simplemem")).resolve()
@@ -160,14 +164,40 @@ def _read_timeline(video_dir: Path) -> dict[str, Any]:
     return raw
 
 
+class IndexingRefused(RuntimeError):
+    """Indexing that finished but must not be called a memory of the video; the message says why."""
+
+
 def _open_memory(video_dir: Path):
-    memory = create(mode="omni", config=_config(), data_dir=str(video_dir))
+    config = _config()
+    memory = create(mode="omni", config=config, data_dir=str(video_dir))
+    # Frame captions go through Clipit's writer: the same prompt and model as
+    # upstream, but a blank reply is asked again with more room, and a caption
+    # that never arrives is counted instead of being stored as "Image captured"
+    # (captions.py). Upstream's process() calls self.generate_summary, so an
+    # instance attribute is enough to take that call over.
+    processor = memory.video_processor.image_processor
+    writer = CaptionWriter(
+        processor._get_llm_client,
+        processor._normalize_model(config.llm.caption_model),
+        load_image=processor._load_image,
+        log=log,
+    )
+    processor.generate_summary = writer.caption
+    processor.clipit_captions = writer
     # Clipit already has a timestamped transcript. Upstream's video audio MAU
     # is untimed, so it does not add usable source-time evidence for moments.
     if not PROCESS_AUDIO:
         memory.video_processor.process_audio = False
         memory.video_processor.audio_processor = None
     return memory
+
+
+def _caption_stats(memory: Any) -> dict[str, Any]:
+    writer = getattr(memory.video_processor.image_processor, "clipit_captions", None)
+    if writer is None:
+        return {"attempted": 0, "captioned": 0, "retried": 0, "failed": 0, "lastError": "captions were not routed through CaptionWriter"}
+    return writer.stats.as_dict()
 
 
 def _modality(item: dict[str, Any]) -> str:
@@ -600,6 +630,22 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
         if not result.success or result.mau is None:
             raise RuntimeError(result.error or "Omni-SimpleMem did not create a video memory")
 
+        captions = _caption_stats(memory)
+        if captions["attempted"] > 0 and captions["captioned"] == 0:
+            # Every kept frame has a picture vector but no words. Calling that
+            # a finished memory would let the search report "nothing matches"
+            # from a memory that describes nothing. The worker marks the index
+            # failed with this reason and the footage search still answers.
+            raise IndexingRefused(
+                f"no frame received a caption ({captions['attempted']} attempted; "
+                f"last error: {captions['lastError']})"
+            )
+        if captions["failed"] > 0:
+            log.warning(
+                "SimpleMem captions missing for %d of %d frames of %s (last error: %s)",
+                captions["failed"], captions["attempted"], video_id, captions["lastError"],
+            )
+
         metadata = result.metadata or {}
         frame_maus = metadata.get("frame_maus") or []
         frames: dict[str, dict[str, float | int]] = {}
@@ -629,6 +675,7 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
                 "crossModalModel": SHARED_CLIP_MODEL,
                 "crossModalDim": SHARED_CLIP_DIM,
                 "embeddingVersion": EMBEDDING_VERSION,
+                "captions": captions,
             },
         )
 
@@ -650,6 +697,7 @@ def _index_sync(video_id: str, source: Path, fps: float, max_frames: int, durati
             "framesSkipped": skipped,
             "coveredThroughSeconds": covered,
             "audioTranscribed": metadata.get("audio_mau") is not None,
+            "captions": captions,
             "durableArchive": archive is not None,
             "cache": cache,
             "elapsedMs": round((time.perf_counter() - started) * 1000),
@@ -826,6 +874,8 @@ async def index_video(
             )
     except HTTPException:
         raise
+    except IndexingRefused as exc:
+        raise HTTPException(status_code=500, detail=f"SimpleMem indexing refused: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"SimpleMem indexing failed: {type(exc).__name__}") from exc
     finally:

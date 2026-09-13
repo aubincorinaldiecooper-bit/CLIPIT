@@ -69,8 +69,21 @@ export async function handleSimpleMemIndexing(job: Job<SimpleMemIndexingJob>): P
       coveredThroughSeconds: reply.coveredThroughSeconds,
       audioTranscribed: reply.audioTranscribed,
       indexMs,
-      config: { models: health.models, version: health.version, fps, maxFrames },
+      // The caption counts ride on the row's config so a memory whose frames
+      // went undescribed can be told apart from one that was read in full.
+      config: { models: health.models, version: health.version, fps, maxFrames, captions: reply.captions },
     });
+
+    if (reply.captions && reply.captions.failed > 0) {
+      // Those frames still carry a picture vector, so they are findable by
+      // what they look like; they just cannot be found by what they show.
+      log.warn('SimpleMem remembered some frames without a caption', {
+        framesWithoutCaption: reply.captions.failed,
+        framesCaptioned: reply.captions.captioned,
+        retried: reply.captions.retried,
+        lastError: reply.captions.lastError,
+      });
+    }
 
     log.info('video remembered by SimpleMem', {
       framesExtracted: reply.framesExtracted,
@@ -79,6 +92,7 @@ export async function handleSimpleMemIndexing(job: Job<SimpleMemIndexingJob>): P
       coveredThroughSeconds: reply.coveredThroughSeconds,
       ofSeconds: Number(video.durationSeconds.toFixed(1)),
       audioTranscribed: reply.audioTranscribed,
+      captions: reply.captions,
       sidecarMs: reply.elapsedMs,
       elapsedMs: indexMs,
       // Seconds of video remembered per second of waiting: the one number
