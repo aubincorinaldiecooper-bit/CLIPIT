@@ -209,9 +209,13 @@ export async function proposeSpokenMoments(input: {
   const failures: SpokenFailure[] = [];
   let proposals: SpokenProposal[] = [];
   const phrases = quotedPhrases(input.instruction);
+  const segments = await listTranscriptSegments(input.videoId);
+  // A chunk in which nobody speaks has nothing for speech to propose, so no
+  // model is asked about it. The footage there is still the watcher's.
+  const spokenChunks = input.chunks.filter((chunk) =>
+    segments.some((segment) => segment.endSeconds > chunk.globalStartSeconds && segment.startSeconds < chunk.globalEndSeconds));
 
   if (phrases.length > 0) {
-    const segments = await listTranscriptSegments(input.videoId);
     proposals = phrases.flatMap((phrase) => findPhraseWindows(segments, phrase, input.durationSeconds))
       .map((window, index) => ({
         id: `spoken-phrase-${index}`,
@@ -222,10 +226,10 @@ export async function proposeSpokenMoments(input: {
         origin: 'quoted_phrase' as const,
       }));
   } else {
-    const results = await mapWithConcurrency([...input.chunks], input.concurrency, (chunk) => input.textSearch(chunk));
+    const results = await mapWithConcurrency(spokenChunks, input.concurrency, (chunk) => input.textSearch(chunk));
     const matches: NewClipMatch[] = [];
     results.forEach((result, index) => {
-      const chunk = input.chunks[index]!;
+      const chunk = spokenChunks[index]!;
       if (result.status === 'fulfilled') {
         matches.push(...result.value);
       } else {
@@ -243,6 +247,8 @@ export async function proposeSpokenMoments(input: {
   const metrics: Record<string, unknown> = {
     origin: phrases.length > 0 ? 'quoted_phrase' : 'text_search',
     phrases: phrases.length,
+    chunks: input.chunks.length,
+    silentChunks: input.chunks.length - spokenChunks.length,
     proposals: proposals.length,
     searchFailures: failures.length,
   };

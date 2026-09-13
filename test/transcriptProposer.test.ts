@@ -129,16 +129,17 @@ describe('proposeSpokenMoments', () => {
     expect(result.metrics).toMatchObject({ origin: 'quoted_phrase', proposals: 2, verified: 2, rejected: 0 });
   });
 
-  it('an undetermined question runs the transcript-only search per chunk and takes what it names', async () => {
+  it('an undetermined question runs the transcript-only search where someone speaks and takes what it names', async () => {
     textSearch.mockImplementation(async (chunk: { chunkIndex: number }) => chunk.chunkIndex === 1
       ? [{ chunkId: 'chunk-1', localStartSeconds: 78, localEndSeconds: 86, globalStartSeconds: 198, globalEndSeconds: 206, description: 'the announcement', confidence: 0.7, source: 'transcript', quote: 'we are shutting it down' }]
       : []);
     const result = await propose('the big moment');
-    expect(textSearch).toHaveBeenCalledTimes(3);
-    expect(listTranscriptSegments).not.toHaveBeenCalled();
+    // Chunks 0 and 1 carry speech; nobody speaks in chunk 2, so no model is asked about it.
+    expect(textSearch).toHaveBeenCalledTimes(2);
+    expect(textSearch.mock.calls.map((call) => call[0].chunkIndex)).toEqual([0, 1]);
     expect(verifyWithVideoChat3.mock.calls[0]?.[0].candidates).toHaveLength(1);
     expect(result.moments.map((moment) => [moment.startSeconds, moment.quote])).toEqual([[198, 'we are shutting it down']]);
-    expect(result.metrics).toMatchObject({ origin: 'text_search', proposals: 1, verified: 1 });
+    expect(result.metrics).toMatchObject({ origin: 'text_search', chunks: 3, silentChunks: 1, proposals: 1, verified: 1 });
   });
 
   it('a verdict under the floor, or no match, is not a moment', async () => {
@@ -156,7 +157,7 @@ describe('proposeSpokenMoments', () => {
 
   it('a chunk the text search could not read, or a proposal the verifier could not judge, is a named gap', async () => {
     textSearch.mockImplementation(async (chunk: { chunkIndex: number }) => {
-      if (chunk.chunkIndex === 2) throw new Error('OpenRouter 503');
+      if (chunk.chunkIndex === 1) throw new Error('OpenRouter 503');
       return chunk.chunkIndex === 0
         ? [{ chunkId: 'chunk-0', localStartSeconds: 4, localEndSeconds: 12, globalStartSeconds: 4, globalEndSeconds: 12, description: 'news', confidence: 0.8, source: 'transcript', quote: 'we are shutting it down' }]
         : [];
@@ -168,7 +169,7 @@ describe('proposeSpokenMoments', () => {
     const result = await propose('the big moment');
     expect(result.moments).toEqual([]);
     expect(result.failures).toEqual([
-      { startSeconds: 240, endSeconds: 300, reason: 'transcript search failed: OpenRouter 503' },
+      { startSeconds: 120, endSeconds: 240, reason: 'transcript search failed: OpenRouter 503' },
       { startSeconds: 4, endSeconds: 12, reason: 'VideoChat3 verification failed: ffmpeg exited 1' },
     ]);
   });

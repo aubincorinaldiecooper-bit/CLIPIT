@@ -134,6 +134,7 @@ const segment = (start: number, end: number, text: string) => ({
 
 /** Speech exists only around 30–35 s ("goodbye"); the 10–14 s stretch is silent. */
 function transcriptOnlyAtGoodbye() {
+  listTranscriptSegments.mockResolvedValue([segment(30.2, 33.8, 'okay, goodbye everyone')]);
   listTranscriptSegmentsInRange.mockImplementation(async (_videoId: string, start: number, end: number) =>
     end > 29 && start < 36 ? [segment(30.2, 33.8, 'okay, goodbye everyone')] : [],
   );
@@ -602,11 +603,10 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
     expect(startClipRequest).toHaveBeenCalledWith('request-1', { chunksTotal: 0, resolvedMode: 'both', resolvedEvidence: 'any' });
     const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
     expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
-    // Speech proposed too, through the transcript-only search: words in, never a chunk of video.
-    expect(searchVideoChunk).toHaveBeenCalledTimes(3);
-    for (const call of searchVideoChunk.mock.calls) {
-      expect(call[0]).toMatchObject({ mode: 'transcript', videoPath: undefined });
-    }
+    // Speech proposed too, through the transcript-only search: words in, never a chunk of video,
+    // and only for the chunk in which someone speaks.
+    expect(searchVideoChunk).toHaveBeenCalledTimes(1);
+    expect(searchVideoChunk.mock.calls[0]?.[0]).toMatchObject({ mode: 'transcript', videoPath: undefined, chunkIndex: 0 });
   });
 
   it('end to end: a quoted phrase spoken over an unchanging shot is found by the transcript and confirmed by the footage', async () => {
