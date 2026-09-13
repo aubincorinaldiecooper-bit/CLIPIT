@@ -101,8 +101,26 @@ async function verifyMixedEvidence(input: {
   try {
     attached = await attachTranscripts(input.videoId, intervals);
   } catch (error) {
-    // Without the transcript nobody can tell a silent candidate from a spoken
-    // one, so none is kept on its footage under either policy.
+    if (policy === 'when_present') {
+      // Either source may establish a moment, and the footage already has.
+      // What the transcript would have added (a joint verdict for the spoken
+      // candidates, and their label) is not available, so every moment stands
+      // on its footage verdict and says so; the outage is on record in the
+      // metrics, and the speech lane records the stretch it could not search.
+      const reason = errorReason(error);
+      return {
+        ...input.analysis,
+        verified: moments.map((moment) => ({ ...moment, source: 'visual' as const })),
+        metrics: {
+          ...input.analysis.metrics,
+          mixedVerification: {
+            policy, candidates: intervals.length, withoutTranscript: null, verified: moments.length, rejected: 0, failed: true, reason,
+          },
+        },
+      };
+    }
+    // Both sources are required and one cannot be read: nothing is verified,
+    // and every candidate is named over its own seconds.
     return unjudged(intervals, [], [], { candidates: intervals.length, withoutTranscript: null }, error);
   }
   const { verifiable, missing } = attached;

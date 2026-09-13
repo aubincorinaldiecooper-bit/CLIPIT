@@ -207,11 +207,25 @@ describe('analyzeUploadedVideo', () => {
     ]);
   });
 
-  it('when the transcript itself cannot be read, nothing is kept on the picture and nothing is called absent', async () => {
+  it('when the transcript itself cannot be read under any, every moment stands on its footage verdict and says so', async () => {
     silentSignAndSpokenLine();
     listTranscriptSegmentsInRange.mockRejectedValue(new Error('transcript store unavailable'));
     const analysis = await analyzeUploadedVideo({
       query: 'the good bit', videoId: 'video-1', mode: 'both', evidence: 'any', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: 300,
+    });
+    expect(verifyWithVideoChat3).toHaveBeenCalledTimes(1);
+    expect(analysis.watchedThroughSeconds).toBe(300);
+    // Either source may establish a moment, and the footage already has: the sign and the spoken stretch both stand, labelled by what established them.
+    expect(analysis.verified.map((moment) => [moment.startSeconds, moment.source])).toEqual([[40, 'visual'], [200, 'visual']]);
+    expect(analysis.failures).toEqual([]);
+    expect(analysis.metrics.mixedVerification).toMatchObject({ policy: 'when_present', candidates: 2, verified: 2, failed: true, reason: 'transcript store unavailable' });
+  });
+
+  it('when the transcript itself cannot be read under all, nothing is verified and every candidate is named', async () => {
+    silentSignAndSpokenLine();
+    listTranscriptSegmentsInRange.mockRejectedValue(new Error('transcript store unavailable'));
+    const analysis = await analyzeUploadedVideo({
+      query: 'show where he says it while the sign is up', videoId: 'video-1', mode: 'both', evidence: 'all', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: 300,
     });
     expect(verifyWithVideoChat3).toHaveBeenCalledTimes(1);
     expect(analysis.watchedThroughSeconds).toBe(300);
