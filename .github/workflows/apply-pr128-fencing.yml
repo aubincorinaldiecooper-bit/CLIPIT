@@ -18,10 +18,12 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
-      - name: Apply focused fencing patch
-        run: python3 tools/apply_pr128_fencing_fix.py
+      - name: Correct and apply focused fencing patch
+        run: |
+          python3 tools/fix_pr128_patch_generator.py
+          python3 tools/apply_pr128_fencing_fix.py
       - name: Install dependencies
         run: npm ci
       - name: Typecheck
