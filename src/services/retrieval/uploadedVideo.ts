@@ -1,10 +1,13 @@
-import { DEFAULT_WATCH_MAX_EVENTS, analyzeInternetVideo, type InternetVideoAnalysis } from './internetVideo.js';
-import { classifyInstruction } from '../search/instructionMode.js';
-import { getVideo } from '../../db/repositories/videos.js';
-import { listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
+import {
+  DEFAULT_WATCH_MAX_EVENTS,
+  analyzeInternetVideo,
+  type InternetVideoAnalysis,
+  type InternetVideoMoment,
+} from './internetVideo.js';
+import { MISSING_TRANSCRIPT_REASON, attachTranscripts, passesEvidenceGate, transcriptPolicy } from './mixedEvidence.js';
 import { verifyWithVideoChat3 } from '../videochat3/client.js';
 import type { NewClipMatch } from '../../db/repositories/clipRequests.js';
-import type { VideoChunk } from '../../domain/types.js';
+import type { EvidenceRequirement, ResolvedSearchMode, VideoChunk } from '../../domain/types.js';
 
 export const WATCH_MAX_EVENTS = DEFAULT_WATCH_MAX_EVENTS;
 
@@ -26,91 +29,166 @@ export function unwatchedTail(input: {
   return { startSeconds: start, endSeconds: input.durationSeconds };
 }
 
-function uploadedVideoId(videoKey: string): string | null {
-  const match = /^proxies\/([^/]+)\/proxy\.mp4$/.exec(videoKey);
-  return match?.[1] ?? null;
-}
-
-async function transcriptForInterval(videoId: string, start: number, end: number): Promise<string> {
-  const rows = await listTranscriptSegmentsInRange(videoId, Math.max(0, start - 1.5), end + 1.5);
-  return rows
-    .map((row) => `[${row.startSeconds.toFixed(1)}-${row.endSeconds.toFixed(1)}] ${row.text.trim()}`)
-    .filter((line) => line.length > 0)
-    .join('\n')
-    .slice(0, 12_000);
-}
-
 /**
  * A mixed visual+spoken question gets one more exact-interval verification
  * after visual retrieval. The verifier sees the clip and only the transcript
- * aligned to that clip, so spoken conditions cannot be silently dropped.
+ * aligned to that clip, so a spoken condition cannot be satisfied by the
+ * picture alone.
  *
- * The request-level resolver deliberately downgrades `both` to `visual` when
- * no usable transcript exists. This helper mirrors that fact from the stored
- * video row, rather than re-classifying an ambiguous sentence and demanding a
- * transcript the request already established was unavailable.
+ * Which questions are mixed, and what a mixed one demands, is not decided
+ * here. The request's resolved mode and evidence requirement arrive from
+ * handleClipSearch, which already weighed the explicit mode, the wording,
+ * and whether the video has a usable transcript: a `both` downgraded to
+ * `visual` upstream arrives as `visual` and gets no transcript work; an
+ * explicit `both` stays `both` however visual its wording. Under 'all', a
+ * candidate whose interval has no transcript is rejected with a reason,
+ * never verified visually instead. Under 'any', it keeps its visual verdict
+ * and is labelled visual, while a candidate with speech is judged again
+ * with it and labelled multimodal. Every verdict is evidence only through
+ * the same gate as every other verification (passesEvidenceGate).
  */
 async function verifyMixedEvidence(input: {
   analysis: InternetVideoAnalysis;
   query: string;
+  videoId: string;
   videoUrl: string;
   videoKey: string;
   expectedBytes?: number;
+  mode: ResolvedSearchMode;
+  evidence: EvidenceRequirement;
 }): Promise<InternetVideoAnalysis> {
-  if (classifyInstruction(input.query).mode !== 'both' || input.analysis.verified.length === 0) {
-    return input.analysis;
-  }
+  const policy = transcriptPolicy(input.mode, input.evidence);
+  if (policy === 'none' || input.analysis.verified.length === 0) return input.analysis;
 
-  const videoId = uploadedVideoId(input.videoKey);
-  // Only Clipit's canonical proxy keys can be joined to a stored transcript.
-  if (!videoId) return input.analysis;
+  const moments = input.analysis.verified;
+  const momentById = new Map(moments.map((moment, index) => [`mixed-${index}`, moment]));
+  const intervals = moments.map((moment, index) => ({ id: `mixed-${index}`, start: moment.startSeconds, end: moment.endSeconds }));
 
-  const video = await getVideo(videoId);
-  if (!video || video.transcriptStatus !== 'ready' || video.transcriptSegmentCount <= 0) {
-    return input.analysis;
-  }
-
-  const candidates = await Promise.all(input.analysis.verified.map(async (moment, index) => ({
-    id: `mixed-${index}`,
-    start: moment.startSeconds,
-    end: moment.endSeconds,
-    transcript: await transcriptForInterval(videoId, moment.startSeconds, moment.endSeconds),
-  })));
-
-  const missingTranscript = candidates.filter((candidate) => candidate.transcript.trim().length === 0);
-  const verifiable = candidates.filter((candidate) => candidate.transcript.trim().length > 0);
-  if (verifiable.length === 0) {
+  // The watch and its footage verdicts stand whatever happens below. A
+  // candidate whose transcript-assisted verdict could not be obtained is
+  // named as unverified over its own seconds: not kept on the picture alone,
+  // not dropped as if judged, and never allowed to turn a finished watch into
+  // an unread video.
+  const unjudged = (
+    candidates: ReadonlyArray<{ id: string; start: number; end: number }>,
+    kept: InternetVideoMoment[],
+    namedFailures: InternetVideoAnalysis['failures'],
+    detail: Record<string, unknown>,
+    error: unknown,
+  ): InternetVideoAnalysis => {
+    const reason = errorReason(error);
     return {
       ...input.analysis,
-      verified: [],
+      verified: kept,
       failures: [
         ...input.analysis.failures,
-        ...missingTranscript.map((candidate) => ({
+        ...namedFailures,
+        ...candidates.map((candidate) => ({
           id: candidate.id,
-          reason: 'mixed question requires transcript evidence, but this interval has no transcript',
+          reason: `mixed verification failed: ${reason}`,
           startSeconds: candidate.start,
           endSeconds: candidate.end,
         })),
       ],
+      metrics: {
+        ...input.analysis.metrics,
+        mixedVerification: { policy, ...detail, verified: kept.length, rejected: 0, failed: true, reason },
+      },
+    };
+  };
+
+  let attached: Awaited<ReturnType<typeof attachTranscripts>>;
+  try {
+    attached = await attachTranscripts(input.videoId, intervals);
+  } catch (error) {
+    if (policy === 'when_present') {
+      // Either source may establish a moment, and the footage already has.
+      // What the transcript would have added (a joint verdict for the spoken
+      // candidates, and their label) is not available, so every moment stands
+      // on its footage verdict and says so; the outage is on record in the
+      // metrics, and the speech lane records the stretch it could not search.
+      const reason = errorReason(error);
+      return {
+        ...input.analysis,
+        verified: moments.map((moment) => ({ ...moment, source: 'visual' as const })),
+        metrics: {
+          ...input.analysis.metrics,
+          mixedVerification: {
+            policy, candidates: intervals.length, withoutTranscript: null, verified: moments.length, rejected: 0, failed: true, reason,
+          },
+        },
+      };
+    }
+    // Both sources are required and one cannot be read: nothing is verified,
+    // and every candidate is named over its own seconds.
+    return unjudged(intervals, [], [], { candidates: intervals.length, withoutTranscript: null }, error);
+  }
+  const { verifiable, missing } = attached;
+  const missingFailures = policy === 'required'
+    ? missing.map((candidate) => ({
+      id: candidate.id,
+      reason: MISSING_TRANSCRIPT_REASON,
+      startSeconds: candidate.start,
+      endSeconds: candidate.end,
+    }))
+    : [];
+  // Under 'any', a silent stretch already passed the visual verification
+  // and the gate; it stays, and says it was established by footage alone.
+  const keptOnFootage: InternetVideoMoment[] = policy === 'when_present'
+    ? missing.flatMap((candidate) => {
+      const moment = momentById.get(candidate.id);
+      return moment ? [{ ...moment, source: 'visual' as const }] : [];
+    })
+    : [];
+  if (verifiable.length === 0) {
+    return {
+      ...input.analysis,
+      verified: keptOnFootage,
+      failures: [...input.analysis.failures, ...missingFailures],
+      metrics: {
+        ...input.analysis.metrics,
+        mixedVerification: {
+          policy, candidates: 0, withoutTranscript: missing.length, verified: keptOnFootage.length, rejected: 0,
+        },
+      },
     };
   }
 
-  const verdicts = await verifyWithVideoChat3({
-    videoUrl: input.videoUrl,
-    query: input.query,
-    expectedBytes: input.expectedBytes,
-    candidates: verifiable,
-  });
-  const original = new Map(candidates.map((candidate, index) => [candidate.id, input.analysis.verified[index]!]));
-  const verified = verdicts.results
-    .filter((result) => result.match)
-    .map((result) => ({
+  let verdicts: Awaited<ReturnType<typeof verifyWithVideoChat3>>;
+  try {
+    verdicts = await verifyWithVideoChat3({
+      videoUrl: input.videoUrl,
+      query: input.query,
+      expectedBytes: input.expectedBytes,
+      candidates: verifiable,
+    });
+  } catch (error) {
+    return unjudged(
+      verifiable,
+      keptOnFootage,
+      missingFailures,
+      { candidates: verifiable.length, withoutTranscript: missing.length },
+      error,
+    );
+  }
+  const candidateById = new Map(verifiable.map((candidate) => [candidate.id, candidate]));
+  let rejected = 0;
+  const verified: InternetVideoMoment[] = [...keptOnFootage];
+  for (const result of verdicts.results) {
+    if (!passesEvidenceGate(result)) {
+      rejected += 1;
+      continue;
+    }
+    verified.push({
       startSeconds: result.startSeconds,
       endSeconds: result.endSeconds,
       confidence: result.confidence,
-      description: result.description || original.get(result.id)?.description || '',
-    }));
-  const failureById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+      description: result.description || momentById.get(result.id)?.description || '',
+      // Footage judged together with its transcript.
+      source: 'multimodal',
+    });
+  }
+  verified.sort((left, right) => right.confidence - left.confidence);
 
   return {
     ...input.analysis,
@@ -119,14 +197,9 @@ async function verifyMixedEvidence(input: {
     verified,
     failures: [
       ...input.analysis.failures,
-      ...missingTranscript.map((candidate) => ({
-        id: candidate.id,
-        reason: 'mixed question requires transcript evidence, but this interval has no transcript',
-        startSeconds: candidate.start,
-        endSeconds: candidate.end,
-      })),
+      ...missingFailures,
       ...verdicts.failed.map((failure) => {
-        const candidate = failureById.get(failure.id);
+        const candidate = candidateById.get(failure.id);
         return {
           id: failure.id,
           reason: `mixed verification failed: ${failure.reason}`,
@@ -134,16 +207,39 @@ async function verifyMixedEvidence(input: {
         };
       }),
     ],
-    metrics: { ...input.analysis.metrics, mixedVerification: verdicts.metrics },
+    metrics: {
+      ...input.analysis.metrics,
+      mixedVerification: {
+        ...verdicts.metrics,
+        policy,
+        candidates: verifiable.length,
+        withoutTranscript: missing.length,
+        verified: verified.length,
+        rejected,
+      },
+    },
   };
 }
 
+function errorReason(error: unknown): string {
+  return error instanceof Error ? error.message : 'whole-video analysis failed';
+}
+
+/**
+ * Read an uploaded video the way an internet video is read, then hold the
+ * result to the request's evidence contract. `mode` and `evidence` are the
+ * request-level decision from handleClipSearch; they are passed down, never
+ * re-derived.
+ */
 export async function analyzeUploadedVideo(input: {
   query: string;
+  videoId: string;
   videoUrl: string;
   videoKey: string;
   expectedBytes?: number;
   durationSeconds: number | null;
+  mode: ResolvedSearchMode;
+  evidence: EvidenceRequirement;
 }): Promise<UploadedVideoAnalysis> {
   try {
     const firstAnalysis = await analyzeInternetVideo({
@@ -156,9 +252,12 @@ export async function analyzeUploadedVideo(input: {
     const analysis = await verifyMixedEvidence({
       analysis: firstAnalysis,
       query: input.query,
+      videoId: input.videoId,
       videoUrl: input.videoUrl,
       videoKey: input.videoKey,
       expectedBytes: input.expectedBytes,
+      mode: input.mode,
+      evidence: input.evidence,
     });
     const durationSeconds = input.durationSeconds ?? analysis.durationSeconds;
     return {
@@ -167,7 +266,7 @@ export async function analyzeUploadedVideo(input: {
     };
   } catch (error) {
     const durationSeconds = input.durationSeconds ?? 0;
-    const reason = error instanceof Error ? error.message : 'whole-video analysis failed';
+    const reason = errorReason(error);
     return {
       model: 'MCG-NJU/VideoChat3-4B',
       revision: 'unavailable',

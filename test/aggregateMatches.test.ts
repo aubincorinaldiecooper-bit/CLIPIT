@@ -152,6 +152,29 @@ describe('aggregateMatches', () => {
     expect(merged[0]?.source).toBe('transcript');
   });
 
+  it('attributes a merged match to the contributor that supplied its description', () => {
+    const merged = aggregateMatches([
+      match({ globalStartSeconds: 10, globalEndSeconds: 20, confidence: 0.7, description: 'seen', provider: 'omni-simplemem', model: 'memory' }),
+      match({
+        globalStartSeconds: 11, globalEndSeconds: 21, confidence: 0.9, description: 'heard and seen',
+        provider: 'modal', model: 'MCG-NJU/VideoChat3-4B', source: 'multimodal', quote: 'goodbye',
+      }),
+    ], options);
+
+    expect(merged).toEqual([expect.objectContaining({
+      description: 'heard and seen', provider: 'modal', model: 'MCG-NJU/VideoChat3-4B', promptVersion: null, source: 'multimodal', quote: 'goodbye',
+    })]);
+  });
+
+  it('falls back to the other contributor\'s attribution when the stronger one has none', () => {
+    const merged = aggregateMatches([
+      match({ globalStartSeconds: 10, globalEndSeconds: 20, confidence: 0.7, provider: 'modal', model: 'vc3' }),
+      match({ globalStartSeconds: 11, globalEndSeconds: 21, confidence: 0.9 }),
+    ], options);
+
+    expect(merged[0]).toMatchObject({ confidence: 0.9, provider: 'modal', model: 'vc3' });
+  });
+
   it('carries a quote through the merge', () => {
     const merged = aggregateMatches(
       [

@@ -18,7 +18,7 @@ import {
 import { isCorrection } from '../../services/search/rescanPolicy.js';
 import { assertVideoInputSupported } from '../../services/search/modelCapabilities.js';
 import { resolveSearchMode } from '../../services/search/instructionMode.js';
-import { aggregateMatches } from '../../services/search/aggregateMatches.js';
+import { aggregateMatches, type MergeableMatch } from '../../services/search/aggregateMatches.js';
 import type { TranscriptLine } from '../../services/search/prompt.js';
 import {
   mapGlobalRangeToChunk,
@@ -62,6 +62,7 @@ import type {
   ChunkFailureCode,
   MatchSource,
   AnsweredFrom,
+  EvidenceRequirement,
   FallbackReason,
   ResolvedSearchMode,
   RetrievalSystem,
@@ -106,6 +107,7 @@ import {
   placeMomentsOnChunks,
   type UploadedVideoAnalysis,
 } from '../../services/retrieval/uploadedVideo.js';
+import { describeSpokenFailure, proposeSpokenMoments, speechUnsearched, type SpokenProposals } from '../../services/retrieval/transcriptProposer.js';
 
 export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
   const { clipRequestId } = job.data;
@@ -315,6 +317,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
 
     log.info('starting clip search', {
       mode: resolved.mode,
+      evidence: resolved.evidence,
       rationale: resolved.rationale,
       chunks: chunks.length,
       instruction,
@@ -325,6 +328,59 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       preparationWaitedMs,
       ...(correcting ? { correctionOf: request.instruction } : {}),
     });
+
+    /**
+     * Speech proposes too. Under a `both` question where either source may
+     * establish a moment, the picture alone would propose: VideoChat3's
+     * watch has no sound and SimpleMem remembers frames. So the transcript
+     * names its own candidates first — a quoted phrase looked up directly,
+     * or the retained transcript-only per-chunk search, which sends words
+     * and never video — and VideoChat3 re-opens each with its footage and
+     * its aligned transcript. Whichever path completes the request stores
+     * what survived beside its own moments.
+     */
+    let spoken: SpokenProposals | null = null;
+    // Only where VideoChat3 is the engine: under the legacy primaries the
+    // per-chunk search reads the transcript beside each chunk itself.
+    if (env.RETRIEVAL_PRIMARY === 'videochat3' && resolved.mode === 'both' && resolved.evidence === 'any' && video.proxyStorageKey) {
+      await startClipRequest(clipRequestId, { chunksTotal: 0, resolvedMode: resolved.mode, resolvedEvidence: resolved.evidence });
+      const proxyKey = video.proxyStorageKey;
+      try {
+        const object = await getStorage().head(proxyKey);
+        const videoUrl = await getStorage().createDownloadUrl(proxyKey, { expiresInSeconds: VIDEOCHAT3_SOURCE_URL_SECONDS });
+        spoken = await withWorkDir(`spoken-${clipRequestId}`, (dir) => proposeSpokenMoments({
+          videoId: video.id,
+          instruction,
+          chunks,
+          durationSeconds: video.durationSeconds,
+          videoUrl,
+          expectedBytes: object?.sizeBytes ?? video.sizeBytes ?? undefined,
+          concurrency: env.OPENROUTER_VIDEO_CONCURRENCY,
+          textSearch: (chunk) => searchSingleChunk({
+            chunk,
+            chunkCount: chunks.length,
+            instruction,
+            // Transcript text only: this mode never downloads or uploads a chunk.
+            mode: 'transcript',
+            videoId: video.id,
+            clipRequestId,
+            workDir: dir,
+            tally,
+            log,
+            onAnsweredWithoutThinking: () => undefined,
+            onDegraded: async () => undefined,
+          }),
+        }));
+        log.info('speech proposed moments', spoken.metrics);
+      } catch (error) {
+        // Either source may establish a moment, so one source's outage is
+        // not a reason to leave the footage unread. The stretch speech never
+        // searched goes on record; the footage paths below still run, and a
+        // storage failure they share fails there, where it is theirs.
+        spoken = speechUnsearched(error, video.durationSeconds ?? chunks.at(-1)?.globalEndSeconds ?? 0);
+        log.warn('speech could not propose; the footage is still read', { reason: spoken.metrics.reason });
+      }
+    }
 
     /**
      * Omni-SimpleMem is the memory/retrieval layer. A confident candidate is
@@ -340,7 +396,9 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       chunks,
       instruction,
       mode: resolved.mode,
+      evidence: resolved.evidence,
       correcting,
+      spoken,
       log,
     });
     if (fromSimpleMem.matchCount > 0) {
@@ -370,6 +428,8 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         chunks,
         instruction,
         mode: resolved.mode,
+        evidence: resolved.evidence,
+        spoken,
         log,
       });
       const primaryOutcome = {
@@ -407,12 +467,28 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       log.info('Omni-SimpleMem handed the question on', { reason: fromSimpleMem.fallback });
     }
 
+    if (env.RETRIEVAL_PRIMARY === 'videochat3' && resolved.mode !== 'transcript') {
+      // Unreachable by design, and kept so it stays that way: under the
+      // VideoChat3 primary every visual and mixed question is answered
+      // above, with moments or with an honest "nothing verified" and the
+      // unexamined stretches on record. The per-chunk footage search below
+      // is the speech path only. Reaching here would mean a hand-off was
+      // added that routes footage questions back into the retired watcher.
+      throw new Error(
+        `invariant violated: a ${resolved.mode} question reached the per-chunk footage search under RETRIEVAL_PRIMARY=videochat3`,
+      );
+    }
+
     // One cheap check before uploading megabytes per chunk: a model without
     // video endpoints refuses every chunk identically, and finding that out
     // once is worth more than finding it out N times.
     if (resolved.mode !== 'transcript') await assertVideoInputSupported();
 
-    await startClipRequest(clipRequestId, { chunksTotal: chunks.length, resolvedMode: resolved.mode });
+    await startClipRequest(clipRequestId, {
+      chunksTotal: chunks.length,
+      resolvedMode: resolved.mode,
+      resolvedEvidence: resolved.evidence,
+    });
     // So the peak reported at the end belongs to this search.
     resetVideoCallPeak();
     // Reading the footage is the only path that can report a real absence, so
@@ -613,48 +689,37 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
  * local range extends past that chunk's end, which is the honest description of
  * what was found. Clips are always cut using the global range.
  */
-async function aggregateStoredMatches(
-  clipRequestId: string,
-  chunks: VideoChunk[],
-  deckAttemptId: string | null,
-): Promise<number> {
-  const stored = await listMatches(clipRequestId);
-  if (stored.length <= 1) return stored.length;
-
-  const merged = aggregateMatches(
-    stored.map((match) => ({
-      chunkId: match.chunkId,
-      globalStartSeconds: match.globalStartSeconds,
-      globalEndSeconds: match.globalEndSeconds,
-      description: match.description,
-      confidence: match.confidence,
-      source: match.source,
-      quote: match.quote,
-    })),
-    {
-      gapSeconds: env.MATCH_MERGE_GAP_SECONDS,
-      minOverlapRatio: env.MATCH_MERGE_MIN_OVERLAP_RATIO,
-      maxDurationSeconds: env.MAX_CLIP_SECONDS,
-    },
-  );
-
-  if (merged.length === stored.length) return stored.length;
-
-  const chunkById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
-
-  // One search runs on one lane, so every stored match carries the same
-  // attribution; merging two of them loses nothing by taking the first's.
-  // Rows from before the evaluation layer carry none, and none is re-created.
-  const attribution = {
-    provider: stored[0]?.provider ?? null,
-    model: stored[0]?.model ?? null,
-    promptVersion: stored[0]?.promptVersion ?? null,
+function mergeOptions() {
+  return {
+    gapSeconds: env.MATCH_MERGE_GAP_SECONDS,
+    minOverlapRatio: env.MATCH_MERGE_MIN_OVERLAP_RATIO,
+    maxDurationSeconds: env.MAX_CLIP_SECONDS,
   };
+}
 
-  const rows: NewClipMatch[] = merged.flatMap((match) => {
+function mergeable(
+  match: Pick<NewClipMatch, 'chunkId' | 'globalStartSeconds' | 'globalEndSeconds' | 'description' | 'confidence' | 'source' | 'quote' | 'provider' | 'model' | 'promptVersion'>,
+): MergeableMatch {
+  return {
+    chunkId: match.chunkId,
+    globalStartSeconds: match.globalStartSeconds,
+    globalEndSeconds: match.globalEndSeconds,
+    description: match.description,
+    confidence: match.confidence,
+    source: match.source,
+    quote: match.quote ?? null,
+    provider: match.provider ?? null,
+    model: match.model ?? null,
+    promptVersion: match.promptVersion ?? null,
+  };
+}
+
+/** Merged matches back onto the chunk grid every stored row lives on. */
+function rowsOnChunks(merged: readonly MergeableMatch[], chunks: readonly VideoChunk[]): NewClipMatch[] {
+  const chunkById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+  return merged.flatMap((match) => {
     const anchor = chunkById.get(match.chunkId);
     if (!anchor) return [];
-
     return [
       {
         chunkId: match.chunkId,
@@ -666,10 +731,43 @@ async function aggregateStoredMatches(
         confidence: match.confidence,
         source: match.source,
         quote: match.quote,
-        ...attribution,
+        provider: match.provider ?? null,
+        model: match.model ?? null,
+        promptVersion: match.promptVersion ?? null,
       } satisfies NewClipMatch,
     ];
   });
+}
+
+/**
+ * The same moment found by two sources is one moment. Duplicates are
+ * collapsed before the requested count is applied, so a second sighting of
+ * one moment never takes the place of a distinct one; what survives is the
+ * strongest first.
+ */
+function distinctStrongest(found: NewClipMatch[], chunks: readonly VideoChunk[], wanted: number | null): NewClipMatch[] {
+  const rows = found.length > 1 ? rowsOnChunks(aggregateMatches(found.map(mergeable), mergeOptions()), chunks) : found;
+  const ordered = [...rows].sort((left, right) => right.confidence - left.confidence);
+  return wanted === null ? ordered : ordered.slice(0, wanted);
+}
+
+async function aggregateStoredMatches(
+  clipRequestId: string,
+  chunks: VideoChunk[],
+  deckAttemptId: string | null,
+): Promise<number> {
+  const stored = await listMatches(clipRequestId);
+  if (stored.length <= 1) return stored.length;
+
+  const merged = aggregateMatches(stored.map(mergeable), mergeOptions());
+
+  if (merged.length === stored.length) return stored.length;
+
+  // Two lanes can meet in one request (a memory moment beside a spoken one),
+  // so the attribution of each merged row is decided per row, by the
+  // contributor that supplied it. Rows from before the evaluation layer carry
+  // none, and none is re-created.
+  const rows = rowsOnChunks(merged, chunks);
 
   // Merging rewrites match rows and their ids, so the clips of the old ids
   // are stale. That used to be free — clips came only from the Keep endpoint,
@@ -986,7 +1084,10 @@ async function answerFromSimpleMem(input: {
   chunks: VideoChunk[];
   instruction: string;
   mode: ResolvedSearchMode;
+  evidence: EvidenceRequirement;
   correcting: boolean;
+  /** What speech proposed and VideoChat3 confirmed, when either source may establish a moment. */
+  spoken: SpokenProposals | null;
   log: Logger;
 }): Promise<{
   matchCount: number;
@@ -1009,7 +1110,11 @@ async function answerFromSimpleMem(input: {
   if (before.use === 'fallback') {
     return { matchCount: 0, released: false, fallback: before.reason, outcome: null };
   }
-  await startClipRequest(input.clipRequestId, { chunksTotal: 0, resolvedMode: input.mode });
+  await startClipRequest(input.clipRequestId, {
+    chunksTotal: 0,
+    resolvedMode: input.mode,
+    resolvedEvidence: input.evidence,
+  });
   let reply;
   try {
     reply = await simplememQuery({ videoId: input.video.id, query: input.instruction, topK: env.SIMPLEMEM_TOP_K });
@@ -1054,9 +1159,12 @@ async function answerFromSimpleMem(input: {
     verified = await rerankSimpleMemCandidates({
       query: input.instruction,
       candidates: mapping.candidates,
+      videoId: input.video.id,
       videoUrl,
       videoKey: input.video.proxyStorageKey,
       expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? 0,
+      mode: input.mode,
+      evidence: input.evidence,
       onUsage: (usage) => {
         void recordModelUsage({
           ...usage,
@@ -1132,20 +1240,44 @@ async function answerFromSimpleMem(input: {
       return { matchCount: verified.candidates.length, released: false, fallback: null, outcome };
     }
   }
-  const wanted = input.requestedResultCount ?? verified.candidates.length;
-  const found = placeMomentsOnChunks(
-    verified.candidates.slice(0, wanted).map((candidate) => ({
+  for (const failure of input.spoken?.failures ?? []) {
+    const chunk = input.chunks.find((item) =>
+      failure.startSeconds >= item.globalStartSeconds && failure.startSeconds < item.globalEndSeconds,
+    ) ?? input.chunks.at(-1);
+    if (!chunk) continue;
+    const stillOwned = await recordChunkFailure(input.clipRequestId, {
+      chunkIndex: chunk.chunkIndex,
+      chunkId: chunk.id,
+      message: describeSpokenFailure(failure),
+      code: 'not_read_yet',
+      globalStartSeconds: failure.startSeconds,
+      globalEndSeconds: failure.endSeconds,
+    }, input.deckAttemptId!);
+    if (!stillOwned) {
+      input.log.info('another delivery owns this request; discarding stale SimpleMem coverage');
+      return { matchCount: verified.candidates.length, released: false, fallback: null, outcome };
+    }
+  }
+  const moments = [
+    ...verified.candidates.map((candidate) => ({
       startSeconds: candidate.startSeconds,
       endSeconds: candidate.endSeconds,
       confidence: candidate.score,
       description: candidate.description,
+      // What established the moment: footage alone, or footage judged
+      // together with its transcript. The row must say which.
+      source: candidate.source ?? MATCH_SOURCE[input.mode],
     })),
-    input.chunks,
-    {
+    ...(input.spoken?.moments ?? []),
+  ];
+  const found = distinctStrongest(
+    placeMomentsOnChunks(moments, input.chunks, {
       instruction: input.instruction,
       provider: 'omni-simplemem',
       model: typeof index?.config?.visual === 'string' ? index.config.visual : 'Omni-SimpleMem',
-    },
+    }),
+    input.chunks,
+    input.requestedResultCount,
   );
   if (found.length === 0) return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
   await insertMatches(input.clipRequestId, found);
@@ -1170,7 +1302,7 @@ async function answerFromSimpleMem(input: {
     coverageFailuresDescribed: unreadTail ? 1 : 0,
     log: input.log,
   });
-  input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, ...outcome });
+  input.log.info('answered from Omni-SimpleMem', { matches: finalCount, released, spoken: input.spoken?.metrics ?? null, ...outcome });
   return { matchCount: finalCount, released, fallback: null, outcome };
 }
 
@@ -1204,6 +1336,9 @@ async function answerFromVideoChat3(input: {
   chunks: VideoChunk[];
   instruction: string;
   mode: ResolvedSearchMode;
+  evidence: EvidenceRequirement;
+  /** What speech proposed and VideoChat3 confirmed, when either source may establish a moment. */
+  spoken: SpokenProposals | null;
   log: Logger;
 }): Promise<{
   /** True when this path finished the request — with moments, or with an honest none. */
@@ -1221,33 +1356,35 @@ async function answerFromVideoChat3(input: {
     };
   }
   if (!input.video.proxyStorageKey) {
-    return {
-      answered: false,
-      matchCount: 0,
-      fallback: 'primary_failed',
-      outcome: { error: 'Video has no analysis proxy to watch' },
-    };
+    // A ready video always has one. Without it there is nothing to watch,
+    // and the per-chunk search is not the answer: it is not the engine for
+    // visual or mixed questions. The request fails and says why.
+    throw new Error('Video has no analysis proxy to watch');
   }
 
-  await startClipRequest(input.clipRequestId, { chunksTotal: 0, resolvedMode: input.mode });
-  let analysis: UploadedVideoAnalysis;
-  try {
-    const object = await getStorage().head(input.video.proxyStorageKey);
-    const videoUrl = await getStorage().createDownloadUrl(input.video.proxyStorageKey, {
-      expiresInSeconds: VIDEOCHAT3_SOURCE_URL_SECONDS,
-    });
-    analysis = await analyzeUploadedVideo({
-      query: input.instruction,
-      videoUrl,
-      videoKey: input.video.proxyStorageKey,
-      expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? undefined,
-      durationSeconds: input.video.durationSeconds,
-    });
-  } catch (error) {
-    const detail = errorMessage(error);
-    input.log.warn('the VideoChat3 pipeline could not read the footage; using the direct footage search', { err: error });
-    return { answered: false, matchCount: 0, fallback: 'primary_failed', outcome: { error: detail } };
-  }
+  await startClipRequest(input.clipRequestId, {
+    chunksTotal: 0,
+    resolvedMode: input.mode,
+    resolvedEvidence: input.evidence,
+  });
+  // Signing the proxy can fail (storage down); that is a failure of this
+  // delivery, retried by the queue, never a reason to read the video some
+  // other way. analyzeUploadedVideo itself does not throw: a watch or
+  // verification failure comes back as a whole-video coverage gap.
+  const object = await getStorage().head(input.video.proxyStorageKey);
+  const videoUrl = await getStorage().createDownloadUrl(input.video.proxyStorageKey, {
+    expiresInSeconds: VIDEOCHAT3_SOURCE_URL_SECONDS,
+  });
+  const analysis: UploadedVideoAnalysis = await analyzeUploadedVideo({
+    query: input.instruction,
+    videoId: input.video.id,
+    videoUrl,
+    videoKey: input.video.proxyStorageKey,
+    expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? undefined,
+    durationSeconds: input.video.durationSeconds,
+    mode: input.mode,
+    evidence: input.evidence,
+  });
 
   const outcome = {
     watchedEvents: analysis.watchedEvents,
@@ -1269,19 +1406,34 @@ async function answerFromVideoChat3(input: {
     input.chunks.find((item) => seconds >= item.globalStartSeconds && seconds < item.globalEndSeconds)
       ?? input.chunks.at(-1);
   const gaps: Array<{ startSeconds: number; endSeconds: number; message: string }> = [];
-  if (analysis.unwatched) {
+  // A read that failed outright is one gap — the whole video, with the reason —
+  // not that gap plus a second copy of it dressed as "the stretch after the
+  // last flagged moment". The record must add up to the video, not to twice it.
+  const unread = analysis.failures.find((failure) => failure.id === 'whole-video-read');
+  if (unread && unread.startSeconds !== undefined && unread.endSeconds !== undefined) {
     gaps.push({
-      ...analysis.unwatched,
-      message: `VideoChat3 stopped watching at ${Math.round(analysis.unwatched.startSeconds)}s: it had flagged ${WATCH_MAX_EVENTS} moments, the most one read may hold.`,
+      startSeconds: unread.startSeconds,
+      endSeconds: unread.endSeconds,
+      message: `VideoChat3 could not read the video, so nothing in it was examined: ${unread.reason}`,
     });
+  } else {
+    if (analysis.unwatched) {
+      gaps.push({
+        ...analysis.unwatched,
+        message: `VideoChat3 stopped watching at ${Math.round(analysis.unwatched.startSeconds)}s: it had flagged ${WATCH_MAX_EVENTS} moments, the most one read may hold.`,
+      });
+    }
+    for (const failure of analysis.failures) {
+      if (failure.startSeconds === undefined || failure.endSeconds === undefined) continue;
+      gaps.push({
+        startSeconds: failure.startSeconds,
+        endSeconds: failure.endSeconds,
+        message: `VideoChat3 flagged this stretch, but it could not be verified: ${failure.reason}`,
+      });
+    }
   }
-  for (const failure of analysis.failures) {
-    if (failure.startSeconds === undefined || failure.endSeconds === undefined) continue;
-    gaps.push({
-      startSeconds: failure.startSeconds,
-      endSeconds: failure.endSeconds,
-      message: `VideoChat3 flagged this stretch, but it could not be verified: ${failure.reason}`,
-    });
+  for (const failure of input.spoken?.failures ?? []) {
+    gaps.push({ startSeconds: failure.startSeconds, endSeconds: failure.endSeconds, message: describeSpokenFailure(failure) });
   }
   for (const gap of gaps) {
     const chunk = chunkAt(gap.startSeconds);
@@ -1300,12 +1452,15 @@ async function answerFromVideoChat3(input: {
     }
   }
 
-  const wanted = input.requestedResultCount ?? analysis.verified.length;
-  const found = placeMomentsOnChunks(analysis.verified.slice(0, wanted), input.chunks, {
-    instruction: input.instruction,
-    provider: 'modal',
-    model: analysis.model,
-  });
+  const moments = [
+    ...analysis.verified.map((moment) => ({ ...moment, source: moment.source ?? MATCH_SOURCE[input.mode] })),
+    ...(input.spoken?.moments ?? []),
+  ];
+  const found = distinctStrongest(
+    placeMomentsOnChunks(moments, input.chunks, { instruction: input.instruction, provider: 'modal', model: analysis.model }),
+    input.chunks,
+    input.requestedResultCount,
+  );
   let finalCount = 0;
   if (found.length > 0) {
     await insertMatches(input.clipRequestId, found);
@@ -1322,15 +1477,18 @@ async function answerFromVideoChat3(input: {
     deckAttemptId: input.deckAttemptId,
     requestedResultCount: input.requestedResultCount,
     question: input.instruction,
-    coverageNote: analysis.unwatched
-      ? `VideoChat3 only watched the first ${Math.round(analysis.unwatched.startSeconds)} of ${Math.round(durationSeconds)} seconds.`
-      : null,
-    // The unwatched tail is persisted above for the structured API and has
-    // its precise prose note here; verification failures keep their warning.
-    coverageFailuresDescribed: analysis.unwatched ? 1 : 0,
+    coverageNote: unread
+      ? 'VideoChat3 could not read the video, so nothing in it was examined.'
+      : analysis.unwatched
+        ? `VideoChat3 only watched the first ${Math.round(analysis.unwatched.startSeconds)} of ${Math.round(durationSeconds)} seconds.`
+        : null,
+    // The unread video or unwatched tail is persisted above for the structured
+    // API and has its precise prose note here; verification failures keep
+    // their warning.
+    coverageFailuresDescribed: unread || analysis.unwatched ? 1 : 0,
     log: input.log,
   });
-  input.log.info('answered from VideoChat3', { matches: finalCount, released, ...outcome });
+  input.log.info('answered from VideoChat3', { matches: finalCount, released, spoken: input.spoken?.metrics ?? null, ...outcome });
   return { answered: true, matchCount: finalCount, fallback: null, outcome };
 }
 

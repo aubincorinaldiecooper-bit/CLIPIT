@@ -243,8 +243,9 @@ const envSchema = z.object({
    * indexing is on, the memory is asked first and its candidates go through
    * the same verification; a miss there is not an answer, so the footage is
    * watched. The direct per-chunk footage search (`clipit`) remains for
-   * questions about speech, which VideoChat3 cannot hear, and as the
-   * fallback when the VideoChat3 pipeline itself fails.
+   * questions about speech, which VideoChat3 cannot hear. It is not a
+   * fallback for visual or mixed questions: a failed VideoChat3 read is
+   * recorded as an unexamined video, never re-read chunk by chunk.
    *
    * `simplemem` asks Omni-SimpleMem first and falls back to the direct
    * footage search. `clipit` is the direct per-chunk footage search alone.

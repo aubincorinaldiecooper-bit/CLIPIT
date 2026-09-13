@@ -1,4 +1,4 @@
-import type { ResolvedSearchMode, SearchMode } from '../../domain/types.js';
+import type { EvidenceRequirement, ResolvedSearchMode, SearchMode } from '../../domain/types.js';
 
 /**
  * Decides whether an instruction is about what is *said*, what is *seen*, or
@@ -51,6 +51,20 @@ const SPOKEN_PATTERNS: RegExp[] = [
  */
 const QUOTATION = /["“”‘]|(?<![\p{L}\p{N}])['’]/u;
 
+/**
+ * Things text is written ON. Without these, "the sign that says EXIT" reads
+ * as pure speech and never gets the video that the sign is visible in. They
+ * also decide what a quoted phrase is: beside one of these the phrase is
+ * plausibly what is written there, which nobody need say aloud.
+ */
+const TEXT_SURFACE_PATTERNS: RegExp[] = [
+  /\b(sign|signs|label|labels|banner|poster|billboard|placard)\b/i,
+  /\b(shirt|jersey|hoodie|cap|hat|badge|name ?tag|sticker|decal)\b/i,
+  /\b(caption|captions|subtitle|subtitles|headline|logo|licen[cs]e plate)\b/i,
+  /\b(hood|bumper|windshield|title card|lower third|whiteboard|slide|chart|graph|screen|scoreboard)\b/i,
+  /\b(text|writing|written|printed|says on|reads)\b/i,
+];
+
 const VISUAL_PATTERNS: RegExp[] = [
   /\b(show|shows|showed|showing|shown)\b/i,
   /\b(see|sees|saw|seen|visible|on screen|onscreen)\b/i,
@@ -62,22 +76,25 @@ const VISUAL_PATTERNS: RegExp[] = [
   /\b(crash|crashes|crashed|explosion|explodes|jump|jumps|dunk|trick)\b/i,
   /\b(enter|enters|entered|join|joins|joined|leave|leaves|walks? in)\b/i,
   /\b(wear|wearing|wears|holding|holds|picks? up)\b/i,
-  /\b(scene|shot|frame|footage|camera|screen|gameplay)\b/i,
-  /\b(level|stage|map|menu|scoreboard|hud|replay)\b/i,
-  // Things text is written ON. Without these, "the sign that says EXIT" reads
-  // as pure speech and never gets the video that the sign is visible in.
-  /\b(sign|signs|label|labels|banner|poster|billboard|placard)\b/i,
-  /\b(shirt|jersey|hoodie|cap|hat|badge|name ?tag|sticker|decal)\b/i,
-  /\b(caption|captions|subtitle|subtitles|headline|logo|licen[cs]e plate)\b/i,
-  /\b(hood|bumper|windshield|door|wall|board|title card|lower third)\b/i,
-  /\b(text|writing|written|printed|says on|reads)\b/i,
+  /\b(scene|shot|frame|footage|camera|gameplay)\b/i,
+  /\b(level|stage|map|menu|hud|replay)\b/i,
+  ...TEXT_SURFACE_PATTERNS,
+  /\b(door|wall|board)\b/i,
   /\b(red|blue|green|yellow|black|white|orange|purple)\b/i,
-  /\b(dog|cat|car|ball|door|whiteboard|slide|chart|graph)\b/i,
+  /\b(dog|cat|car|ball)\b/i,
   /\b(celebrat\w+|dance|dancing|laugh\w*|smile|smiling|cry\w*)\b/i,
 ];
 
 export interface ModeClassification {
   mode: ResolvedSearchMode;
+  /**
+   * `both` is returned for two different reasons, and they must not be
+   * confused downstream: a question that mixes spoken and visual signals
+   * needs both ('all'); a question with no signal, or a quoted phrase that
+   * may be spoken or on screen, is searched in both sources and either may
+   * satisfy it ('any').
+   */
+  evidence: EvidenceRequirement;
   spokenScore: number;
   visualScore: number;
   /** Human-readable justification, echoed back on the clip request for debugging. */
@@ -92,6 +109,7 @@ export function classifyInstruction(instruction: string): ModeClassification {
   if (spokenScore === 0 && visualScore === 0) {
     return {
       mode: 'both',
+      evidence: 'any',
       spokenScore,
       visualScore,
       rationale: 'no strong spoken or visual signal; searching frames and transcript',
@@ -106,20 +124,37 @@ export function classifyInstruction(instruction: string): ModeClassification {
     if (QUOTATION.test(text)) {
       return {
         mode: 'both',
+        evidence: 'any',
         spokenScore,
         visualScore,
         rationale: 'quoted phrase may be spoken or visible on screen; searching video and transcript',
       };
     }
-    return { mode: 'transcript', spokenScore, visualScore, rationale: 'instruction refers to spoken content' };
+    return { mode: 'transcript', evidence: 'all', spokenScore, visualScore, rationale: 'instruction refers to spoken content' };
   }
 
   if (visualScore > 0 && spokenScore === 0) {
-    return { mode: 'visual', spokenScore, visualScore, rationale: 'instruction refers to on-screen content' };
+    return { mode: 'visual', evidence: 'all', spokenScore, visualScore, rationale: 'instruction refers to on-screen content' };
   }
 
+  // A quoted phrase is modality-ambiguous when the sentence names a surface
+  // text is written on: `the sign that says "EXIT"` names a sign and "says",
+  // and the sign satisfies it with nobody speaking, so either source may
+  // establish it. Without such a surface, "says" beside a visual condition is
+  // speech beside that condition (`she says "goodbye" while leaving the
+  // room`), and a sentence that mixes spoken and visual conditions needs both.
+  if (QUOTATION.test(text) && TEXT_SURFACE_PATTERNS.some((pattern) => pattern.test(text))) {
+    return {
+      mode: 'both',
+      evidence: 'any',
+      spokenScore,
+      visualScore,
+      rationale: 'quoted phrase beside a surface text is written on; either source may establish it',
+    };
+  }
   return {
     mode: 'both',
+    evidence: 'all',
     spokenScore,
     visualScore,
     rationale: 'instruction mixes spoken and visual signals',
@@ -135,6 +170,8 @@ export interface ResolveModeInput {
 
 export interface ResolvedMode {
   mode: ResolvedSearchMode;
+  /** See ModeClassification.evidence. An explicitly requested `both` is 'all'. */
+  evidence: EvidenceRequirement;
   rationale: string;
 }
 
@@ -146,23 +183,28 @@ export function resolveSearchMode(input: ResolveModeInput): ResolvedMode {
   const requested = input.requested;
 
   let candidate: ResolvedSearchMode;
+  let evidence: EvidenceRequirement;
   let rationale: string;
 
   if (requested === 'auto') {
     const classification = classifyInstruction(input.instruction);
     candidate = classification.mode;
+    evidence = classification.evidence;
     rationale = `auto: ${classification.rationale}`;
   } else {
+    // A caller who asks for both sources by name means both.
     candidate = requested;
+    evidence = 'all';
     rationale = `explicitly requested: ${requested}`;
   }
 
   if (!input.transcriptAvailable && candidate !== 'visual') {
     return {
       mode: 'visual',
+      evidence: 'all',
       rationale: `${rationale}; no transcript available, falling back to visual search`,
     };
   }
 
-  return { mode: candidate, rationale };
+  return { mode: candidate, evidence, rationale };
 }
