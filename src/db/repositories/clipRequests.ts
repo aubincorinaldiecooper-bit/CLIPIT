@@ -175,11 +175,15 @@ export async function startClipRequest(
   return Boolean(row);
 }
 
-export async function recordChunkCompleted(requestId: string): Promise<void> {
-  await queryOne(
-    `UPDATE clip_requests SET chunks_completed = chunks_completed + 1, updated_at = now() WHERE id = $1`,
-    [requestId],
+export async function recordChunkCompleted(requestId: string, deckAttemptId: string): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
+    `UPDATE clip_requests
+        SET chunks_completed = chunks_completed + 1, updated_at = now()
+      WHERE id = $1 AND deck_attempt_id = $2::uuid AND deck_completed_at IS NULL
+      RETURNING id`,
+    [requestId, deckAttemptId],
   );
+  return Boolean(row);
 }
 
 /** A failed chunk is recorded and skipped — it never fails the whole search. */
@@ -209,14 +213,20 @@ export async function recordChunkFailure(
  * inside that window, which the response reports as a caveat rather than a
  * gap.
  */
-export async function recordChunkDegraded(requestId: string, degradation: ChunkDegradation): Promise<void> {
-  await queryOne(
+export async function recordChunkDegraded(
+  requestId: string,
+  degradation: ChunkDegradation,
+  deckAttemptId: string,
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET chunk_degradations = chunk_degradations || $2::jsonb,
             updated_at = now()
-      WHERE id = $1`,
-    [requestId, JSON.stringify([degradation])],
+      WHERE id = $1 AND deck_attempt_id = $3::uuid AND deck_completed_at IS NULL
+      RETURNING id`,
+    [requestId, JSON.stringify([degradation]), deckAttemptId],
   );
+  return Boolean(row);
 }
 
 /**
@@ -229,9 +239,10 @@ export async function recordChunkDegraded(requestId: string, degradation: ChunkD
 export async function recordUncertainMatches(
   requestId: string,
   matches: UncertainMatch[],
-): Promise<void> {
-  if (matches.length === 0) return;
-  await queryOne(
+  deckAttemptId: string,
+): Promise<boolean> {
+  if (matches.length === 0) return true;
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET uncertain_matches = (
               SELECT jsonb_agg(entry)
@@ -243,19 +254,27 @@ export async function recordUncertainMatches(
                 ) AS kept
             ),
             updated_at = now()
-      WHERE id = $1`,
-    [requestId, JSON.stringify(matches)],
+      WHERE id = $1 AND deck_attempt_id = $3::uuid AND deck_completed_at IS NULL
+      RETURNING id`,
+    [requestId, JSON.stringify(matches), deckAttemptId],
   );
+  return Boolean(row);
 }
 
 /** Records the request a correction refers to. */
-export async function recordCorrection(requestId: string, correctionOf: string): Promise<void> {
-  await queryOne(
+export async function recordCorrection(
+  requestId: string,
+  correctionOf: string,
+  deckAttemptId: string,
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET corrected_request_id = $2, updated_at = now()
-      WHERE id = $1`,
-    [requestId, correctionOf],
+      WHERE id = $1 AND deck_attempt_id = $3::uuid AND deck_completed_at IS NULL
+      RETURNING id`,
+    [requestId, correctionOf, deckAttemptId],
   );
+  return Boolean(row);
 }
 
 /**
@@ -283,17 +302,27 @@ export async function recordRetrievalOutcome(
     fallbackReason: FallbackReason | null;
     primaryOutcome: Record<string, unknown> | null;
   },
-): Promise<void> {
-  await queryOne(
+  deckAttemptId: string,
+): Promise<boolean> {
+  const row = await queryOne<{ id: string }>(
     `UPDATE clip_requests
         SET retrieval_primary = $2,
             retrieval_system  = $3,
             fallback_reason   = $4,
             primary_outcome   = $5::jsonb,
             updated_at        = now()
-      WHERE id = $1`,
-    [requestId, input.primary, input.system, input.fallbackReason, input.primaryOutcome === null ? null : JSON.stringify(input.primaryOutcome)],
+      WHERE id = $1 AND deck_attempt_id = $6::uuid
+      RETURNING id`,
+    [
+      requestId,
+      input.primary,
+      input.system,
+      input.fallbackReason,
+      input.primaryOutcome === null ? null : JSON.stringify(input.primaryOutcome),
+      deckAttemptId,
+    ],
   );
+  return Boolean(row);
 }
 
 /**
@@ -691,11 +720,15 @@ export interface NewClipMatch {
   promptVersion?: string | null;
 }
 
-export async function insertMatches(requestId: string, matches: NewClipMatch[]): Promise<ClipMatch[]> {
+export async function insertMatches(
+  requestId: string,
+  matches: NewClipMatch[],
+  deckAttemptId: string,
+): Promise<ClipMatch[]> {
   if (matches.length === 0) return [];
 
   const values: string[] = [];
-  const params: unknown[] = [requestId];
+  const params: unknown[] = [requestId, deckAttemptId];
 
   for (const match of matches) {
     const base = params.length;
@@ -723,7 +756,19 @@ export async function insertMatches(requestId: string, matches: NewClipMatch[]):
        clip_request_id, chunk_id, local_start_seconds, local_end_seconds,
        global_start_seconds, global_end_seconds, description, confidence, source, quote,
        provider, model, prompt_version
-     ) VALUES ${values.join(', ')}
+     )
+     SELECT candidate.*
+       FROM (VALUES ${values.join(', ')}) AS candidate(
+         clip_request_id, chunk_id, local_start_seconds, local_end_seconds,
+         global_start_seconds, global_end_seconds, description, confidence, source, quote,
+         provider, model, prompt_version
+       )
+      WHERE EXISTS (
+        SELECT 1 FROM clip_requests r
+         WHERE r.id = $1
+           AND r.deck_attempt_id = $2::uuid
+           AND r.deck_completed_at IS NULL
+      )
      RETURNING *`,
     params,
   );
@@ -739,14 +784,35 @@ export async function insertMatches(requestId: string, matches: NewClipMatch[]):
  */
 export async function setMatchThumbnails(
   thumbnails: Array<{ matchId: string; thumbnailKey: string }>,
+  fence?: { requestId: string; deckAttemptId: string },
 ): Promise<void> {
   if (thumbnails.length === 0) return;
+  if (!fence) {
+    await queryOne(
+      `UPDATE clip_matches AS m
+          SET thumbnail_key = v.thumbnail_key
+         FROM (SELECT * FROM unnest($1::uuid[], $2::text[]) AS t(id, thumbnail_key)) AS v
+        WHERE m.id = v.id`,
+      [thumbnails.map((t) => t.matchId), thumbnails.map((t) => t.thumbnailKey)],
+    );
+    return;
+  }
   await queryOne(
     `UPDATE clip_matches AS m
         SET thumbnail_key = v.thumbnail_key
-       FROM (SELECT * FROM unnest($1::uuid[], $2::text[]) AS t(id, thumbnail_key)) AS v
-      WHERE m.id = v.id`,
-    [thumbnails.map((t) => t.matchId), thumbnails.map((t) => t.thumbnailKey)],
+       FROM (SELECT * FROM unnest($1::uuid[], $2::text[]) AS t(id, thumbnail_key)) AS v,
+            clip_requests AS r
+      WHERE m.id = v.id
+        AND r.id = m.clip_request_id
+        AND r.id = $3::uuid
+        AND r.deck_attempt_id = $4::uuid
+        AND r.deck_completed_at IS NULL`,
+    [
+      thumbnails.map((t) => t.matchId),
+      thumbnails.map((t) => t.thumbnailKey),
+      fence.requestId,
+      fence.deckAttemptId,
+    ],
   );
 }
 

@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest';
 const repo = readFileSync(path.join(__dirname, '..', 'src/db/repositories/clipRequests.ts'), 'utf8');
 const media = readFileSync(path.join(__dirname, '..', 'src/db/repositories/verticalMedia.ts'), 'utf8');
 const handler = readFileSync(path.join(__dirname, '..', 'src/worker/handlers/clipSearch.ts'), 'utf8');
+const thumbnails = readFileSync(path.join(__dirname, '..', 'src/services/media/thumbnails.ts'), 'utf8');
 
 const between = (src: string, from: string, to: string) => src.slice(src.indexOf(from), src.indexOf(to));
 
@@ -65,6 +66,32 @@ describe('a superseded attempt must not release an answer', () => {
     expect(videoChat3).toContain('recordChunkFailure(input.clipRequestId');
     expect(videoChat3).toContain('input.deckAttemptId!');
     expect(videoChat3).toContain('discarding stale VideoChat3 coverage');
+  });
+
+  it('fences every interim search write, not only start and completion', () => {
+    const completed = between(repo, 'export async function recordChunkCompleted', '/** A failed chunk');
+    expect(completed).toContain('deck_attempt_id = $2::uuid');
+    expect(completed).toContain('RETURNING id');
+
+    const degraded = between(repo, 'export async function recordChunkDegraded', '/**\n * Records moments the threshold discarded');
+    expect(degraded).toContain('deck_attempt_id = $3::uuid');
+
+    const uncertain = between(repo, 'export async function recordUncertainMatches', '/** Records the request a correction refers to.');
+    expect(uncertain).toContain('deck_attempt_id = $3::uuid');
+
+    const retrieval = between(repo, 'export async function recordRetrievalOutcome', '/**\n * Declare that this request owes a post-ready deck');
+    expect(retrieval).toContain('deck_attempt_id = $6::uuid');
+
+    const inserts = between(repo, 'export async function insertMatches', '/**\n * Attaches stills to matches');
+    expect(inserts).toContain('r.deck_attempt_id = $2::uuid');
+    expect(inserts).toContain('r.deck_completed_at IS NULL');
+    expect(handler).toContain('insertMatches(clipRequestId, found, deckAttemptId)');
+    expect(handler).toContain('insertMatches(input.clipRequestId, found, input.deckAttemptId!)');
+
+    const thumbnailWrite = between(repo, 'export async function setMatchThumbnails', '/**\n * Videos holding matches');
+    expect(thumbnailWrite).toContain('r.deck_attempt_id = $4::uuid');
+    expect(thumbnails).toContain('setMatchThumbnails(attached, input.attemptFence)');
+    expect(handler).toContain('attemptFence: { requestId: clipRequestId, deckAttemptId }');
   });
 
   it('fences the release to the attempt that planned it, and releases and completes in one statement', () => {

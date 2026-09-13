@@ -244,7 +244,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       });
       // The strongest signal there is — a person saying our answer was wrong.
       // Stored so it survives the footage and can be counted later.
-      await recordCorrection(clipRequestId, previous.id);
+      await recordCorrection(clipRequestId, previous.id, deckAttemptId);
       log.info('treating this as a correction rather than a new question', {
         said: request.instruction,
         lookingAgainFor: instruction,
@@ -371,6 +371,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
             mode: 'transcript',
             videoId: video.id,
             clipRequestId,
+            deckAttemptId,
             workDir: dir,
             tally,
             log,
@@ -419,7 +420,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         system: 'simplemem',
         fallbackReason: null,
         primaryOutcome: fromSimpleMem.outcome,
-      });
+      }, deckAttemptId);
       outcome = 'completed';
       searchMode = resolved.mode;
       chunkCount = 0;
@@ -461,7 +462,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           system: 'videochat3',
           fallbackReason: null,
           primaryOutcome,
-        });
+        }, deckAttemptId);
         outcome = 'completed';
         searchMode = resolved.mode;
         chunkCount = 0;
@@ -472,7 +473,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         system: null,
         fallbackReason: fromVideoChat3.fallback,
         primaryOutcome,
-      });
+      }, deckAttemptId);
       log.info('VideoChat3 handed the question on to the direct footage search', { reason: fromVideoChat3.fallback });
     } else if (env.RETRIEVAL_PRIMARY === 'simplemem') {
       await recordRetrievalOutcome(clipRequestId, {
@@ -480,7 +481,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
         system: null,
         fallbackReason: fromSimpleMem.fallback,
         primaryOutcome: fromSimpleMem.outcome,
-      });
+      }, deckAttemptId);
       log.info('Omni-SimpleMem handed the question on', { reason: fromSimpleMem.fallback });
     }
 
@@ -539,6 +540,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
           mode: resolved.mode,
           videoId: video.id,
           clipRequestId,
+          deckAttemptId,
           workDir: dir,
           tally,
           log,
@@ -551,12 +553,12 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
             // coverage from the row, so a degradation left in memory would
             // report a recovered chunk as clean once the worker moved on —
             // the exact silent coverage loss this work exists to remove.
-            await recordChunkDegraded(clipRequestId, degradation);
+            await recordChunkDegraded(clipRequestId, degradation, deckAttemptId);
           },
         });
 
-        if (found.length > 0) await insertMatches(clipRequestId, found);
-        await recordChunkCompleted(clipRequestId);
+        if (found.length > 0) await insertMatches(clipRequestId, found, deckAttemptId);
+        await recordChunkCompleted(clipRequestId, deckAttemptId);
 
         completed += 1;
         totalMatches += found.length;
@@ -628,7 +630,7 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       const finalCount = await aggregateStoredMatches(clipRequestId, chunks, deckAttemptId);
 
       // After aggregation, because merging rewrites match rows and their ids.
-      await attachSearchThumbnails({ clipRequestId, video, workDir: dir, log });
+      await attachSearchThumbnails({ clipRequestId, deckAttemptId, video, workDir: dir, log });
 
       // The moments are the answer. They are released the moment they have
       // their pictures — nothing is cut, framed or encoded until somebody
@@ -802,7 +804,7 @@ async function aggregateStoredMatches(
   // the deck, which is a great deal better than reaching into someone's
   // library and deleting what they chose.
   await clearPreviousAttempt(clipRequestId, logger.child({ clipRequestId }), deckAttemptId);
-  await insertMatches(clipRequestId, rows);
+  await insertMatches(clipRequestId, rows, deckAttemptId!);
 
   logger.info('merged overlapping matches', {
     clipRequestId,
@@ -1039,11 +1041,12 @@ export async function completeRequest(input: {
 
 async function attachSearchThumbnails(input: {
   clipRequestId: string;
+  deckAttemptId: string;
   video: Video;
   workDir: string;
   log: Logger;
 }): Promise<void> {
-  const { clipRequestId, video, workDir, log } = input;
+  const { clipRequestId, deckAttemptId, video, workDir, log } = input;
   if (!video.proxyStorageKey) return;
 
   // The request row already says how its moments will be delivered; the
@@ -1062,6 +1065,7 @@ async function attachSearchThumbnails(input: {
     matches,
     workDir,
     log,
+    attemptFence: { requestId: clipRequestId, deckAttemptId },
   });
 }
 
@@ -1072,6 +1076,7 @@ interface SearchSingleChunkInput {
   mode: ResolvedSearchMode;
   videoId: string;
   clipRequestId: string;
+  deckAttemptId: string;
   workDir: string;
   tally: UsageTally;
   /** Records that a chunk was searched with less evidence than intended. */
@@ -1307,10 +1312,10 @@ async function answerFromSimpleMem(input: {
     input.requestedResultCount,
   );
   if (found.length === 0) return { matchCount: 0, released: false, fallback: 'no_candidates', outcome };
-  await insertMatches(input.clipRequestId, found);
+  await insertMatches(input.clipRequestId, found, input.deckAttemptId!);
   const finalCount = await aggregateStoredMatches(input.clipRequestId, input.chunks, input.deckAttemptId);
   await withWorkDir(`simplemem-${input.clipRequestId}`, async (dir) => {
-    await attachSearchThumbnails({ clipRequestId: input.clipRequestId, video: input.video, workDir: dir, log: input.log });
+    await attachSearchThumbnails({ clipRequestId: input.clipRequestId, deckAttemptId: input.deckAttemptId!, video: input.video, workDir: dir, log: input.log });
   });
   const released = await completeRequest({
     clipRequestId: input.clipRequestId,
@@ -1494,10 +1499,10 @@ async function answerFromVideoChat3(input: {
   );
   let finalCount = 0;
   if (found.length > 0) {
-    await insertMatches(input.clipRequestId, found);
+    await insertMatches(input.clipRequestId, found, input.deckAttemptId!);
     finalCount = await aggregateStoredMatches(input.clipRequestId, input.chunks, input.deckAttemptId);
     await withWorkDir(`videochat3-${input.clipRequestId}`, async (dir) => {
-      await attachSearchThumbnails({ clipRequestId: input.clipRequestId, video: input.video, workDir: dir, log: input.log });
+      await attachSearchThumbnails({ clipRequestId: input.clipRequestId, deckAttemptId: input.deckAttemptId!, video: input.video, workDir: dir, log: input.log });
     });
   }
   const durationSeconds = input.video.durationSeconds ?? analysis.durationSeconds;
@@ -1642,6 +1647,7 @@ async function searchSingleChunk(input: SearchSingleChunkInput): Promise<NewClip
           description: match.description,
         }];
       }),
+      input.deckAttemptId,
     );
 
     input.log.warn('discarded low-confidence matches', {
