@@ -46,10 +46,15 @@ describe('a superseded attempt must not release an answer', () => {
     expect(failure).toContain('deck_attempt_id = $3::uuid');
     expect(failure).toContain('RETURNING id');
 
-    const simpleMem = between(handler, 'async function answerFromSimpleMem', '/**\n * Answers from what was written down');
+    const simpleMem = between(handler, 'async function answerFromSimpleMem', 'async function answerFromVideoChat3');
     expect(simpleMem).toContain('recordChunkFailure(input.clipRequestId');
     expect(simpleMem).toContain('input.deckAttemptId!');
     expect(simpleMem).toContain('discarding stale SimpleMem coverage');
+
+    const videoChat3 = between(handler, 'async function answerFromVideoChat3', 'async function searchSingleChunk');
+    expect(videoChat3).toContain('recordChunkFailure(input.clipRequestId');
+    expect(videoChat3).toContain('input.deckAttemptId!');
+    expect(videoChat3).toContain('discarding stale VideoChat3 coverage');
   });
 
   it('fences the release to the attempt that planned it, and releases and completes in one statement', () => {
@@ -102,5 +107,49 @@ describe('a question may be sent before the video is prepared', () => {
     // The wait comes BEFORE the segment list is read — there is nothing to
     // read until the video is prepared.
     expect(handler.indexOf('preparationWait(video.status')).toBeLessThan(handler.indexOf('const chunks = await listChunks(video.id)'));
+  });
+});
+
+describe('an uploaded video is read by VideoChat3 before anything re-reads it per chunk', () => {
+  /**
+   * The order is the product: memory is asked first (a hit is verified
+   * against the footage), the footage is then watched the way an internet
+   * video is, and the per-chunk search — many model calls over the same
+   * video — runs only for a question about speech or when the watch itself
+   * failed. A watch that verified nothing completes the request: it read
+   * every second, so its silence is a finding, not a memory's blank.
+   */
+  it('asks memory, then watches, and only then falls back to the per-chunk search', () => {
+    const memory = handler.indexOf('const fromSimpleMem = await answerFromSimpleMem(');
+    const watch = handler.indexOf('const fromVideoChat3 = await answerFromVideoChat3(');
+    const perChunk = handler.indexOf('mapWithConcurrency(chunks, env.OPENROUTER_VIDEO_CONCURRENCY');
+    expect(memory).toBeGreaterThan(-1);
+    expect(watch).toBeGreaterThan(memory);
+    expect(perChunk).toBeGreaterThan(watch);
+  });
+
+  it('completes on the watch\'s own answer, and hands on only speech and failure', () => {
+    const videoChat3 = between(handler, 'async function answerFromVideoChat3', 'async function searchSingleChunk');
+    expect(videoChat3).toContain("if (input.mode === 'transcript') {");
+    expect(videoChat3).toContain("fallback: 'unsupported_mode'");
+    expect(videoChat3).toContain("fallback: 'primary_failed'");
+    expect(videoChat3).not.toContain("fallback: 'no_candidates'");
+    expect(videoChat3).toContain("answeredFrom: 'footage'");
+    expect(videoChat3).toContain("retrievalSystem: 'videochat3'");
+    // A memory miss is consulted, then watched; both hand-offs are recorded.
+    expect(handler).toContain("primary: 'videochat3',\n          system: 'videochat3',");
+    expect(handler).toContain("fallbackReason: fromVideoChat3.fallback,");
+  });
+
+  it('never reports the seconds after the watch cap as empty', () => {
+    const videoChat3 = between(handler, 'async function answerFromVideoChat3', 'async function searchSingleChunk');
+    expect(videoChat3).toContain('if (analysis.unwatched) {');
+    expect(videoChat3).toContain("code: 'not_read_yet'");
+    expect(videoChat3).toContain('coverageFailuresDescribed: analysis.unwatched ? 1 : 0');
+  });
+
+  it('memory stays a memory: consulted under the VideoChat3 primary only when uploads are indexed', () => {
+    const simpleMem = between(handler, 'async function answerFromSimpleMem', 'async function answerFromVideoChat3');
+    expect(simpleMem).toContain("(env.RETRIEVAL_PRIMARY === 'videochat3' && env.SIMPLEMEM_INDEX_ENABLED)");
   });
 });

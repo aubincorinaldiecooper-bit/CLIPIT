@@ -14,15 +14,36 @@ export interface InternetVideoMoment {
   description: string;
 }
 
+/**
+ * A stage that could not judge one flagged stretch. The seconds are carried
+ * so a caller can say which stretch went unexamined rather than only that
+ * something did.
+ */
+export interface InternetVideoFailure {
+  id: string;
+  reason: string;
+  startSeconds?: number;
+  endSeconds?: number;
+}
+
 export interface InternetVideoAnalysis {
   model: string;
   revision: string;
   durationSeconds: number;
   watchedEvents: number;
+  /**
+   * How far the watch read. The watcher reads frames in order and stops once
+   * it has flagged `maxEvents` moments, so the end of the last flagged moment
+   * is where reading ended; fewer flagged means it read to the end.
+   */
+  watchedThroughSeconds: number;
   verified: InternetVideoMoment[];
-  failures: Array<{ id: string; reason: string }>;
+  failures: InternetVideoFailure[];
   metrics: Record<string, unknown>;
 }
+
+/** The most moments one watch may flag before it stops reading; mirrors the client's default. */
+export const DEFAULT_WATCH_MAX_EVENTS = 64;
 
 /**
  * Understand one accessible internet-video candidate.
@@ -37,12 +58,19 @@ export async function analyzeInternetVideo(input: {
   videoUrl: string;
   videoKey: string;
   expectedBytes?: number;
+  /** The most moments the watch may flag before it stops reading. */
+  maxEvents?: number;
 }): Promise<InternetVideoAnalysis> {
+  const maxEvents = input.maxEvents ?? DEFAULT_WATCH_MAX_EVENTS;
   const watched = await watchWithVideoChat3({
     videoUrl: input.videoUrl,
     query: input.query,
     expectedBytes: input.expectedBytes,
+    maxEvents,
   });
+  const watchedThroughSeconds = watched.events.length >= maxEvents
+    ? (watched.events.at(-1)?.endSeconds ?? watched.durationSeconds)
+    : watched.durationSeconds;
 
   const intervals = watched.events.map((event, index) => ({
     id: `watch-${index}`,
@@ -50,12 +78,18 @@ export async function analyzeInternetVideo(input: {
     end: event.endSeconds,
     description: event.description,
   }));
+  const intervalById = new Map(intervals.map((row) => [row.id, row]));
+  const failureAt = (id: string, reason: string): InternetVideoFailure => {
+    const interval = intervalById.get(id);
+    return interval ? { id, reason, startSeconds: interval.start, endSeconds: interval.end } : { id, reason };
+  };
 
   if (intervals.length === 0) {
     return {
       model: watched.model,
       revision: watched.revision,
       durationSeconds: watched.durationSeconds,
+      watchedThroughSeconds,
       watchedEvents: 0,
       verified: [],
       failures: [],
@@ -76,7 +110,6 @@ export async function analyzeInternetVideo(input: {
   const queryVector = queryEmbedding.embedded.find((row) => row.id === 'query')?.embedding;
   if (!queryVector) throw new Error('Qwen embedding service returned no query vector');
 
-  const intervalById = new Map(intervals.map((row) => [row.id, row]));
   const embeddingById = new Map(intervalEmbeddings.embedded.map((row) => [row.id, row.embedding]));
   const embeddingRanked = intervals
     .filter((row) => embeddingById.has(row.id))
@@ -86,16 +119,14 @@ export async function analyzeInternetVideo(input: {
     }))
     .sort((left, right) => right.score - left.score);
 
-  const failures = intervalEmbeddings.failed.map((failure) => ({
-    id: failure.id,
-    reason: `embedding failed: ${failure.reason}`,
-  }));
+  const failures = intervalEmbeddings.failed.map((failure) => failureAt(failure.id, `embedding failed: ${failure.reason}`));
 
   if (embeddingRanked.length === 0) {
     return {
       model: watched.model,
       revision: watched.revision,
       durationSeconds: watched.durationSeconds,
+      watchedThroughSeconds,
       watchedEvents: watched.events.length,
       verified: [],
       failures,
@@ -114,10 +145,7 @@ export async function analyzeInternetVideo(input: {
     candidates: embeddingRanked.map(({ id, start, end }) => ({ id, start, end })),
   });
 
-  failures.push(...reranked.failed.map((failure) => ({
-    id: failure.id,
-    reason: `reranker failed: ${failure.reason}`,
-  })));
+  failures.push(...reranked.failed.map((failure) => failureAt(failure.id, `reranker failed: ${failure.reason}`)));
 
   const ordered = reranked.ranked
     .map((row) => intervalById.get(row.id))
@@ -128,6 +156,7 @@ export async function analyzeInternetVideo(input: {
       model: watched.model,
       revision: watched.revision,
       durationSeconds: watched.durationSeconds,
+      watchedThroughSeconds,
       watchedEvents: watched.events.length,
       verified: [],
       failures,
@@ -146,10 +175,7 @@ export async function analyzeInternetVideo(input: {
     candidates: ordered.map(({ id, start, end }) => ({ id, start, end })),
   });
 
-  failures.push(...verified.failed.map((failure) => ({
-    id: failure.id,
-    reason: `VideoChat3 verification failed: ${failure.reason}`,
-  })));
+  failures.push(...verified.failed.map((failure) => failureAt(failure.id, `VideoChat3 verification failed: ${failure.reason}`)));
 
   const moments = verified.results
     .filter((result) => result.match && result.confidence >= env.MIN_MATCH_CONFIDENCE)
@@ -165,6 +191,7 @@ export async function analyzeInternetVideo(input: {
     model: verified.model,
     revision: verified.revision,
     durationSeconds: watched.durationSeconds,
+    watchedThroughSeconds,
     watchedEvents: watched.events.length,
     verified: moments,
     failures,

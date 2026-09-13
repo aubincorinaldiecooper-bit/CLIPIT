@@ -39,14 +39,13 @@ Cleanup is different: code and documentation that describe a retired architectur
 
 ## Current retrieval architecture
 
-The current memory system is Omni-SimpleMem.
+The engine that reads footage is VideoChat3 on Modal, with Qwen embeddings and the Qwen reranker between its two reads. Omni-SimpleMem is the persistent memory around that engine.
 
 1. After preprocessing, SimpleMem indexes the video when `SIMPLEMEM_INDEX_ENABLED=true`.
-2. When `RETRIEVAL_PRIMARY=simplemem`, a question goes to SimpleMem first.
-3. SimpleMem returns timestamped candidates. Those candidates are leads, not final evidence.
-4. Clipit opens the corresponding actual footage and verifies it through the configured video provider.
-5. If memory is unavailable, incomplete, or inconclusive, Clipit may fall back to direct actual-footage search.
-6. A final conversational answer is written only from grounded evidence already produced by the retrieval path.
+2. With `RETRIEVAL_PRIMARY=videochat3` (the default), a question about an uploaded video goes to SimpleMem first when uploads are indexed. SimpleMem returns timestamped candidates. Those candidates are leads, not final evidence; they go through Qwen embedding, Qwen reranking, and VideoChat3 verification of the actual footage.
+3. When memory has no verified answer, the footage is read the way an internet video is read: VideoChat3 watches the analysis proxy for the question, Qwen embeddings and the Qwen reranker order what it flagged, and VideoChat3 re-opens each candidate before it becomes evidence. A watch that verified nothing completes the request; the stretch after the watch's event cap, if it is reached, is recorded as unexamined.
+4. The direct per-chunk footage search (OpenRouter/Qwen, or MiniCPM-V on Modal) runs only for a question about speech, which the watcher cannot hear, and when the VideoChat3 pipeline itself fails. With `RETRIEVAL_PRIMARY=simplemem` it is the fallback for every memory miss; with `clipit` it is the only path.
+5. A final conversational answer is written only from grounded evidence already produced by the retrieval path.
 
 There is no upload-time notes/scene-index retrieval system and no Media Index runtime path. Do not reintroduce either as a fallback.
 

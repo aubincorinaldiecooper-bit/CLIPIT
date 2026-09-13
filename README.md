@@ -47,7 +47,8 @@ The sidecar preserves timestamped memories, stores durable archives in S3-compat
 Important controls:
 
 - `SIMPLEMEM_INDEX_ENABLED=true` indexes videos after preprocessing.
-- `RETRIEVAL_PRIMARY=simplemem` makes SimpleMem the first retrieval path.
+- `RETRIEVAL_PRIMARY=videochat3` (the default) reads an uploaded video the way an internet video is read: VideoChat3 watches the analysis proxy for the question, Qwen embeddings and the Qwen reranker order what it flagged, and VideoChat3 re-opens each candidate before it becomes evidence. When uploads are indexed, SimpleMem is asked first and a hit goes through the same verification; a miss is not an answer, so the footage is watched. The direct per-chunk footage search runs only for questions about speech (the watcher has no sound) and when the VideoChat3 pipeline itself fails. Needs `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` on the worker.
+- `RETRIEVAL_PRIMARY=simplemem` makes SimpleMem the first retrieval path, with the per-chunk footage search as the fallback.
 - `SIMPLEMEM_URL` points at the internal sidecar.
 - `SIMPLEMEM_INTERNAL_TOKEN` authenticates internal requests.
 

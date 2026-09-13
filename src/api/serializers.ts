@@ -268,7 +268,9 @@ function clipRequestProgress(request: ClipRequest, candidatesFound: number): Cli
         ? // A question answered from memory reads no segments at all, so
           // counting them would report 0 of 0 while it works.
           total === 0
-          ? 'Checking what I remember about this video'
+          ? // Memory is checked first, then the footage is watched; neither
+            // reads segments, so the count would say 0 of 0 while it works.
+            'Looking through the video for your question'
           : `Searched ${done} of ${total} segments`
         : request.status === 'completed'
           ? // Never claim a whole video was searched when part of it was not.
@@ -278,6 +280,12 @@ function clipRequestProgress(request: ClipRequest, candidatesFound: number): Cli
             // saying otherwise would dress a recollection up as a search.
             request.answeredFrom === 'simplemem'
               ? 'Answered from Omni-SimpleMem video memory'
+              : request.retrievalSystem === 'videochat3'
+              ? // No segments were read: VideoChat3 watched the proxy itself. A
+                // recorded failure is a stretch it did not reach or could not verify.
+                request.chunksFailed > 0
+                ? `VideoChat3 watched the video — ${request.chunksFailed} stretch${request.chunksFailed === 1 ? '' : 'es'} could not be examined`
+                : 'VideoChat3 watched the whole video'
               : request.chunksFailed > 0
               ? `Searched ${request.chunksCompleted} of ${total} segments — ${request.chunksFailed} could not be examined`
               : `Search complete (${total} segments)`
