@@ -128,11 +128,14 @@ describe('an uploaded video is read by VideoChat3 before anything re-reads it pe
     expect(perChunk).toBeGreaterThan(watch);
   });
 
-  it('completes on the watch\'s own answer, and hands on only speech and failure', () => {
+  it('completes on the watch\'s own answer, and hands on speech only — never a failure', () => {
     const videoChat3 = between(handler, 'async function answerFromVideoChat3', 'async function searchSingleChunk');
     expect(videoChat3).toContain("if (input.mode === 'transcript') {");
     expect(videoChat3).toContain("fallback: 'unsupported_mode'");
-    expect(videoChat3).toContain("fallback: 'primary_failed'");
+    // A failed watch is a whole-video coverage gap; a failed signing is a
+    // failed delivery the queue retries. Neither is a reason to read the
+    // video with the retired per-chunk watcher.
+    expect(videoChat3).not.toContain("fallback: 'primary_failed'");
     expect(videoChat3).not.toContain("fallback: 'no_candidates'");
     expect(videoChat3).toContain("answeredFrom: 'footage'");
     expect(videoChat3).toContain("retrievalSystem: 'videochat3'");
@@ -145,7 +148,7 @@ describe('an uploaded video is read by VideoChat3 before anything re-reads it pe
     const videoChat3 = between(handler, 'async function answerFromVideoChat3', 'async function searchSingleChunk');
     expect(videoChat3).toContain('if (analysis.unwatched) {');
     expect(videoChat3).toContain("code: 'not_read_yet'");
-    expect(videoChat3).toContain('coverageFailuresDescribed: analysis.unwatched ? 1 : 0');
+    expect(videoChat3).toContain('coverageFailuresDescribed: unread || analysis.unwatched ? 1 : 0');
   });
 
   it('memory stays a memory: consulted under the VideoChat3 primary only when uploads are indexed', () => {

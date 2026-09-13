@@ -407,6 +407,18 @@ export async function handleClipSearch(job: Job<ClipSearchJob>): Promise<void> {
       log.info('Omni-SimpleMem handed the question on', { reason: fromSimpleMem.fallback });
     }
 
+    if (env.RETRIEVAL_PRIMARY === 'videochat3' && resolved.mode !== 'transcript') {
+      // Unreachable by design, and kept so it stays that way: under the
+      // VideoChat3 primary every visual and mixed question is answered
+      // above, with moments or with an honest "nothing verified" and the
+      // unexamined stretches on record. The per-chunk footage search below
+      // is the speech path only. Reaching here would mean a hand-off was
+      // added that routes footage questions back into the retired watcher.
+      throw new Error(
+        `invariant violated: a ${resolved.mode} question reached the per-chunk footage search under RETRIEVAL_PRIMARY=videochat3`,
+      );
+    }
+
     // One cheap check before uploading megabytes per chunk: a model without
     // video endpoints refuses every chunk identically, and finding that out
     // once is worth more than finding it out N times.
@@ -1054,9 +1066,11 @@ async function answerFromSimpleMem(input: {
     verified = await rerankSimpleMemCandidates({
       query: input.instruction,
       candidates: mapping.candidates,
+      videoId: input.video.id,
       videoUrl,
       videoKey: input.video.proxyStorageKey,
       expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? 0,
+      mode: input.mode,
       onUsage: (usage) => {
         void recordModelUsage({
           ...usage,
@@ -1221,33 +1235,30 @@ async function answerFromVideoChat3(input: {
     };
   }
   if (!input.video.proxyStorageKey) {
-    return {
-      answered: false,
-      matchCount: 0,
-      fallback: 'primary_failed',
-      outcome: { error: 'Video has no analysis proxy to watch' },
-    };
+    // A ready video always has one. Without it there is nothing to watch,
+    // and the per-chunk search is not the answer: it is not the engine for
+    // visual or mixed questions. The request fails and says why.
+    throw new Error('Video has no analysis proxy to watch');
   }
 
   await startClipRequest(input.clipRequestId, { chunksTotal: 0, resolvedMode: input.mode });
-  let analysis: UploadedVideoAnalysis;
-  try {
-    const object = await getStorage().head(input.video.proxyStorageKey);
-    const videoUrl = await getStorage().createDownloadUrl(input.video.proxyStorageKey, {
-      expiresInSeconds: VIDEOCHAT3_SOURCE_URL_SECONDS,
-    });
-    analysis = await analyzeUploadedVideo({
-      query: input.instruction,
-      videoUrl,
-      videoKey: input.video.proxyStorageKey,
-      expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? undefined,
-      durationSeconds: input.video.durationSeconds,
-    });
-  } catch (error) {
-    const detail = errorMessage(error);
-    input.log.warn('the VideoChat3 pipeline could not read the footage; using the direct footage search', { err: error });
-    return { answered: false, matchCount: 0, fallback: 'primary_failed', outcome: { error: detail } };
-  }
+  // Signing the proxy can fail (storage down); that is a failure of this
+  // delivery, retried by the queue, never a reason to read the video some
+  // other way. analyzeUploadedVideo itself does not throw: a watch or
+  // verification failure comes back as a whole-video coverage gap.
+  const object = await getStorage().head(input.video.proxyStorageKey);
+  const videoUrl = await getStorage().createDownloadUrl(input.video.proxyStorageKey, {
+    expiresInSeconds: VIDEOCHAT3_SOURCE_URL_SECONDS,
+  });
+  const analysis: UploadedVideoAnalysis = await analyzeUploadedVideo({
+    query: input.instruction,
+    videoId: input.video.id,
+    videoUrl,
+    videoKey: input.video.proxyStorageKey,
+    expectedBytes: object?.sizeBytes ?? input.video.sizeBytes ?? undefined,
+    durationSeconds: input.video.durationSeconds,
+    mode: input.mode,
+  });
 
   const outcome = {
     watchedEvents: analysis.watchedEvents,
@@ -1269,19 +1280,31 @@ async function answerFromVideoChat3(input: {
     input.chunks.find((item) => seconds >= item.globalStartSeconds && seconds < item.globalEndSeconds)
       ?? input.chunks.at(-1);
   const gaps: Array<{ startSeconds: number; endSeconds: number; message: string }> = [];
-  if (analysis.unwatched) {
+  // A read that failed outright is one gap — the whole video, with the reason —
+  // not that gap plus a second copy of it dressed as "the stretch after the
+  // last flagged moment". The record must add up to the video, not to twice it.
+  const unread = analysis.failures.find((failure) => failure.id === 'whole-video-read');
+  if (unread && unread.startSeconds !== undefined && unread.endSeconds !== undefined) {
     gaps.push({
-      ...analysis.unwatched,
-      message: `VideoChat3 stopped watching at ${Math.round(analysis.unwatched.startSeconds)}s: it had flagged ${WATCH_MAX_EVENTS} moments, the most one read may hold.`,
+      startSeconds: unread.startSeconds,
+      endSeconds: unread.endSeconds,
+      message: `VideoChat3 could not read the video, so nothing in it was examined: ${unread.reason}`,
     });
-  }
-  for (const failure of analysis.failures) {
-    if (failure.startSeconds === undefined || failure.endSeconds === undefined) continue;
-    gaps.push({
-      startSeconds: failure.startSeconds,
-      endSeconds: failure.endSeconds,
-      message: `VideoChat3 flagged this stretch, but it could not be verified: ${failure.reason}`,
-    });
+  } else {
+    if (analysis.unwatched) {
+      gaps.push({
+        ...analysis.unwatched,
+        message: `VideoChat3 stopped watching at ${Math.round(analysis.unwatched.startSeconds)}s: it had flagged ${WATCH_MAX_EVENTS} moments, the most one read may hold.`,
+      });
+    }
+    for (const failure of analysis.failures) {
+      if (failure.startSeconds === undefined || failure.endSeconds === undefined) continue;
+      gaps.push({
+        startSeconds: failure.startSeconds,
+        endSeconds: failure.endSeconds,
+        message: `VideoChat3 flagged this stretch, but it could not be verified: ${failure.reason}`,
+      });
+    }
   }
   for (const gap of gaps) {
     const chunk = chunkAt(gap.startSeconds);
@@ -1322,12 +1345,15 @@ async function answerFromVideoChat3(input: {
     deckAttemptId: input.deckAttemptId,
     requestedResultCount: input.requestedResultCount,
     question: input.instruction,
-    coverageNote: analysis.unwatched
-      ? `VideoChat3 only watched the first ${Math.round(analysis.unwatched.startSeconds)} of ${Math.round(durationSeconds)} seconds.`
-      : null,
-    // The unwatched tail is persisted above for the structured API and has
-    // its precise prose note here; verification failures keep their warning.
-    coverageFailuresDescribed: analysis.unwatched ? 1 : 0,
+    coverageNote: unread
+      ? 'VideoChat3 could not read the video, so nothing in it was examined.'
+      : analysis.unwatched
+        ? `VideoChat3 only watched the first ${Math.round(analysis.unwatched.startSeconds)} of ${Math.round(durationSeconds)} seconds.`
+        : null,
+    // The unread video or unwatched tail is persisted above for the structured
+    // API and has its precise prose note here; verification failures keep
+    // their warning.
+    coverageFailuresDescribed: unread || analysis.unwatched ? 1 : 0,
     log: input.log,
   });
   input.log.info('answered from VideoChat3', { matches: finalCount, released, ...outcome });

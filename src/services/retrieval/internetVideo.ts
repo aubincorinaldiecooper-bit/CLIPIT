@@ -1,4 +1,3 @@
-import { env } from '../../config/env.js';
 import {
   cosineSimilarity,
   embedQuery,
@@ -6,6 +5,7 @@ import {
   rerankVideoIntervals,
 } from './qwenModal.js';
 import { verifyWithVideoChat3, watchWithVideoChat3 } from '../videochat3/client.js';
+import { passesEvidenceGate } from './mixedEvidence.js';
 
 export interface InternetVideoMoment {
   startSeconds: number;
@@ -178,7 +178,7 @@ export async function analyzeInternetVideo(input: {
   failures.push(...verified.failed.map((failure) => failureAt(failure.id, `VideoChat3 verification failed: ${failure.reason}`)));
 
   const moments = verified.results
-    .filter((result) => result.match && result.confidence >= env.MIN_MATCH_CONFIDENCE)
+    .filter((result) => passesEvidenceGate(result))
     .map((result) => ({
       startSeconds: result.startSeconds,
       endSeconds: result.endSeconds,

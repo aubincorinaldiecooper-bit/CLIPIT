@@ -14,6 +14,8 @@ vi.mock('../src/services/retrieval/qwenModal.js', () => ({
 }));
 
 vi.mock('../src/services/videochat3/client.js', () => ({ verifyWithVideoChat3 }));
+const listTranscriptSegmentsInRange = vi.fn();
+vi.mock('../src/db/repositories/transcripts.js', () => ({ listTranscriptSegmentsInRange }));
 
 const { rerankSimpleMemCandidates } = await import('../src/services/retrieval/simplemem/rerank.js');
 
@@ -87,6 +89,8 @@ describe('Omni-SimpleMem candidate verification', () => {
     const result = await rerankSimpleMemCandidates({
       query: 'find the right sign',
       candidates,
+      videoId: 'video-1',
+      mode: 'visual',
       videoUrl: 'https://signed/video',
       videoKey: 'proxy',
       expectedBytes: 123,
@@ -140,7 +144,7 @@ describe('Omni-SimpleMem candidate verification', () => {
     });
 
     const result = await rerankSimpleMemCandidates({
-      query: 'find it', candidates, videoUrl: 'https://signed/video', videoKey: 'proxy', expectedBytes: 123,
+      query: 'find it', candidates, videoId: 'video-1', mode: 'visual', videoUrl: 'https://signed/video', videoKey: 'proxy', expectedBytes: 123,
     });
 
     expect(rerankVideoIntervals.mock.calls[0]?.[0].candidates).toHaveLength(1);

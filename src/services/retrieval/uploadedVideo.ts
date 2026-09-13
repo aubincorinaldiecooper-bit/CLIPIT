@@ -1,10 +1,13 @@
-import { DEFAULT_WATCH_MAX_EVENTS, analyzeInternetVideo, type InternetVideoAnalysis } from './internetVideo.js';
-import { classifyInstruction } from '../search/instructionMode.js';
-import { getVideo } from '../../db/repositories/videos.js';
-import { listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
+import {
+  DEFAULT_WATCH_MAX_EVENTS,
+  analyzeInternetVideo,
+  type InternetVideoAnalysis,
+  type InternetVideoMoment,
+} from './internetVideo.js';
+import { MISSING_TRANSCRIPT_REASON, attachTranscripts, passesEvidenceGate, requiresTranscript } from './mixedEvidence.js';
 import { verifyWithVideoChat3 } from '../videochat3/client.js';
 import type { NewClipMatch } from '../../db/repositories/clipRequests.js';
-import type { VideoChunk } from '../../domain/types.js';
+import type { ResolvedSearchMode, VideoChunk } from '../../domain/types.js';
 
 export const WATCH_MAX_EVENTS = DEFAULT_WATCH_MAX_EVENTS;
 
@@ -26,72 +29,52 @@ export function unwatchedTail(input: {
   return { startSeconds: start, endSeconds: input.durationSeconds };
 }
 
-function uploadedVideoId(videoKey: string): string | null {
-  const match = /^proxies\/([^/]+)\/proxy\.mp4$/.exec(videoKey);
-  return match?.[1] ?? null;
-}
-
-async function transcriptForInterval(videoId: string, start: number, end: number): Promise<string> {
-  const rows = await listTranscriptSegmentsInRange(videoId, Math.max(0, start - 1.5), end + 1.5);
-  return rows
-    .map((row) => `[${row.startSeconds.toFixed(1)}-${row.endSeconds.toFixed(1)}] ${row.text.trim()}`)
-    .filter((line) => line.length > 0)
-    .join('\n')
-    .slice(0, 12_000);
-}
-
 /**
  * A mixed visual+spoken question gets one more exact-interval verification
  * after visual retrieval. The verifier sees the clip and only the transcript
- * aligned to that clip, so spoken conditions cannot be silently dropped.
+ * aligned to that clip, so a spoken condition cannot be satisfied by the
+ * picture alone.
  *
- * The request-level resolver deliberately downgrades `both` to `visual` when
- * no usable transcript exists. This helper mirrors that fact from the stored
- * video row, rather than re-classifying an ambiguous sentence and demanding a
- * transcript the request already established was unavailable.
+ * Which questions are mixed is not decided here. The request's resolved mode
+ * arrives from handleClipSearch, which already weighed the explicit mode,
+ * the wording, and whether the video has a usable transcript: a `both` that
+ * was downgraded to `visual` upstream arrives as `visual` and gets no
+ * transcript work, and an explicit `both` stays `both` however visual its
+ * wording. A candidate whose interval has no transcript is rejected with a
+ * reason, never verified visually instead; and a verdict is evidence only
+ * through the same gate as every other verification (passesEvidenceGate).
  */
 async function verifyMixedEvidence(input: {
   analysis: InternetVideoAnalysis;
   query: string;
+  videoId: string;
   videoUrl: string;
   videoKey: string;
   expectedBytes?: number;
+  mode: ResolvedSearchMode;
 }): Promise<InternetVideoAnalysis> {
-  if (classifyInstruction(input.query).mode !== 'both' || input.analysis.verified.length === 0) {
-    return input.analysis;
-  }
+  if (!requiresTranscript(input.mode) || input.analysis.verified.length === 0) return input.analysis;
 
-  const videoId = uploadedVideoId(input.videoKey);
-  // Only Clipit's canonical proxy keys can be joined to a stored transcript.
-  if (!videoId) return input.analysis;
-
-  const video = await getVideo(videoId);
-  if (!video || video.transcriptStatus !== 'ready' || video.transcriptSegmentCount <= 0) {
-    return input.analysis;
-  }
-
-  const candidates = await Promise.all(input.analysis.verified.map(async (moment, index) => ({
-    id: `mixed-${index}`,
-    start: moment.startSeconds,
-    end: moment.endSeconds,
-    transcript: await transcriptForInterval(videoId, moment.startSeconds, moment.endSeconds),
-  })));
-
-  const missingTranscript = candidates.filter((candidate) => candidate.transcript.trim().length === 0);
-  const verifiable = candidates.filter((candidate) => candidate.transcript.trim().length > 0);
+  const moments = input.analysis.verified;
+  const { verifiable, missing } = await attachTranscripts(
+    input.videoId,
+    moments.map((moment, index) => ({ id: `mixed-${index}`, start: moment.startSeconds, end: moment.endSeconds })),
+  );
+  const missingFailures = missing.map((candidate) => ({
+    id: candidate.id,
+    reason: MISSING_TRANSCRIPT_REASON,
+    startSeconds: candidate.start,
+    endSeconds: candidate.end,
+  }));
   if (verifiable.length === 0) {
     return {
       ...input.analysis,
       verified: [],
-      failures: [
-        ...input.analysis.failures,
-        ...missingTranscript.map((candidate) => ({
-          id: candidate.id,
-          reason: 'mixed question requires transcript evidence, but this interval has no transcript',
-          startSeconds: candidate.start,
-          endSeconds: candidate.end,
-        })),
-      ],
+      failures: [...input.analysis.failures, ...missingFailures],
+      metrics: {
+        ...input.analysis.metrics,
+        mixedVerification: { candidates: 0, withoutTranscript: missing.length, verified: 0, rejected: 0 },
+      },
     };
   }
 
@@ -101,16 +84,23 @@ async function verifyMixedEvidence(input: {
     expectedBytes: input.expectedBytes,
     candidates: verifiable,
   });
-  const original = new Map(candidates.map((candidate, index) => [candidate.id, input.analysis.verified[index]!]));
-  const verified = verdicts.results
-    .filter((result) => result.match)
-    .map((result) => ({
+  const momentById = new Map(moments.map((moment, index) => [`mixed-${index}`, moment]));
+  const candidateById = new Map(verifiable.map((candidate) => [candidate.id, candidate]));
+  let rejected = 0;
+  const verified: InternetVideoMoment[] = [];
+  for (const result of verdicts.results) {
+    if (!passesEvidenceGate(result)) {
+      rejected += 1;
+      continue;
+    }
+    verified.push({
       startSeconds: result.startSeconds,
       endSeconds: result.endSeconds,
       confidence: result.confidence,
-      description: result.description || original.get(result.id)?.description || '',
-    }));
-  const failureById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+      description: result.description || momentById.get(result.id)?.description || '',
+    });
+  }
+  verified.sort((left, right) => right.confidence - left.confidence);
 
   return {
     ...input.analysis,
@@ -119,14 +109,9 @@ async function verifyMixedEvidence(input: {
     verified,
     failures: [
       ...input.analysis.failures,
-      ...missingTranscript.map((candidate) => ({
-        id: candidate.id,
-        reason: 'mixed question requires transcript evidence, but this interval has no transcript',
-        startSeconds: candidate.start,
-        endSeconds: candidate.end,
-      })),
+      ...missingFailures,
       ...verdicts.failed.map((failure) => {
-        const candidate = failureById.get(failure.id);
+        const candidate = candidateById.get(failure.id);
         return {
           id: failure.id,
           reason: `mixed verification failed: ${failure.reason}`,
@@ -134,16 +119,32 @@ async function verifyMixedEvidence(input: {
         };
       }),
     ],
-    metrics: { ...input.analysis.metrics, mixedVerification: verdicts.metrics },
+    metrics: {
+      ...input.analysis.metrics,
+      mixedVerification: {
+        ...verdicts.metrics,
+        candidates: verifiable.length,
+        withoutTranscript: missing.length,
+        verified: verified.length,
+        rejected,
+      },
+    },
   };
 }
 
+/**
+ * Read an uploaded video the way an internet video is read, then hold the
+ * result to the request's evidence contract. `mode` is the ResolvedSearchMode
+ * decided once in handleClipSearch; it is passed down, never re-derived.
+ */
 export async function analyzeUploadedVideo(input: {
   query: string;
+  videoId: string;
   videoUrl: string;
   videoKey: string;
   expectedBytes?: number;
   durationSeconds: number | null;
+  mode: ResolvedSearchMode;
 }): Promise<UploadedVideoAnalysis> {
   try {
     const firstAnalysis = await analyzeInternetVideo({
@@ -156,9 +157,11 @@ export async function analyzeUploadedVideo(input: {
     const analysis = await verifyMixedEvidence({
       analysis: firstAnalysis,
       query: input.query,
+      videoId: input.videoId,
       videoUrl: input.videoUrl,
       videoKey: input.videoKey,
       expectedBytes: input.expectedBytes,
+      mode: input.mode,
     });
     const durationSeconds = input.durationSeconds ?? analysis.durationSeconds;
     return {
