@@ -28,6 +28,14 @@ vi.mock('../src/services/retrieval/qwenModal.js', () => ({
 const { analyzeUploadedVideo, placeMomentsOnChunks, unwatchedTail, WATCH_MAX_EVENTS } = await import(
   '../src/services/retrieval/uploadedVideo.js'
 );
+const { MISSING_TRANSCRIPT_REASON } = await import('../src/services/retrieval/mixedEvidence.js');
+
+const passEverything = async (input: { candidates: Array<{ id: string; start: number; end: number }> }) => ({
+  model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+  results: input.candidates.map((row) => ({
+    id: row.id, startSeconds: row.start, endSeconds: row.end, match: true, confidence: 0.9, description: 'seen',
+  })),
+});
 
 const chunk = (index: number, start: number, end: number) => ({
   id: `chunk-${index}`,
@@ -144,12 +152,72 @@ describe('analyzeUploadedVideo', () => {
       model: 'rr', revision: 'r', failed: [], metrics: {},
       ranked: input.candidates.map((row, index) => ({ id: row.id, score: 1 - index * 0.001 })),
     }));
-    verifyWithVideoChat3.mockImplementation(async (input: { candidates: Array<{ id: string; start: number; end: number }> }) => ({
-      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
-      results: input.candidates.map((row) => ({
-        id: row.id, startSeconds: row.start, endSeconds: row.end, match: true, confidence: 0.9, description: 'seen',
-      })),
-    }));
+    verifyWithVideoChat3.mockImplementation(passEverything);
+    listTranscriptSegmentsInRange.mockResolvedValue([]);
+  });
+
+  const silentSignAndSpokenLine = () => {
+    watchWithVideoChat3.mockResolvedValue({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', durationSeconds: 300, metrics: {},
+      events: [
+        { startSeconds: 40, endSeconds: 44, description: 'a sign in shot' },
+        { startSeconds: 200, endSeconds: 204, description: 'he speaks to camera' },
+      ],
+    });
+    listTranscriptSegmentsInRange.mockImplementation(async (_videoId: string, start: number, end: number) =>
+      end > 199 && start < 205
+        ? [{ id: 's1', videoId: 'video-1', segmentIndex: 0, startSeconds: 200, endSeconds: 204, text: 'we are shutting it down', source: 'openrouter_stt' }]
+        : [],
+    );
+  };
+  // The footage verification passes; the joint verification cannot be obtained.
+  const jointVerdictTimesOut = () =>
+    verifyWithVideoChat3.mockImplementationOnce(passEverything).mockRejectedValueOnce(new Error('Modal timed out after 1800s'));
+
+  it('keeps the watch and its footage verdicts when the transcript-assisted verification itself fails (any)', async () => {
+    silentSignAndSpokenLine();
+    jointVerdictTimesOut();
+    const analysis = await analyzeUploadedVideo({
+      query: 'the good bit', videoId: 'video-1', mode: 'both', evidence: 'any', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: 300,
+    });
+    expect(verifyWithVideoChat3).toHaveBeenCalledTimes(2);
+    expect(analysis.watchedThroughSeconds).toBe(300);
+    expect(analysis.unwatched).toBeNull();
+    expect(analysis.failures.find((failure) => failure.id === 'whole-video-read')).toBeUndefined();
+    // The silent sign stands on its footage verdict; the spoken stretch is named as unverified, not dropped as absent.
+    expect(analysis.verified).toHaveLength(1);
+    expect(analysis.verified[0]).toMatchObject({ startSeconds: 40, endSeconds: 44, source: 'visual' });
+    expect(analysis.failures).toEqual([
+      { id: 'mixed-1', reason: 'mixed verification failed: Modal timed out after 1800s', startSeconds: 200, endSeconds: 204 },
+    ]);
+    expect(analysis.metrics.mixedVerification).toMatchObject({ policy: 'when_present', candidates: 1, withoutTranscript: 1, verified: 1, failed: true });
+  });
+
+  it('under all, the same failure keeps the watch and names every candidate, verifying none', async () => {
+    silentSignAndSpokenLine();
+    jointVerdictTimesOut();
+    const analysis = await analyzeUploadedVideo({
+      query: 'show where he says it while the sign is up', videoId: 'video-1', mode: 'both', evidence: 'all', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: 300,
+    });
+    expect(analysis.watchedThroughSeconds).toBe(300);
+    expect(analysis.verified).toEqual([]);
+    expect(analysis.failures).toEqual([
+      { id: 'mixed-0', reason: MISSING_TRANSCRIPT_REASON, startSeconds: 40, endSeconds: 44 },
+      { id: 'mixed-1', reason: 'mixed verification failed: Modal timed out after 1800s', startSeconds: 200, endSeconds: 204 },
+    ]);
+  });
+
+  it('when the transcript itself cannot be read, nothing is kept on the picture and nothing is called absent', async () => {
+    silentSignAndSpokenLine();
+    listTranscriptSegmentsInRange.mockRejectedValue(new Error('transcript store unavailable'));
+    const analysis = await analyzeUploadedVideo({
+      query: 'the good bit', videoId: 'video-1', mode: 'both', evidence: 'any', videoUrl: 'https://signed/proxy.mp4', videoKey: 'proxies/v.mp4', durationSeconds: 300,
+    });
+    expect(verifyWithVideoChat3).toHaveBeenCalledTimes(1);
+    expect(analysis.watchedThroughSeconds).toBe(300);
+    expect(analysis.verified).toEqual([]);
+    expect(analysis.failures.map((failure) => [failure.id, failure.startSeconds, failure.endSeconds])).toEqual([['mixed-0', 40, 44], ['mixed-1', 200, 204]]);
+    expect(analysis.failures.every((failure) => failure.reason === 'mixed verification failed: transcript store unavailable')).toBe(true);
   });
 
   it('asks the watch for the upload cap and reads to the end when the cap is not hit', async () => {

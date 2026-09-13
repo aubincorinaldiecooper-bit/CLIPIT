@@ -29,6 +29,10 @@ export interface MergeableMatch {
   confidence: number;
   source: MatchSource;
   quote: string | null;
+  /** Which call produced this match. Matches from different lanes may now meet here. */
+  provider?: string | null;
+  model?: string | null;
+  promptVersion?: string | null;
 }
 
 export interface AggregateOptions {
@@ -77,6 +81,7 @@ function combine(earlier: MergeableMatch, later: MergeableMatch): MergeableMatch
   // one supplies the anchor chunk, so the merged range never starts before the
   // chunk it is attributed to.
   const best = later.confidence > earlier.confidence ? later : earlier;
+  const other = best === later ? earlier : later;
 
   return {
     chunkId: earlier.chunkId,
@@ -87,6 +92,11 @@ function combine(earlier: MergeableMatch, later: MergeableMatch): MergeableMatch
     // A moment confirmed by both frames and speech is genuinely multimodal.
     source: earlier.source === later.source ? earlier.source : 'multimodal',
     quote: best.quote ?? earlier.quote ?? later.quote,
+    // The call that supplied the description is the one the merged match is
+    // pinned on; two lanes can meet here, so this is decided per match.
+    provider: best.provider ?? other.provider ?? null,
+    model: best.model ?? other.model ?? null,
+    promptVersion: best.promptVersion ?? other.promptVersion ?? null,
   };
 }
 

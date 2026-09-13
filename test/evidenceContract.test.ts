@@ -639,6 +639,59 @@ describe('11. an undetermined both keeps either modality; a mixed one needs both
     });
   });
 
+  it('end to end: when speech cannot propose at all, the footage still answers and the unsearched stretch is on record', async () => {
+    getClipRequest.mockResolvedValue({ ...request, instruction: 'the good bit' });
+    wholeVideoPipeline();
+    transcriptOnlyAtGoodbye();
+    listTranscriptSegments.mockRejectedValueOnce(new Error('transcript store unavailable'));
+    verifyWithVideoChat3.mockResolvedValueOnce({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'mixed-0', startSeconds: 30, endSeconds: 35, match: true, confidence: 0.9, description: 'goodbye' }],
+    });
+    const job = { data: { clipRequestId: 'request-1' }, processedOn: Date.now(), timestamp: Date.now(), attemptsMade: 0, updateProgress: vi.fn() };
+
+    await handleClipSearch(job as never);
+
+    const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
+    expect(rows.map((row) => [row.globalStartSeconds, row.source])).toEqual([[30, 'multimodal'], [10, 'visual']]);
+    const gaps = recordChunkFailure.mock.calls.map((call) => call[1] as Record<string, unknown>);
+    expect(gaps).toEqual([expect.objectContaining({
+      message: 'Speech was not searched here: transcript store unavailable', globalStartSeconds: 0, globalEndSeconds: 300, code: 'not_read_yet',
+    })]);
+    expect(releaseDeckAndComplete).toHaveBeenCalled();
+  });
+
+  it('end to end: the same moment heard and seen is one moment, and never takes the place of a distinct one', async () => {
+    // Two moments asked for; the phrase is said over the second flagged stretch.
+    getClipRequest.mockResolvedValue({ ...request, instruction: 'find 2 moments where she says "goodbye everyone"' });
+    expect(resolveSearchMode({ instruction: 'find 2 moments where she says "goodbye everyone"', requested: 'auto', transcriptAvailable: true })).toMatchObject({ mode: 'both', evidence: 'any' });
+    // Speech proposes 28.7-35.3 (the line, padded); its verdict is the first verify call.
+    verifyWithVideoChat3.mockResolvedValueOnce({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'spoken-phrase-0', startSeconds: 28.7, endSeconds: 35.3, match: true, confidence: 0.91, description: 'she says goodbye everyone' }],
+    });
+    wholeVideoPipeline();
+    transcriptOnlyAtGoodbye();
+    // The watch's own spoken candidate (30-35) is re-judged with its transcript.
+    verifyWithVideoChat3.mockResolvedValueOnce({
+      model: 'MCG-NJU/VideoChat3-4B', revision: 'vc3', failed: [], metrics: {},
+      results: [{ id: 'mixed-0', startSeconds: 30, endSeconds: 35, match: true, confidence: 0.9, description: 'goodbye, waving' }],
+    });
+    const job = { data: { clipRequestId: 'request-1' }, processedOn: Date.now(), timestamp: Date.now(), attemptsMade: 0, updateProgress: vi.fn() };
+
+    await handleClipSearch(job as never);
+
+    const rows = insertMatches.mock.calls[0]?.[1] as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ globalStartSeconds: 28.7, globalEndSeconds: 35.3, source: 'multimodal', quote: 'okay, goodbye everyone', provider: 'modal' });
+    expect(rows[1]).toMatchObject({ globalStartSeconds: 10, source: 'visual' });
+  });
+
+  it('speech proposes only where VideoChat3 is the engine', async () => {
+    const handler = await read('src/worker/handlers/clipSearch.ts');
+    expect(handler).toContain("if (env.RETRIEVAL_PRIMARY === 'videochat3' && resolved.mode === 'both' && resolved.evidence === 'any' && video.proxyStorageKey) {");
+  });
+
   it('under all, speech does not propose: the transcript is consulted only for the candidates the picture found', async () => {
     getClipRequest.mockResolvedValue({ ...request });
     wholeVideoPipeline();

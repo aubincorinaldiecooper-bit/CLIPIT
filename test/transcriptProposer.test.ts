@@ -16,7 +16,8 @@ vi.mock('../src/services/videochat3/client.js', () => ({ verifyWithVideoChat3 })
 
 const { env } = await import('../src/config/env.js');
 const {
-  MAX_SPOKEN_PROPOSALS, findPhraseWindows, proposalsFromTextSearch, proposeSpokenMoments, quotedPhrases, rankProposals, speechTokens,
+  MAX_SPOKEN_PROPOSALS, describeSpokenFailure, findPhraseWindows, proposalsFromTextSearch, proposeSpokenMoments, quotedPhrases, rankProposals,
+  speechTokens, speechUnsearched,
 } = await import('../src/services/retrieval/transcriptProposer.js');
 const { MISSING_TRANSCRIPT_REASON } = await import('../src/services/retrieval/mixedEvidence.js');
 
@@ -169,8 +170,8 @@ describe('proposeSpokenMoments', () => {
     const result = await propose('the big moment');
     expect(result.moments).toEqual([]);
     expect(result.failures).toEqual([
-      { startSeconds: 120, endSeconds: 240, reason: 'transcript search failed: OpenRouter 503' },
-      { startSeconds: 4, endSeconds: 12, reason: 'VideoChat3 verification failed: ffmpeg exited 1' },
+      { kind: 'unsearched', startSeconds: 120, endSeconds: 240, reason: 'transcript search failed: OpenRouter 503' },
+      { kind: 'unverified', startSeconds: 4, endSeconds: 12, reason: 'VideoChat3 verification failed: ffmpeg exited 1' },
     ]);
   });
 
@@ -181,7 +182,19 @@ describe('proposeSpokenMoments', () => {
       : []);
     const result = await propose('the big moment');
     expect(verifyWithVideoChat3).not.toHaveBeenCalled();
-    expect(result.failures).toEqual([{ startSeconds: 50, endSeconds: 55, reason: MISSING_TRANSCRIPT_REASON }]);
+    expect(result.failures).toEqual([{ kind: 'unverified', startSeconds: 50, endSeconds: 55, reason: MISSING_TRANSCRIPT_REASON }]);
+  });
+
+  it('says in the record whether speech searched a stretch or proposed it', () => {
+    expect(describeSpokenFailure({ kind: 'unsearched', startSeconds: 0, endSeconds: 300, reason: 'transcript store unavailable' }))
+      .toBe('Speech was not searched here: transcript store unavailable');
+    expect(describeSpokenFailure({ kind: 'unverified', startSeconds: 4, endSeconds: 12, reason: 'ffmpeg exited 1' }))
+      .toBe('Speech proposed this stretch, but it could not be verified against the footage: ffmpeg exited 1');
+    expect(speechUnsearched(new Error('Modal 503'), 300)).toEqual({
+      proposals: [], moments: [], metrics: { failed: true, reason: 'Modal 503' },
+      failures: [{ kind: 'unsearched', startSeconds: 0, endSeconds: 300, reason: 'Modal 503' }],
+    });
+    expect(speechUnsearched('boom', 0).failures).toEqual([]);
   });
 
   it('with nothing quoted and nothing named, nothing is asked of the verifier', async () => {

@@ -201,6 +201,14 @@ describe('which both the resolver means', () => {
     expect(classifyInstruction('Find the sign that says "EXIT"')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('the part where she says “we are live” on the banner')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('show where she says goodbye while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
+    // A quote beside a named surface may be what is written there. Beside a
+    // speech verb and a separate visual condition it is speech, and the
+    // condition still has to hold: quoting "goodbye" does not waive the leaving.
+    expect(classifyInstruction('show where she says "goodbye" while leaving the room')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('he announces "we are live" and the crowd celebrates')).toMatchObject({ mode: 'both', evidence: 'all' });
+    expect(classifyInstruction('the slide that says "Q3 results"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('Find "SALE"')).toMatchObject({ mode: 'both', evidence: 'any' });
+    expect(classifyInstruction('the part where he says "no way"')).toMatchObject({ mode: 'both', evidence: 'any' });
     expect(classifyInstruction('Clip the boss fight')).toMatchObject({ mode: 'visual', evidence: 'all' });
     expect(classifyInstruction('Where do they discuss the merger?')).toMatchObject({ mode: 'transcript', evidence: 'all' });
     expect(resolveSearchMode({ instruction: 'the good bit', requested: 'both', transcriptAvailable: true }).evidence).toBe('all');

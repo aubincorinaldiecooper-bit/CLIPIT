@@ -49,6 +49,12 @@ export interface SpokenMoment {
 }
 
 export interface SpokenFailure {
+  /**
+   * 'unsearched': speech never named anything here (the text search could not
+   * read the chunk, or the whole lane failed). 'unverified': speech named this
+   * stretch and the footage verdict could not be obtained.
+   */
+  kind: 'unsearched' | 'unverified';
   startSeconds: number;
   endSeconds: number;
   reason: string;
@@ -195,6 +201,28 @@ export function rankProposals(proposals: readonly SpokenProposal[]): SpokenPropo
     .slice(0, MAX_SPOKEN_PROPOSALS);
 }
 
+/** The coverage record's sentence for a stretch speech could not establish. */
+export function describeSpokenFailure(failure: SpokenFailure): string {
+  return failure.kind === 'unsearched'
+    ? `Speech was not searched here: ${failure.reason}`
+    : `Speech proposed this stretch, but it could not be verified against the footage: ${failure.reason}`;
+}
+
+/**
+ * The whole speech lane failed before it could name anything. Under `any`
+ * the footage still answers; the stretch speech never searched is recorded,
+ * never presumed empty.
+ */
+export function speechUnsearched(error: unknown, endSeconds: number): SpokenProposals {
+  const reason = errorMessage(error);
+  return {
+    proposals: [],
+    moments: [],
+    failures: endSeconds > 0 ? [{ kind: 'unsearched', startSeconds: 0, endSeconds, reason }] : [],
+    metrics: { failed: true, reason },
+  };
+}
+
 export async function proposeSpokenMoments(input: {
   videoId: string;
   instruction: string;
@@ -234,6 +262,7 @@ export async function proposeSpokenMoments(input: {
         matches.push(...result.value);
       } else {
         failures.push({
+          kind: 'unsearched',
           startSeconds: chunk.globalStartSeconds,
           endSeconds: chunk.globalEndSeconds,
           reason: `transcript search failed: ${errorMessage(result.reason)}`,
@@ -261,7 +290,7 @@ export async function proposeSpokenMoments(input: {
     proposals.map((proposal) => ({ id: proposal.id, start: proposal.startSeconds, end: proposal.endSeconds })),
   );
   for (const candidate of missing) {
-    failures.push({ startSeconds: candidate.start, endSeconds: candidate.end, reason: MISSING_TRANSCRIPT_REASON });
+    failures.push({ kind: 'unverified', startSeconds: candidate.start, endSeconds: candidate.end, reason: MISSING_TRANSCRIPT_REASON });
   }
   if (verifiable.length === 0) return { proposals, moments: [], failures, metrics: { ...metrics, verified: 0 } };
 
@@ -296,6 +325,7 @@ export async function proposeSpokenMoments(input: {
     const proposal = byId.get(failure.id);
     if (!proposal) continue;
     failures.push({
+      kind: 'unverified',
       startSeconds: proposal.startSeconds,
       endSeconds: proposal.endSeconds,
       reason: `VideoChat3 verification failed: ${failure.reason}`,

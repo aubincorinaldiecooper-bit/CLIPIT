@@ -62,10 +62,50 @@ async function verifyMixedEvidence(input: {
 
   const moments = input.analysis.verified;
   const momentById = new Map(moments.map((moment, index) => [`mixed-${index}`, moment]));
-  const { verifiable, missing } = await attachTranscripts(
-    input.videoId,
-    moments.map((moment, index) => ({ id: `mixed-${index}`, start: moment.startSeconds, end: moment.endSeconds })),
-  );
+  const intervals = moments.map((moment, index) => ({ id: `mixed-${index}`, start: moment.startSeconds, end: moment.endSeconds }));
+
+  // The watch and its footage verdicts stand whatever happens below. A
+  // candidate whose transcript-assisted verdict could not be obtained is
+  // named as unverified over its own seconds: not kept on the picture alone,
+  // not dropped as if judged, and never allowed to turn a finished watch into
+  // an unread video.
+  const unjudged = (
+    candidates: ReadonlyArray<{ id: string; start: number; end: number }>,
+    kept: InternetVideoMoment[],
+    namedFailures: InternetVideoAnalysis['failures'],
+    detail: Record<string, unknown>,
+    error: unknown,
+  ): InternetVideoAnalysis => {
+    const reason = errorReason(error);
+    return {
+      ...input.analysis,
+      verified: kept,
+      failures: [
+        ...input.analysis.failures,
+        ...namedFailures,
+        ...candidates.map((candidate) => ({
+          id: candidate.id,
+          reason: `mixed verification failed: ${reason}`,
+          startSeconds: candidate.start,
+          endSeconds: candidate.end,
+        })),
+      ],
+      metrics: {
+        ...input.analysis.metrics,
+        mixedVerification: { policy, ...detail, verified: kept.length, rejected: 0, failed: true, reason },
+      },
+    };
+  };
+
+  let attached: Awaited<ReturnType<typeof attachTranscripts>>;
+  try {
+    attached = await attachTranscripts(input.videoId, intervals);
+  } catch (error) {
+    // Without the transcript nobody can tell a silent candidate from a spoken
+    // one, so none is kept on its footage under either policy.
+    return unjudged(intervals, [], [], { candidates: intervals.length, withoutTranscript: null }, error);
+  }
+  const { verifiable, missing } = attached;
   const missingFailures = policy === 'required'
     ? missing.map((candidate) => ({
       id: candidate.id,
@@ -96,12 +136,23 @@ async function verifyMixedEvidence(input: {
     };
   }
 
-  const verdicts = await verifyWithVideoChat3({
-    videoUrl: input.videoUrl,
-    query: input.query,
-    expectedBytes: input.expectedBytes,
-    candidates: verifiable,
-  });
+  let verdicts: Awaited<ReturnType<typeof verifyWithVideoChat3>>;
+  try {
+    verdicts = await verifyWithVideoChat3({
+      videoUrl: input.videoUrl,
+      query: input.query,
+      expectedBytes: input.expectedBytes,
+      candidates: verifiable,
+    });
+  } catch (error) {
+    return unjudged(
+      verifiable,
+      keptOnFootage,
+      missingFailures,
+      { candidates: verifiable.length, withoutTranscript: missing.length },
+      error,
+    );
+  }
   const candidateById = new Map(verifiable.map((candidate) => [candidate.id, candidate]));
   let rejected = 0;
   const verified: InternetVideoMoment[] = [...keptOnFootage];
@@ -152,6 +203,10 @@ async function verifyMixedEvidence(input: {
   };
 }
 
+function errorReason(error: unknown): string {
+  return error instanceof Error ? error.message : 'whole-video analysis failed';
+}
+
 /**
  * Read an uploaded video the way an internet video is read, then hold the
  * result to the request's evidence contract. `mode` and `evidence` are the
@@ -193,7 +248,7 @@ export async function analyzeUploadedVideo(input: {
     };
   } catch (error) {
     const durationSeconds = input.durationSeconds ?? 0;
-    const reason = error instanceof Error ? error.message : 'whole-video analysis failed';
+    const reason = errorReason(error);
     return {
       model: 'MCG-NJU/VideoChat3-4B',
       revision: 'unavailable',

@@ -51,6 +51,20 @@ const SPOKEN_PATTERNS: RegExp[] = [
  */
 const QUOTATION = /["“”‘]|(?<![\p{L}\p{N}])['’]/u;
 
+/**
+ * Things text is written ON. Without these, "the sign that says EXIT" reads
+ * as pure speech and never gets the video that the sign is visible in. They
+ * also decide what a quoted phrase is: beside one of these the phrase is
+ * plausibly what is written there, which nobody need say aloud.
+ */
+const TEXT_SURFACE_PATTERNS: RegExp[] = [
+  /\b(sign|signs|label|labels|banner|poster|billboard|placard)\b/i,
+  /\b(shirt|jersey|hoodie|cap|hat|badge|name ?tag|sticker|decal)\b/i,
+  /\b(caption|captions|subtitle|subtitles|headline|logo|licen[cs]e plate)\b/i,
+  /\b(hood|bumper|windshield|title card|lower third|whiteboard|slide|chart|graph|screen|scoreboard)\b/i,
+  /\b(text|writing|written|printed|says on|reads)\b/i,
+];
+
 const VISUAL_PATTERNS: RegExp[] = [
   /\b(show|shows|showed|showing|shown)\b/i,
   /\b(see|sees|saw|seen|visible|on screen|onscreen)\b/i,
@@ -62,17 +76,12 @@ const VISUAL_PATTERNS: RegExp[] = [
   /\b(crash|crashes|crashed|explosion|explodes|jump|jumps|dunk|trick)\b/i,
   /\b(enter|enters|entered|join|joins|joined|leave|leaves|walks? in)\b/i,
   /\b(wear|wearing|wears|holding|holds|picks? up)\b/i,
-  /\b(scene|shot|frame|footage|camera|screen|gameplay)\b/i,
-  /\b(level|stage|map|menu|scoreboard|hud|replay)\b/i,
-  // Things text is written ON. Without these, "the sign that says EXIT" reads
-  // as pure speech and never gets the video that the sign is visible in.
-  /\b(sign|signs|label|labels|banner|poster|billboard|placard)\b/i,
-  /\b(shirt|jersey|hoodie|cap|hat|badge|name ?tag|sticker|decal)\b/i,
-  /\b(caption|captions|subtitle|subtitles|headline|logo|licen[cs]e plate)\b/i,
-  /\b(hood|bumper|windshield|door|wall|board|title card|lower third)\b/i,
-  /\b(text|writing|written|printed|says on|reads)\b/i,
+  /\b(scene|shot|frame|footage|camera|gameplay)\b/i,
+  /\b(level|stage|map|menu|hud|replay)\b/i,
+  ...TEXT_SURFACE_PATTERNS,
+  /\b(door|wall|board)\b/i,
   /\b(red|blue|green|yellow|black|white|orange|purple)\b/i,
-  /\b(dog|cat|car|ball|door|whiteboard|slide|chart|graph)\b/i,
+  /\b(dog|cat|car|ball)\b/i,
   /\b(celebrat\w+|dance|dancing|laugh\w*|smile|smiling|cry\w*)\b/i,
 ];
 
@@ -128,18 +137,19 @@ export function classifyInstruction(instruction: string): ModeClassification {
     return { mode: 'visual', evidence: 'all', spokenScore, visualScore, rationale: 'instruction refers to on-screen content' };
   }
 
-  // A quoted phrase is modality-ambiguous even when the sentence around it
-  // scores on both sides: `the sign that says "EXIT"` names a sign and "says",
-  // and the sign satisfies it with nobody speaking. Either source may
-  // establish it. Without a quote, a sentence that mixes spoken and visual
-  // conditions needs both.
-  if (QUOTATION.test(text)) {
+  // A quoted phrase is modality-ambiguous when the sentence names a surface
+  // text is written on: `the sign that says "EXIT"` names a sign and "says",
+  // and the sign satisfies it with nobody speaking, so either source may
+  // establish it. Without such a surface, "says" beside a visual condition is
+  // speech beside that condition (`she says "goodbye" while leaving the
+  // room`), and a sentence that mixes spoken and visual conditions needs both.
+  if (QUOTATION.test(text) && TEXT_SURFACE_PATTERNS.some((pattern) => pattern.test(text))) {
     return {
       mode: 'both',
       evidence: 'any',
       spokenScore,
       visualScore,
-      rationale: 'quoted phrase beside spoken and visual signals; either source may establish it',
+      rationale: 'quoted phrase beside a surface text is written on; either source may establish it',
     };
   }
   return {
