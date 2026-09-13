@@ -1,4 +1,4 @@
-"""VideoChat3 on Modal for Clipit's internet-video search.
+"""VideoChat3 on Modal for Clipit's internet-video and uploaded-video search.
 
 One L4-backed service owns the model weights and exposes two jobs:
 
@@ -7,11 +7,9 @@ One L4-backed service owns the model weights and exposes two jobs:
   It returns timestamped response events. These are retrieval leads, not
   user-facing evidence.
 * ``verify_intervals``: a dense second look at exact source intervals and a
-  strict relevance judgement. Only this path is eligible to become evidence
-  after Clipit's retrieval/reranking stages have narrowed the search.
-
-The service is separate from MiniCPM so the two models can scale independently
-for concurrent searches. Both use L4 GPUs.
+  strict relevance judgement. Candidate-specific timestamped transcript text
+  may accompany the clip for mixed visual+spoken questions. Only this path is
+  eligible to become evidence after retrieval/reranking has narrowed the search.
 """
 
 from __future__ import annotations
@@ -250,15 +248,24 @@ class VideoChat3Service:
                 },
             }
 
-    def _verify_clip(self, clip_path: Path, query: str) -> dict[str, Any]:
+    def _verify_clip(self, clip_path: Path, query: str, transcript: str | None = None) -> dict[str, Any]:
         from qwen_vl_utils import process_vision_info
 
+        transcript_text = (transcript or "").strip()[:12000]
+        evidence_rule = (
+            "Judge the visible clip and the timestamp-aligned transcript together. "
+            "If the search requires both a visible action and spoken content, both must be present in this interval. "
+            "Do not invent speech or visuals that are absent."
+            if transcript_text
+            else "Judge only what is visible in this clip. Do not infer missing events."
+        )
+        transcript_block = f"\n\nTranscript during this exact interval:\n{transcript_text}" if transcript_text else ""
         prompt = (
-            "You are verifying actual video evidence for a search result. "
-            "Judge only what is visible in this clip. Do not infer missing events.\n\n"
-            f"Search: {query}\n\n"
+            "You are verifying actual source evidence for a video search result. "
+            f"{evidence_rule}\n\n"
+            f"Search: {query}{transcript_block}\n\n"
             "Return JSON only with exactly these keys: "
-            '{"match": true|false, "confidence": 0.0-1.0, "description": "brief visible evidence"}.'
+            '{"match": true|false, "confidence": 0.0-1.0, "description": "brief evidence"}.'
         )
         messages = [{
             "role": "user",
@@ -326,9 +333,12 @@ class VideoChat3Service:
                     end_seconds = min(duration, float(candidate["end"]))
                     if not candidate_id or end_seconds <= start_seconds:
                         raise ValueError("candidate has an invalid id or interval")
+                    transcript = candidate.get("transcript")
+                    if transcript is not None and not isinstance(transcript, str):
+                        raise ValueError("candidate transcript must be a string")
                     clip = work / f"candidate-{index}.mp4"
                     _cut_interval(source, clip, start_seconds, end_seconds)
-                    verdict = self._verify_clip(clip, query)
+                    verdict = self._verify_clip(clip, query, transcript)
                     results.append({
                         "id": candidate_id,
                         "start": start_seconds,
