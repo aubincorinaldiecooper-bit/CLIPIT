@@ -1,4 +1,7 @@
 import { DEFAULT_WATCH_MAX_EVENTS, analyzeInternetVideo, type InternetVideoAnalysis } from './internetVideo.js';
+import { classifyInstruction } from '../search/instructionMode.js';
+import { listTranscriptSegmentsInRange } from '../../db/repositories/transcripts.js';
+import { verifyWithVideoChat3 } from '../videochat3/client.js';
 import type { NewClipMatch } from '../../db/repositories/clipRequests.js';
 import type { VideoChunk } from '../../domain/types.js';
 
@@ -22,6 +25,120 @@ export function unwatchedTail(input: {
   return { startSeconds: start, endSeconds: input.durationSeconds };
 }
 
+function uploadedVideoId(videoKey: string): string | null {
+  const match = /^proxies\/([^/]+)\/proxy\.mp4$/.exec(videoKey);
+  return match?.[1] ?? null;
+}
+
+async function transcriptForInterval(videoId: string, start: number, end: number): Promise<string> {
+  const rows = await listTranscriptSegmentsInRange(videoId, Math.max(0, start - 1.5), end + 1.5);
+  return rows
+    .map((row) => `[${row.startSeconds.toFixed(1)}-${row.endSeconds.toFixed(1)}] ${row.text.trim()}`)
+    .filter((line) => line.length > 0)
+    .join('\n')
+    .slice(0, 12_000);
+}
+
+/**
+ * A mixed visual+spoken question gets one more exact-interval verification
+ * after visual retrieval. The verifier sees the clip and only the transcript
+ * aligned to that clip, so spoken conditions cannot be silently dropped.
+ */
+async function verifyMixedEvidence(input: {
+  analysis: InternetVideoAnalysis;
+  query: string;
+  videoUrl: string;
+  videoKey: string;
+  expectedBytes?: number;
+}): Promise<InternetVideoAnalysis> {
+  if (classifyInstruction(input.query).mode !== 'both' || input.analysis.verified.length === 0) {
+    return input.analysis;
+  }
+  const videoId = uploadedVideoId(input.videoKey);
+  if (!videoId) {
+    return {
+      ...input.analysis,
+      verified: [],
+      failures: [
+        ...input.analysis.failures,
+        ...input.analysis.verified.map((moment, index) => ({
+          id: `mixed-${index}`,
+          reason: 'could not identify uploaded video transcript for mixed verification',
+          startSeconds: moment.startSeconds,
+          endSeconds: moment.endSeconds,
+        })),
+      ],
+    };
+  }
+
+  const candidates = await Promise.all(input.analysis.verified.map(async (moment, index) => ({
+    id: `mixed-${index}`,
+    start: moment.startSeconds,
+    end: moment.endSeconds,
+    transcript: await transcriptForInterval(videoId, moment.startSeconds, moment.endSeconds),
+  })));
+
+  const missingTranscript = candidates.filter((candidate) => candidate.transcript.trim().length === 0);
+  const verifiable = candidates.filter((candidate) => candidate.transcript.trim().length > 0);
+  if (verifiable.length === 0) {
+    return {
+      ...input.analysis,
+      verified: [],
+      failures: [
+        ...input.analysis.failures,
+        ...missingTranscript.map((candidate) => ({
+          id: candidate.id,
+          reason: 'mixed question requires transcript evidence, but this interval has no transcript',
+          startSeconds: candidate.start,
+          endSeconds: candidate.end,
+        })),
+      ],
+    };
+  }
+
+  const verdicts = await verifyWithVideoChat3({
+    videoUrl: input.videoUrl,
+    query: input.query,
+    expectedBytes: input.expectedBytes,
+    candidates: verifiable,
+  });
+  const original = new Map(candidates.map((candidate, index) => [candidate.id, input.analysis.verified[index]!]))
+  const verified = verdicts.results
+    .filter((result) => result.match)
+    .map((result) => ({
+      startSeconds: result.startSeconds,
+      endSeconds: result.endSeconds,
+      confidence: result.confidence,
+      description: result.description || original.get(result.id)?.description || '',
+    }));
+  const failureById = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+
+  return {
+    ...input.analysis,
+    model: verdicts.model,
+    revision: verdicts.revision,
+    verified,
+    failures: [
+      ...input.analysis.failures,
+      ...missingTranscript.map((candidate) => ({
+        id: candidate.id,
+        reason: 'mixed question requires transcript evidence, but this interval has no transcript',
+        startSeconds: candidate.start,
+        endSeconds: candidate.end,
+      })),
+      ...verdicts.failed.map((failure) => {
+        const candidate = failureById.get(failure.id);
+        return {
+          id: failure.id,
+          reason: `mixed verification failed: ${failure.reason}`,
+          ...(candidate ? { startSeconds: candidate.start, endSeconds: candidate.end } : {}),
+        };
+      }),
+    ],
+    metrics: { ...input.analysis.metrics, mixedVerification: verdicts.metrics },
+  };
+}
+
 export async function analyzeUploadedVideo(input: {
   query: string;
   videoUrl: string;
@@ -30,12 +147,19 @@ export async function analyzeUploadedVideo(input: {
   durationSeconds: number | null;
 }): Promise<UploadedVideoAnalysis> {
   try {
-    const analysis = await analyzeInternetVideo({
+    const firstAnalysis = await analyzeInternetVideo({
       query: input.query,
       videoUrl: input.videoUrl,
       videoKey: input.videoKey,
       expectedBytes: input.expectedBytes,
       maxEvents: WATCH_MAX_EVENTS,
+    });
+    const analysis = await verifyMixedEvidence({
+      analysis: firstAnalysis,
+      query: input.query,
+      videoUrl: input.videoUrl,
+      videoKey: input.videoKey,
+      expectedBytes: input.expectedBytes,
     });
     const durationSeconds = input.durationSeconds ?? analysis.durationSeconds;
     return {
@@ -43,10 +167,6 @@ export async function analyzeUploadedVideo(input: {
       unwatched: unwatchedTail({ watchedThroughSeconds: analysis.watchedThroughSeconds, durationSeconds }),
     };
   } catch (error) {
-    // Uploaded-video retrieval no longer falls back to the retired per-chunk
-    // video model when the whole-video stack fails. Preserve the failure as
-    // an explicit coverage gap so the caller can finish honestly rather than
-    // silently re-reading every two-minute chunk through another model.
     const durationSeconds = input.durationSeconds ?? 0;
     const reason = error instanceof Error ? error.message : 'whole-video analysis failed';
     return {
