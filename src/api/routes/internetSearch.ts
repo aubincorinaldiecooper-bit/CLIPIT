@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { HttpError } from '../../lib/errors.js';
+import { logger } from '../../lib/logger.js';
 import { search } from '../../services/discovery/searxng.js';
 import { requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR } from '../rateLimit.js';
@@ -43,7 +44,8 @@ export async function registerInternetSearchRoutes(app: FastifyInstance): Promis
       // say "the internet has nothing on this", which is a different answer
       // from "we could not look" — so say which one it is.
       const message = error instanceof Error ? error.message : String(error);
-      request.log.warn({ err: error, query }, 'internet search provider failed');
+      // Fastify is built with `logger: false`, so request.log goes nowhere.
+      logger.warn('internet search provider failed', { query, err: message });
       throw HttpError.serviceUnavailable(`Could not search the internet right now: ${message}`);
     }
   });

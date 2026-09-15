@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import dns from 'node:dns/promises';
 import net from 'node:net';
+import { logger } from '../../lib/logger.js';
 
 /**
  * Discovery, as a search provider and nothing more.
@@ -130,6 +131,48 @@ export function normalizeSearxResults(query: string, raw: unknown, limit: number
 export const SEARCH_CANDIDATE_CEILING = 20;
 
 /**
+ * Drop anything that points inside our own network, before it is handed out.
+ *
+ * These URLs come from a search engine, so they come from the internet, and
+ * the browser runtime will navigate to whatever is returned here. A result
+ * naming localhost or a private range would make it fetch our own services on
+ * an attacker's behalf, so the guard runs on every candidate rather than on
+ * none: a page that fails it is discarded, and a thumbnail that fails it is
+ * dropped from an otherwise good candidate.
+ */
+async function publicOnly(candidates: Candidate[]): Promise<Candidate[]> {
+  const checked = await Promise.all(candidates.map(async (candidate) => {
+    try {
+      await assertPublicInternetUrl(candidate.pageUrl);
+    } catch (error) {
+      logger.warn('discarded a search result pointing inside the network', {
+        pageUrl: candidate.pageUrl,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+
+    if (!candidate.thumbnailUrl) return candidate;
+    try {
+      await assertPublicInternetUrl(candidate.thumbnailUrl);
+      return candidate;
+    } catch {
+      // The page is fine; only its picture is not worth fetching.
+      return { ...candidate, thumbnailUrl: null };
+    }
+  }));
+
+  const kept = checked.filter((row): row is Candidate => row !== null);
+  if (kept.length !== candidates.length) {
+    logger.warn('some search results were refused', {
+      returned: candidates.length,
+      kept: kept.length,
+    });
+  }
+  return kept;
+}
+
+/**
  * Ask SearXNG what is worth watching for this query.
  *
  * Whatever the user typed is what is searched, passed through verbatim.
@@ -152,7 +195,7 @@ export async function search(query: string): Promise<Candidate[]> {
 
   const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`SearXNG search failed with HTTP ${response.status}`);
-  return normalizeSearxResults(trimmed, await response.json(), limit);
+  return publicOnly(normalizeSearxResults(trimmed, await response.json(), limit));
 }
 
 export const searxngProvider: SearchProvider = { search };

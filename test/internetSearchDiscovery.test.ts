@@ -1,11 +1,33 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
+import net from 'node:net';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * DNS is stubbed so the guard can be exercised without the network: a host in
+ * this table resolves to whatever it says, an IP literal resolves to itself,
+ * and anything else is a public address.
+ */
+const LOOKUP: Record<string, string> = {};
+
+vi.mock('node:dns/promises', () => ({
+  default: {
+    lookup: async (hostname: string) => {
+      const address = LOOKUP[hostname] ?? (net.isIP(hostname) ? hostname : '93.184.216.34');
+      return [{ address, family: net.isIP(address) === 6 ? 6 : 4 }];
+    },
+  },
+}));
+
+const {
   assertPublicInternetUrl,
   normalizeSearxResults,
   search,
-} from '../src/services/discovery/searxng.js';
+} = await import('../src/services/discovery/searxng.js');
 
 const originalFetch = globalThis.fetch;
+
+beforeEach(() => {
+  for (const key of Object.keys(LOOKUP)) delete LOOKUP[key];
+});
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -132,5 +154,79 @@ describe('asking the provider', () => {
     expect(requested.searchParams.get('format')).toBe('json');
     expect(candidates).toHaveLength(1);
     expect(candidates[0]!.query).toBe('a man walking a dog');
+  });
+});
+
+describe('the guard runs on what is actually handed out', () => {
+  beforeEach(() => {
+    process.env.SEARXNG_URL = 'http://searx.internal';
+  });
+
+  const reply = (results: unknown[]) => {
+    globalThis.fetch = vi.fn(async () => Response.json({ results })) as unknown as typeof fetch;
+  };
+
+  it('discards a result that resolves inside our own network', async () => {
+    // The browser runtime navigates to whatever comes back from here, so a
+    // search engine naming an internal host must not reach it.
+    LOOKUP['intranet.example'] = '10.0.0.5';
+    reply([
+      { url: 'https://intranet.example/admin', title: 'Internal' },
+      { url: 'https://publisher.example/watch/1', title: 'A clip' },
+    ]);
+
+    const candidates = await search('anything');
+    expect(candidates.map((row) => row.pageUrl)).toEqual(['https://publisher.example/watch/1']);
+  });
+
+  it('discards loopback and link-local results', async () => {
+    reply([
+      { url: 'http://127.0.0.1/admin', title: 'Loopback' },
+      { url: 'http://169.254.169.254/latest/meta-data/', title: 'Metadata' },
+      { url: 'https://publisher.example/watch/1', title: 'A clip' },
+    ]);
+
+    const candidates = await search('anything');
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]!.pageUrl).toBe('https://publisher.example/watch/1');
+  });
+
+  it('discards a result carrying credentials', async () => {
+    reply([
+      { url: 'https://user:pw@publisher.example/watch/1', title: 'Creds' },
+      { url: 'https://publisher.example/watch/2', title: 'A clip' },
+    ]);
+
+    const candidates = await search('anything');
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]!.pageUrl).toBe('https://publisher.example/watch/2');
+  });
+
+  it('keeps a good page but drops a thumbnail pointing inside', async () => {
+    LOOKUP['thumbs.internal'] = '192.168.1.9';
+    reply([
+      {
+        url: 'https://publisher.example/watch/1',
+        title: 'A clip',
+        thumbnail: 'https://thumbs.internal/pic.jpg',
+      },
+    ]);
+
+    const candidates = await search('anything');
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]!.thumbnailUrl).toBeNull();
+  });
+
+  it('keeps public thumbnails as they are', async () => {
+    reply([
+      {
+        url: 'https://publisher.example/watch/1',
+        title: 'A clip',
+        thumbnail: 'https://img.example/pic.jpg',
+      },
+    ]);
+
+    const candidates = await search('anything');
+    expect(candidates[0]!.thumbnailUrl).toBe('https://img.example/pic.jpg');
   });
 });
