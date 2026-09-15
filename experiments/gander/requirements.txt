@@ -1,0 +1,2 @@
+# Gander runtime is installed from its pinned upstream repository/commit.
+# The current Gander + Ornith checkpoint adds no extra Python dependencies here.
