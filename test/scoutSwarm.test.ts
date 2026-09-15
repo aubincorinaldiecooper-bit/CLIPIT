@@ -13,7 +13,6 @@ interface Candidate extends ScoutCandidate {
 
 function runtimeFor(input: {
   inspect: (scoutId: ScoutId, candidate: Candidate) => Promise<Array<{ startSeconds: number; endSeconds: number; description: string }>>;
-  verify: (scoutId: ScoutId, candidate: Candidate, startSeconds: number) => Promise<boolean>;
 }): ScoutRuntime<Candidate> {
   return {
     async inspect({ scoutId, candidate }) {
@@ -22,19 +21,13 @@ function runtimeFor(input: {
         mediaSecondsObserved: 30,
       };
     },
-    async verify({ scoutId, candidate, startSeconds }) {
-      return {
-        match: await input.verify(scoutId, candidate, startSeconds),
-        mediaSecondsObserved: 20,
-      };
-    },
   };
 }
 
 describe('runScoutSwarm', () => {
-  it('uses exactly four scouts across the whole search and independently confirms a found moment', async () => {
+  it('uses exactly four scouts across the whole search and surfaces a found moment directly', async () => {
     const inspectors = new Set<ScoutId>();
-    const verifiers = new Set<ScoutId>();
+    const progress: string[] = [];
     const result = await runScoutSwarm<Candidate>({
       searchId: 'search-1',
       query: 'find the red backpack',
@@ -45,69 +38,42 @@ describe('runScoutSwarm', () => {
           if (candidate.id !== 'c-1') return [];
           return [{ startSeconds: 10, endSeconds: 32, description: 'A person picks up the red backpack.' }];
         },
-        async verify(scoutId, candidate, startSeconds) {
-          verifiers.add(scoutId);
-          expect(candidate.id).toBe('c-1');
-          expect(startSeconds).toBe(10);
-          return true;
-        },
       }),
+      onProgress(event) {
+        progress.push(event.event);
+      },
     });
 
     expect(SCOUT_IDS).toHaveLength(4);
     expect(result.scoutCount).toBe(4);
     expect(inspectors.size).toBeLessThanOrEqual(4);
-    expect(verifiers.size).toBe(2);
-    expect(result.confirmed).toHaveLength(1);
-    expect(result.confirmed[0]?.agreement).toEqual({ yes: 2, no: 0, required: 2, complete: true });
-    expect(result.confirmed[0]?.finderScoutId).not.toBe(result.confirmed[0]?.verdicts[0]?.scoutId);
-    expect(result.confirmed[0]?.finderScoutId).not.toBe(result.confirmed[0]?.verdicts[1]?.scoutId);
+    expect(result.moments).toHaveLength(1);
+    expect(result.moments[0]?.candidate.id).toBe('c-1');
+    expect(progress).toContain('moment.found');
   });
 
-  it('marks one-confirm one-reject as possible rather than inventing confidence', async () => {
-    let verification = 0;
+  it('does not require replay or independent verification before returning a relevant moment', async () => {
+    let inspections = 0;
     const result = await runScoutSwarm<Candidate>({
       searchId: 'search-2',
       query: 'find the wave',
       candidates: [{ id: 'only', label: 'only candidate' }],
       runtime: runtimeFor({
         async inspect() {
-          return [{ startSeconds: 4, endSeconds: 12, description: 'The person may wave.' }];
-        },
-        async verify() {
-          verification += 1;
-          return verification === 1;
+          inspections += 1;
+          return [{ startSeconds: 4, endSeconds: 12, description: 'The person waves.' }];
         },
       }),
     });
 
-    expect(result.confirmed).toHaveLength(0);
-    expect(result.possible).toHaveLength(1);
-    expect(result.possible[0]?.agreement).toEqual({ yes: 1, no: 1, required: 2, complete: true });
-  });
-
-  it('rejects a moment only after two independent rejections', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-3',
-      query: 'find a bicycle',
-      candidates: [{ id: 'candidate', label: 'candidate' }],
-      runtime: runtimeFor({
-        async inspect() {
-          return [{ startSeconds: 20, endSeconds: 40, description: 'Possible bicycle.' }];
-        },
-        async verify() {
-          return false;
-        },
-      }),
-    });
-
-    expect(result.rejected).toHaveLength(1);
-    expect(result.rejected[0]?.agreement).toEqual({ yes: 0, no: 2, required: 2, complete: true });
+    expect(inspections).toBe(1);
+    expect(result.moments).toHaveLength(1);
+    expect(result.metrics.inspectOperations).toBe(1);
   });
 
   it('does not force moments when scouts find none', async () => {
     const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-4',
+      searchId: 'search-3',
       query: 'find something that is not present',
       candidates: [
         { id: 'a', label: 'a' },
@@ -117,16 +83,32 @@ describe('runScoutSwarm', () => {
         async inspect() {
           return [];
         },
-        async verify() {
-          throw new Error('verify should not run');
+      }),
+    });
+
+    expect(result.moments).toEqual([]);
+  });
+
+  it('allows exactly one valid result without trying to manufacture more', async () => {
+    const result = await runScoutSwarm<Candidate>({
+      searchId: 'search-4',
+      query: 'find the only occurrence',
+      candidates: [
+        { id: 'a', label: 'a' },
+        { id: 'b', label: 'b' },
+        { id: 'c', label: 'c' },
+      ],
+      runtime: runtimeFor({
+        async inspect(_scoutId, candidate) {
+          return candidate.id === 'b'
+            ? [{ startSeconds: 20, endSeconds: 45, description: 'The only matching moment.' }]
+            : [];
         },
       }),
     });
 
-    expect(result.confirmed).toEqual([]);
-    expect(result.possible).toEqual([]);
-    expect(result.rejected).toEqual([]);
-    expect(result.metrics.verifyOperations).toBe(0);
+    expect(result.moments).toHaveLength(1);
+    expect(result.moments[0]?.candidate.id).toBe('b');
   });
 
   it('caps the search at fifteen candidates', async () => {
@@ -137,9 +119,6 @@ describe('runScoutSwarm', () => {
       runtime: runtimeFor({
         async inspect() {
           return [];
-        },
-        async verify() {
-          return true;
         },
       }),
     });
