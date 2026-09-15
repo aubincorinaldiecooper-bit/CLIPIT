@@ -1,7 +1,9 @@
 """Versioned Modal deployment for Clipit's Ornith Brain service.
 
-This mirrors the runtime characteristics observed in the notebook deployment:
-Ornith-1.5-9B served through vLLM's OpenAI-compatible API on a single L40S.
+This mirrors the notebook-deployed runtime for migration testing: Ornith-1.5-9B
+served through vLLM's OpenAI-compatible API on a single L40S. Once the
+versioned deployment is proven equivalent, pin the resolved vLLM image digest
+instead of relying on the historical `latest` tag.
 """
 
 from __future__ import annotations
@@ -21,10 +23,7 @@ SECRET_NAME = os.environ.get("ORNITH_SECRET_NAME", "clipit-gander-ornith")
 cache = modal.Volume.from_name(CACHE_VOLUME_NAME, create_if_missing=False)
 ornith_secret = modal.Secret.from_name(SECRET_NAME)
 
-image = (
-    modal.Image.from_registry("vllm/vllm-openai:v0.29.0")
-    .entrypoint([])
-)
+image = modal.Image.from_registry("vllm/vllm-openai:latest").entrypoint([])
 
 app = modal.App(APP_NAME, image=image, include_source=False)
 
