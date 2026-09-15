@@ -1,0 +1,169 @@
+name: Vendor Gander runtime once
+
+on:
+  push:
+    branches:
+      - chore/vendor-gander-runtime
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout CLIPIT
+        uses: actions/checkout@v4
+        with:
+          ref: chore/vendor-gander-runtime
+          fetch-depth: 0
+
+      - name: Checkout pinned Gander fork
+        uses: actions/checkout@v4
+        with:
+          repository: aubincorinaldiecooper-bit/Omni-Interaction-Agent
+          ref: e5f3f755c39dcda30ab0638ce332d3b2dca6526e
+          path: .vendor-source
+          persist-credentials: false
+
+      - name: Vendor runtime-only source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C .vendor-source rev-parse HEAD)" = "e5f3f755c39dcda30ab0638ce332d3b2dca6526e"
+          rm -rf gander
+          mkdir -p gander/minicpm_ft
+          cp -R .vendor-source/gander_runtime gander/
+          cp -R .vendor-source/minicpm_ft/mcpmft gander/minicpm_ft/
+          cp -R .vendor-source/minicpm_ft/tests gander/minicpm_ft/
+          cp .vendor-source/minicpm_ft/pyproject.toml gander/minicpm_ft/pyproject.toml
+          cp .vendor-source/LICENSE gander/LICENSE
+          find gander -type d -name __pycache__ -prune -exec rm -rf {} +
+          find gander -type f -name '*.py[co]' -delete
+
+      - name: Integrate Ornith as a normal Gander provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp experiments/gander/ornith_provider.py gander/gander_runtime/gander_runtime/providers/ornith.py
+          cat > gander/gander_runtime/gander_runtime/providers/__init__.py <<'PY'
+          """Worker provider implementations and their configuration registry."""
+
+          from .registry import (
+              ProviderBuildContext,
+              ProviderFactoryRegistry,
+              ProviderRegistration,
+          )
+
+
+          def builtin_provider_registry() -> ProviderFactoryRegistry:
+              from .codex import CODEX_PROVIDER_REGISTRATION
+              from .ornith import ORNITH_PROVIDER_REGISTRATION
+
+              registry = ProviderFactoryRegistry()
+              registry.register(CODEX_PROVIDER_REGISTRATION)
+              registry.register(ORNITH_PROVIDER_REGISTRATION)
+              return registry
+
+
+          __all__ = [
+              "ProviderBuildContext",
+              "ProviderFactoryRegistry",
+              "ProviderRegistration",
+              "builtin_provider_registry",
+          ]
+          PY
+          cp experiments/gander/test_ornith_provider_contract.py gander/gander_runtime/tests/test_ornith_provider_contract.py
+
+      - name: Add Clipit video-search runtime config
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p gander/configs
+          cat > gander/configs/clipit-video-search.yaml <<'YAML'
+          model:
+            model_name_or_path: /models/MiniCPM-o-4_5
+            processor_name_or_path: /models/MiniCPM-o-4_5
+            trust_remote_code: true
+            torch_dtype: bfloat16
+            attn_implementation: sdpa
+            init_vision: true
+            init_audio: true
+            init_tts: false
+            low_cpu_mem_usage: true
+            device_map: cuda
+
+          server:
+            host: 0.0.0.0
+            port: 7975
+            runtime_dir: /var/gander
+            ledger_dir: /var/gander/ledger
+            mode: lean
+            log_level: info
+            cuda_visible_devices: "0"
+
+          asr:
+            mode: disabled
+
+          duplex:
+            checkpoint: /models/Gander/thinker
+            generate_audio: false
+            decode_mode: sampling
+            media_mode: omni
+            allow_client_video: true
+            client_video_mode: omni
+            client_video_sources:
+              - screen
+            vision_max_slice_nums: 1
+            vision_batch_feed: false
+            context_max_units: 128
+            memory_slate_max_tokens: 256
+            temperature: 0.7
+            top_p: 0.8
+            top_k: 20
+            warm_first_unit: true
+
+          worker:
+            provider: ornith
+            cwd: /workspace
+            profile: full
+            settings:
+              base_url: https://aubincorinaldiecooper--clipit-ornith-brain-v2-ornith-server-v2.modal.run
+              model: ornith
+              api_key_env: ORNITH_API_KEY
+              timeout_sec: 120
+              temperature: 0.2
+              max_tokens: 1536
+          YAML
+
+      - name: Record upstream provenance
+        shell: bash
+        run: |
+          cat > gander/UPSTREAM.md <<'MD'
+          # Gander upstream provenance
+
+          CLIPIT vendors the runtime required to run and test Gander so the production build no longer depends on another repository.
+
+          - Upstream project: `Omni-Interaction-Gander/Omni-Interaction-Agent`
+          - Clipit fork used for this import: `aubincorinaldiecooper-bit/Omni-Interaction-Agent`
+          - Imported fork commit: `e5f3f755c39dcda30ab0638ce332d3b2dca6526e`
+          - Import scope: `gander_runtime/`, `minicpm_ft/mcpmft/`, their tests/package metadata, and Apache-2.0 license.
+          - Deliberately excluded: docs, report/images, training/examples, caches/bytecode.
+
+          ## Syncing upstream later
+
+          Compare a future upstream/fork revision against the imported commit above, review runtime changes, then intentionally port the relevant changes into `gander/`. Do not make production builds clone the external repository.
+
+          Clipit's Ornith provider is maintained directly under `gander/gander_runtime/gander_runtime/providers/ornith.py` and is registered alongside the upstream Codex provider.
+          MD
+
+      - name: Commit vendored runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: vendor Gander runtime into CLIPIT"
+          git push origin HEAD:chore/vendor-gander-runtime
