@@ -1,10 +1,8 @@
-"""Phase-1 Gander WorkerProvider for an OpenAI-compatible Ornith server.
+"""Working Gander WorkerProvider adapter for the Ornith OpenAI-compatible server.
 
 Copy this file into `gander_runtime/gander_runtime/providers/ornith.py` in the
-pinned Gander checkout and register it beside the built-in Codex provider.
-
-Phase 1 proves only: delegate -> reason -> return -> cancel. It intentionally
-advertises no worker tools, steering, side queries, or interactions.
+pinned Gander checkout. This is the provider version validated with the current
+Gander + Ornith Modal runtime.
 """
 
 from __future__ import annotations
@@ -12,13 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import urllib.error
 import urllib.request
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, AsyncIterator
 
-from ..contracts import stable_id
+from ..contracts import new_id
 from ..coordination import (
     BackendCapabilities,
     DonePayload,
@@ -34,27 +30,12 @@ from .registry import ProviderBuildContext, ProviderRegistration
 
 @dataclass(frozen=True)
 class OrnithProviderSettings:
-    base_url: str = "http://127.0.0.1:8000/v1"
-    model: str = "Ornith-1.5-9B"
+    base_url: str
+    model: str = "ornith"
     api_key_env: str = "ORNITH_API_KEY"
-    request_timeout_sec: float = 300.0
-    max_parallel_projects: int = 1
+    timeout_sec: float = 120.0
     temperature: float = 0.2
-    max_tokens: int = 4096
-
-    def __post_init__(self) -> None:
-        if not self.base_url.startswith(("http://", "https://")):
-            raise ValueError("base_url must be an absolute HTTP(S) URL")
-        if not self.model.strip():
-            raise ValueError("model must not be empty")
-        if self.request_timeout_sec <= 0:
-            raise ValueError("request_timeout_sec must be positive")
-        if self.max_parallel_projects < 1:
-            raise ValueError("max_parallel_projects must be positive")
-        if not 0 <= self.temperature <= 2:
-            raise ValueError("temperature must be between 0 and 2")
-        if self.max_tokens < 1:
-            raise ValueError("max_tokens must be positive")
+    max_tokens: int = 1536
 
 
 ORNITH_CAPABILITIES = BackendCapabilities(
@@ -63,243 +44,264 @@ ORNITH_CAPABILITIES = BackendCapabilities(
     terminal_side_queries="none",
     interactions=False,
     blocking_granularity="run",
-    authority_enforcement="none",
-    structured_events="limited",
+    authority_enforcement="gateway",
+    structured_events="native",
     trusted_risk_signals=False,
     session_resume=False,
     modalities=frozenset({"text"}),
-    max_parallel_projects=1,
+    max_parallel_projects=4,
     context_provisioning="push_bounded",
     session="stateless",
     worker_tools=frozenset(),
 )
 
 
-def _chat_url(base_url: str) -> str:
-    return base_url.rstrip("/") + "/chat/completions"
-
-
-def _bounded_context(request: WorkerRequest) -> str:
-    """Render only context already selected and pushed by Gander."""
-
-    chunks: list[str] = []
-    if request.original_turn.strip():
-        chunks.append(f"Original user utterance:\n{request.original_turn.strip()}")
-
-    source_turn = request.source_turn
-    if source_turn is not None and source_turn.final_asr.strip():
-        current = source_turn.final_asr.strip()
-        if current != request.original_turn.strip():
-            chunks.append(f"Current trusted transcript:\n{current}")
-
-    if request.context_plan.brief.strip():
-        chunks.append(f"Bounded runtime context:\n{request.context_plan.brief.strip()}")
-
-    refs: list[str] = []
-    refs.extend(f"event:{value}" for value in request.context_plan.event_refs)
-    refs.extend(f"media:{value}" for value in request.context_plan.media_refs)
-    refs.extend(f"artifact:{value}" for value in request.context_plan.artifact_refs)
-    if refs:
-        chunks.append(
-            "Selected evidence references (identifiers only; do not infer their contents):\n"
-            + "\n".join(refs)
-        )
-
-    chunks.append(f"Delegated task:\n{request.instruction.strip()}")
-    return "\n\n".join(chunks)
-
-
-def _extract_text(payload: dict[str, Any]) -> str:
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise RuntimeError("Ornith response did not contain choices")
-    choice = choices[0]
-    if not isinstance(choice, dict):
-        raise RuntimeError("Ornith response choice was not an object")
-    message = choice.get("message")
-    if not isinstance(message, dict):
-        raise RuntimeError("Ornith response did not contain a message")
-    content = message.get("content")
-    if isinstance(content, str) and content.strip():
-        return content.strip()
-    if message.get("reasoning_content"):
-        raise RuntimeError("Ornith returned reasoning_content but no final content")
-    raise RuntimeError("Ornith returned an empty final answer")
-
-
-def _request_ornith(settings: OrnithProviderSettings, prompt: str) -> str:
-    body = json.dumps(
-        {
-            "model": settings.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are the reasoning brain behind a realtime multimodal "
-                        "assistant. Complete the delegated task using only the "
-                        "supplied text context. Evidence reference identifiers are "
-                        "not evidence contents. Do not claim to have seen, heard, "
-                        "searched, opened, or used anything that is not explicitly "
-                        "present in the supplied context. Return the useful final "
-                        "result, not private chain-of-thought."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": settings.temperature,
-            "max_tokens": settings.max_tokens,
-            "stream": False,
-        }
-    ).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    api_key = os.getenv(settings.api_key_env, "").strip()
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    request = urllib.request.Request(
-        _chat_url(settings.base_url),
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=settings.request_timeout_sec) as response:
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:1000]
-        raise RuntimeError(f"Ornith HTTP {exc.code}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"Ornith request failed: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("Ornith response was not a JSON object")
-    return _extract_text(payload)
-
-
-class _OrnithRun:
-    def __init__(self, request: WorkerRequest, settings: OrnithProviderSettings) -> None:
+class OrnithRun:
+    def __init__(self, request: WorkerRequest, settings: OrnithProviderSettings):
         self.request = request
         self.settings = settings
-        self.session_id = request.lineage_id or request.run_id
+        self.session_id = f"ornith:{request.run_id}"
         self._queue: asyncio.Queue[WorkerEvent | None] = asyncio.Queue()
-        self._cancelled = asyncio.Event()
-        self._task = asyncio.create_task(self._execute(), name=f"ornith-{request.run_id}")
+        self._seq = 0
+        self._terminal = False
+        self._task: asyncio.Task | None = None
 
-    def _event(self, seq: int, payload: UpdatePayload | DonePayload, ref: str) -> WorkerEvent:
+    async def start(self):
+        self._task = asyncio.create_task(
+            self._drive(),
+            name=f"ornith-{self.request.run_id}",
+        )
+
+    def _make_event(self, payload):
+        self._seq += 1
+        if isinstance(payload, UpdatePayload):
+            event_type = "update"
+        elif isinstance(payload, DonePayload):
+            event_type = "done"
+        else:
+            raise TypeError(f"Unsupported Ornith payload: {type(payload)}")
+
         return WorkerEvent(
-            event_id=stable_id("event", self.request.run_id, ref),
+            event_id=new_id("event"),
             owner_id=self.request.owner_id,
             task_id=self.request.task_id,
             project_id=self.request.project_id,
             run_id=self.request.run_id,
             generation=self.request.generation,
-            seq=seq,
-            type="update" if isinstance(payload, UpdatePayload) else "done",
+            seq=self._seq,
+            type=event_type,
             payload=payload,
         )
 
-    async def _execute(self) -> None:
-        try:
-            await self._queue.put(
-                self._event(
-                    1,
-                    UpdatePayload(
-                        kind="activity",
-                        summary="Ornith is reasoning about the delegated task.",
-                        next_step="Return the result to the live Gander session.",
-                    ),
-                    "ornith-start",
-                )
-            )
-            result = await asyncio.to_thread(
-                _request_ornith, self.settings, _bounded_context(self.request)
-            )
-            if self._cancelled.is_set():
-                await self._queue.put(
-                    self._event(2, DonePayload("cancelled", "Ornith task cancelled."), "ornith-cancelled")
-                )
-            else:
-                await self._queue.put(
-                    self._event(2, DonePayload("completed", result), "ornith-done")
-                )
-        except asyncio.CancelledError:
-            await self._queue.put(
-                self._event(2, DonePayload("cancelled", "Ornith task cancelled."), "ornith-cancelled")
-            )
-        except Exception as exc:
-            await self._queue.put(
-                self._event(2, DonePayload("failed", str(exc)), "ornith-failed")
-            )
-        finally:
-            await self._queue.put(None)
+    async def _publish(self, payload):
+        if self._terminal:
+            return
+        event = self._make_event(payload)
+        if event.type == "done":
+            self._terminal = True
+        await self._queue.put(event)
 
-    def events(self) -> AsyncIterator[WorkerEvent]:
-        async def iterate() -> AsyncIterator[WorkerEvent]:
-            while True:
-                event = await self._queue.get()
-                if event is None:
-                    return
-                yield event
-                if event.type == "done":
-                    return
-        return iterate()
+    def _build_prompt(self) -> str:
+        pieces = [
+            "You are the long-horizon Brain inside Gander.",
+            "",
+            "Gander's realtime Cerebellum handles live audio-visual perception and interaction timing.",
+            "",
+            "Your job is reasoning, planning, and deciding what the agent should do with the task.",
+            "",
+            f"TASK:\n{self.request.instruction}",
+        ]
+
+        brief = getattr(self.request.context_plan, "brief", "")
+        if brief:
+            pieces.extend(["", "GANDER CONTEXT:", brief])
+
+        source_turn = self.request.source_turn
+        if source_turn is not None:
+            text = getattr(source_turn, "final_asr", "")
+            if text:
+                pieces.extend(["", "TRUSTED USER TURN:", text])
+
+        pieces.extend([
+            "",
+            "Return a concise final response.",
+            "Do not expose chain-of-thought.",
+        ])
+        return "\n".join(pieces)
+
+    def _request_ornith(self) -> dict[str, Any]:
+        api_key = os.environ.get(self.settings.api_key_env, "")
+        if not api_key:
+            raise RuntimeError(f"Missing environment variable {self.settings.api_key_env}")
+
+        url = self.settings.base_url.rstrip("/") + "/v1/chat/completions"
+        payload = {
+            "model": self.settings.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Gander's back Brain. "
+                        "Gander's Cerebellum owns realtime audio-visual perception. "
+                        "You own longer-horizon reasoning."
+                    ),
+                },
+                {"role": "user", "content": self._build_prompt()},
+            ],
+            "temperature": self.settings.temperature,
+            "max_tokens": self.settings.max_tokens,
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self.settings.timeout_sec) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    async def _drive(self):
+        try:
+            await self._publish(
+                UpdatePayload(
+                    kind="activity",
+                    summary="Ornith Brain accepted the Gander task.",
+                    next_step="Reasoning about the task.",
+                )
+            )
+            result = await asyncio.to_thread(self._request_ornith)
+            choices = result.get("choices") or []
+            if not choices:
+                raise RuntimeError("Ornith returned no choices")
+            message = choices[0].get("message") or {}
+            answer = message.get("content")
+            if not answer:
+                raise RuntimeError("Ornith returned no final content")
+            await self._publish(DonePayload(status="completed", result=answer.strip()))
+        except asyncio.CancelledError:
+            if not self._terminal:
+                await self._publish(DonePayload(status="cancelled", result="Ornith task cancelled."))
+            raise
+        except Exception as exc:
+            if not self._terminal:
+                await self._publish(
+                    DonePayload(
+                        status="failed",
+                        result=f"Ornith Brain failure: {type(exc).__name__}: {exc}",
+                    )
+                )
+
+    async def events(self) -> AsyncIterator[WorkerEvent]:
+        while True:
+            event = await self._queue.get()
+            if event is None:
+                return
+            yield event
+            if event.type == "done":
+                return
 
     async def send(self, message: WorkerMessage) -> bool:
-        del message
         return False
 
     async def cancel(self, request_id: str) -> bool:
-        del request_id
-        if self._task.done() or self._cancelled.is_set():
+        if self._terminal:
             return True
-        self._cancelled.set()
-        self._task.cancel()
+        if self._task is not None:
+            self._task.cancel()
         return False
 
-    async def close(self) -> None:
-        if not self._task.done():
-            self._cancelled.set()
+    async def close(self):
+        if self._task is not None and not self._task.done():
             self._task.cancel()
-        await asyncio.gather(self._task, return_exceptions=True)
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        await self._queue.put(None)
 
 
-class _OrnithProject:
-    def __init__(self, settings: OrnithProviderSettings) -> None:
+class OrnithProject:
+    def __init__(self, project: ProjectRecord, settings: OrnithProviderSettings):
+        self.project = project
         self.settings = settings
+        self._runs: set[OrnithRun] = set()
         self._closed = False
 
-    async def start(self, request: WorkerRequest, control: WorkerControl) -> _OrnithRun:
-        del control
+    async def start(self, request: WorkerRequest, control: WorkerControl) -> OrnithRun:
         if self._closed:
             raise RuntimeError("Ornith project is closed")
-        return _OrnithRun(request, self.settings)
+        if request.project_id != self.project.project_id:
+            raise ValueError("WorkerRequest project mismatch")
+        run = OrnithRun(request=request, settings=self.settings)
+        self._runs.add(run)
+        await run.start()
+        return run
 
-    async def close(self) -> None:
+    async def close(self):
+        if self._closed:
+            return
         self._closed = True
+        runs = tuple(self._runs)
+        for run in runs:
+            await run.close()
+        self._runs.clear()
 
 
-class OrnithProvider:
+class OrnithWorkerProvider:
     name = "ornith-openai"
     capabilities = ORNITH_CAPABILITIES
 
-    def __init__(self, settings: OrnithProviderSettings) -> None:
+    def __init__(self, settings: OrnithProviderSettings):
         self.settings = settings
+        self._projects: dict[str, OrnithProject] = {}
         self._closed = False
 
-    async def open_project(self, project: ProjectRecord) -> _OrnithProject:
-        del project
+    def _warmup_sync(self) -> None:
+        api_key = os.environ.get(self.settings.api_key_env, "")
+        if not api_key:
+            raise RuntimeError(f"Missing environment variable {self.settings.api_key_env}")
+        url = self.settings.base_url.rstrip("/") + "/v1/models"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=self.settings.timeout_sec) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"Ornith warmup failed: HTTP {response.status}")
+            response.read()
+
+    async def warmup(self) -> None:
+        # Gander calls provider.warmup() before announcing the realtime session ready.
+        await asyncio.to_thread(self._warmup_sync)
+
+    async def open_project(self, project: ProjectRecord) -> OrnithProject:
         if self._closed:
             raise RuntimeError("Ornith provider is closed")
-        return _OrnithProject(self.settings)
+        existing = self._projects.get(project.project_id)
+        if existing is not None:
+            return existing
+        created = OrnithProject(project=project, settings=self.settings)
+        self._projects[project.project_id] = created
+        return created
 
-    async def close(self) -> None:
+    async def close(self):
+        if self._closed:
+            return
         self._closed = True
+        for project in tuple(self._projects.values()):
+            await project.close()
+        self._projects.clear()
 
 
 def _build_ornith_provider(
     context: ProviderBuildContext,
     settings: OrnithProviderSettings,
-) -> OrnithProvider:
-    del context
-    return OrnithProvider(settings)
+):
+    return OrnithWorkerProvider(settings)
 
 
 ORNITH_PROVIDER_REGISTRATION = ProviderRegistration(
