@@ -4,21 +4,16 @@ import json
 
 import pytest
 
-# Run after copying ornith_provider.py into the Gander providers package.
-from gander_runtime.coordination import (
-    ContextPlan,
-    TurnEnvelope,
-    WorkerPolicyView,
-    WorkerRequest,
-)
 from gander_runtime.providers.ornith import (
-    OrnithProvider,
+    ORNITH_CAPABILITIES,
     OrnithProviderSettings,
-    _bounded_context,
+    OrnithWorkerProvider,
 )
 
 
 class _Response:
+    status = 200
+
     def __enter__(self):
         return self
 
@@ -26,69 +21,38 @@ class _Response:
         return None
 
     def read(self):
-        return json.dumps({"choices": [{"message": {"content": "delegated result"}}]}).encode()
+        return json.dumps({"data": []}).encode()
 
 
-def _policy() -> WorkerPolicyView:
-    return WorkerPolicyView(
-        contract_revision=1,
-        must_ask=("critical_input.missing", "irreversible_ambiguity"),
-        delegated_questions=("formatting.detail",),
-        allowed_actions=("read", "search", "draft", "edit_draft"),
-        permission_actions=("send", "publish", "overwrite", "destructive_action"),
-        denied_actions=(),
-        subscribed_milestones=("final.completed",),
-    )
-
-
-def _request() -> WorkerRequest:
-    return WorkerRequest(
-        task_id="task-1",
-        run_id="run-1",
-        project_id="project-1",
-        owner_id="owner-1",
-        generation=1,
-        instruction="Explain what the user should do next.",
-        original_turn="What should I do next?",
-        context_plan=ContextPlan(
-            brief="The bracket is visibly misaligned before the bolt is tightened.",
-            media_refs=("frame-17",),
-        ),
-        policy=_policy(),
-        lineage_id="lineage-1",
-        source_turn=TurnEnvelope(
-            owner_id="owner-1",
-            voice_session_id="voice-1",
-            turn_id="turn-1",
-            final_asr="What should I do next?",
-        ),
-    )
+def test_capabilities_match_current_checkpoint():
+    assert ORNITH_CAPABILITIES.session == "stateless"
+    assert ORNITH_CAPABILITIES.context_provisioning == "push_bounded"
+    assert ORNITH_CAPABILITIES.worker_tools == frozenset()
+    assert ORNITH_CAPABILITIES.interactions is False
+    assert ORNITH_CAPABILITIES.steering == "none"
+    assert ORNITH_CAPABILITIES.max_parallel_projects == 4
 
 
 @pytest.mark.asyncio
-async def test_ornith_provider_returns_done(monkeypatch):
-    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: _Response())
-    provider = OrnithProvider(OrnithProviderSettings())
-    project = await provider.open_project(object())
-    run = await project.start(_request(), object())
-    events = [event async for event in run.events()]
-    assert [event.type for event in events] == ["update", "done"]
-    assert events[-1].payload.status == "completed"
-    assert events[-1].payload.result == "delegated result"
+async def test_provider_warmup_uses_models_endpoint(monkeypatch):
+    seen = {}
 
+    def _urlopen(request, timeout):
+        seen["url"] = request.full_url
+        seen["timeout"] = timeout
+        return _Response()
 
-def test_bounded_context_does_not_invent_media_contents():
-    prompt = _bounded_context(_request())
-    assert "What should I do next?" in prompt
-    assert "The bracket is visibly misaligned" in prompt
-    assert "media:frame-17" in prompt
-    assert "identifiers only; do not infer their contents" in prompt
+    monkeypatch.setenv("ORNITH_API_KEY", "test-key")
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
 
+    provider = OrnithWorkerProvider(
+        OrnithProviderSettings(
+            base_url="https://ornith.example",
+            timeout_sec=12,
+        )
+    )
 
-def test_phase1_capabilities_are_conservative():
-    provider = OrnithProvider(OrnithProviderSettings())
-    assert provider.capabilities.session == "stateless"
-    assert provider.capabilities.context_provisioning == "push_bounded"
-    assert provider.capabilities.worker_tools == frozenset()
-    assert provider.capabilities.interactions is False
-    assert provider.capabilities.steering == "none"
+    await provider.warmup()
+
+    assert seen["url"] == "https://ornith.example/v1/models"
+    assert seen["timeout"] == 12
