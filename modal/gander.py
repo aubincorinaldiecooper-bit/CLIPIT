@@ -1,4 +1,8 @@
-"""Versioned Modal definition for Clipit's Gander Thinker service."""
+"""Versioned Modal definition for the GNSIS realtime runtime.
+
+Gander remains the vendored internal engine; deployment names and the service
+boundary exposed to Clipit use the GNSIS product name.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +10,18 @@ import os
 
 import modal
 
-APP_NAME = os.environ.get("GANDER_APP_NAME", "clipit-gander-thinker-test")
+APP_NAME = os.environ.get("GNSIS_APP_NAME", "clipit-gnsis-runtime-test")
 MODELS_VOLUME_NAME = os.environ.get("GANDER_MODELS_VOLUME", "clipit-gander-weights")
-SECRET_NAME = os.environ.get("GANDER_SECRET_NAME", "clipit-gander-ornith")
+ORNITH_SECRET_NAME = os.environ.get("ORNITH_SECRET_NAME", "clipit-gander-ornith")
+ACCESS_SECRET_NAME = os.environ.get("GNSIS_ACCESS_SECRET_NAME", "clipit-gnsis-access")
+ORNITH_BASE_URL = (os.environ.get("ORNITH_BASE_URL") or "").strip()
+
+if not ORNITH_BASE_URL:
+    raise RuntimeError("ORNITH_BASE_URL is required at deploy time")
 
 models = modal.Volume.from_name(MODELS_VOLUME_NAME, create_if_missing=False)
-gander_secret = modal.Secret.from_name(SECRET_NAME)
+ornith_secret = modal.Secret.from_name(ORNITH_SECRET_NAME)
+access_secret = modal.Secret.from_name(ACCESS_SECRET_NAME)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -49,6 +59,7 @@ image = (
         "python -m pip install --no-deps /workspace/gander/gander_runtime",
         "mkdir -p /workspace /var/gander /var/gander/ledger",
     )
+    .env({"ORNITH_BASE_URL": ORNITH_BASE_URL})
 )
 
 app = modal.App(APP_NAME, image=image, include_source=False)
@@ -70,12 +81,12 @@ def cache_gander_models() -> dict[str, str]:
 @app.function(
     gpu="L40S",
     volumes={"/models": models},
-    secrets=[gander_secret],
+    secrets=[ornith_secret, access_secret],
     timeout=24 * 60 * 60,
     scaledown_window=60,
 )
 @modal.asgi_app()
-def gander_server():
+def gnsis_server():
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
     from gander_entrypoint import app as asgi_app
 
