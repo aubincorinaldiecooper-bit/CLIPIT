@@ -1,32 +1,17 @@
-"""Versioned Modal definition for Clipit's existing Gander Thinker service.
-
-The Gander runtime is vendored under ``gander/``. This deployment keeps the
-existing Modal app/function identity while moving the source of truth into
-CLIPIT. Model weights and secrets remain external runtime prerequisites.
-"""
+"""Versioned Modal definition for Clipit's Gander Thinker service."""
 
 from __future__ import annotations
 
 import os
-import subprocess
 
 import modal
 
-APP_NAME = "clipit-gander-thinker"
-PORT = 7975
-CONFIG_PATH = "/workspace/gander/configs/clipit-video-search.yaml"
-
-# These names were never versioned in CLIPIT. Require them explicitly rather
-# than guessing and accidentally creating a second production resource.
-MODELS_VOLUME_NAME = os.environ.get("GANDER_MODELS_VOLUME")
-SECRET_NAME = os.environ.get("GANDER_SECRET_NAME")
-if not MODELS_VOLUME_NAME:
-    raise RuntimeError("Set GANDER_MODELS_VOLUME to the existing Gander model Volume name")
-if not SECRET_NAME:
-    raise RuntimeError("Set GANDER_SECRET_NAME to the existing Modal Secret containing ORNITH_API_KEY")
+APP_NAME = os.environ.get("GANDER_APP_NAME", "clipit-gander-thinker-test")
+MODELS_VOLUME_NAME = os.environ.get("GANDER_MODELS_VOLUME", "clipit-gander-weights")
+SECRET_NAME = os.environ.get("GANDER_SECRET_NAME", "clipit-gander-ornith")
 
 models = modal.Volume.from_name(MODELS_VOLUME_NAME, create_if_missing=False)
-ornith_secret = modal.Secret.from_name(SECRET_NAME)
+gander_secret = modal.Secret.from_name(SECRET_NAME)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -58,6 +43,7 @@ image = (
         "websockets>=12",
     )
     .add_local_dir("gander", remote_path="/workspace/gander", copy=True)
+    .add_local_file("modal/gander_entrypoint.py", remote_path="/workspace/gander_entrypoint.py", copy=True)
     .run_commands(
         "python -m pip install --no-deps /workspace/gander/minicpm_ft",
         "python -m pip install --no-deps /workspace/gander/gander_runtime",
@@ -70,7 +56,6 @@ app = modal.App(APP_NAME, image=image, include_source=False)
 
 @app.function(volumes={"/models": models}, timeout=600)
 def cache_gander_models() -> dict[str, str]:
-    """Validate that the externally supplied model volume is populated."""
     from pathlib import Path
 
     model_dir = Path("/models/MiniCPM-o-4_5")
@@ -85,17 +70,13 @@ def cache_gander_models() -> dict[str, str]:
 @app.function(
     gpu="L40S",
     volumes={"/models": models},
-    secrets=[ornith_secret],
+    secrets=[gander_secret],
     timeout=24 * 60 * 60,
     scaledown_window=60,
 )
-@modal.web_server(PORT, startup_timeout=1800)
-def gander_server() -> None:
-    """Serve Gander from the vendored CLIPIT runtime."""
-    env = os.environ.copy()
-    env.setdefault("CUDA_VISIBLE_DEVICES", "0")
-    subprocess.Popen(
-        ["gander-serve", "--config", CONFIG_PATH],
-        cwd="/workspace",
-        env=env,
-    )
+@modal.asgi_app()
+def gander_server():
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    from gander_entrypoint import app as asgi_app
+
+    return asgi_app
