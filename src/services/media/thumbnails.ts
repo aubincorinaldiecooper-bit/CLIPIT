@@ -68,6 +68,8 @@ export async function attachThumbnails(input: {
   /** A directory this call may write into; the caller owns its lifetime. */
   workDir: string;
   log: Logger;
+  /** Optional search-attempt fence; background thumbnail backfills omit it. */
+  attemptFence?: { requestId: string; deckAttemptId: string };
 }): Promise<number> {
   const { videoId, matches, workDir, log } = input;
   if (matches.length === 0) return 0;
@@ -104,7 +106,7 @@ export async function attachThumbnails(input: {
     const attached = results.flatMap((result) =>
       result.status === 'fulfilled' && result.value ? [result.value] : [],
     );
-    await setMatchThumbnails(attached);
+    await setMatchThumbnails(attached, input.attemptFence);
 
     log.info('match thumbnails attached', {
       videoId,
