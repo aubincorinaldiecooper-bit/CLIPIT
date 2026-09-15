@@ -1,34 +1,40 @@
-# Gander + CrisperWhisper + Ornith (Phase 1)
+# Gander + Ornith runtime
 
-This directory contains an isolated experiment for adding Gander as Clipit's realtime perception layer without changing the current production video Q&A path.
+This directory contains the current Clipit experiment for using Gander as the realtime audiovisual perception layer with Ornith as the delegated Brain.
 
-Target stack:
+Current validated shape:
 
-- Gander: continuous audiovisual perception and interaction.
-- CrisperWhisper: external ASR candidate using Gander's existing HTTP ASR contract.
-- Ornith: delegated reasoning Brain through Gander's WorkerProvider contract.
-- Clipit persistent video memory: intentionally not connected in Phase 1.
+- Gander Thinker: realtime vision + raw audio perception
+- Ornith: longer-horizon reasoning through Gander's WorkerProvider contract
+- ASR: disabled for now
+- Talker/TTS: disabled for now
+- client video: enabled
+- provider warmup: implemented and validated
 
-## Guardrails
+The current goal is to prove a stable Gander + Ornith runtime before wiring it into the Clipit web-video search backend.
 
-This experiment must not alter the current notes-first / footage-fallback production search path.
+## Provider contract
 
-CrisperWhisper is a candidate, not an assumed winner. We need to measure realtime latency, interruption handling, timing accuracy, GPU use, and cost before choosing it over Faster-Whisper.
+The Ornith adapter is intentionally conservative:
 
-The CrisperWhisper repository code is MIT-licensed, but its standard model weights require a commercial license for commercial use. Do not deploy those weights commercially until licensing is resolved.
+- stateless
+- bounded pushed context
+- no steering
+- no side queries
+- no interactions
+- no worker tools
+- up to four parallel projects declared for the eventual four-scout search architecture
 
-Ornith is not treated as a drop-in Codex replacement. Gander expects a WorkerProvider lifecycle, so the adapter in this directory implements that contract explicitly and declares only the capabilities it actually supports.
+The provider exposes `warmup()` because Gander calls that hook before announcing a realtime session ready.
 
-## Phase 1 success criteria
+## Current runtime behavior
 
-1. Live camera and microphone can reach Gander.
-2. CrisperWhisper can satisfy Gander's external `/health` and `/transcribe` ASR contract.
-3. Audio timestamps remain aligned to Gander's source timeline.
-4. Gander can delegate a reasoning task to Ornith.
-5. Ornith returns a result to the correct Gander task.
-6. Gander can keep perceiving while the delegated task is running.
-7. Every unsupported provider capability is reported honestly rather than emulated incorrectly.
+Gander owns live audiovisual perception and timing. Ornith receives the delegated task plus bounded context selected by Gander and returns the longer-horizon result.
 
-## Modal
+The current runtime does not depend on CrisperWhisper or Talker. Those can be evaluated later without blocking the web-search integration.
 
-Do not deploy this experiment to Modal until the local contracts are working. The first Modal build should be used to measure the actual GPU footprint and latency of Gander Thinker/Talker, CrisperWhisper, and Ornith rather than assuming the upstream reference topology is the final architecture.
+## Next step
+
+Integrate the validated Gander + Ornith runtime into the Clipit backend path:
+
+query -> discovery -> managed browser playback -> Gander observation -> Ornith reasoning when needed -> timestamped result -> existing Clipit frontend
