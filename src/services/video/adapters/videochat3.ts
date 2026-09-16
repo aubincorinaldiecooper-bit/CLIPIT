@@ -14,12 +14,20 @@ export const videoChat3Adapter: VideoModelAdapter = {
     if (isStoredVideoSource(source)) {
       const watched = await watchWithVideoChat3({ videoUrl: source.videoUrl, query, expectedBytes: source.expectedBytes, maxEvents: eventCap });
       for (const moment of watched.events) await onMoment?.(moment);
+      // A capped offline watch did not reach the tail of the video. Preserve
+      // the old evidence semantics: only the footage through the last emitted
+      // event was actually examined, even though the downloaded file's total
+      // duration is known.
+      const capped = watched.events.length >= eventCap;
+      const watchedThroughSeconds = capped
+        ? (watched.events.at(-1)?.endSeconds ?? 0)
+        : watched.durationSeconds;
       return {
         model: watched.model,
         revision: watched.revision,
         durationSeconds: watched.durationSeconds,
-        watchedThroughSeconds: watched.watchedThroughSeconds ?? watched.durationSeconds,
-        exhausted: watched.exhausted ?? true,
+        watchedThroughSeconds,
+        exhausted: !capped,
         moments: watched.events,
         metrics: watched.metrics,
       };
