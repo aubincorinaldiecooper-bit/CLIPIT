@@ -37,10 +37,30 @@ export interface ScoutSwarmResult<Candidate extends ScoutCandidate> {
  * apart, all describing the same event, filling a results band that holds five.
  *
  * Two seconds is one missed look at a frame a second: enough to ride over a
- * frame the model did not match in the middle of something it did, without
- * joining two things that happened at different times.
+ * frame the model did not match in the middle of something it did. Nearness
+ * alone is not enough to join two findings, though — see `sameThing`.
  */
 const MERGE_GAP_SECONDS = 2;
+
+/**
+ * Whether two findings are the watcher saying the same thing again.
+ *
+ * Time alone cannot tell one long event from two short ones a second apart: a
+ * woman waving at 00:10 and a man waving at 00:12 are as close together as two
+ * frames of one wave. Joining those would put one card on screen carrying the
+ * first description and silently lose the second, over a stretch that includes
+ * footage matching neither (Codex's finding on #143).
+ *
+ * What the model said is the one signal available. It watches at temperature
+ * zero, so one continuing event answered about frame by frame comes back in
+ * the same words, and two different events come back in different words. Where
+ * two genuinely separate events do produce the same sentence, nothing we hold
+ * can tell them apart, and one card saying it once loses the reader nothing.
+ */
+function sameThing(one: string, other: string): boolean {
+  const plain = (text: string) => text.trim().toLowerCase().replace(/\s+/g, ' ');
+  return plain(one) === plain(other);
+}
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -91,6 +111,9 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
     // join is not a continuation of it.
     if (proposal.startSeconds < previous.startSeconds) return null;
     if (proposal.startSeconds - previous.endSeconds > MERGE_GAP_SECONDS) return null;
+    // Near in time and the same account of what is happening. Different words
+    // mean a different thing was seen, however close together it was.
+    if (!sameThing(proposal.description, previous.description)) return null;
     // Growing past the ceiling would turn a stretch the product does not call a
     // moment into one card. Beyond it the finding starts a moment of its own.
     if (Math.max(previous.endSeconds, proposal.endSeconds) - previous.startSeconds > maxMomentSeconds) return null;

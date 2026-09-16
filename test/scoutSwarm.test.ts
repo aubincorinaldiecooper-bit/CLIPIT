@@ -186,6 +186,33 @@ describe('runScoutSwarm', () => {
     expect(result.moments[1]).toMatchObject({ startSeconds: 30, endSeconds: 31, description: 'She waves again.' });
   });
 
+  it('keeps two things seen a second apart as two moments, not one', async () => {
+    const result = await runScoutSwarm<Candidate>({
+      searchId: 'search-10',
+      query: 'find people waving',
+      candidates: [{ id: 'only', label: 'only candidate' }],
+      runtime: streamingRuntimeFor({
+        frames: () => [
+          ...secondBySecond(10, 11, 'A woman waves from the left.'),
+          ...secondBySecond(12, 13, 'A man waves from the right.'),
+        ],
+      }),
+    });
+
+    // One second apart, so near enough in time to join. Different accounts of
+    // what is happening, so two different things: keeping one would put the
+    // woman's words over the man's moment and lose his entirely.
+    expect(result.moments).toHaveLength(2);
+    expect(result.moments.map((moment) => moment.description)).toEqual([
+      'A woman waves from the left.',
+      'A man waves from the right.',
+    ]);
+    expect(result.moments.map((moment) => [moment.startSeconds, moment.endSeconds])).toEqual([
+      [10, 11],
+      [12, 13],
+    ]);
+  });
+
   it('never joins findings that came from two different pages', async () => {
     const result = await runScoutSwarm<Candidate>({
       searchId: 'search-8',
