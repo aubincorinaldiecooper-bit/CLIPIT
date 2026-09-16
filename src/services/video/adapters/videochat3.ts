@@ -1,76 +1,54 @@
 import { ExternalServiceError } from '../../../lib/errors.js';
-import {
-  verifyWithVideoChat3,
-  watchWithVideoChat3,
-} from '../../videochat3/client.js';
-import type {
-  VideoModelAdapter,
-  VideoVerificationCandidate,
-  VideoWatchResult,
-} from '../model.js';
-import { isStoredVideoSource } from '../source.js';
+import { verifyWithVideoChat3, watchStreamWithVideoChat3, watchWithVideoChat3 } from '../../videochat3/client.js';
+import type { VideoModelAdapter, VideoVerificationCandidate, VideoWatchResult } from '../model.js';
+import { isFrameStreamVideoSource, isStoredVideoSource } from '../source.js';
 
 const DEFAULT_MAX_EVENTS = 64;
 
-/**
- * Current VideoChat3 adapter.
- *
- * The model itself uses VideoChat3's StreamingSession internally, but the
- * deployed Modal boundary still accepts a fetchable video URL. Declaring only
- * `stored-video` here is intentional: the future live-frame adapter can be
- * added without lying to orchestration about what today's deployment accepts.
- */
 export const videoChat3Adapter: VideoModelAdapter = {
   id: 'videochat3',
-  sourceKinds: new Set(['stored-video']),
+  sourceKinds: new Set(['stored-video', 'frame-stream']),
 
-  async watch({ source, query, maxEvents }): Promise<VideoWatchResult> {
-    if (!isStoredVideoSource(source)) {
-      throw new ExternalServiceError('videochat3', `VideoChat3 cannot read source kind "${source.kind}"`, { retryable: false });
-    }
+  async watch({ source, query, maxEvents, signal, onMoment }): Promise<VideoWatchResult> {
     const eventCap = maxEvents ?? DEFAULT_MAX_EVENTS;
-    const watched = await watchWithVideoChat3({
-      videoUrl: source.videoUrl,
-      query,
-      expectedBytes: source.expectedBytes,
-      maxEvents: eventCap,
-    });
-    const watchedThroughSeconds = watched.events.length >= eventCap
-      ? (watched.events.at(-1)?.endSeconds ?? watched.durationSeconds)
-      : watched.durationSeconds;
-
-    return {
-      model: watched.model,
-      revision: watched.revision,
-      durationSeconds: watched.durationSeconds,
-      watchedThroughSeconds,
-      moments: watched.events,
-      metrics: watched.metrics,
-    };
+    if (isStoredVideoSource(source)) {
+      const watched = await watchWithVideoChat3({ videoUrl: source.videoUrl, query, expectedBytes: source.expectedBytes, maxEvents: eventCap });
+      for (const moment of watched.events) await onMoment?.(moment);
+      // A capped offline watch did not reach the tail of the video. Preserve
+      // the old evidence semantics: only the footage through the last emitted
+      // event was actually examined, even though the downloaded file's total
+      // duration is known.
+      const capped = watched.events.length >= eventCap;
+      const watchedThroughSeconds = capped
+        ? (watched.events.at(-1)?.endSeconds ?? 0)
+        : watched.durationSeconds;
+      return {
+        model: watched.model,
+        revision: watched.revision,
+        durationSeconds: watched.durationSeconds,
+        watchedThroughSeconds,
+        exhausted: !capped,
+        moments: watched.events,
+        metrics: watched.metrics,
+      };
+    }
+    if (isFrameStreamVideoSource(source)) {
+      const watched = await watchStreamWithVideoChat3({ source, query, signal, maxEvents: eventCap, onMoment });
+      return {
+        model: watched.model,
+        revision: watched.revision,
+        durationSeconds: watched.durationSeconds,
+        watchedThroughSeconds: watched.watchedThroughSeconds ?? watched.durationSeconds,
+        exhausted: watched.exhausted,
+        moments: watched.events,
+        metrics: watched.metrics,
+      };
+    }
+    throw new ExternalServiceError('videochat3', `VideoChat3 cannot read source kind "${(source as { kind: string }).kind}"`, { retryable: false });
   },
 
-  async verify({ source, query, candidates }): Promise<{
-    model: string;
-    revision: string;
-    results: Array<{
-      id: string;
-      startSeconds: number;
-      endSeconds: number;
-      match: boolean;
-      confidence: number;
-      description: string;
-    }>;
-    failed: Array<{ id: string; reason: string }>;
-    metrics: Record<string, unknown>;
-  }> {
-    if (!isStoredVideoSource(source)) {
-      throw new ExternalServiceError('videochat3', `VideoChat3 cannot verify source kind "${source.kind}"`, { retryable: false });
-    }
-    return verifyWithVideoChat3({
-      videoUrl: source.videoUrl,
-      query,
-      expectedBytes: source.expectedBytes,
-      candidates: candidates as VideoVerificationCandidate[],
-    });
+  async verify({ source, query, candidates }) {
+    if (!isStoredVideoSource(source)) throw new ExternalServiceError('videochat3', 'VideoChat3 interval verification requires stored footage', { retryable: false });
+    return verifyWithVideoChat3({ videoUrl: source.videoUrl, query, expectedBytes: source.expectedBytes, candidates: candidates as VideoVerificationCandidate[] });
   },
 };

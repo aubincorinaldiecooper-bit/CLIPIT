@@ -1,21 +1,23 @@
 """VideoChat3 on Modal for Clipit's internet-video and uploaded-video search.
 
-One L4-backed service owns the model weights and exposes two jobs:
+One L4-backed service owns the model weights and exposes three jobs:
 
-* ``watch``: a progressive first pass over a candidate video using the
+* ``watch``: an offline first pass over a fetchable candidate video using the
   official VideoChat3 StreamingSession / VideoFrameExtractor implementation.
-  It returns timestamped response events. These are retrieval leads, not
-  user-facing evidence.
-* ``verify_intervals``: a dense second look at exact source intervals and a
-  strict relevance judgement. Candidate-specific timestamped transcript text
-  may accompany the clip for mixed visual+spoken questions. Only this path is
-  eligible to become evidence after retrieval/reranking has narrowed the search.
+* ``watch_stream``: the same official streaming session kept alive while
+  timestamped browser frames arrive through Modal queues. Matching moments are
+  emitted as soon as the model produces them.
+* ``verify_intervals``: a dense second look at exact stored-video intervals and
+  a strict relevance judgement.
 """
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -247,6 +249,121 @@ class VideoChat3Service:
                     "total_ms": int((time.time() - started) * 1000),
                 },
             }
+
+    @modal.method()
+    def watch_stream(
+        self,
+        input_queue_id: str,
+        output_queue_id: str,
+        query: str,
+        max_rounds: int = 256,
+        max_events: int = 64,
+    ) -> dict[str, Any]:
+        """Watch timestamped browser frames through one stateful session."""
+        from PIL import Image
+
+        input_queue = modal.Queue.from_id(input_queue_id)
+        output_queue = modal.Queue.from_id(output_queue_id)
+        started = time.time()
+        session = self.StreamingSession(
+            self.engine,
+            question=query,
+            question_time=0,
+            max_rounds=max_rounds,
+            global_question=True,
+            max_tokens=128,
+            temperature=0.0,
+        )
+        events: list[dict[str, Any]] = []
+        frames_seen = 0
+        last_end = 0.0
+        exhausted = False
+        end_reason = "the frame stream ended without a terminal event"
+
+        try:
+            while frames_seen < max_rounds and len(events) < max_events:
+                try:
+                    item = input_queue.get(timeout=30)
+                except queue.Empty:
+                    # Browser navigation/cold starts can leave the queue empty
+                    # briefly. An empty poll is not the end of the video.
+                    continue
+                if not isinstance(item, dict):
+                    raise ValueError("stream queue item must be an object")
+                kind = item.get("type")
+                if kind == "end":
+                    exhausted = bool(item.get("exhausted"))
+                    end_reason = str(item.get("reason") or "stream ended")[:500]
+                    watched = item.get("watched_through_seconds")
+                    if isinstance(watched, (int, float)) and watched >= 0:
+                        last_end = max(last_end, float(watched))
+                    break
+                if kind != "frame":
+                    raise ValueError(f"unsupported stream item type: {kind!r}")
+
+                timestamp_ms = float(item["timestamp_ms"])
+                duration_ms = max(1.0, float(item.get("duration_ms") or 1000.0))
+                if timestamp_ms < 0:
+                    raise ValueError("frame timestamp must be non-negative")
+                encoded = item.get("image_base64")
+                if not isinstance(encoded, str) or not encoded:
+                    raise ValueError("frame image is missing")
+
+                raw = base64.b64decode(encoded, validate=True)
+                with Image.open(io.BytesIO(raw)) as picture:
+                    # The upstream StreamingSession contract takes PIL images.
+                    # copy() detaches the frame before the BytesIO/image closes.
+                    frame = picture.convert("RGB").copy()
+                start_seconds = timestamp_ms / 1000.0
+                end_seconds = (timestamp_ms + duration_ms) / 1000.0
+                last_end = max(last_end, end_seconds)
+                answer = session.step(
+                    frame,
+                    round_idx=frames_seen,
+                    time_start=start_seconds,
+                    time_end=end_seconds,
+                )
+                frames_seen += 1
+                response = _RESPONSE_RE.match(answer or "")
+                if response:
+                    event = {
+                        "type": "moment",
+                        "start": round(start_seconds, 3),
+                        "end": round(end_seconds, 3),
+                        "description": response.group(1).strip()[:1000],
+                    }
+                    events.append(event)
+                    output_queue.put(event)
+
+            if frames_seen >= max_rounds and not exhausted:
+                end_reason = "VideoChat3 reached its live frame ceiling"
+            if len(events) >= max_events and not exhausted:
+                end_reason = "VideoChat3 reached its live moment ceiling"
+
+            result = {
+                "model": MODEL_ID,
+                "revision": self.revision,
+                "mode": "watch_stream",
+                "duration_seconds": last_end,
+                "watched_through_seconds": last_end,
+                "exhausted": exhausted,
+                "reason": end_reason,
+                "events": events,
+                "metrics": {
+                    "container": self.container,
+                    "startup_ms": self.startup_ms,
+                    "frames_seen": frames_seen,
+                    "total_ms": int((time.time() - started) * 1000),
+                },
+            }
+            output_queue.put({"type": "done", **result})
+            return result
+        except Exception as error:
+            output_queue.put({
+                "type": "error",
+                "reason": f"{type(error).__name__}: {error}"[:500],
+            })
+            raise
 
     def _verify_clip(self, clip_path: Path, query: str, transcript: str | None = None) -> dict[str, Any]:
         from qwen_vl_utils import process_vision_info

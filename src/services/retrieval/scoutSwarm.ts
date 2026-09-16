@@ -2,25 +2,9 @@ import { logger } from '../../lib/logger.js';
 
 export const SCOUT_IDS = ['scout-1', 'scout-2', 'scout-3', 'scout-4'] as const;
 export type ScoutId = (typeof SCOUT_IDS)[number];
-
-export interface ScoutCandidate {
-  id: string;
-}
-
-export interface ScoutProposal {
-  startSeconds: number;
-  endSeconds: number;
-  description: string;
-  confidence?: number;
-}
-
-export interface ScoutInspection {
-  moments: ScoutProposal[];
-  mediaSecondsObserved?: number;
-  exhausted?: boolean;
-  metrics?: Record<string, unknown>;
-}
-
+export interface ScoutCandidate { id: string; }
+export interface ScoutProposal { startSeconds: number; endSeconds: number; description: string; confidence?: number; }
+export interface ScoutInspection { moments: ScoutProposal[]; mediaSecondsObserved?: number; exhausted?: boolean; metrics?: Record<string, unknown>; }
 export interface ScoutRuntime<Candidate extends ScoutCandidate> {
   inspect(input: {
     scoutId: ScoutId;
@@ -28,112 +12,35 @@ export interface ScoutRuntime<Candidate extends ScoutCandidate> {
     query: string;
     candidate: Candidate;
     signal: AbortSignal;
+    onMoment?: (moment: ScoutProposal) => void | Promise<void>;
   }): Promise<ScoutInspection>;
-
   closeScout?(scoutId: ScoutId): Promise<void>;
 }
-
-export interface SwarmMoment<Candidate extends ScoutCandidate> {
-  id: string;
-  candidate: Candidate;
-  scoutId: ScoutId;
-  startSeconds: number;
-  endSeconds: number;
-  description: string;
-  confidence?: number;
-}
-
-export interface ScoutSwarmSnapshot<Candidate extends ScoutCandidate> {
-  scoutCount: 4;
-  candidatesTotal: number;
-  candidatesAssigned: number;
-  candidatesCompleted: number;
-  activeOperations: number;
-  momentsFound: number;
-  moments: SwarmMoment<Candidate>[];
-}
-
+export interface SwarmMoment<Candidate extends ScoutCandidate> { id: string; candidate: Candidate; scoutId: ScoutId; startSeconds: number; endSeconds: number; description: string; confidence?: number; }
+export interface ScoutSwarmSnapshot<Candidate extends ScoutCandidate> { scoutCount: 4; candidatesTotal: number; candidatesAssigned: number; candidatesCompleted: number; activeOperations: number; momentsFound: number; moments: SwarmMoment<Candidate>[]; }
 export interface ScoutSwarmProgress<Candidate extends ScoutCandidate> {
   stage: 'searching' | 'complete' | 'cancelled';
-  event:
-    | 'swarm.started'
-    | 'scout.candidate_assigned'
-    | 'scout.candidate_completed'
-    | 'moment.found'
-    | 'swarm.completed'
-    | 'swarm.cancelled';
-  scoutId?: ScoutId;
-  candidateId?: string;
-  momentId?: string;
-  snapshot: ScoutSwarmSnapshot<Candidate>;
+  event: 'swarm.started' | 'scout.candidate_assigned' | 'scout.candidate_completed' | 'moment.found' | 'swarm.completed' | 'swarm.cancelled';
+  scoutId?: ScoutId; candidateId?: string; momentId?: string; snapshot: ScoutSwarmSnapshot<Candidate>;
 }
-
-export interface ScoutSwarmFailure {
-  scoutId: ScoutId;
-  candidateId: string;
-  stage: 'inspect';
-  reason: string;
-}
-
+export interface ScoutSwarmFailure { scoutId: ScoutId; candidateId: string; stage: 'inspect'; reason: string; }
 export interface ScoutSwarmResult<Candidate extends ScoutCandidate> {
-  searchId: string;
-  status: 'completed' | 'ceiling_reached' | 'cancelled';
-  scoutCount: 4;
-  candidatesAvailable: number;
-  candidatesConsidered: number;
-  candidatesCompleted: number;
-  /**
-   * Candidates a scout looked at but did not get to the end of, plus those
-   * whose inspection was cut short when the search was cancelled or hit its
-   * wall-time ceiling.
-   *
-   * Neither shows up in `failures` — a cancelled inspection is deliberately
-   * not a failure, and a page that simply ran past the watch limit did not
-   * fail either. But both leave part of a page unlooked-at, and a caller that
-   * counts only failures would report an incomplete search as a complete one
-   * that found nothing. Those are different answers.
-   */
-  candidatesPartlyExamined: number;
-  moments: SwarmMoment<Candidate>[];
-  failures: ScoutSwarmFailure[];
-  metrics: {
-    wallMs: number;
-    inspectOperations: number;
-    mediaSecondsObserved: number;
-  };
+  searchId: string; status: 'completed' | 'ceiling_reached' | 'cancelled'; scoutCount: 4; candidatesAvailable: number; candidatesConsidered: number; candidatesCompleted: number;
+  candidatesPartlyExamined: number; moments: SwarmMoment<Candidate>[]; failures: ScoutSwarmFailure[];
+  metrics: { wallMs: number; inspectOperations: number; mediaSecondsObserved: number; };
 }
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
+function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(signal.reason ?? new Error('aborted'));
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(signal.reason ?? new Error('aborted'));
     signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener('abort', onAbort);
-        reject(error);
-      },
-    );
+    promise.then((value) => { signal.removeEventListener('abort', onAbort); resolve(value); }, (error) => { signal.removeEventListener('abort', onAbort); reject(error); });
   });
 }
 
 export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
-  searchId: string;
-  query: string;
-  candidates: Candidate[];
-  runtime: ScoutRuntime<Candidate>;
-  maxCandidates?: number;
-  timeoutMs?: number;
-  maxMomentSeconds?: number;
-  signal?: AbortSignal;
+  searchId: string; query: string; candidates: Candidate[]; runtime: ScoutRuntime<Candidate>; maxCandidates?: number; timeoutMs?: number; maxMomentSeconds?: number; signal?: AbortSignal;
   onProgress?: (progress: ScoutSwarmProgress<Candidate>) => void | Promise<void>;
 }): Promise<ScoutSwarmResult<Candidate>> {
   const startedAt = Date.now();
@@ -142,158 +49,62 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
   const maxMomentSeconds = Math.max(1, input.maxMomentSeconds ?? 60);
   const candidates = input.candidates.slice(0, maxCandidates);
   const log = logger.child({ search_id: input.searchId, component: 'scout_swarm' });
-
   const controller = new AbortController();
   const forwardAbort = () => controller.abort(input.signal?.reason ?? new Error('search cancelled'));
-  if (input.signal?.aborted) forwardAbort();
-  else input.signal?.addEventListener('abort', forwardAbort, { once: true });
+  if (input.signal?.aborted) forwardAbort(); else input.signal?.addEventListener('abort', forwardAbort, { once: true });
+  const timeout = setTimeout(() => controller.abort(new Error('scout swarm wall-time ceiling reached')), timeoutMs); timeout.unref?.();
 
-  const timeout = setTimeout(() => controller.abort(new Error('scout swarm wall-time ceiling reached')), timeoutMs);
-  timeout.unref?.();
-
-  let candidateCursor = 0;
-  let candidatesAssigned = 0;
-  let candidatesCompleted = 0;
-  let activeOperations = 0;
-  let inspectOperations = 0;
-  let mediaSecondsObserved = 0;
-  let momentSequence = 0;
-  let candidatesPartlyExamined = 0;
-  const moments: SwarmMoment<Candidate>[] = [];
-  const failures: ScoutSwarmFailure[] = [];
-
-  const snapshot = (): ScoutSwarmSnapshot<Candidate> => ({
-    scoutCount: 4,
-    candidatesTotal: candidates.length,
-    candidatesAssigned,
-    candidatesCompleted,
-    activeOperations,
-    momentsFound: moments.length,
-    moments: [...moments],
-  });
-
-  const emit = async (
-    event: ScoutSwarmProgress<Candidate>['event'],
-    detail: { scoutId?: ScoutId; candidateId?: string; momentId?: string } = {},
-  ) => {
-    const stage: ScoutSwarmProgress<Candidate>['stage'] = controller.signal.aborted
-      ? 'cancelled'
-      : event === 'swarm.completed'
-        ? 'complete'
-        : 'searching';
+  let candidateCursor = 0, candidatesAssigned = 0, candidatesCompleted = 0, activeOperations = 0, inspectOperations = 0, mediaSecondsObserved = 0, momentSequence = 0, candidatesPartlyExamined = 0;
+  const moments: SwarmMoment<Candidate>[] = []; const failures: ScoutSwarmFailure[] = [];
+  const snapshot = (): ScoutSwarmSnapshot<Candidate> => ({ scoutCount: 4, candidatesTotal: candidates.length, candidatesAssigned, candidatesCompleted, activeOperations, momentsFound: moments.length, moments: [...moments] });
+  const emit = async (event: ScoutSwarmProgress<Candidate>['event'], detail: { scoutId?: ScoutId; candidateId?: string; momentId?: string } = {}) => {
+    const stage: ScoutSwarmProgress<Candidate>['stage'] = controller.signal.aborted ? 'cancelled' : event === 'swarm.completed' ? 'complete' : 'searching';
     const progress: ScoutSwarmProgress<Candidate> = { stage, event, ...detail, snapshot: snapshot() };
-    log.debug(event, {
-      scout_id: detail.scoutId,
-      candidate_id: detail.candidateId,
-      moment_id: detail.momentId,
-      ...progress.snapshot,
-    });
+    log.debug(event, { scout_id: detail.scoutId, candidate_id: detail.candidateId, moment_id: detail.momentId, ...progress.snapshot });
     await input.onProgress?.(progress);
+  };
+  const accept = async (proposal: ScoutProposal, scoutId: ScoutId, candidate: Candidate) => {
+    if (!Number.isFinite(proposal.startSeconds) || !Number.isFinite(proposal.endSeconds)) return;
+    if (proposal.startSeconds < 0 || proposal.endSeconds <= proposal.startSeconds) return;
+    if (proposal.endSeconds - proposal.startSeconds > maxMomentSeconds) {
+      failures.push({ scoutId, candidateId: candidate.id, stage: 'inspect', reason: `proposed moment exceeds ${maxMomentSeconds}s maximum` }); return;
+    }
+    momentSequence += 1;
+    const moment: SwarmMoment<Candidate> = { id: `moment-${momentSequence}`, candidate, scoutId, startSeconds: proposal.startSeconds, endSeconds: proposal.endSeconds, description: proposal.description, confidence: proposal.confidence };
+    moments.push(moment);
+    await emit('moment.found', { scoutId, candidateId: candidate.id, momentId: moment.id });
   };
 
   await emit('swarm.started');
-
   const worker = async (scoutId: ScoutId) => {
     try {
       while (!controller.signal.aborted) {
-        const index = candidateCursor++;
-        if (index >= candidates.length) return;
-        const candidate = candidates[index]!;
-        candidatesAssigned += 1;
-        activeOperations += 1;
-        inspectOperations += 1;
+        const index = candidateCursor++; if (index >= candidates.length) return;
+        const candidate = candidates[index]!; candidatesAssigned += 1; activeOperations += 1; inspectOperations += 1;
         await emit('scout.candidate_assigned', { scoutId, candidateId: candidate.id });
-
+        let streamed = 0;
         try {
-          const inspection = await abortable(
-            input.runtime.inspect({
-              scoutId,
-              searchId: input.searchId,
-              query: input.query,
-              candidate,
-              signal: controller.signal,
-            }),
-            controller.signal,
-          );
+          const inspection = await abortable(input.runtime.inspect({
+            scoutId, searchId: input.searchId, query: input.query, candidate, signal: controller.signal,
+            onMoment: async (proposal) => { streamed += 1; await accept(proposal, scoutId, candidate); },
+          }), controller.signal);
           mediaSecondsObserved += Math.max(0, inspection.mediaSecondsObserved ?? 0);
-          // The scout reached the end of what it was given only if it says so.
           if (inspection.exhausted !== true) candidatesPartlyExamined += 1;
-
-          for (const proposal of inspection.moments) {
-            if (!Number.isFinite(proposal.startSeconds) || !Number.isFinite(proposal.endSeconds)) continue;
-            if (proposal.startSeconds < 0 || proposal.endSeconds <= proposal.startSeconds) continue;
-            if (proposal.endSeconds - proposal.startSeconds > maxMomentSeconds) {
-              failures.push({
-                scoutId,
-                candidateId: candidate.id,
-                stage: 'inspect',
-                reason: `proposed moment exceeds ${maxMomentSeconds}s maximum`,
-              });
-              continue;
-            }
-
-            momentSequence += 1;
-            const moment: SwarmMoment<Candidate> = {
-              id: `moment-${momentSequence}`,
-              candidate,
-              scoutId,
-              startSeconds: proposal.startSeconds,
-              endSeconds: proposal.endSeconds,
-              description: proposal.description,
-              confidence: proposal.confidence,
-            };
-            moments.push(moment);
-            await emit('moment.found', { scoutId, candidateId: candidate.id, momentId: moment.id });
-          }
+          if (streamed === 0) for (const proposal of inspection.moments) await accept(proposal, scoutId, candidate);
         } catch (error) {
-          if (controller.signal.aborted) {
-            // Cut short rather than failed — but the page was not finished
-            // either, and saying nothing about it would lose that.
-            candidatesPartlyExamined += 1;
-          } else {
-            failures.push({ scoutId, candidateId: candidate.id, stage: 'inspect', reason: errorMessage(error) });
-          }
+          if (controller.signal.aborted) candidatesPartlyExamined += 1;
+          else failures.push({ scoutId, candidateId: candidate.id, stage: 'inspect', reason: errorMessage(error) });
         } finally {
-          activeOperations -= 1;
-          candidatesCompleted += 1;
-          await emit('scout.candidate_completed', { scoutId, candidateId: candidate.id });
+          activeOperations -= 1; candidatesCompleted += 1; await emit('scout.candidate_completed', { scoutId, candidateId: candidate.id });
         }
       }
-    } finally {
-      await input.runtime.closeScout?.(scoutId);
-    }
+    } finally { await input.runtime.closeScout?.(scoutId); }
   };
 
-  try {
-    await Promise.all(SCOUT_IDS.map((scoutId) => worker(scoutId)));
-  } finally {
-    clearTimeout(timeout);
-    input.signal?.removeEventListener('abort', forwardAbort);
-  }
-
+  try { await Promise.all(SCOUT_IDS.map((scoutId) => worker(scoutId))); }
+  finally { clearTimeout(timeout); input.signal?.removeEventListener('abort', forwardAbort); }
   const cancelled = controller.signal.aborted;
-  const status: ScoutSwarmResult<Candidate>['status'] = cancelled
-    ? 'cancelled'
-    : input.candidates.length > candidates.length
-      ? 'ceiling_reached'
-      : 'completed';
-
+  const status: ScoutSwarmResult<Candidate>['status'] = cancelled ? 'cancelled' : input.candidates.length > candidates.length ? 'ceiling_reached' : 'completed';
   await emit(cancelled ? 'swarm.cancelled' : 'swarm.completed');
-
-  return {
-    searchId: input.searchId,
-    status,
-    scoutCount: 4,
-    candidatesAvailable: input.candidates.length,
-    candidatesConsidered: candidates.length,
-    candidatesCompleted,
-    candidatesPartlyExamined,
-    moments,
-    failures,
-    metrics: {
-      wallMs: Date.now() - startedAt,
-      inspectOperations,
-      mediaSecondsObserved,
-    },
-  };
+  return { searchId: input.searchId, status, scoutCount: 4, candidatesAvailable: input.candidates.length, candidatesConsidered: candidates.length, candidatesCompleted, candidatesPartlyExamined, moments, failures, metrics: { wallMs: Date.now() - startedAt, inspectOperations, mediaSecondsObserved } };
 }

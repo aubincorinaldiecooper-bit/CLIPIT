@@ -25,17 +25,15 @@ const handles = new Map<string, Promise<Function_>>();
 const gate = new Semaphore(4);
 
 function modalClient(): ModalClient {
-  client ??= new ModalClient({
-    tokenId: env.MODAL_TOKEN_ID!,
-    tokenSecret: env.MODAL_TOKEN_SECRET!,
-    environment: env.MODAL_ENVIRONMENT,
-  });
+  client ??= new ModalClient({ tokenId: env.MODAL_TOKEN_ID!, tokenSecret: env.MODAL_TOKEN_SECRET!, environment: env.MODAL_ENVIRONMENT });
   return client;
 }
 
-function key(target: ModalTarget): string {
-  return `${target.app}/${target.className}/${target.method}`;
+function configured(label: string): void {
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) throw new ExternalServiceError(label, `${label} is not configured`, { retryable: false });
 }
+
+function key(target: ModalTarget): string { return `${target.app}/${target.className}/${target.method}`; }
 
 function lookup(target: ModalTarget): Promise<Function_> {
   const cacheKey = key(target);
@@ -51,132 +49,72 @@ function lookup(target: ModalTarget): Promise<Function_> {
   return handle;
 }
 
-export function resetModalHandles(): void {
-  client = null;
-  handles.clear();
-}
+export function resetModalHandles(): void { client = null; handles.clear(); }
 
 function classify(target: ModalTarget, error: unknown): ExternalServiceError {
   if (error instanceof ExternalServiceError) return error;
-  if (error instanceof InternalFailure) {
-    return new ExternalServiceError(target.label, `Modal internal failure: ${error.message}`, { retryable: true, cause: error });
-  }
-  if (error instanceof FunctionTimeoutError) {
-    return new ExternalServiceError(target.label, `${target.method} exceeded its Modal timeout: ${error.message}`, {
-      retryable: false,
-      cause: error,
-    });
-  }
-  if (error instanceof NotFoundError) {
-    return new ExternalServiceError(
-      target.label,
-      `Modal cannot find ${target.app}/${target.className} in ${env.MODAL_ENVIRONMENT} (${error.message})`,
-      { retryable: false, cause: error },
-    );
-  }
-  if (error instanceof ExecutionError || error instanceof RemoteError || error instanceof InvalidError) {
-    return new ExternalServiceError(target.label, `${target.method} failed remotely: ${error.message}`, {
-      retryable: false,
-      cause: error,
-    });
-  }
+  if (error instanceof InternalFailure) return new ExternalServiceError(target.label, `Modal internal failure: ${error.message}`, { retryable: true, cause: error });
+  if (error instanceof FunctionTimeoutError) return new ExternalServiceError(target.label, `${target.method} exceeded its Modal timeout: ${error.message}`, { retryable: false, cause: error });
+  if (error instanceof NotFoundError) return new ExternalServiceError(target.label, `Modal cannot find ${target.app}/${target.className} in ${env.MODAL_ENVIRONMENT} (${error.message})`, { retryable: false, cause: error });
+  if (error instanceof ExecutionError || error instanceof RemoteError || error instanceof InvalidError) return new ExternalServiceError(target.label, `${target.method} failed remotely: ${error.message}`, { retryable: false, cause: error });
   const message = (error as Error)?.message ?? String(error);
-  if (/auth|credential|token|permission|unauthenticated|unauthorized/i.test(message)) {
-    return new ExternalServiceError(target.label, `Modal rejected Clipit's credentials (${message})`, {
-      retryable: false,
-      cause: error,
-    });
-  }
+  if (/auth|credential|token|permission|unauthenticated|unauthorized/i.test(message)) return new ExternalServiceError(target.label, `Modal rejected Clipit's credentials (${message})`, { retryable: false, cause: error });
   return new ExternalServiceError(target.label, `Modal call failed: ${message}`, { retryable: true, cause: error });
 }
 
 async function withDeadline<T>(promise: Promise<T>, ms: number, target: ModalTarget): Promise<T> {
   let timer: NodeJS.Timeout;
   const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new ExternalServiceError(target.label, `${target.method} exceeded the ${Math.round(ms / 1000)}s client deadline`, {
-        retryable: false,
-      })),
-      ms,
-    );
+    timer = setTimeout(() => reject(new ExternalServiceError(target.label, `${target.method} exceeded the ${Math.round(ms / 1000)}s client deadline`, { retryable: false })), ms);
   });
-  try {
-    return await Promise.race([promise, deadline]);
-  } finally {
-    clearTimeout(timer!);
-  }
+  try { return await Promise.race([promise, deadline]); } finally { clearTimeout(timer!); }
 }
 
 async function once<T>(target: ModalTarget, kwargs: Record<string, unknown>, timeoutMs: number): Promise<T> {
   let method: Function_;
-  try {
-    method = await lookup(target);
-  } catch (error) {
-    handles.delete(key(target));
-    throw classify(target, error);
-  }
-
-  try {
-    return await withDeadline(method.remote([], kwargs) as Promise<T>, timeoutMs, target);
-  } catch (error) {
+  try { method = await lookup(target); } catch (error) { handles.delete(key(target)); throw classify(target, error); }
+  try { return await withDeadline(method.remote([], kwargs) as Promise<T>, timeoutMs, target); }
+  catch (error) {
     if (error instanceof NotFoundError) {
       handles.delete(key(target));
-      try {
-        const fresh = await lookup(target);
-        return await withDeadline(fresh.remote([], kwargs) as Promise<T>, timeoutMs, target);
-      } catch (secondError) {
-        throw classify(target, secondError);
-      }
+      try { const fresh = await lookup(target); return await withDeadline(fresh.remote([], kwargs) as Promise<T>, timeoutMs, target); }
+      catch (secondError) { throw classify(target, secondError); }
     }
     throw classify(target, error);
   }
 }
 
 export async function assertModalTargetAvailable(target: ModalTarget): Promise<void> {
-  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
-    throw new ExternalServiceError(target.label, `${target.label} is not configured`, { retryable: false });
-  }
-  try {
-    await lookup(target);
-  } catch (error) {
-    handles.delete(key(target));
-    throw classify(target, error);
-  }
+  configured(target.label);
+  try { await lookup(target); } catch (error) { handles.delete(key(target)); throw classify(target, error); }
 }
 
-export async function invokeModal<T>(
-  target: ModalTarget,
-  kwargs: Record<string, unknown>,
-  options: {
-    timeoutSeconds?: number;
-    maxRetries?: number;
-    context?: Record<string, unknown>;
-  } = {},
-): Promise<T> {
-  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
-    throw new ExternalServiceError(target.label, `${target.label} is not configured`, { retryable: false });
-  }
+export async function spawnModal(target: ModalTarget, kwargs: Record<string, unknown>) {
+  configured(target.label);
+  try { const method = await lookup(target); return await method.spawn([], kwargs); }
+  catch (error) { handles.delete(key(target)); throw classify(target, error); }
+}
 
+export async function createEphemeralModalQueue() {
+  configured('modal-queue');
+  try { return await modalClient().queues.ephemeral({ environment: env.MODAL_ENVIRONMENT }); }
+  catch (error) { throw new ExternalServiceError('modal-queue', `Could not create live video queue: ${(error as Error)?.message ?? String(error)}`, { retryable: true, cause: error }); }
+}
+
+export async function invokeModal<T>(target: ModalTarget, kwargs: Record<string, unknown>, options: { timeoutSeconds?: number; maxRetries?: number; context?: Record<string, unknown> } = {}): Promise<T> {
+  configured(target.label);
   const timeoutMs = (options.timeoutSeconds ?? 900) * 1000;
   const maxRetries = options.maxRetries ?? 2;
-
   return gate.run(async () => {
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-      try {
-        return await once<T>(target, kwargs, timeoutMs);
-      } catch (error) {
+      try { return await once<T>(target, kwargs, timeoutMs); }
+      catch (error) {
         lastError = error;
         const retryable = error instanceof ExternalServiceError && error.retryable;
         if (!retryable || attempt === maxRetries) break;
         const delayMs = Math.min(30_000, 1_000 * 2 ** attempt);
-        logger.warn('retrying Modal call', {
-          service: target.label,
-          method: target.method,
-          attempt: attempt + 1,
-          delayMs,
-          ...options.context,
-        });
+        logger.warn('retrying Modal call', { service: target.label, method: target.method, attempt: attempt + 1, delayMs, ...options.context });
         await sleep(delayMs);
       }
     }
