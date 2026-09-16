@@ -58,18 +58,22 @@ export function questionFor(query: string): string {
   ].join('\n');
 }
 
-/** The span of video a turn was produced over, from the frames it consumed. */
-function spanOf(frameIds: Iterable<string>): { startMs: number; endMs: number } | null {
-  let startMs = Number.POSITIVE_INFINITY;
-  let endMs = Number.NEGATIVE_INFINITY;
-  for (const frameId of frameIds) {
-    const position = positionFromFrameId(frameId);
-    if (position === null) continue;
-    if (position < startMs) startMs = position;
-    if (position > endMs) endMs = position;
-  }
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return null;
-  return { startMs, endMs };
+/**
+ * The stretch of video a turn is about: the frames it had just seen.
+ *
+ * Not every frame consumed since the model last spoke. Asked to stay quiet
+ * until something happens, it does — so a first finding ninety seconds in has
+ * ninety seconds of silent watching behind it, and taking all of that would
+ * make the moment the whole video up to that point. What the model is talking
+ * about is what it had just been shown, so the stretch is bounded to the most
+ * recent window before it spoke (Codex's finding on #139).
+ */
+function spanOf(positions: number[], windowMs: number): { startMs: number; endMs: number } | null {
+  if (!positions.length) return null;
+  const endMs = Math.max(...positions);
+  const floor = endMs - windowMs;
+  const recent = positions.filter((position) => position >= floor);
+  return { startMs: Math.min(...recent), endMs };
 }
 
 /** The sentence after the marker, or null when the turn never said it. */
@@ -95,7 +99,8 @@ function describedIn(text: string): string | null {
  */
 export class MomentReader {
   private text = '';
-  private frameIds = new Set<string>();
+  /** Where in the video each frame of the current turn came from, in ms. */
+  private positions: number[] = [];
   private readonly maxMomentSeconds: number;
   readonly moments: ReadMoment[] = [];
   /** Every frame the model actually consumed, for reporting coverage. */
@@ -108,8 +113,9 @@ export class MomentReader {
   /** Take one chunk. Returns a moment when this chunk completed one. */
   take(chunk: GanderChunk): ReadMoment | null {
     for (const frameId of chunk.consumedFrameIds) {
-      this.frameIds.add(frameId);
       this.consumed.add(frameId);
+      const position = positionFromFrameId(frameId);
+      if (position !== null) this.positions.push(position);
     }
     // A listening step carries frames but no speech: it is part of the span
     // the next thing said was produced over, not a turn of its own.
@@ -124,14 +130,14 @@ export class MomentReader {
   /** Read the accumulated turn, then start the next one. */
   private finish(): ReadMoment | null {
     const text = this.text;
-    const frameIds = this.frameIds;
+    const positions = this.positions;
     this.text = '';
-    this.frameIds = new Set();
+    this.positions = [];
 
     const description = describedIn(text);
     if (!description) return null;
 
-    const span = spanOf(frameIds);
+    const span = spanOf(positions, this.maxMomentSeconds * 1000);
     // The model claimed a moment while looking at nothing. There is no honest
     // timestamp to give it, so it is not a moment.
     if (!span) return null;
@@ -141,11 +147,10 @@ export class MomentReader {
     // frame it was seen in rather than a zero-length moment the coordinator
     // would reject outright.
     const endSeconds = span.endMs > span.startMs ? span.endMs / 1000 : startSeconds + 1;
-    if (endSeconds - startSeconds > this.maxMomentSeconds) {
-      // Too long to be one moment. Keeping the start and trimming the end
-      // would be inventing an ending, so this is dropped and said so.
-      return null;
-    }
+    // The window above already holds the span inside the maximum. This stands
+    // as a floor under that rather than a second rule: a span that got past it
+    // is a bug here, and a moment the coordinator would reject anyway.
+    if (endSeconds - startSeconds > this.maxMomentSeconds) return null;
     return { startSeconds, endSeconds, description };
   }
 

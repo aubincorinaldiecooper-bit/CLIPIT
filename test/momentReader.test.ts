@@ -96,18 +96,37 @@ describe('reading moments out of what the model says', () => {
     expect(moment?.endSeconds).toBeGreaterThan(30);
   });
 
-  it('drops a span too long to be one moment rather than trimming it', () => {
+  it('finds a moment late in a video it watched in silence', () => {
+    // The model is asked to say nothing until something happens, and it does.
+    // So a first finding a minute and a half in has a minute and a half of
+    // quiet watching behind it. Counting all of that would make the moment
+    // the whole video so far, and it would then be thrown away for being too
+    // long — losing exactly the findings the scout exists to produce.
     const reader = new MomentReader({ query: 'the wave', maxMomentSeconds: 60 });
+    for (let second = 0; second < 90; second += 1) {
+      reader.take(chunk({ consumedFrameIds: framesFrom(second, 1), isListen: true }));
+    }
     const moment = reader.take(
-      chunk({
-        text: 'MOMENT: She waves.',
-        consumedFrameIds: [frameIdForPosition(0, 1), frameIdForPosition(90_000, 2)],
-        endOfTurn: true,
-      }),
+      chunk({ text: 'MOMENT: She waves.', consumedFrameIds: framesFrom(90, 1), endOfTurn: true }),
     );
 
-    // Trimming would be inventing an ending the model never gave.
-    expect(moment).toBeNull();
+    expect(moment).not.toBeNull();
+    expect(moment!.endSeconds).toBe(90);
+    // What it is talking about is what it had just been shown, not everything
+    // it has ever been shown.
+    expect(moment!.endSeconds - moment!.startSeconds).toBeLessThanOrEqual(60);
+    expect(moment!.startSeconds).toBe(30);
+  });
+
+  it('keeps a short moment short rather than padding it to the window', () => {
+    const reader = new MomentReader({ query: 'the wave', maxMomentSeconds: 60 });
+    reader.take(chunk({ consumedFrameIds: framesFrom(12, 2), isListen: true }));
+    const moment = reader.take(
+      chunk({ text: 'MOMENT: She waves.', consumedFrameIds: framesFrom(14, 1), endOfTurn: true }),
+    );
+
+    expect(moment?.startSeconds).toBe(12);
+    expect(moment?.endSeconds).toBe(14);
   });
 
   it('carries the frames from listening steps into the turn they belong to', () => {

@@ -168,17 +168,44 @@ function readReady(payload: Record<string, unknown>): GanderReady | null {
   };
 }
 
+/**
+ * Keep a socket's `error` event handled for as long as the socket lives.
+ *
+ * Node treats an EventEmitter `error` with no listener as an exception. The
+ * readiness waits below install their own and take them off again when they
+ * settle, so without this a transport error after startup would take the
+ * whole worker down rather than failing one inspection.
+ */
+function holdErrors(socket: WebSocket, what: string, onFail: (error: Error) => void): void {
+  socket.on('error', (error: Error) => {
+    logger.warn('gander socket failed', { socket: what, err: error.message });
+    onFail(error);
+  });
+}
+
 export class GanderSession {
   private audioSequence = 0;
   private audioSamplesSent = 0;
   private frameSequence = 0;
   private closed = false;
 
+  /** Set when a socket fails; every later send refuses rather than pretending. */
+  private failure: Error | null = null;
+
   private constructor(
     readonly ready: GanderReady,
     private readonly duplex: WebSocket,
     private readonly screen: WebSocket | null,
-  ) {}
+  ) {
+    const fail = (error: Error) => {
+      this.failure = this.failure ?? error;
+      // Closing wakes the chunk reader, so the inspection ends with this
+      // error rather than waiting on a session that is already gone.
+      this.close();
+    };
+    holdErrors(duplex, 'duplex', fail);
+    if (screen) holdErrors(screen, 'screen', fail);
+  }
 
   /**
    * Open a session and wait until the runtime is perceptually ready.
@@ -248,6 +275,7 @@ export class GanderSession {
    * which is what lets a sentence be placed in the video.
    */
   sendFrame(input: { videoMs: number; capturedAtMs: number; image: Buffer; encoding?: string }): string {
+    if (this.failure) throw this.failure;
     const frameId = frameIdForPosition(input.videoMs, ++this.frameSequence);
     if (!this.screen) throw new Error('this session has no screen socket');
     this.screen.send(
@@ -271,6 +299,7 @@ export class GanderSession {
    * said cannot be answered from frames.
    */
   sendAudio(pcm16: Buffer, capturedAtMs: number): void {
+    if (this.failure) throw this.failure;
     const sampleCount = Math.floor(pcm16.byteLength / 2);
     if (sampleCount <= 0) return;
     this.duplex.send(
