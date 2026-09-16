@@ -4,7 +4,9 @@ import {
   embedVideoIntervals,
   rerankVideoIntervals,
 } from './qwenModal.js';
-import { verifyWithVideoChat3, watchWithVideoChat3 } from '../videochat3/client.js';
+import { videoChat3Adapter } from '../video/adapters/videochat3.js';
+import { verifyVideo, watchVideo } from '../video/model.js';
+import type { StoredVideoSource } from '../video/source.js';
 import { passesEvidenceGate } from './mixedEvidence.js';
 
 export interface InternetVideoMoment {
@@ -48,12 +50,11 @@ export interface InternetVideoAnalysis {
 export const DEFAULT_WATCH_MAX_EVENTS = 64;
 
 /**
- * Understand one accessible internet-video candidate.
+ * Understand one accessible video candidate through the source/model ports.
  *
- * Discovery metadata is never passed in as evidence. VideoChat3 first watches
- * the footage, Qwen embeddings retrieve broadly from those temporal leads,
- * Qwen reranks them, and VideoChat3 re-opens the exact intervals before a
- * moment is returned as verified.
+ * Today the stored-video source is read by VideoChat3. The retrieval pipeline
+ * does not know how VideoChat3 is served, which lets a later model adapter
+ * replace it without rewriting embeddings, reranking, or evidence handling.
  */
 export async function analyzeInternetVideo(input: {
   query: string;
@@ -64,17 +65,22 @@ export async function analyzeInternetVideo(input: {
   maxEvents?: number;
 }): Promise<InternetVideoAnalysis> {
   const maxEvents = input.maxEvents ?? DEFAULT_WATCH_MAX_EVENTS;
-  const watched = await watchWithVideoChat3({
+  const source: StoredVideoSource = {
+    kind: 'stored-video',
+    id: input.videoKey,
     videoUrl: input.videoUrl,
-    query: input.query,
+    videoKey: input.videoKey,
     expectedBytes: input.expectedBytes,
+  };
+  const watched = await watchVideo({
+    model: videoChat3Adapter,
+    source,
+    query: input.query,
     maxEvents,
   });
-  const watchedThroughSeconds = watched.events.length >= maxEvents
-    ? (watched.events.at(-1)?.endSeconds ?? watched.durationSeconds)
-    : watched.durationSeconds;
+  const watchedThroughSeconds = watched.watchedThroughSeconds;
 
-  const intervals = watched.events.map((event, index) => ({
+  const intervals = watched.moments.map((event, index) => ({
     id: `watch-${index}`,
     start: event.startSeconds,
     end: event.endSeconds,
@@ -129,7 +135,7 @@ export async function analyzeInternetVideo(input: {
       revision: watched.revision,
       durationSeconds: watched.durationSeconds,
       watchedThroughSeconds,
-      watchedEvents: watched.events.length,
+      watchedEvents: watched.moments.length,
       verified: [],
       failures,
       metrics: {
@@ -159,7 +165,7 @@ export async function analyzeInternetVideo(input: {
       revision: watched.revision,
       durationSeconds: watched.durationSeconds,
       watchedThroughSeconds,
-      watchedEvents: watched.events.length,
+      watchedEvents: watched.moments.length,
       verified: [],
       failures,
       metrics: {
@@ -170,10 +176,10 @@ export async function analyzeInternetVideo(input: {
     };
   }
 
-  const verified = await verifyWithVideoChat3({
-    videoUrl: input.videoUrl,
+  const verified = await verifyVideo({
+    model: videoChat3Adapter,
+    source,
     query: input.query,
-    expectedBytes: input.expectedBytes,
     candidates: ordered.map(({ id, start, end }) => ({ id, start, end })),
   });
 
@@ -194,7 +200,7 @@ export async function analyzeInternetVideo(input: {
     revision: verified.revision,
     durationSeconds: watched.durationSeconds,
     watchedThroughSeconds,
-    watchedEvents: watched.events.length,
+    watchedEvents: watched.moments.length,
     verified: moments,
     failures,
     metrics: {
