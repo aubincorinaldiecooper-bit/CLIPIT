@@ -2,26 +2,10 @@ import type { Job } from 'bullmq';
 import { logger } from '../../lib/logger.js';
 import type { InternetSearchJob, InternetSearchMoment, InternetSearchProgress } from '../../queues/internetSearch.js';
 import { search, type Candidate } from '../../services/discovery/searxng.js';
-import { createGanderScoutRuntime } from '../../services/retrieval/ganderScoutRuntime.js';
 import { runScoutSwarm, type SwarmMoment } from '../../services/retrieval/scoutSwarm.js';
-import { ganderUrl } from '../../services/scout/ganderAddress.js';
-import { ThinkerSlot } from '../../services/scout/ganderSlot.js';
-
-/**
- * One internet search, from a question to the moments that answer it.
- *
- * SearXNG says which pages might be worth watching. Four scouts share one
- * Gander and watch them. Every moment a scout finds is reported the instant
- * it is found, so the screen fills as the search runs rather than all at once
- * at the end — which is the whole reason this is a job with progress rather
- * than a request that answers.
- *
- * The pages themselves never leave here. They are where to look, not what was
- * found, and the screen is never given them.
- */
-
-/** The one model, shared by every scout in this worker. */
-const slot = new ThinkerSlot();
+import { createVideoModelScoutRuntime } from '../../services/retrieval/videoModelScoutRuntime.js';
+import { videoChat3Adapter } from '../../services/video/adapters/videochat3.js';
+import { createWebFrameStreamSource } from '../../services/video/webFrameSource.js';
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
@@ -29,14 +13,9 @@ function required(name: string): string {
   return value.replace(/\/$/, '');
 }
 
-/** Where a moment came from, for the line under the card. */
 function sourceOf(candidate: Candidate): string | null {
   if (candidate.source) return candidate.source;
-  try {
-    return new URL(candidate.pageUrl).host.replace(/^www\./, '');
-  } catch {
-    return null;
-  }
+  try { return new URL(candidate.pageUrl).host.replace(/^www\./, ''); } catch { return null; }
 }
 
 function asMoment(found: SwarmMoment<Candidate>): InternetSearchMoment {
@@ -45,48 +24,45 @@ function asMoment(found: SwarmMoment<Candidate>): InternetSearchMoment {
     description: found.description,
     startSeconds: found.startSeconds,
     endSeconds: found.endSeconds,
-    // Nothing takes a frame from the moment yet, so there is no picture to
-    // show. The card says so by showing the words instead of inventing one.
     still: null,
     source: sourceOf(found.candidate),
   };
 }
 
+/**
+ * Internet search now uses the same source/model ports as uploaded footage.
+ * SearXNG finds pages, the browser turns a page into timestamped frames, and
+ * VideoChat3's online StreamingSession watches those frames with the text query
+ * attached from the first round. The scout swarm remains the coordinator.
+ */
 export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise<InternetSearchProgress> {
   const searchId = job.id ?? 'unknown';
   const log = logger.child({ search_id: searchId, component: 'internet_search' });
+  const report = async (progress: InternetSearchProgress) => job.updateProgress(progress as unknown as Record<string, unknown>);
 
-  const report = async (progress: InternetSearchProgress) => {
-    await job.updateProgress(progress as unknown as Record<string, unknown>);
-  };
-
-  // Every search starts here, whatever it is about to find. The screen shows
-  // the question and nothing else until there is something to watch.
   await report({ phase: 'loading', moments: [], candidatesFound: 0 });
-
   const candidates = await search(job.data.query);
   if (candidates.length === 0) {
-    // The provider looked and came back with nothing. There is nothing to
-    // watch, so the search is over and the answer is that it found nothing.
     const done: InternetSearchProgress = { phase: 'answered', moments: [], candidatesFound: 0 };
     await report(done);
     return done;
   }
 
-  const runtime = createGanderScoutRuntime({
-    webAccessUrl: required('WEB_ACCESS_URL'),
-    webAccessToken: required('WEB_ACCESS_INTERNAL_TOKEN'),
-    // Asked for rather than configured: Modal knows where it deployed the
-    // runtime, and a hand-written address goes stale the moment the app is
-    // renamed. GANDER_URL still wins when it is set.
-    ganderUrl: await ganderUrl(),
-    ganderApiKey: required('GANDER_API_KEY'),
-    slot,
+  const webAccessUrl = required('WEB_ACCESS_URL');
+  const webAccessToken = required('WEB_ACCESS_INTERNAL_TOKEN');
+  const runtime = createVideoModelScoutRuntime<Candidate>({
+    model: videoChat3Adapter,
+    sourceForCandidate: (candidate) => createWebFrameStreamSource({
+      id: `${searchId}:${candidate.id}`,
+      pageUrl: candidate.pageUrl,
+      webAccessUrl,
+      webAccessToken,
+      maxSeconds: 90,
+      fps: 1,
+    }),
   });
 
-  // Pages were found and are about to be watched: the slots go up now.
   await report({ phase: 'searching', moments: [], candidatesFound: candidates.length });
-
   const moments: InternetSearchMoment[] = [];
   const result = await runScoutSwarm<Candidate>({
     searchId,
@@ -98,24 +74,10 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
       const found = progress.snapshot.moments.at(-1);
       if (!found) return;
       moments.push(asMoment(found));
-      // Reported the instant it is found, not collected for the end.
       await report({ phase: 'searching', moments: [...moments], candidatesFound: candidates.length });
     },
   });
 
-  /*
-   * Everything the search did not get a proper look at.
-   *
-   * Four ways a page ends up here, and none of them is "nothing was there":
-   * a scout could not watch it at all; it was still playing when the watch
-   * limit came; its inspection was cut short when the search was cancelled or
-   * ran out of time; or it was never reached, because discovery found more
-   * pages than the coordinator's ceiling allows.
-   *
-   * Counting only the first would let an incomplete search report itself as a
-   * complete one that found nothing, which is the one thing this whole path
-   * is built not to do.
-   */
   const neverReached = Math.max(0, result.candidatesAvailable - result.candidatesConsidered);
   const notStarted = Math.max(0, result.candidatesConsidered - result.candidatesCompleted);
   const unexamined = result.failures.length + result.candidatesPartlyExamined + neverReached + notStarted;
@@ -128,6 +90,7 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   await report(done);
 
   log.info('internet search finished', {
+    model: videoChat3Adapter.id,
     moments: moments.length,
     candidates_considered: result.candidatesConsidered,
     candidates_completed: result.candidatesCompleted,
