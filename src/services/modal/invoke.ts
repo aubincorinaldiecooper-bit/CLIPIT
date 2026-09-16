@@ -33,6 +33,12 @@ function modalClient(): ModalClient {
   return client;
 }
 
+function configured(targetLabel: string): void {
+  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
+    throw new ExternalServiceError(targetLabel, `${targetLabel} is not configured`, { retryable: false });
+  }
+}
+
 function key(target: ModalTarget): string {
   return `${target.app}/${target.className}/${target.method}`;
 }
@@ -133,14 +139,47 @@ async function once<T>(target: ModalTarget, kwargs: Record<string, unknown>, tim
 }
 
 export async function assertModalTargetAvailable(target: ModalTarget): Promise<void> {
-  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
-    throw new ExternalServiceError(target.label, `${target.label} is not configured`, { retryable: false });
-  }
+  configured(target.label);
   try {
     await lookup(target);
   } catch (error) {
     handles.delete(key(target));
     throw classify(target, error);
+  }
+}
+
+/**
+ * Start one long-running Modal method without waiting for it to finish.
+ *
+ * Live video uses this together with ephemeral queues: one invocation owns one
+ * VideoChat3 StreamingSession while browser frames arrive over time. That is
+ * different from calling a method once per frame, which could land on
+ * different containers and lose the model's temporal state.
+ */
+export async function spawnModal(
+  target: ModalTarget,
+  kwargs: Record<string, unknown>,
+) {
+  configured(target.label);
+  try {
+    const method = await lookup(target);
+    return await method.spawn([], kwargs);
+  } catch (error) {
+    handles.delete(key(target));
+    throw classify(target, error);
+  }
+}
+
+/** Create a temporary Modal Queue for the lifetime of one live watch. */
+export async function createEphemeralModalQueue() {
+  configured('modal-queue');
+  try {
+    return await modalClient().queues.ephemeral({ environment: env.MODAL_ENVIRONMENT });
+  } catch (error) {
+    throw new ExternalServiceError('modal-queue', `Could not create live video queue: ${(error as Error)?.message ?? String(error)}`, {
+      retryable: true,
+      cause: error,
+    });
   }
 }
 
@@ -153,9 +192,7 @@ export async function invokeModal<T>(
     context?: Record<string, unknown>;
   } = {},
 ): Promise<T> {
-  if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) {
-    throw new ExternalServiceError(target.label, `${target.label} is not configured`, { retryable: false });
-  }
+  configured(target.label);
 
   const timeoutMs = (options.timeoutSeconds ?? 900) * 1000;
   const maxRetries = options.maxRetries ?? 2;
