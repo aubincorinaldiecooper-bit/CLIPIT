@@ -82,6 +82,18 @@ export interface ScoutSwarmResult<Candidate extends ScoutCandidate> {
   candidatesAvailable: number;
   candidatesConsidered: number;
   candidatesCompleted: number;
+  /**
+   * Candidates a scout looked at but did not get to the end of, plus those
+   * whose inspection was cut short when the search was cancelled or hit its
+   * wall-time ceiling.
+   *
+   * Neither shows up in `failures` — a cancelled inspection is deliberately
+   * not a failure, and a page that simply ran past the watch limit did not
+   * fail either. But both leave part of a page unlooked-at, and a caller that
+   * counts only failures would report an incomplete search as a complete one
+   * that found nothing. Those are different answers.
+   */
+  candidatesPartlyExamined: number;
   moments: SwarmMoment<Candidate>[];
   failures: ScoutSwarmFailure[];
   metrics: {
@@ -146,6 +158,7 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
   let inspectOperations = 0;
   let mediaSecondsObserved = 0;
   let momentSequence = 0;
+  let candidatesPartlyExamined = 0;
   const moments: SwarmMoment<Candidate>[] = [];
   const failures: ScoutSwarmFailure[] = [];
 
@@ -203,6 +216,8 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
             controller.signal,
           );
           mediaSecondsObserved += Math.max(0, inspection.mediaSecondsObserved ?? 0);
+          // The scout reached the end of what it was given only if it says so.
+          if (inspection.exhausted !== true) candidatesPartlyExamined += 1;
 
           for (const proposal of inspection.moments) {
             if (!Number.isFinite(proposal.startSeconds) || !Number.isFinite(proposal.endSeconds)) continue;
@@ -231,7 +246,11 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
             await emit('moment.found', { scoutId, candidateId: candidate.id, momentId: moment.id });
           }
         } catch (error) {
-          if (!controller.signal.aborted) {
+          if (controller.signal.aborted) {
+            // Cut short rather than failed — but the page was not finished
+            // either, and saying nothing about it would lose that.
+            candidatesPartlyExamined += 1;
+          } else {
             failures.push({ scoutId, candidateId: candidate.id, stage: 'inspect', reason: errorMessage(error) });
           }
         } finally {
@@ -268,6 +287,7 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
     candidatesAvailable: input.candidates.length,
     candidatesConsidered: candidates.length,
     candidatesCompleted,
+    candidatesPartlyExamined,
     moments,
     failures,
     metrics: {
