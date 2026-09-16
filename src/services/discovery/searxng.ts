@@ -43,9 +43,6 @@ const TRACKING_PARAMS = new Set([
   'igshid',
   'mc_cid',
   'mc_eid',
-  'ref',
-  'ref_src',
-  'source',
 ]);
 
 function isTrackingParam(name: string): boolean {
@@ -101,11 +98,16 @@ export async function assertPublicInternetUrl(raw: string): Promise<string> {
  * Build a stable identity for a discovered page without changing the URL the
  * browser will actually navigate to.
  *
- * Search providers commonly return the same page with fragments, tracking
- * parameters, `www`, parameter-order differences, or a trailing slash. Those
- * variants should consume one candidate slot, not several. The canonical URL
- * is therefore used only for deduplication and candidate identity; `pageUrl`
- * preserves the provider's real destination (apart from its fragment).
+ * Search providers commonly return the same page with fragments, unambiguous
+ * tracking parameters, `www`, parameter-order differences, or a trailing
+ * slash. Those variants should consume one candidate slot, not several. The
+ * canonical URL is therefore used only for deduplication and candidate
+ * identity; `pageUrl` preserves the provider's real destination (apart from
+ * its fragment).
+ *
+ * Generic parameters such as `source` and `ref` are deliberately preserved:
+ * on arbitrary video sites they may select different content rather than act
+ * as tracking metadata.
  */
 export function canonicalizeCandidateUrl(value: string): string | null {
   try {
