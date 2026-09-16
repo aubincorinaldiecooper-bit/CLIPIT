@@ -37,6 +37,19 @@ interface SearxReply {
   results?: unknown;
 }
 
+const TRACKING_PARAMS = new Set([
+  'fbclid',
+  'gclid',
+  'igshid',
+  'mc_cid',
+  'mc_eid',
+]);
+
+function isTrackingParam(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower.startsWith('utm_') || TRACKING_PARAMS.has(lower);
+}
+
 function configured(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} is required for internet search`);
@@ -81,6 +94,49 @@ export async function assertPublicInternetUrl(raw: string): Promise<string> {
   return parsed.toString();
 }
 
+/**
+ * Build a stable identity for a discovered page without changing the URL the
+ * browser will actually navigate to.
+ *
+ * Search providers commonly return the same page with fragments, unambiguous
+ * tracking parameters, `www`, parameter-order differences, or a trailing
+ * slash. Those variants should consume one candidate slot, not several. The
+ * canonical URL is therefore used only for deduplication and candidate
+ * identity; `pageUrl` preserves the provider's real destination (apart from
+ * its fragment).
+ *
+ * Generic parameters such as `source` and `ref` are deliberately preserved:
+ * on arbitrary video sites they may select different content rather than act
+ * as tracking metadata.
+ */
+export function canonicalizeCandidateUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol)) return null;
+    url.hash = '';
+    url.hostname = url.hostname.toLowerCase().replace(/^www\./, '');
+    for (const key of [...url.searchParams.keys()]) {
+      if (isTrackingParam(key)) url.searchParams.delete(key);
+    }
+    url.searchParams.sort();
+    if (url.pathname !== '/') url.pathname = url.pathname.replace(/\/+$/, '');
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function navigablePageUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol)) return null;
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function sourceName(row: SearxResult): string | null {
   if (typeof row.engine === 'string' && row.engine.trim()) return row.engine.trim();
   if (Array.isArray(row.engines)) {
@@ -103,20 +159,14 @@ export function normalizeSearxResults(query: string, raw: unknown, limit: number
 
   for (const row of rows) {
     if (typeof row.url !== 'string') continue;
-    let pageUrl: string;
-    try {
-      const parsed = new URL(row.url);
-      if (!['http:', 'https:'].includes(parsed.protocol)) continue;
-      parsed.hash = '';
-      pageUrl = parsed.toString();
-    } catch {
-      continue;
-    }
-    if (seen.has(pageUrl)) continue;
-    seen.add(pageUrl);
+    const pageUrl = navigablePageUrl(row.url);
+    const canonicalUrl = canonicalizeCandidateUrl(row.url);
+    if (!pageUrl || !canonicalUrl) continue;
+    if (seen.has(canonicalUrl)) continue;
+    seen.add(canonicalUrl);
 
     candidates.push({
-      id: candidateId(pageUrl),
+      id: candidateId(canonicalUrl),
       query,
       title: typeof row.title === 'string' && row.title.trim() ? row.title.trim() : pageUrl,
       pageUrl,
