@@ -14,6 +14,8 @@ export interface VideoWatchResult {
   durationSeconds: number;
   watchedThroughSeconds: number;
   moments: VideoMoment[];
+  /** True only when the source itself says playback reached its end. */
+  exhausted?: boolean;
   metrics: Record<string, unknown>;
 }
 
@@ -41,14 +43,6 @@ export interface VideoVerificationBatch {
   metrics: Record<string, unknown>;
 }
 
-/**
- * The model-side USB port.
- *
- * Orchestration asks a model to watch a source. The adapter declares which
- * source representations it accepts, so a file-only model cannot accidentally
- * be handed a live browser stream and a stream-native model does not need to
- * know anything about buckets or signed URLs.
- */
 export interface VideoModelAdapter {
   readonly id: string;
   readonly sourceKinds: ReadonlySet<VideoSourceKind>;
@@ -58,9 +52,9 @@ export interface VideoModelAdapter {
     query: string;
     signal?: AbortSignal;
     maxEvents?: number;
+    onMoment?: (moment: VideoMoment) => void | Promise<void>;
   }): Promise<VideoWatchResult>;
 
-  /** Optional because not every watcher has a separate dense-verification API. */
   verify?(input: {
     source: VideoSource;
     query: string;
@@ -78,18 +72,13 @@ export function assertModelAcceptsSource(model: VideoModelAdapter, source: Video
   );
 }
 
-/**
- * One place for orchestration to cross the model boundary.
- *
- * Keeping this check outside each adapter makes capability failures explicit
- * and testable before any provider call is attempted.
- */
 export async function watchVideo(input: {
   model: VideoModelAdapter;
   source: VideoSource;
   query: string;
   signal?: AbortSignal;
   maxEvents?: number;
+  onMoment?: (moment: VideoMoment) => void | Promise<void>;
 }): Promise<VideoWatchResult> {
   assertModelAcceptsSource(input.model, input.source);
   return input.model.watch({
@@ -97,6 +86,7 @@ export async function watchVideo(input: {
     query: input.query,
     signal: input.signal,
     maxEvents: input.maxEvents,
+    onMoment: input.onMoment,
   });
 }
 
