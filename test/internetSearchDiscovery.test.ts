@@ -30,10 +30,21 @@ beforeEach(() => {
   for (const key of Object.keys(LOOKUP)) delete LOOKUP[key];
 });
 
+const SETTING_NAMES = [
+  'SEARXNG_URL',
+  'WEB_SEARCH_MAX_CANDIDATES',
+  'WEB_SEARCH_TIMEOUT_MS',
+  'WEB_SEARCH_SAFESEARCH',
+  'WEB_SEARCH_LANGUAGE',
+  'WEB_VIDEO_MAX_CANDIDATES',
+  'WEB_VIDEO_SEARCH_TIMEOUT_MS',
+  'WEB_VIDEO_DEFAULT_SAFESEARCH',
+  'WEB_VIDEO_DEFAULT_LANGUAGE',
+];
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
-  delete process.env.SEARXNG_URL;
-  delete process.env.WEB_SEARCH_MAX_CANDIDATES;
+  for (const name of SETTING_NAMES) delete process.env[name];
   vi.restoreAllMocks();
 });
 
@@ -269,5 +280,69 @@ describe('the guard runs on what is actually handed out', () => {
 
     const candidates = await search('anything');
     expect(candidates[0]!.thumbnailUrl).toBe('https://img.example/pic.jpg');
+  });
+});
+
+describe('settings a deployment already had', () => {
+  const captureRequest = () => {
+    const fetchMock = vi.fn(async () => Response.json({ results: [] }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    return () => new URL(String(fetchMock.mock.calls[0]![0]));
+  };
+
+  beforeEach(() => {
+    process.env.SEARXNG_URL = 'http://searx.internal';
+  });
+
+  it('honours the names the old discovery path used', async () => {
+    // These are the names a deployment configured before this provider
+    // existed. Ignoring them would silently replace deliberate settings
+    // with the defaults below.
+    process.env.WEB_VIDEO_DEFAULT_SAFESEARCH = '2';
+    process.env.WEB_VIDEO_DEFAULT_LANGUAGE = 'en-GB';
+    process.env.WEB_VIDEO_MAX_CANDIDATES = '7';
+    const requested = captureRequest();
+
+    await search('anything');
+
+    const url = requested();
+    expect(url.searchParams.get('safesearch')).toBe('2');
+    expect(url.searchParams.get('language')).toBe('en-GB');
+  });
+
+  it('prefers the new name when both are set', async () => {
+    process.env.WEB_SEARCH_SAFESEARCH = '1';
+    process.env.WEB_VIDEO_DEFAULT_SAFESEARCH = '2';
+    process.env.WEB_SEARCH_LANGUAGE = 'fr';
+    process.env.WEB_VIDEO_DEFAULT_LANGUAGE = 'en-GB';
+    const requested = captureRequest();
+
+    await search('anything');
+
+    const url = requested();
+    expect(url.searchParams.get('safesearch')).toBe('1');
+    expect(url.searchParams.get('language')).toBe('fr');
+  });
+
+  it('falls back to its own defaults when neither is set', async () => {
+    const requested = captureRequest();
+
+    await search('anything');
+
+    const url = requested();
+    expect(url.searchParams.get('safesearch')).toBe('0');
+    expect(url.searchParams.has('language')).toBe(false);
+  });
+
+  it('applies an old candidate ceiling to what comes back', async () => {
+    process.env.WEB_VIDEO_MAX_CANDIDATES = '2';
+    globalThis.fetch = vi.fn(async () => Response.json({
+      results: Array.from({ length: 6 }, (_, index) => ({
+        url: `https://publisher.example/watch/${index}`,
+        title: String(index),
+      })),
+    })) as unknown as typeof fetch;
+
+    expect(await search('anything')).toHaveLength(2);
   });
 });

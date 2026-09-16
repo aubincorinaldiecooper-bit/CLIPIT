@@ -56,8 +56,29 @@ function configured(name: string): string {
   return value.replace(/\/$/, '');
 }
 
-function numericEnv(name: string, fallback: number, min: number, max: number): number {
-  const raw = Number(process.env[name] ?? fallback);
+/**
+ * First of these names that is actually set.
+ *
+ * This provider gave the discovery settings new names, but deployments were
+ * configured under the old ones long before it existed. Reading both means an
+ * existing deployment keeps the safe-search, language and limits it was given,
+ * rather than having them silently replaced by the defaults below.
+ */
+function setting(...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function numericSetting(
+  value: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const raw = Number(value ?? fallback);
   if (!Number.isFinite(raw)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(raw)));
 }
@@ -232,16 +253,28 @@ export async function search(query: string): Promise<Candidate[]> {
   if (!trimmed) throw new Error('search query must not be empty');
 
   const base = configured('SEARXNG_URL');
-  const limit = numericEnv('WEB_SEARCH_MAX_CANDIDATES', SEARCH_CANDIDATE_CEILING, 1, 100);
-  const timeoutMs = numericEnv('WEB_SEARCH_TIMEOUT_MS', 10_000, 1_000, 60_000);
+  const limit = numericSetting(
+    setting('WEB_SEARCH_MAX_CANDIDATES', 'WEB_VIDEO_MAX_CANDIDATES'),
+    SEARCH_CANDIDATE_CEILING,
+    1,
+    100,
+  );
+  const timeoutMs = numericSetting(
+    setting('WEB_SEARCH_TIMEOUT_MS', 'WEB_VIDEO_SEARCH_TIMEOUT_MS'),
+    10_000,
+    1_000,
+    60_000,
+  );
   const url = new URL('/search', `${base}/`);
   url.searchParams.set('q', trimmed);
   url.searchParams.set('format', 'json');
   url.searchParams.set('categories', 'videos');
-  url.searchParams.set('safesearch', process.env.WEB_SEARCH_SAFESEARCH?.trim() || '0');
-  if (process.env.WEB_SEARCH_LANGUAGE?.trim()) {
-    url.searchParams.set('language', process.env.WEB_SEARCH_LANGUAGE!.trim());
-  }
+  url.searchParams.set(
+    'safesearch',
+    setting('WEB_SEARCH_SAFESEARCH', 'WEB_VIDEO_DEFAULT_SAFESEARCH') ?? '0',
+  );
+  const language = setting('WEB_SEARCH_LANGUAGE', 'WEB_VIDEO_DEFAULT_LANGUAGE');
+  if (language) url.searchParams.set('language', language);
 
   const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`SearXNG search failed with HTTP ${response.status}`);
