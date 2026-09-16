@@ -29,6 +29,12 @@ export interface VideoFrame {
   image: Buffer;
 }
 
+export interface FrameStreamCompletion {
+  exhausted: boolean;
+  reason: string;
+  watchedThroughSeconds: number;
+}
+
 /**
  * One consumable frame stream.
  *
@@ -39,6 +45,8 @@ export interface FrameStreamVideoSource {
   kind: 'frame-stream';
   id: string;
   open(signal: AbortSignal): AsyncIterable<VideoFrame>;
+  /** Resolves when the source says whether playback reached the real end. */
+  completion?: Promise<FrameStreamCompletion>;
   durationSeconds?: number | null;
 }
 
