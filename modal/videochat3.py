@@ -17,6 +17,7 @@ import base64
 import io
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -51,7 +52,6 @@ image = (
         "opencv-python-headless",
         "decord",
         "pillow",
-        "numpy",
         "safetensors",
         FLASH_ATTN_WHEEL,
     )
@@ -259,13 +259,7 @@ class VideoChat3Service:
         max_rounds: int = 256,
         max_events: int = 64,
     ) -> dict[str, Any]:
-        """Watch browser frames as they arrive, preserving one temporal session.
-
-        The browser owns timestamps. The model never gets to invent a time: a
-        response is anchored to the exact source-time interval carried beside
-        the frame that produced it.
-        """
-        import numpy as np
+        """Watch timestamped browser frames through one stateful session."""
         from PIL import Image
 
         input_queue = modal.Queue.from_id(input_queue_id)
@@ -288,7 +282,12 @@ class VideoChat3Service:
 
         try:
             while frames_seen < max_rounds and len(events) < max_events:
-                item = input_queue.get(timeout=30)
+                try:
+                    item = input_queue.get(timeout=30)
+                except queue.Empty:
+                    # Browser navigation/cold starts can leave the queue empty
+                    # briefly. An empty poll is not the end of the video.
+                    continue
                 if not isinstance(item, dict):
                     raise ValueError("stream queue item must be an object")
                 kind = item.get("type")
@@ -312,7 +311,9 @@ class VideoChat3Service:
 
                 raw = base64.b64decode(encoded, validate=True)
                 with Image.open(io.BytesIO(raw)) as picture:
-                    frame = np.asarray(picture.convert("RGB"))
+                    # The upstream StreamingSession contract takes PIL images.
+                    # copy() detaches the frame before the BytesIO/image closes.
+                    frame = picture.convert("RGB").copy()
                 start_seconds = timestamp_ms / 1000.0
                 end_seconds = (timestamp_ms + duration_ms) / 1000.0
                 last_end = max(last_end, end_seconds)
