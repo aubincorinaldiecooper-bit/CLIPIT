@@ -1,14 +1,21 @@
-name: VideoChat3 validation
+name: VideoChat3 legacy validation
 
 on:
   push:
     branches:
       - feat/videochat3-search-stack
       - feat/videochat3-search-stack-audit
+    paths:
+      - 'modal/videochat3.py'
+      - 'src/services/videochat3/**'
+      - 'test/videochat3Client.test.ts'
+      - '.github/workflows/videochat3-validation.yml'
   pull_request:
-    branches:
-      - main
-      - feat/videochat3-search-stack
+    paths:
+      - 'modal/videochat3.py'
+      - 'src/services/videochat3/**'
+      - 'test/videochat3Client.test.ts'
+      - '.github/workflows/videochat3-validation.yml'
 
 jobs:
   validate:
