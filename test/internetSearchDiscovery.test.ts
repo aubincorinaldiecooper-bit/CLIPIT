@@ -38,7 +38,7 @@ afterEach(() => {
 });
 
 describe('search candidates', () => {
-  it('canonicalizes tracking variants into one candidate identity', () => {
+  it('canonicalizes unambiguous tracking variants into one candidate identity', () => {
     expect(
       canonicalizeCandidateUrl(
         'https://www.Publisher.Example/watch/9/?b=2&utm_source=test&a=1&fbclid=tracking#t=30',
@@ -70,6 +70,24 @@ describe('search candidates', () => {
       source: 'example-video',
       query: 'find the red car',
     });
+  });
+
+  it('preserves generic source and ref parameters because they may select different content', () => {
+    expect(canonicalizeCandidateUrl('https://video.example/watch?source=camera-a&ref=one')).toBe(
+      'https://video.example/watch?ref=one&source=camera-a',
+    );
+    expect(canonicalizeCandidateUrl('https://video.example/watch?source=camera-b&ref=two')).toBe(
+      'https://video.example/watch?ref=two&source=camera-b',
+    );
+
+    const results = normalizeSearxResults('q', {
+      results: [
+        { url: 'https://video.example/watch?source=camera-a', title: 'a' },
+        { url: 'https://video.example/watch?source=camera-b', title: 'b' },
+      ],
+    }, 20);
+
+    expect(results.map((row) => row.title)).toEqual(['a', 'b']);
   });
 
   it('keeps distinct functional query parameters distinct', () => {
