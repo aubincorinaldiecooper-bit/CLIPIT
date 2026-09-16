@@ -36,6 +36,29 @@ function assertOwner(request: FastifyRequest, data: { sessionId: string | null; 
 const STARTING: InternetSearchProgress = { phase: 'loading', moments: [], candidatesFound: 0 };
 
 /**
+ * What to tell the screen about a search, from what the job knows.
+ *
+ * The finished answer if there is one, otherwise the last thing the worker
+ * reported, otherwise that it is still starting.
+ *
+ * The care here is over what counts as "reported". BullMQ starts a job's
+ * progress at the NUMBER 0, not null, and a search can sit queued for minutes
+ * behind another. Taking that 0 as a report would answer with no phase at
+ * all — and a reply with no phase reads, on the screen, as a search that
+ * finished and found nothing. A queued search would appear to have failed.
+ */
+export function reportFor(
+  progress: unknown,
+  returnValue: unknown,
+): InternetSearchProgress {
+  const asReport = (value: unknown): InternetSearchProgress | null =>
+    value && typeof value === 'object' && !Array.isArray(value) && 'phase' in value
+      ? (value as InternetSearchProgress)
+      : null;
+  return asReport(returnValue) ?? asReport(progress) ?? STARTING;
+}
+
+/**
  * Search the internet for something worth watching.
  *
  * Whatever the user typed is what is searched, passed through verbatim: there
@@ -119,8 +142,6 @@ export async function registerInternetSearchRoutes(app: FastifyInstance): Promis
       throw HttpError.serviceUnavailable(job.failedReason || 'That search could not be finished.');
     }
 
-    const reported = (job.progress ?? null) as InternetSearchProgress | null;
-    const finished = (job.returnvalue ?? null) as InternetSearchProgress | null;
-    return reply.send({ searchId, query: job.data.query, ...(finished ?? reported ?? STARTING) });
+    return reply.send({ searchId, query: job.data.query, ...reportFor(job.progress, job.returnvalue) });
   });
 }

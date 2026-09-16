@@ -74,7 +74,7 @@ describe('one internet search, from a question to its moments', () => {
 
   it('puts the slots up once there are pages to watch', async () => {
     found.mockResolvedValue([candidate('a')]);
-    inspect.mockResolvedValue({ moments: [] });
+    inspect.mockResolvedValue({ moments: [], exhausted: true });
     const { job, reported } = fakeJob();
 
     await handleInternetSearch(job);
@@ -88,8 +88,8 @@ describe('one internet search, from a question to its moments', () => {
     found.mockResolvedValue([candidate('a'), candidate('b')]);
     inspect.mockImplementation(async ({ candidate: page }) =>
       page.id === 'a'
-        ? { moments: [{ startSeconds: 10, endSeconds: 14, description: 'A dog rolls past.' }] }
-        : { moments: [] },
+        ? { moments: [{ startSeconds: 10, endSeconds: 14, description: 'A dog rolls past.' }], exhausted: true }
+        : { moments: [], exhausted: true },
     );
     const { job, reported } = fakeJob();
 
@@ -105,6 +105,7 @@ describe('one internet search, from a question to its moments', () => {
     found.mockResolvedValue([candidate('a'), candidate('b')]);
     inspect.mockImplementation(async ({ candidate: page }) => ({
       moments: [{ startSeconds: 1, endSeconds: 3, description: `something in ${page.id}` }],
+      exhausted: true,
     }));
     const { job } = fakeJob();
 
@@ -115,7 +116,7 @@ describe('one internet search, from a question to its moments', () => {
 
   it('names the site a moment came from, and never the page itself', async () => {
     found.mockResolvedValue([candidate('a', null)]);
-    inspect.mockResolvedValue({ moments: [{ startSeconds: 2, endSeconds: 5, description: 'A wave.' }] });
+    inspect.mockResolvedValue({ moments: [{ startSeconds: 2, endSeconds: 5, description: 'A wave.' }], exhausted: true });
     const { job, reported } = fakeJob();
 
     const result = await handleInternetSearch(job);
@@ -132,7 +133,7 @@ describe('one internet search, from a question to its moments', () => {
     found.mockResolvedValue([candidate('a'), candidate('b')]);
     inspect.mockImplementation(async ({ candidate: page }) => {
       if (page.id === 'a') throw new Error('the video never started playing');
-      return { moments: [] };
+      return { moments: [], exhausted: true };
     });
     const { job } = fakeJob();
 
@@ -143,9 +144,33 @@ describe('one internet search, from a question to its moments', () => {
     expect(result.moments).toEqual([]);
   });
 
+  it('counts a page still playing when the watch ended as unexamined', async () => {
+    found.mockResolvedValue([candidate('a')]);
+    // The scout watched it and did not reach the end. That is not a failure,
+    // and it is not "nothing was there" either.
+    inspect.mockResolvedValue({ moments: [], exhausted: false });
+    const { job } = fakeJob();
+
+    const result = await handleInternetSearch(job);
+
+    expect(result.unexamined).toBe(1);
+  });
+
+  it('treats a page that never said it finished as unexamined', async () => {
+    found.mockResolvedValue([candidate('a')]);
+    // Nothing said the page was watched to its end, so nothing may claim it
+    // was. Silence is not a report that the whole page was seen.
+    inspect.mockResolvedValue({ moments: [] });
+    const { job } = fakeJob();
+
+    const result = await handleInternetSearch(job);
+
+    expect(result.unexamined).toBe(1);
+  });
+
   it('says nothing about being unexamined when everything was watched', async () => {
     found.mockResolvedValue([candidate('a')]);
-    inspect.mockResolvedValue({ moments: [] });
+    inspect.mockResolvedValue({ moments: [], exhausted: true });
     const { job } = fakeJob();
 
     const result = await handleInternetSearch(job);

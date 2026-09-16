@@ -99,10 +99,22 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     },
   });
 
-  // A page a scout could not watch was not examined, and the difference
-  // between that and "nothing was there" is the difference between an honest
-  // answer and a wrong one. It is counted, not quietly dropped.
-  const unexamined = result.failures.length + (result.candidatesAvailable - result.candidatesConsidered);
+  /*
+   * Everything the search did not get a proper look at.
+   *
+   * Four ways a page ends up here, and none of them is "nothing was there":
+   * a scout could not watch it at all; it was still playing when the watch
+   * limit came; its inspection was cut short when the search was cancelled or
+   * ran out of time; or it was never reached, because discovery found more
+   * pages than the coordinator's ceiling allows.
+   *
+   * Counting only the first would let an incomplete search report itself as a
+   * complete one that found nothing, which is the one thing this whole path
+   * is built not to do.
+   */
+  const neverReached = Math.max(0, result.candidatesAvailable - result.candidatesConsidered);
+  const notStarted = Math.max(0, result.candidatesConsidered - result.candidatesCompleted);
+  const unexamined = result.failures.length + result.candidatesPartlyExamined + neverReached + notStarted;
   const done: InternetSearchProgress = {
     phase: 'answered',
     moments,
@@ -115,6 +127,7 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     moments: moments.length,
     candidates_considered: result.candidatesConsidered,
     candidates_completed: result.candidatesCompleted,
+    partly_examined: result.candidatesPartlyExamined,
     unexamined,
     status: result.status,
     wall_ms: result.metrics.wallMs,
