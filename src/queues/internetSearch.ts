@@ -9,16 +9,41 @@ export interface InternetSearchJob {
   userId: string | null;
 }
 
-/** A moment the scouts approved, as the screen needs it. */
-export interface InternetSearchMoment {
-  id: string;
-  description: string;
+/** Somewhere in a video the watcher approved, for jumping to. */
+export interface InternetSearchMark {
   startSeconds: number;
   endSeconds: number;
-  /** A frame from the moment. Null until something takes one. */
+  /** What the watcher said was happening there. */
+  description: string;
+}
+
+/**
+ * A video the scouts approved, as the screen needs it.
+ *
+ * The video is the result. A video that answers the question in three places
+ * is one card with three places to jump to, not three cards — the same video
+ * appearing repeatedly would eat a band that holds five and bury the others.
+ * Answering repeatedly makes it a stronger answer, which is how the list is
+ * ordered, not a more numerous one.
+ *
+ * The page travels with it because the card plays it: the person opens the
+ * video and jumps to what the watcher called out. Only a video something was
+ * actually approved in ever becomes one of these. A page discovery merely
+ * turned up has no marks and is not a result.
+ */
+export interface InternetSearchMoment {
+  /** The video's own id, held steady as marks accumulate under it. */
+  id: string;
+  /** Where the video plays. */
+  pageUrl: string;
+  /** The video's title, as the site gives it. */
+  title: string;
+  /** A frame the site already publishes. Null when it publishes none. */
   still: string | null;
   /** The site it came from, for attribution. */
   source: string | null;
+  /** Everywhere the watcher approved, earliest first. Never empty. */
+  marks: InternetSearchMark[];
 }
 
 /**

@@ -18,15 +18,61 @@ function sourceOf(candidate: Candidate): string | null {
   try { return new URL(candidate.pageUrl).host.replace(/^www\./, ''); } catch { return null; }
 }
 
-function asMoment(found: SwarmMoment<Candidate>): InternetSearchMoment {
+/**
+ * The approved stretches of one video, gathered into the card that plays it.
+ *
+ * The card keeps the video's own id rather than a running number, so a video
+ * that goes on being approved stays the same card on screen: it gains places
+ * to jump to and may move up the band, but it never turns into a different
+ * card or a second copy of itself.
+ */
+function asMoment(candidate: Candidate, found: SwarmMoment<Candidate>[]): InternetSearchMoment {
   return {
-    id: found.id,
-    description: found.description,
-    startSeconds: found.startSeconds,
-    endSeconds: found.endSeconds,
-    still: null,
-    source: sourceOf(found.candidate),
+    id: candidate.id,
+    pageUrl: candidate.pageUrl,
+    title: candidate.title,
+    still: candidate.thumbnailUrl,
+    source: sourceOf(candidate),
+    marks: found
+      .map((moment) => ({ startSeconds: moment.startSeconds, endSeconds: moment.endSeconds, description: moment.description }))
+      .sort((one, other) => one.startSeconds - other.startSeconds),
   };
+}
+
+/**
+ * How many approvals a video has, and how much footage they cover.
+ *
+ * A video the watcher approved in three separate places answers the question
+ * more strongly than one it approved once, so the count leads. Total approved
+ * footage settles ties between videos approved the same number of times.
+ */
+function strength(moment: InternetSearchMoment): [number, number] {
+  const seconds = moment.marks.reduce((total, mark) => total + (mark.endSeconds - mark.startSeconds), 0);
+  return [moment.marks.length, seconds];
+}
+
+/**
+ * Every approved video, strongest first.
+ *
+ * Grouped by the video rather than by the finding, because the video is the
+ * result. Sorting is stable and the grouping keeps the order the scouts found
+ * them in, so videos of equal strength hold their places instead of swapping
+ * between one report and the next.
+ */
+function asMoments(found: SwarmMoment<Candidate>[]): InternetSearchMoment[] {
+  const byVideo = new Map<string, { candidate: Candidate; found: SwarmMoment<Candidate>[] }>();
+  for (const moment of found) {
+    const gathered = byVideo.get(moment.candidate.id) ?? { candidate: moment.candidate, found: [] };
+    gathered.found.push(moment);
+    byVideo.set(moment.candidate.id, gathered);
+  }
+  return [...byVideo.values()]
+    .map((gathered) => asMoment(gathered.candidate, gathered.found))
+    .sort((one, other) => {
+      const [oneMarks, oneSeconds] = strength(one);
+      const [otherMarks, otherSeconds] = strength(other);
+      return otherMarks - oneMarks || otherSeconds - oneSeconds;
+    });
 }
 
 /**
@@ -34,6 +80,10 @@ function asMoment(found: SwarmMoment<Candidate>): InternetSearchMoment {
  * SearXNG finds pages, the browser turns a page into timestamped frames, and
  * VideoChat3's online StreamingSession watches those frames with the text query
  * attached from the first round. The scout swarm remains the coordinator.
+ *
+ * What comes back is videos, not findings. Each approved video is one card
+ * carrying the places inside it worth jumping to, ordered by how often the
+ * watcher approved it.
  */
 export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise<InternetSearchProgress> {
   const searchId = job.id ?? 'unknown';
@@ -74,11 +124,11 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
       // shows what it currently holds, rather than a tally kept alongside it
       // that has no way to take something back.
       if (progress.event !== 'moment.found' && progress.event !== 'moment.extended') return;
-      await report({ phase: 'searching', moments: progress.snapshot.moments.map(asMoment), candidatesFound: candidates.length });
+      await report({ phase: 'searching', moments: asMoments(progress.snapshot.moments), candidatesFound: candidates.length });
     },
   });
 
-  const moments: InternetSearchMoment[] = result.moments.map(asMoment);
+  const moments: InternetSearchMoment[] = asMoments(result.moments);
 
   const neverReached = Math.max(0, result.candidatesAvailable - result.candidatesConsidered);
   const notStarted = Math.max(0, result.candidatesConsidered - result.candidatesCompleted);
@@ -93,7 +143,8 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
 
   log.info('internet search finished', {
     model: videoChat3Adapter.id,
-    moments: moments.length,
+    videos: moments.length,
+    marks: moments.reduce((total, moment) => total + moment.marks.length, 0),
     candidates_considered: result.candidatesConsidered,
     candidates_completed: result.candidatesCompleted,
     partly_examined: result.candidatesPartlyExamined,

@@ -16,7 +16,7 @@ vi.mock('../src/services/video/adapters/videochat3.js', () => ({ videoChat3Adapt
 const { handleInternetSearch } = await import('../src/worker/handlers/internetSearch.js');
 
 function candidate(id: string, source: string | null = 'youtube.com'): Candidate {
-  return { id, query: 'a dog on a skateboard', title: `page ${id}`, pageUrl: `https://publisher.example/watch/${id}`, thumbnailUrl: null, source };
+  return { id, query: 'a dog on a skateboard', title: `page ${id}`, pageUrl: `https://publisher.example/watch/${id}`, thumbnailUrl: `https://publisher.example/still/${id}.jpg`, source };
 }
 function fakeJob() {
   const reported: InternetSearchProgress[] = [];
@@ -55,7 +55,7 @@ describe('one internet search, from a question to its moments', () => {
       ? { moments: [{ startSeconds: 10, endSeconds: 14, description: 'A dog rolls past.' }], exhausted: true }
       : { moments: [], exhausted: true });
     const { job, reported } = fakeJob(); await handleInternetSearch(job);
-    expect(reported.some((step) => step.phase === 'searching' && step.moments[0]?.description === 'A dog rolls past.')).toBe(true);
+    expect(reported.some((step) => step.phase === 'searching' && step.moments[0]?.marks[0]?.description === 'A dog rolls past.')).toBe(true);
   });
   it('shows one card for one event, however many frames the watcher answered about', async () => {
     found.mockResolvedValue([candidate('a')]);
@@ -65,21 +65,54 @@ describe('one internet search, from a question to its moments', () => {
     });
     const { job, reported } = fakeJob(); const result = await handleInternetSearch(job);
     expect(result.moments).toHaveLength(1);
-    expect(result.moments[0]).toMatchObject({ startSeconds: 42, endSeconds: 46, description: 'The dog falls off the board.' });
+    expect(result.moments[0]!.marks).toEqual([{ startSeconds: 42, endSeconds: 46, description: 'The dog falls off the board.' }]);
     // And no step on the way to that answer put more on screen than the answer
     // holds: a card that appeared and then had to be taken back is the bug.
-    for (const step of reported) expect(step.moments.length).toBeLessThanOrEqual(1);
+    for (const step of reported) for (const moment of step.moments) expect(moment.marks.length).toBeLessThanOrEqual(1);
   });
   it('carries every moment on the final result', async () => {
     found.mockResolvedValue([candidate('a'), candidate('b')]);
     inspect.mockImplementation(async ({ candidate: page }) => ({ moments: [{ startSeconds: 1, endSeconds: 3, description: `something in ${page.id}` }], exhausted: true }));
     const { job } = fakeJob(); expect((await handleInternetSearch(job)).moments).toHaveLength(2);
   });
-  it('returns the site but never the candidate page URL', async () => {
+  it('returns an approved video with the page that plays it, and the site it came from', async () => {
     found.mockResolvedValue([candidate('a', null)]); inspect.mockResolvedValue({ moments: [{ startSeconds: 2, endSeconds: 5, description: 'A wave.' }], exhausted: true });
+    const { job } = fakeJob(); const result = await handleInternetSearch(job);
+    expect(result.moments[0]).toMatchObject({
+      id: 'a',
+      pageUrl: 'https://publisher.example/watch/a',
+      title: 'page a',
+      still: 'https://publisher.example/still/a.jpg',
+      source: 'publisher.example',
+    });
+  });
+  it('never returns a page nothing was approved in', async () => {
+    found.mockResolvedValue([candidate('watched'), candidate('empty')]);
+    inspect.mockImplementation(async ({ candidate: page }) => page.id === 'watched'
+      ? { moments: [{ startSeconds: 2, endSeconds: 5, description: 'A wave.' }], exhausted: true }
+      : { moments: [], exhausted: true });
     const { job, reported } = fakeJob(); const result = await handleInternetSearch(job);
-    expect(result.moments[0]!.source).toBe('publisher.example');
-    const everything = JSON.stringify(reported); expect(everything).not.toContain('publisher.example/watch'); expect(everything).not.toContain('pageUrl');
+    // Discovery turned both up and both were watched. Only the one something
+    // was found in is a result; the other is not a weaker result, it is none.
+    expect(result.moments.map((moment) => moment.id)).toEqual(['watched']);
+    expect(JSON.stringify(reported)).not.toContain('watch/empty');
+  });
+  it('gives one video one card however many places it was approved in, strongest first', async () => {
+    found.mockResolvedValue([candidate('once'), candidate('thrice')]);
+    inspect.mockImplementation(async ({ candidate: page }) => page.id === 'thrice'
+      ? { moments: [
+          { startSeconds: 10, endSeconds: 12, description: 'The first time.' },
+          { startSeconds: 40, endSeconds: 43, description: 'The second time.' },
+          { startSeconds: 70, endSeconds: 72, description: 'The third time.' },
+        ], exhausted: true }
+      : { moments: [{ startSeconds: 5, endSeconds: 9, description: 'The only time.' }], exhausted: true });
+    const { job } = fakeJob(); const result = await handleInternetSearch(job);
+
+    // Two videos, not four cards. The one approved three times leads, because
+    // answering repeatedly is a stronger answer rather than more answers.
+    expect(result.moments.map((moment) => moment.id)).toEqual(['thrice', 'once']);
+    expect(result.moments[0]!.marks.map((mark) => mark.startSeconds)).toEqual([10, 40, 70]);
+    expect(result.moments[1]!.marks).toHaveLength(1);
   });
   it('counts a page the model could not watch as unexamined', async () => {
     found.mockResolvedValue([candidate('a'), candidate('b')]);
