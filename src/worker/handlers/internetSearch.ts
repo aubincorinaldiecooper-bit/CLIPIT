@@ -4,6 +4,7 @@ import type { InternetSearchJob, InternetSearchMoment, InternetSearchProgress } 
 import { search, type Candidate } from '../../services/discovery/searxng.js';
 import { createGanderScoutRuntime } from '../../services/retrieval/ganderScoutRuntime.js';
 import { runScoutSwarm, type SwarmMoment } from '../../services/retrieval/scoutSwarm.js';
+import { ganderUrl } from '../../services/scout/ganderAddress.js';
 import { ThinkerSlot } from '../../services/scout/ganderSlot.js';
 
 /**
@@ -75,7 +76,10 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const runtime = createGanderScoutRuntime({
     webAccessUrl: required('WEB_ACCESS_URL'),
     webAccessToken: required('WEB_ACCESS_INTERNAL_TOKEN'),
-    ganderUrl: required('GANDER_URL'),
+    // Asked for rather than configured: Modal knows where it deployed the
+    // runtime, and a hand-written address goes stale the moment the app is
+    // renamed. GANDER_URL still wins when it is set.
+    ganderUrl: await ganderUrl(),
     ganderApiKey: required('GANDER_API_KEY'),
     slot,
   });
