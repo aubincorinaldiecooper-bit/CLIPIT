@@ -19,6 +19,7 @@ vi.mock('node:dns/promises', () => ({
 
 const {
   assertPublicInternetUrl,
+  canonicalizeCandidateUrl,
   normalizeSearxResults,
   search,
 } = await import('../src/services/discovery/searxng.js');
@@ -37,27 +38,49 @@ afterEach(() => {
 });
 
 describe('search candidates', () => {
-  it('deduplicates by page URL and ignores the fragment', () => {
+  it('canonicalizes tracking variants into one candidate identity', () => {
+    expect(
+      canonicalizeCandidateUrl(
+        'https://www.Publisher.Example/watch/9/?b=2&utm_source=test&a=1&fbclid=tracking#t=30',
+      ),
+    ).toBe('https://publisher.example/watch/9?a=1&b=2');
+  });
+
+  it('uses the canonical URL for dedupe while preserving the browser destination', () => {
     const results = normalizeSearxResults('find the red car', {
       results: [
         {
-          url: 'https://publisher.example/watch/9#t=30',
+          url: 'https://www.publisher.example/watch/9/?utm_source=feed#t=30',
           title: 'Red car',
           thumbnail: 'https://img.example/car.jpg',
           engine: 'example-video',
         },
-        { url: 'https://publisher.example/watch/9', title: 'Duplicate' },
+        {
+          url: 'https://publisher.example/watch/9',
+          title: 'Duplicate',
+        },
       ],
     }, 20);
 
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({
       title: 'Red car',
-      pageUrl: 'https://publisher.example/watch/9',
+      pageUrl: 'https://www.publisher.example/watch/9/?utm_source=feed',
       thumbnailUrl: 'https://img.example/car.jpg',
       source: 'example-video',
       query: 'find the red car',
     });
+  });
+
+  it('keeps distinct functional query parameters distinct', () => {
+    const results = normalizeSearxResults('q', {
+      results: [
+        { url: 'https://youtube.com/watch?v=one&utm_source=a', title: 'one' },
+        { url: 'https://www.youtube.com/watch?v=two&utm_source=b', title: 'two' },
+      ],
+    }, 20);
+
+    expect(results.map((row) => row.title)).toEqual(['one', 'two']);
   });
 
   it('keeps only http and https results', () => {
