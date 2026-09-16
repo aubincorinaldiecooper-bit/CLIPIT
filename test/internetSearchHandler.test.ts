@@ -57,6 +57,19 @@ describe('one internet search, from a question to its moments', () => {
     const { job, reported } = fakeJob(); await handleInternetSearch(job);
     expect(reported.some((step) => step.phase === 'searching' && step.moments[0]?.description === 'A dog rolls past.')).toBe(true);
   });
+  it('shows one card for one event, however many frames the watcher answered about', async () => {
+    found.mockResolvedValue([candidate('a')]);
+    inspect.mockResolvedValue({
+      moments: [42, 43, 44, 45].map((second) => ({ startSeconds: second, endSeconds: second + 1, description: 'The dog falls off the board.' })),
+      exhausted: true,
+    });
+    const { job, reported } = fakeJob(); const result = await handleInternetSearch(job);
+    expect(result.moments).toHaveLength(1);
+    expect(result.moments[0]).toMatchObject({ startSeconds: 42, endSeconds: 46, description: 'The dog falls off the board.' });
+    // And no step on the way to that answer put more on screen than the answer
+    // holds: a card that appeared and then had to be taken back is the bug.
+    for (const step of reported) expect(step.moments.length).toBeLessThanOrEqual(1);
+  });
   it('carries every moment on the final result', async () => {
     found.mockResolvedValue([candidate('a'), candidate('b')]);
     inspect.mockImplementation(async ({ candidate: page }) => ({ moments: [{ startSeconds: 1, endSeconds: 3, description: `something in ${page.id}` }], exhausted: true }));

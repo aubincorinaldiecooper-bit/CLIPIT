@@ -63,20 +63,22 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   });
 
   await report({ phase: 'searching', moments: [], candidatesFound: candidates.length });
-  const moments: InternetSearchMoment[] = [];
   const result = await runScoutSwarm<Candidate>({
     searchId,
     query: job.data.query,
     candidates,
     runtime,
     onProgress: async (progress) => {
-      if (progress.event !== 'moment.found') return;
-      const found = progress.snapshot.moments.at(-1);
-      if (!found) return;
-      moments.push(asMoment(found));
-      await report({ phase: 'searching', moments: [...moments], candidatesFound: candidates.length });
+      // A moment that grew is the same card with a longer stretch, not another
+      // one. Sending the swarm's whole list on either event means the screen
+      // shows what it currently holds, rather than a tally kept alongside it
+      // that has no way to take something back.
+      if (progress.event !== 'moment.found' && progress.event !== 'moment.extended') return;
+      await report({ phase: 'searching', moments: progress.snapshot.moments.map(asMoment), candidatesFound: candidates.length });
     },
   });
+
+  const moments: InternetSearchMoment[] = result.moments.map(asMoment);
 
   const neverReached = Math.max(0, result.candidatesAvailable - result.candidatesConsidered);
   const notStarted = Math.max(0, result.candidatesConsidered - result.candidatesCompleted);

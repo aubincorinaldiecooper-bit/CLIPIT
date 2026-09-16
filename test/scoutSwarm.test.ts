@@ -24,6 +24,30 @@ function runtimeFor(input: {
   };
 }
 
+/** A runtime that reports findings as it goes, the way a live watcher does. */
+function streamingRuntimeFor(input: {
+  frames: (candidate: Candidate) => Array<{ startSeconds: number; endSeconds: number; description: string }>;
+}): ScoutRuntime<Candidate> {
+  return {
+    async inspect({ candidate, onMoment }) {
+      for (const frame of input.frames(candidate)) await onMoment?.(frame);
+      return { moments: [], mediaSecondsObserved: 30, exhausted: true };
+    },
+  };
+}
+
+/**
+ * One finding per second of an event, which is what a watcher asked about each
+ * frame in turn actually produces.
+ */
+function secondBySecond(from: number, to: number, description: string) {
+  return Array.from({ length: to - from }, (_, index) => ({
+    startSeconds: from + index,
+    endSeconds: from + index + 1,
+    description,
+  }));
+}
+
 describe('runScoutSwarm', () => {
   it('uses exactly four scouts across the whole search and surfaces a found moment directly', async () => {
     const inspectors = new Set<ScoutId>();
@@ -126,5 +150,75 @@ describe('runScoutSwarm', () => {
     expect(result.status).toBe('ceiling_reached');
     expect(result.candidatesConsidered).toBe(15);
     expect(result.candidatesCompleted).toBe(15);
+  });
+  it('keeps one card for one event when the watcher answers about every frame', async () => {
+    const events: string[] = [];
+    const result = await runScoutSwarm<Candidate>({
+      searchId: 'search-6',
+      query: 'find when the skateboarder falls',
+      candidates: [{ id: 'only', label: 'only candidate' }],
+      runtime: streamingRuntimeFor({ frames: () => secondBySecond(42, 46, 'The skateboarder loses balance.') }),
+      onProgress(progress) {
+        events.push(progress.event);
+      },
+    });
+
+    expect(result.moments).toHaveLength(1);
+    expect(result.moments[0]?.startSeconds).toBe(42);
+    expect(result.moments[0]?.endSeconds).toBe(46);
+    expect(result.moments[0]?.description).toBe('The skateboarder loses balance.');
+    expect(events.filter((event) => event === 'moment.found')).toHaveLength(1);
+    expect(events.filter((event) => event === 'moment.extended')).toHaveLength(3);
+  });
+
+  it('starts a new moment when the next finding is not part of the same event', async () => {
+    const result = await runScoutSwarm<Candidate>({
+      searchId: 'search-7',
+      query: 'find every wave',
+      candidates: [{ id: 'only', label: 'only candidate' }],
+      runtime: streamingRuntimeFor({
+        frames: () => [...secondBySecond(10, 12, 'She waves.'), ...secondBySecond(30, 31, 'She waves again.')],
+      }),
+    });
+
+    expect(result.moments).toHaveLength(2);
+    expect(result.moments[0]).toMatchObject({ startSeconds: 10, endSeconds: 12, description: 'She waves.' });
+    expect(result.moments[1]).toMatchObject({ startSeconds: 30, endSeconds: 31, description: 'She waves again.' });
+  });
+
+  it('never joins findings that came from two different pages', async () => {
+    const result = await runScoutSwarm<Candidate>({
+      searchId: 'search-8',
+      query: 'find the dog',
+      candidates: [
+        { id: 'a', label: 'a' },
+        { id: 'b', label: 'b' },
+      ],
+      runtime: streamingRuntimeFor({ frames: (candidate) => secondBySecond(5, 8, `A dog on ${candidate.id}.`) }),
+    });
+
+    // One moment per page: each page's own run joins up, and the two pages
+    // never join each other however close their timestamps are.
+    expect(result.moments).toHaveLength(2);
+    expect(result.moments.map((moment) => moment.candidate.id).sort()).toEqual(['a', 'b']);
+    for (const moment of result.moments) expect(moment).toMatchObject({ startSeconds: 5, endSeconds: 8 });
+  });
+
+  it('stops a moment growing at the maximum length instead of making one long card', async () => {
+    const result = await runScoutSwarm<Candidate>({
+      searchId: 'search-9',
+      query: 'find the thing that never stops',
+      candidates: [{ id: 'only', label: 'only candidate' }],
+      maxMomentSeconds: 4,
+      runtime: streamingRuntimeFor({ frames: () => secondBySecond(0, 10, 'It is still happening.') }),
+    });
+
+    // Ten seconds of continuous matching, cut into the longest moments the
+    // ceiling allows rather than one card per second or one card of ten.
+    expect(result.moments.map((moment) => [moment.startSeconds, moment.endSeconds])).toEqual([
+      [0, 4],
+      [4, 8],
+      [8, 10],
+    ]);
   });
 });
