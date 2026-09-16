@@ -20,7 +20,7 @@ export interface SwarmMoment<Candidate extends ScoutCandidate> { id: string; can
 export interface ScoutSwarmSnapshot<Candidate extends ScoutCandidate> { scoutCount: 4; candidatesTotal: number; candidatesAssigned: number; candidatesCompleted: number; activeOperations: number; momentsFound: number; moments: SwarmMoment<Candidate>[]; }
 export interface ScoutSwarmProgress<Candidate extends ScoutCandidate> {
   stage: 'searching' | 'complete' | 'cancelled';
-  event: 'swarm.started' | 'scout.candidate_assigned' | 'scout.candidate_completed' | 'moment.found' | 'swarm.completed' | 'swarm.cancelled';
+  event: 'swarm.started' | 'scout.candidate_assigned' | 'scout.candidate_completed' | 'moment.found' | 'moment.extended' | 'swarm.completed' | 'swarm.cancelled';
   scoutId?: ScoutId; candidateId?: string; momentId?: string; snapshot: ScoutSwarmSnapshot<Candidate>;
 }
 export interface ScoutSwarmFailure { scoutId: ScoutId; candidateId: string; stage: 'inspect'; reason: string; }
@@ -29,6 +29,39 @@ export interface ScoutSwarmResult<Candidate extends ScoutCandidate> {
   candidatesPartlyExamined: number; moments: SwarmMoment<Candidate>[]; failures: ScoutSwarmFailure[];
   metrics: { wallMs: number; inspectOperations: number; mediaSecondsObserved: number; };
 }
+/**
+ * How far apart two findings can be and still be one moment, in seconds.
+ *
+ * A live watcher is asked about one frame at a time, so something that lasts
+ * four seconds answers four times. Left alone that becomes four cards a second
+ * apart, all describing the same event, filling a results band that holds five.
+ *
+ * Two seconds is one missed look at a frame a second: enough to ride over a
+ * frame the model did not match in the middle of something it did. Nearness
+ * alone is not enough to join two findings, though — see `sameThing`.
+ */
+const MERGE_GAP_SECONDS = 2;
+
+/**
+ * Whether two findings are the watcher saying the same thing again.
+ *
+ * Time alone cannot tell one long event from two short ones a second apart: a
+ * woman waving at 00:10 and a man waving at 00:12 are as close together as two
+ * frames of one wave. Joining those would put one card on screen carrying the
+ * first description and silently lose the second, over a stretch that includes
+ * footage matching neither (Codex's finding on #143).
+ *
+ * What the model said is the one signal available. It watches at temperature
+ * zero, so one continuing event answered about frame by frame comes back in
+ * the same words, and two different events come back in different words. Where
+ * two genuinely separate events do produce the same sentence, nothing we hold
+ * can tell them apart, and one card saying it once loses the reader nothing.
+ */
+function sameThing(one: string, other: string): boolean {
+  const plain = (text: string) => text.trim().toLowerCase().replace(/\s+/g, ' ');
+  return plain(one) === plain(other);
+}
+
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(signal.reason ?? new Error('aborted'));
@@ -56,18 +89,50 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
 
   let candidateCursor = 0, candidatesAssigned = 0, candidatesCompleted = 0, activeOperations = 0, inspectOperations = 0, mediaSecondsObserved = 0, momentSequence = 0, candidatesPartlyExamined = 0;
   const moments: SwarmMoment<Candidate>[] = []; const failures: ScoutSwarmFailure[] = [];
-  const snapshot = (): ScoutSwarmSnapshot<Candidate> => ({ scoutCount: 4, candidatesTotal: candidates.length, candidatesAssigned, candidatesCompleted, activeOperations, momentsFound: moments.length, moments: [...moments] });
+  const snapshot = (): ScoutSwarmSnapshot<Candidate> => ({ scoutCount: 4, candidatesTotal: candidates.length, candidatesAssigned, candidatesCompleted, activeOperations, momentsFound: moments.length, moments: moments.map((moment) => ({ ...moment })) });
   const emit = async (event: ScoutSwarmProgress<Candidate>['event'], detail: { scoutId?: ScoutId; candidateId?: string; momentId?: string } = {}) => {
     const stage: ScoutSwarmProgress<Candidate>['stage'] = controller.signal.aborted ? 'cancelled' : event === 'swarm.completed' ? 'complete' : 'searching';
     const progress: ScoutSwarmProgress<Candidate> = { stage, event, ...detail, snapshot: snapshot() };
     log.debug(event, { scout_id: detail.scoutId, candidate_id: detail.candidateId, moment_id: detail.momentId, ...progress.snapshot });
     await input.onProgress?.(progress);
   };
+  /**
+   * The moment this finding continues, when it continues one.
+   *
+   * Scouts watch different pages at the same time, so the newest finding for
+   * this page is not necessarily the newest finding overall: the list has to be
+   * searched backwards for this page's own last moment rather than read off the
+   * end.
+   */
+  const continues = (proposal: ScoutProposal, scoutId: ScoutId, candidate: Candidate): SwarmMoment<Candidate> | null => {
+    const previous = moments.findLast((moment) => moment.candidate.id === candidate.id && moment.scoutId === scoutId);
+    if (!previous) return null;
+    // Frames arrive in order. A finding that starts before the moment it would
+    // join is not a continuation of it.
+    if (proposal.startSeconds < previous.startSeconds) return null;
+    if (proposal.startSeconds - previous.endSeconds > MERGE_GAP_SECONDS) return null;
+    // Near in time and the same account of what is happening. Different words
+    // mean a different thing was seen, however close together it was.
+    if (!sameThing(proposal.description, previous.description)) return null;
+    // Growing past the ceiling would turn a stretch the product does not call a
+    // moment into one card. Beyond it the finding starts a moment of its own.
+    if (Math.max(previous.endSeconds, proposal.endSeconds) - previous.startSeconds > maxMomentSeconds) return null;
+    return previous;
+  };
   const accept = async (proposal: ScoutProposal, scoutId: ScoutId, candidate: Candidate) => {
     if (!Number.isFinite(proposal.startSeconds) || !Number.isFinite(proposal.endSeconds)) return;
     if (proposal.startSeconds < 0 || proposal.endSeconds <= proposal.startSeconds) return;
     if (proposal.endSeconds - proposal.startSeconds > maxMomentSeconds) {
       failures.push({ scoutId, candidateId: candidate.id, stage: 'inspect', reason: `proposed moment exceeds ${maxMomentSeconds}s maximum` }); return;
+    }
+    const previous = continues(proposal, scoutId, candidate);
+    if (previous) {
+      // The same event, still going. The moment already on screen grows to
+      // cover it; a second card would only say the same thing again. The words
+      // stay as first given — they are what the model said as it began.
+      previous.endSeconds = Math.max(previous.endSeconds, proposal.endSeconds);
+      await emit('moment.extended', { scoutId, candidateId: candidate.id, momentId: previous.id });
+      return;
     }
     momentSequence += 1;
     const moment: SwarmMoment<Candidate> = { id: `moment-${momentSequence}`, candidate, scoutId, startSeconds: proposal.startSeconds, endSeconds: proposal.endSeconds, description: proposal.description, confidence: proposal.confidence };
