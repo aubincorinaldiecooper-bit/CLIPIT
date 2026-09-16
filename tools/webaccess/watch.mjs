@@ -1,45 +1,30 @@
 import { chromium } from 'playwright';
 
 /**
- * Watching a page, rather than resolving it.
+ * Watch a page rather than resolving it to a media file.
  *
- * The old job here was to sniff out a media file URL so something else could
- * download it. This one never leaves the browser: it opens the page, gets the
- * video actually playing, and streams out what is on screen along with where
- * in the video each picture came from. Gander watches the result.
+ * The browser opens the real page, gets its main video playing, and streams
+ * pictures with the player's own currentTime. Downstream video models receive
+ * those timestamps as source truth; model prose is never trusted for time.
  *
- * Every frame is stamped with the player's own `currentTime`, read at the
- * moment the picture is taken. That stamp is the whole reason this exists:
- * downstream, a frame's position is what lets something the model says be
- * placed in the video exactly instead of guessed at from elapsed time.
- *
- * What this cannot do, stated plainly so nothing downstream assumes it can:
- * there is no audio. A headless browser will not hand over the page's sound,
- * so a page watched this way is watched and not heard.
+ * This path is visual-only. The headless browser does not expose page audio.
  */
 
-/** Pictures per second. Gander consumes about one per unit; more is waste. */
 const DEFAULT_FPS = 1;
-
-/** Longest a single page is watched before the scout moves on. */
 const DEFAULT_MAX_SECONDS = 90;
-
-/** How long to wait for a page to produce a playing video at all. */
 const PLAYBACK_TIMEOUT_MS = 20_000;
 
-/** Beyond this, a frame is too big for the runtime to take. */
-const MAX_FRAME_BYTES = 900_000;
-
 /**
- * Get a video element playing, past the obstacles a real page puts up.
- *
- * Muted autoplay is what browsers allow without a gesture, and muted costs
- * nothing here because the sound cannot be captured anyway.
+ * Live frames currently cross a Modal Queue as base64 JSON. Queue items are
+ * capped at 1 MiB, and base64 adds roughly one third, so keep the raw JPEG
+ * comfortably below that boundary rather than discovering the limit after
+ * capture. 680kB -> ~907kB before the small JSON envelope.
  */
+const MAX_FRAME_BYTES = 680_000;
+
 async function startPlayback(page) {
   return page.evaluate(async () => {
     const videos = Array.from(document.querySelectorAll('video'));
-    // The one that is actually the content: biggest on screen wins.
     const video = videos
       .map((node) => ({ node, area: node.clientWidth * node.clientHeight }))
       .sort((a, b) => b.area - a.area)[0]?.node;
@@ -61,7 +46,6 @@ async function startPlayback(page) {
   });
 }
 
-/** Where the player is now, in milliseconds, or null if it has gone away. */
 async function positionMs(page) {
   return page.evaluate(() => {
     const videos = Array.from(document.querySelectorAll('video'));
@@ -73,13 +57,6 @@ async function positionMs(page) {
   });
 }
 
-/**
- * Open a page, play its video, and hand each frame to `onFrame` with the
- * position it was taken at.
- *
- * `onFrame` is awaited, so a slow consumer slows the capture rather than
- * building a backlog of stale pictures nobody has looked at yet.
- */
 export async function watchPage(input, onFrame) {
   const { pageUrl, maxSeconds = DEFAULT_MAX_SECONDS, fps = DEFAULT_FPS, signal } = input;
   const browser = await chromium.launch({
@@ -95,11 +72,8 @@ export async function watchPage(input, onFrame) {
     const page = await context.newPage();
     await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: PLAYBACK_TIMEOUT_MS });
 
-    // A page that cannot be played is not a failure of the search; it is a
-    // page that could not be examined, and the difference matters upstream.
     let playback = await startPlayback(page);
     if (!playback.playing) {
-      // One more try after the page has had a moment to build its player.
       await page.waitForTimeout(2_000);
       playback = await startPlayback(page);
     }
@@ -124,7 +98,6 @@ export async function watchPage(input, onFrame) {
       } catch (error) {
         return { watched: true, reason: `the picture could not be taken: ${String(error)}`, framesSent, lastPositionMs };
       }
-      // A frame the runtime would refuse is not worth the round trip.
       if (image.byteLength <= MAX_FRAME_BYTES) {
         await onFrame({ videoMs: where.ms, image, encoding: 'jpeg' });
         framesSent += 1;
