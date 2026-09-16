@@ -23,6 +23,8 @@ export interface StoredVideoSource {
 export interface VideoFrame {
   /** Position in the source video, not wall-clock time. */
   timestampMs: number;
+  /** How much source time this picture represents. Defaults to one second. */
+  durationMs?: number;
   encoding: 'jpeg' | 'png';
   image: Buffer;
 }
