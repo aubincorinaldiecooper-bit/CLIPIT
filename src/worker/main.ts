@@ -14,6 +14,7 @@ import {
   enqueueThumbnailBackfill,
   QUEUE_NAMES,
 } from '../queues/index.js';
+import { INTERNET_SEARCH_QUEUE } from '../queues/internetSearch.js';
 import { INTERNET_VIDEO_SEARCH_QUEUE } from '../queues/internetVideoSearch.js';
 import { assertFfmpegAvailable } from '../services/media/ffmpeg.js';
 import { assertMiniCpmDeploymentAvailable } from '../services/search/minicpmVideo.js';
@@ -29,6 +30,7 @@ import { handleThumbnailBackfill } from './handlers/thumbnailBackfill.js';
 import { handleRetention } from './handlers/retention.js';
 import { handleScheduledPublish } from './handlers/scheduledPublish.js';
 import { handleLearningReport } from './handlers/learningReport.js';
+import { handleInternetSearch } from './handlers/internetSearch.js';
 import { handleInternetVideoSearch } from './handlers/internetVideoSearch.js';
 
 const workers: Worker[] = [];
@@ -135,12 +137,16 @@ async function main(): Promise<void> {
   startWorker(QUEUE_NAMES.scheduledPublish, handleScheduledPublish, 1);
   startWorker(QUEUE_NAMES.learningReport, handleLearningReport, 1);
   startWorker(INTERNET_VIDEO_SEARCH_QUEUE, handleInternetVideoSearch, 1);
+  // One at a time: the four scouts inside a search already share the single
+  // Thinker, so a second search running beside the first would only queue
+  // behind it while holding a browser open.
+  startWorker(INTERNET_SEARCH_QUEUE, handleInternetSearch, 1);
 
   await enqueueSimpleMemRebuilds().catch((error: unknown) => {
     logger.warn('could not queue invalidated SimpleMem memories for rebuild', { err: error });
   });
 
-  logger.info('worker ready', { queues: [...Object.values(QUEUE_NAMES), INTERNET_VIDEO_SEARCH_QUEUE] });
+  logger.info('worker ready', { queues: [...Object.values(QUEUE_NAMES), INTERNET_VIDEO_SEARCH_QUEUE, INTERNET_SEARCH_QUEUE] });
 
   if (env.THUMBNAIL_BACKFILL_ON_START) {
     await enqueueThumbnailBackfill(new Date().toISOString()).catch((error: unknown) => {
