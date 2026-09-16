@@ -1,5 +1,3 @@
-import type { Readable } from 'node:stream';
-
 /**
  * A video source is deliberately separate from whichever model will read it.
  *
@@ -51,7 +49,3 @@ export function isStoredVideoSource(source: VideoSource): source is StoredVideoS
 export function isFrameStreamVideoSource(source: VideoSource): source is FrameStreamVideoSource {
   return source.kind === 'frame-stream';
 }
-
-// Keep this module free of browser/storage implementations. Concrete source
-// adapters belong next to the code that owns those credentials and transports.
-void (0 as unknown as Readable | null);
