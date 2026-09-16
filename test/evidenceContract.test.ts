@@ -449,7 +449,11 @@ describe('10. a failed watch never falls back to the retired per-chunk watcher',
       code: 'not_read_yet', globalStartSeconds: 0, globalEndSeconds: 300,
       message: expect.stringContaining('VideoChat3 could not read the video, so nothing in it was examined'),
     });
-    expect(recordRetrievalOutcome).toHaveBeenCalledWith('request-1', expect.objectContaining({ primary: 'videochat3', system: 'videochat3' }));
+    expect(recordRetrievalOutcome).toHaveBeenCalledWith(
+      'request-1',
+      expect.objectContaining({ primary: 'videochat3', system: 'videochat3' }),
+      'attempt-1',
+    );
     expect(insertMatches).not.toHaveBeenCalled();
   });
 
