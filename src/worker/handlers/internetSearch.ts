@@ -2,7 +2,7 @@ import type { Job } from 'bullmq';
 import { logger } from '../../lib/logger.js';
 import type { InternetSearchJob, InternetSearchMoment, InternetSearchProgress } from '../../queues/internetSearch.js';
 import { search, type Candidate } from '../../services/discovery/searxng.js';
-import { runScoutSwarm, type SwarmMoment } from '../../services/retrieval/scoutSwarm.js';
+import { runScoutSwarm, type ScoutInspectionPlan, type ScoutId, type SwarmMoment } from '../../services/retrieval/scoutSwarm.js';
 import { createVideoModelScoutRuntime } from '../../services/retrieval/videoModelScoutRuntime.js';
 import { videoChat3Adapter } from '../../services/video/adapters/videochat3.js';
 import { createWebFrameStreamSource } from '../../services/video/webFrameSource.js';
@@ -71,9 +71,10 @@ function asMoments(found: SwarmMoment<Candidate>[]): InternetSearchMoment[] {
 }
 
 /**
- * V2 is feature-gated while we compare it with the original one-fps path.
- * Capture begins modestly at six fps; VideoChat3 groups those pictures into
- * temporal rounds instead of making six language-model decisions per second.
+ * Realtime v2 keeps discovery narrow and spends model time inside the video.
+ * The top seven candidates are searched in rank order. For each candidate all
+ * four scouts inspect separate quarters of the first ten minutes using sparse
+ * one-second bursts, then promising windows are re-watched continuously.
  */
 export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise<InternetSearchProgress> {
   const searchId = job.id ?? 'unknown';
@@ -81,8 +82,8 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const report = async (progress: InternetSearchProgress) => job.updateProgress(progress as unknown as Record<string, unknown>);
 
   await report({ phase: 'loading', moments: [], candidatesFound: 0 });
-  const candidates = await search(job.data.query);
-  if (candidates.length === 0) {
+  const discovered = await search(job.data.query);
+  if (discovered.length === 0) {
     const done: InternetSearchProgress = { phase: 'answered', moments: [], candidatesFound: 0 };
     await report(done);
     return done;
@@ -92,21 +93,28 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const webAccessToken = required('WEB_ACCESS_INTERNAL_TOKEN');
   const realtimeV2 = enabled('VIDEO_STREAM_V2');
   const captureFps = realtimeV2 ? boundedNumber('VIDEO_STREAM_CAPTURE_FPS', 6, 0.2, 30) : 1;
-  // Whole-video coarse navigation is the next retrieval change. Keep this
-  // first perception experiment on the existing time budget so recall, lag,
-  // and GPU cost can be compared without moving two variables at once.
-  const maxSeconds = boundedNumber('INTERNET_WATCH_MAX_SECONDS', 90, 1, 600);
+  const horizonSeconds = realtimeV2 ? boundedNumber('INTERNET_WATCH_MAX_SECONDS', 600, 60, 600) : 90;
+  const maxCandidates = realtimeV2 ? Math.round(boundedNumber('INTERNET_SEARCH_MAX_CANDIDATES', 7, 1, 7)) : 7;
+  const coarseBurstSeconds = boundedNumber('VIDEO_STREAM_COARSE_BURST_SECONDS', 1, 0.25, 5);
+  const coarseStrideSeconds = boundedNumber('VIDEO_STREAM_COARSE_STRIDE_SECONDS', 5, coarseBurstSeconds, 30);
+  const densePaddingSeconds = boundedNumber('VIDEO_STREAM_DENSE_PADDING_SECONDS', 6, 1, 30);
+  const candidates = discovered.slice(0, maxCandidates);
 
   const runtime = createVideoModelScoutRuntime<Candidate>({
     model: videoChat3Adapter,
-    sourceForCandidate: (candidate) => createWebFrameStreamSource({
-      id: `${searchId}:${candidate.id}`,
+    sourceForInspection: (candidate: Candidate, plan: ScoutInspectionPlan, scoutId: ScoutId) => createWebFrameStreamSource({
+      id: `${searchId}:${candidate.id}:${scoutId}:${plan.mode}:${plan.startSeconds.toFixed(1)}-${plan.endSeconds.toFixed(1)}`,
       pageUrl: candidate.pageUrl,
       webAccessUrl,
       webAccessToken,
-      maxSeconds,
+      maxSeconds: Math.max(1, plan.endSeconds - plan.startSeconds),
       fps: captureFps,
       realtimeV2,
+      startSeconds: plan.startSeconds,
+      endSeconds: plan.endSeconds,
+      scanMode: plan.mode === 'coarse' ? 'coarse' : 'continuous',
+      burstSeconds: plan.burstSeconds,
+      strideSeconds: plan.strideSeconds,
     }),
   });
 
@@ -116,6 +124,12 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     query: job.data.query,
     candidates,
     runtime,
+    maxCandidates,
+    horizonSeconds,
+    coarseBurstSeconds,
+    coarseStrideSeconds,
+    densePaddingSeconds,
+    timeoutMs: realtimeV2 ? 10 * 60_000 : 5 * 60_000,
     onProgress: async (progress) => {
       if (progress.event !== 'moment.found' && progress.event !== 'moment.extended') return;
       await report({ phase: 'searching', moments: asMoments(progress.snapshot.moments), candidatesFound: candidates.length });
@@ -138,11 +152,16 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     model: videoChat3Adapter.id,
     stream_v2: realtimeV2,
     capture_fps: captureFps,
+    horizon_seconds: horizonSeconds,
+    candidates_limit: maxCandidates,
+    coarse_burst_seconds: coarseBurstSeconds,
+    coarse_stride_seconds: coarseStrideSeconds,
     videos: moments.length,
     marks: moments.reduce((total, moment) => total + moment.marks.length, 0),
     candidates_considered: result.candidatesConsidered,
     candidates_completed: result.candidatesCompleted,
     partly_examined: result.candidatesPartlyExamined,
+    media_seconds_observed: result.metrics.mediaSecondsObserved,
     unexamined,
     status: result.status,
     wall_ms: result.metrics.wallMs,
