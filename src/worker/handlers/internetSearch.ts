@@ -70,6 +70,25 @@ function asMoments(found: SwarmMoment<Candidate>[]): InternetSearchMoment[] {
     });
 }
 
+function numeric(metrics: Record<string, unknown>, key: string): number | null {
+  const value = metrics[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function text(metrics: Record<string, unknown>, key: string): string | null {
+  const value = metrics[key];
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function sum(values: Array<number | null>): number {
+  return values.reduce<number>((total, value) => total + (value ?? 0), 0);
+}
+
+function max(values: Array<number | null>): number | null {
+  const finite = values.filter((value): value is number => value !== null);
+  return finite.length === 0 ? null : Math.max(...finite);
+}
+
 /**
  * Realtime v2 keeps discovery narrow and spends model time inside the video.
  * The top seven candidates are searched in rank order. For each candidate all
@@ -80,12 +99,27 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const searchId = job.id ?? 'unknown';
   const log = logger.child({ search_id: searchId, component: 'internet_search' });
   const report = async (progress: InternetSearchProgress) => job.updateProgress(progress as unknown as Record<string, unknown>);
+  const searchStartedAt = Date.now();
 
   await report({ phase: 'loading', moments: [], candidatesFound: 0 });
+  const discoveryStartedAt = Date.now();
   const discovered = await search(job.data.query);
+  const discoveryMs = Date.now() - discoveryStartedAt;
   if (discovered.length === 0) {
     const done: InternetSearchProgress = { phase: 'answered', moments: [], candidatesFound: 0 };
     await report(done);
+    log.info('internet search finished', {
+      model: videoChat3Adapter.id,
+      query_length: job.data.query.length,
+      discovery_ms: discoveryMs,
+      candidates_discovered: 0,
+      candidates_considered: 0,
+      videos: 0,
+      marks: 0,
+      wall_ms: Date.now() - searchStartedAt,
+      status: 'completed',
+      zero_reason: 'discovery returned no candidates',
+    });
     return done;
   }
 
@@ -99,6 +133,21 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const coarseStrideSeconds = boundedNumber('VIDEO_STREAM_COARSE_STRIDE_SECONDS', 5, coarseBurstSeconds, 30);
   const densePaddingSeconds = boundedNumber('VIDEO_STREAM_DENSE_PADDING_SECONDS', 6, 1, 30);
   const candidates = discovered.slice(0, maxCandidates);
+
+  log.info('internet search started', {
+    model: videoChat3Adapter.id,
+    stream_v2: realtimeV2,
+    query_length: job.data.query.length,
+    discovery_ms: discoveryMs,
+    candidates_discovered: discovered.length,
+    candidates_selected: candidates.length,
+    capture_fps: captureFps,
+    horizon_seconds: horizonSeconds,
+    candidates_limit: maxCandidates,
+    coarse_burst_seconds: coarseBurstSeconds,
+    coarse_stride_seconds: coarseStrideSeconds,
+    dense_padding_seconds: densePaddingSeconds,
+  });
 
   const runtime = createVideoModelScoutRuntime<Candidate>({
     model: videoChat3Adapter,
@@ -148,23 +197,67 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   };
   await report(done);
 
+  const successful = result.inspections.filter((inspection) => inspection.success);
+  const inspectionMetrics = successful.map((inspection) => inspection.metrics);
+  const containers = [...new Set(inspectionMetrics.map((metrics) => text(metrics, 'container')).filter((value): value is string => value !== null))];
+  const framesSent = sum(inspectionMetrics.map((metrics) => numeric(metrics, 'client_frames_sent')));
+  const framesProcessed = sum(inspectionMetrics.map((metrics) => numeric(metrics, 'client_frames_processed')));
+  const framesDropped = sum(inspectionMetrics.map((metrics) => numeric(metrics, 'client_frames_dropped_for_lag')));
+  const roundsProcessed = sum(inspectionMetrics.map((metrics) => numeric(metrics, 'rounds_processed')));
+  const highResRounds = sum(inspectionMetrics.map((metrics) => numeric(metrics, 'high_res_rounds')));
+  const maxVideoLagMs = max(inspectionMetrics.map((metrics) => numeric(metrics, 'max_video_lag_ms')));
+  const modalTotalMs = sum(inspectionMetrics.map((metrics) => numeric(metrics, 'total_ms')));
+  const modelRoundRate = modalTotalMs > 0 ? roundsProcessed / (modalTotalMs / 1000) : null;
+  const frameDropRate = framesSent + framesDropped > 0 ? framesDropped / (framesSent + framesDropped) : 0;
+
+  const resultEvidence = result.moments.map((moment) => ({
+    moment_id: moment.id,
+    candidate_id: moment.candidate.id,
+    scout_id: moment.scoutId,
+    start_seconds: moment.startSeconds,
+    end_seconds: moment.endSeconds,
+    confidence: moment.confidence ?? null,
+    description: moment.description,
+  }));
+
   log.info('internet search finished', {
     model: videoChat3Adapter.id,
     stream_v2: realtimeV2,
+    query_length: job.data.query.length,
+    discovery_ms: discoveryMs,
     capture_fps: captureFps,
     horizon_seconds: horizonSeconds,
     candidates_limit: maxCandidates,
     coarse_burst_seconds: coarseBurstSeconds,
     coarse_stride_seconds: coarseStrideSeconds,
+    dense_padding_seconds: densePaddingSeconds,
+    candidates_discovered: discovered.length,
     videos: moments.length,
     marks: moments.reduce((total, moment) => total + moment.marks.length, 0),
     candidates_considered: result.candidatesConsidered,
     candidates_completed: result.candidatesCompleted,
     partly_examined: result.candidatesPartlyExamined,
     media_seconds_observed: result.metrics.mediaSecondsObserved,
+    inspect_operations: result.metrics.inspectOperations,
+    first_moment_ms: result.metrics.firstMomentMs,
     unexamined,
+    failures: result.failures,
     status: result.status,
     wall_ms: result.metrics.wallMs,
+    total_request_wall_ms: Date.now() - searchStartedAt,
+    frames_sent: framesSent,
+    frames_processed: framesProcessed,
+    frames_dropped_for_lag: framesDropped,
+    frame_drop_rate: Number(frameDropRate.toFixed(6)),
+    rounds_processed: roundsProcessed,
+    rounds_per_second: modelRoundRate === null ? null : Number(modelRoundRate.toFixed(3)),
+    high_res_rounds: highResRounds,
+    max_video_lag_ms: maxVideoLagMs,
+    modal_containers: containers,
+    modal_container_count: containers.length,
+    shared_single_container: realtimeV2 ? containers.length === 1 : null,
+    inspections: result.inspections,
+    results: resultEvidence,
   });
   return done;
 }
