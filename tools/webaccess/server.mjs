@@ -123,14 +123,10 @@ function send(res, status, body) {
 /**
  * Watch a page and stream what is on screen, one line of NDJSON per event.
  *
- * Streamed rather than collected because the point is to watch in step with
- * something else watching: a scout feeds each picture to Gander as it arrives,
- * and a response that only came back at the end would make the whole page a
- * wait rather than a watch.
- *
- * The pictures are base64 inside the JSON line. At about one frame a second
- * that costs little, and it keeps the stream one thing a reader can parse
- * line by line instead of two interleaved framings.
+ * The v2 path is still just a transport here: watch.mjs owns player selection
+ * and media-clock sampling, while downstream owns temporal grouping/model
+ * inference. Keeping those responsibilities separate means a slow model cannot
+ * change which timestamp the browser says a captured picture came from.
  */
 async function streamWatch(req, res, body) {
   const pageUrl = await assertPublicHttpUrl(String(body.pageUrl || '').trim());
@@ -140,14 +136,14 @@ async function streamWatch(req, res, body) {
   res.writeHead(200, {
     'content-type': 'application/x-ndjson',
     'cache-control': 'no-store',
-    // Nothing downstream should buffer this; the value is in its timing.
     'x-accel-buffering': 'no',
   });
 
   const write = (event) =>
     new Promise((resolve) => {
-      // Respect back-pressure: a consumer slower than the capture should slow
-      // the capture, not accumulate pictures nobody has looked at yet.
+      // The worker consumes this stream continuously and applies a bounded
+      // model-side backlog. Respect socket back-pressure here so an actually
+      // disconnected/slow HTTP reader cannot grow web-access memory forever.
       if (res.write(`${JSON.stringify(event)}\n`)) resolve();
       else res.once('drain', resolve);
     });
@@ -158,6 +154,7 @@ async function streamWatch(req, res, body) {
         pageUrl,
         maxSeconds: Number(body.maxSeconds) || undefined,
         fps: Number(body.fps) || undefined,
+        realtimeV2: body.realtimeV2 === true,
         signal: controller.signal,
       },
       async (frame) => {
