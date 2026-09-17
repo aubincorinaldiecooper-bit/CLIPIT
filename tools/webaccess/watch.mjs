@@ -19,14 +19,6 @@ const PLAYBACK_TIMEOUT_MS = 20_000;
 const SAMPLE_WAIT_TIMEOUT_MS = 1_000;
 const STALL_RECOVER_MS = 2_500;
 const STALL_GIVE_UP_MS = 8_000;
-const PLAYER_ATTRIBUTE = 'data-clipit-player';
-
-/**
- * Live frames currently cross a Modal Queue as base64 JSON. Queue items are
- * capped at 1 MiB, and base64 adds roughly one third, so keep the raw JPEG
- * comfortably below that boundary rather than discovering the limit after
- * capture. 680kB -> ~907kB before the small JSON envelope.
- */
 const MAX_FRAME_BYTES = 680_000;
 
 function truthy(value) {
@@ -107,14 +99,12 @@ async function collectVideoCandidates(page) {
         });
         if (!info.visible) continue;
         const area = box.width * box.height;
-        // Area leads because the main player is usually the dominant surface.
-        // Playback/readiness break ties without letting a tiny autoplay ad win.
         const score = Math.log2(area + 1)
           + (!info.paused && !info.ended ? 4 : 0)
           + (info.readyState >= 2 ? 2 : 0)
           + (info.videoWidth > 0 && info.videoHeight > 0 ? 1 : 0)
           + (info.duration === null || info.duration >= 3 ? 1 : 0);
-        candidates.push({ frame, locator, box, info, area, score });
+        candidates.push({ locator, info, area, score });
       } catch {
         // A detached or cross-navigation node is simply not a candidate.
       }
@@ -126,18 +116,13 @@ async function collectVideoCandidates(page) {
 function ambiguous(candidates) {
   if (candidates.length < 2) return false;
   const [first, second] = candidates;
-  // If two visible players are of similar size, semantic page understanding is
-  // more reliable than guessing which one is content and which one is an ad or
-  // preview. A clearly dominant surface stays deterministic and free.
   return second.area >= first.area * 0.6;
 }
 
 async function pin(locator) {
-  const token = `clipit-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  await locator.evaluate((video, value) => video.setAttribute('data-clipit-player', value), token);
-  const frame = locator.frameLocator ? null : null; // keep this module Playwright-version agnostic
-  void frame;
-  return { locator, token };
+  // Retaining this exact Locator is the pin. We do not rediscover the largest
+  // player on every frame; resolution only runs again if this node disappears.
+  return { locator };
 }
 
 async function stagehandIntervention(stagehand, page) {
@@ -162,9 +147,6 @@ async function resolvePlayer(page, getStagehand) {
     if (await stagehandIntervention(stagehand, page)) candidates = await collectVideoCandidates(page);
   }
   if (candidates.length === 0) return null;
-
-  // Prefer a player that is already advancing after Stagehand interacted with
-  // the page, otherwise fall back to the strongest deterministic candidate.
   const playing = candidates.find((candidate) => !candidate.info.paused && !candidate.info.ended);
   return pin((playing ?? candidates[0]).locator);
 }
@@ -195,17 +177,35 @@ async function playerState(player) {
       ms: Math.round(video.currentTime * 1000),
       ended: video.ended,
       paused: video.paused,
+      duration: Number.isFinite(video.duration) ? video.duration : null,
     }));
   } catch {
     return null;
   }
 }
 
-/**
- * Wait on actual video presentation rather than sleeping for a wall-clock
- * interval. requestVideoFrameCallback is the browser's media-frame clock; the
- * currentTime fallback is only for players/browsers that do not expose it.
- */
+async function seekPlayer(player, seconds) {
+  return player.locator.evaluate((video, requested) => new Promise((resolve) => {
+    let settled = false;
+    const duration = Number.isFinite(video.duration) ? Math.max(0, video.duration) : null;
+    const target = duration === null
+      ? Math.max(0, requested)
+      : Math.min(Math.max(0, requested), Math.max(0, duration - 0.01));
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        ms: Math.round(video.currentTime * 1000),
+        duration,
+        ended: video.ended,
+      });
+    };
+    const timer = setTimeout(finish, 1_500);
+    video.addEventListener('seeked', () => { clearTimeout(timer); finish(); }, { once: true });
+    try { video.currentTime = target; } catch { clearTimeout(timer); finish(); }
+  }), seconds);
+}
+
 async function waitForMediaSample(player, afterMs, targetGapMs, timeoutMs) {
   return player.locator.evaluate((video, args) => new Promise((resolve) => {
     let settled = false;
@@ -218,12 +218,7 @@ async function waitForMediaSample(player, afterMs, targetGapMs, timeoutMs) {
       if (callbackId !== null && typeof video.cancelVideoFrameCallback === 'function') {
         try { video.cancelVideoFrameCallback(callbackId); } catch { /* no-op */ }
       }
-      resolve({
-        ms: Math.round(mediaMs),
-        ended: video.ended,
-        paused: video.paused,
-        timedOut,
-      });
+      resolve({ ms: Math.round(mediaMs), ended: video.ended, paused: video.paused, timedOut });
     };
     const threshold = args.afterMs < 0 ? 0 : args.afterMs + args.targetGapMs * 0.9;
     timer = setTimeout(() => finish(video.currentTime * 1000, true), args.timeoutMs);
@@ -264,23 +259,47 @@ export async function watchPage(input, onFrame) {
     maxSeconds = DEFAULT_MAX_SECONDS,
     fps = DEFAULT_FPS,
     realtimeV2 = false,
+    startSeconds = 0,
+    endSeconds,
+    scanMode = 'continuous',
+    burstSeconds = 1,
+    strideSeconds = 5,
     signal,
   } = input;
   const captureFps = Math.min(30, Math.max(0.2, Number(fps) || DEFAULT_FPS));
   const targetGapMs = 1_000 / captureFps;
+  const requestedStartMs = Math.max(0, Number(startSeconds) || 0) * 1000;
+  const requestedEndMs = Math.max(
+    requestedStartMs + 1,
+    Number.isFinite(Number(endSeconds)) ? Number(endSeconds) * 1000 : requestedStartMs + Math.max(1, maxSeconds) * 1000,
+  );
+  const coarse = realtimeV2 && scanMode === 'coarse';
+  const burstMs = Math.max(250, Number(burstSeconds) * 1000 || 1_000);
+  const strideMs = Math.max(burstMs, Number(strideSeconds) * 1000 || 5_000);
   const stagehandConfig = realtimeV2 ? stagehandSettings() : null;
   const cdpPort = stagehandConfig ? await reservePort() : null;
   const launchArgs = ['--autoplay-policy=no-user-gesture-required', '--mute-audio'];
-  if (cdpPort) {
-    launchArgs.push(`--remote-debugging-port=${cdpPort}`, '--remote-debugging-address=127.0.0.1');
-  }
+  if (cdpPort) launchArgs.push(`--remote-debugging-port=${cdpPort}`, '--remote-debugging-address=127.0.0.1');
 
   const browser = await chromium.launch({ headless: true, args: launchArgs });
   let stagehand = null;
   let framesSent = 0;
   let framesSkipped = 0;
   let stallsRecovered = 0;
-  let lastPositionMs = 0;
+  let seeks = 0;
+  let lastPositionMs = requestedStartMs;
+
+  const finish = (reason, rangeComplete = false, watched = true) => ({
+    watched,
+    reason,
+    framesSent,
+    framesSkipped,
+    stallsRecovered,
+    seeks,
+    lastPositionMs,
+    rangeComplete,
+    mediaSecondsObserved: framesSent / captureFps,
+  });
 
   try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
@@ -300,9 +319,7 @@ export async function watchPage(input, onFrame) {
       await page.waitForTimeout(1_000);
       player = await resolvePlayer(page, getStagehand);
     }
-    if (!player) {
-      return { watched: false, reason: 'no video element on the page', framesSent: 0, framesSkipped, stallsRecovered, lastPositionMs: 0 };
-    }
+    if (!player) return finish('no video element on the page', false, false);
 
     let playback = await startPlayback(player);
     if (!playback.playing && getStagehand) {
@@ -314,36 +331,75 @@ export async function watchPage(input, onFrame) {
       await page.waitForTimeout(1_000);
       playback = await startPlayback(player);
     }
-    if (!playback.playing) {
-      return { watched: false, reason: playback.reason ?? 'the video never started playing', framesSent: 0, framesSkipped, stallsRecovered, lastPositionMs: 0 };
+    if (!playback.playing) return finish(playback.reason ?? 'the video never started playing', false, false);
+
+    const durationMs = playback.duration === null ? null : playback.duration * 1000;
+    const rangeEndMs = durationMs === null ? requestedEndMs : Math.min(requestedEndMs, durationMs);
+    if (durationMs !== null && requestedStartMs >= durationMs - 10) {
+      lastPositionMs = durationMs;
+      return finish('assigned range starts after the video end', true);
     }
 
-    const initial = await playerState(player);
-    lastPositionMs = initial?.ms ?? 0;
-    let lastCapturedMs = -targetGapMs;
+    if (requestedStartMs > 0) {
+      const sought = await seekPlayer(player, requestedStartMs / 1000);
+      seeks += 1;
+      lastPositionMs = sought.ms;
+      await startPlayback(player);
+    } else {
+      const initial = await playerState(player);
+      lastPositionMs = initial?.ms ?? 0;
+    }
+
+    let burstStartMs = requestedStartMs;
+    let burstEndMs = Math.min(rangeEndMs, burstStartMs + burstMs);
+    let lastCapturedMs = lastPositionMs - targetGapMs;
     let lastProgressAt = Date.now();
-    const watchStarted = Date.now();
-    const deadline = watchStarted + Math.max(1, maxSeconds) * 1_000;
+    const deadline = Date.now() + Math.max(30, Math.max(1, maxSeconds) + 30) * 1000;
 
     while (Date.now() < deadline) {
-      if (signal?.aborted) return { watched: true, reason: 'cancelled', framesSent, framesSkipped, stallsRecovered, lastPositionMs };
+      if (signal?.aborted) return finish('cancelled');
 
       let where;
       try {
         where = await waitForMediaSample(player, lastCapturedMs, targetGapMs, SAMPLE_WAIT_TIMEOUT_MS);
       } catch {
-        // Modern sites can replace the <video> node during an ad/content or
-        // quality transition. Re-resolve once instead of treating that DOM
-        // replacement as the end of the actual video.
         const replacement = await resolvePlayer(page, getStagehand);
-        if (!replacement) return { watched: true, reason: 'the player went away', framesSent, framesSkipped, stallsRecovered, lastPositionMs };
+        if (!replacement) return finish('the player went away');
         player = replacement;
         await startPlayback(player);
+        const sought = await seekPlayer(player, lastPositionMs / 1000);
+        seeks += 1;
+        lastPositionMs = sought.ms;
+        lastCapturedMs = sought.ms - targetGapMs;
         framesSkipped += 1;
         continue;
       }
 
-      if (where.ended) return { watched: true, reason: 'the video ended', framesSent, framesSkipped, stallsRecovered, lastPositionMs: Math.max(lastPositionMs, where.ms) };
+      if (where.ended) {
+        lastPositionMs = Math.max(lastPositionMs, where.ms);
+        return finish('the video ended', true);
+      }
+      if (where.ms >= rangeEndMs) {
+        lastPositionMs = Math.max(lastPositionMs, rangeEndMs);
+        return finish('completed assigned range', true);
+      }
+
+      if (coarse && where.ms >= burstEndMs) {
+        const nextBurstStart = burstStartMs + strideMs;
+        if (nextBurstStart >= rangeEndMs) {
+          lastPositionMs = Math.max(lastPositionMs, rangeEndMs);
+          return finish('completed assigned coarse range', true);
+        }
+        const sought = await seekPlayer(player, nextBurstStart / 1000);
+        seeks += 1;
+        burstStartMs = nextBurstStart;
+        burstEndMs = Math.min(rangeEndMs, burstStartMs + burstMs);
+        lastPositionMs = sought.ms;
+        lastCapturedMs = sought.ms - targetGapMs;
+        lastProgressAt = Date.now();
+        await startPlayback(player);
+        continue;
+      }
 
       if (where.ms > lastPositionMs + 5) {
         lastProgressAt = Date.now();
@@ -352,13 +408,9 @@ export async function watchPage(input, onFrame) {
         const resumed = await startPlayback(player);
         stallsRecovered += 1;
         if (!resumed.playing && getStagehand) await stagehandIntervention(await getStagehand(), page);
-        if (Date.now() - lastProgressAt >= STALL_GIVE_UP_MS) {
-          return { watched: true, reason: 'the video stalled', framesSent, framesSkipped, stallsRecovered, lastPositionMs };
-        }
+        if (Date.now() - lastProgressAt >= STALL_GIVE_UP_MS) return finish('the video stalled');
       }
 
-      // A timed-out callback or a very slow screenshot can leave us on the same
-      // presented frame. Do not spend model budget on duplicate evidence.
       if (where.ms < lastCapturedMs + targetGapMs * 0.5) {
         framesSkipped += 1;
         continue;
@@ -369,9 +421,13 @@ export async function watchPage(input, onFrame) {
         image = await captureFrame(player, realtimeV2);
       } catch {
         const replacement = await resolvePlayer(page, getStagehand);
-        if (!replacement) return { watched: true, reason: 'the picture could not be taken because the player disappeared', framesSent, framesSkipped, stallsRecovered, lastPositionMs };
+        if (!replacement) return finish('the picture could not be taken because the player disappeared');
         player = replacement;
         await startPlayback(player);
+        const sought = await seekPlayer(player, lastPositionMs / 1000);
+        seeks += 1;
+        lastPositionMs = sought.ms;
+        lastCapturedMs = sought.ms - targetGapMs;
         framesSkipped += 1;
         continue;
       }
@@ -380,15 +436,18 @@ export async function watchPage(input, onFrame) {
         continue;
       }
 
-      // Read the player clock after the screenshot. That is the closest honest
-      // timestamp to the pixels Playwright just captured.
       const capturedAt = await playerState(player);
       if (!capturedAt) {
         framesSkipped += 1;
         continue;
       }
       if (capturedAt.ended) {
-        return { watched: true, reason: 'the video ended', framesSent, framesSkipped, stallsRecovered, lastPositionMs: Math.max(lastPositionMs, capturedAt.ms) };
+        lastPositionMs = Math.max(lastPositionMs, capturedAt.ms);
+        return finish('the video ended', true);
+      }
+      if (capturedAt.ms >= rangeEndMs || (coarse && capturedAt.ms >= burstEndMs)) {
+        lastPositionMs = Math.max(lastPositionMs, Math.min(capturedAt.ms, rangeEndMs));
+        continue;
       }
       if (capturedAt.ms < lastCapturedMs + targetGapMs * 0.5) {
         framesSkipped += 1;
@@ -401,10 +460,8 @@ export async function watchPage(input, onFrame) {
       lastPositionMs = Math.max(lastPositionMs, capturedAt.ms);
     }
 
-    return { watched: true, reason: 'reached the time limit', framesSent, framesSkipped, stallsRecovered, lastPositionMs };
+    return finish('reached the watch wall-time limit');
   } finally {
-    // Stagehand is attached to the same local Chromium. Close it first so its
-    // CDP session is released before Playwright owns the final browser close.
     if (stagehand) await stagehand.close().catch(() => undefined);
     await browser.close();
   }
