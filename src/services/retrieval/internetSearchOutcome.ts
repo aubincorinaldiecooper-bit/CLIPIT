@@ -1,6 +1,7 @@
 import type {
   InternetSearchFailure,
   InternetSearchFailureKind,
+  InternetSearchMoment,
   InternetSearchOutcome,
   InternetSearchProgress,
 } from '../../queues/internetSearch.js';
@@ -133,4 +134,35 @@ export function decideEnding(coverage: InternetSearchCoverage): InternetSearchEn
  */
 export function meansNothingMatched(progress: Pick<InternetSearchProgress, 'outcome'>): boolean {
   return progress.outcome === 'no_candidates' || progress.outcome === 'no_matches';
+}
+
+/**
+ * What to tell the screen about a search that stopped rather than ended.
+ *
+ * A search whose worker died never reached `decideEnding`, so it has no
+ * outcome of its own and nothing to say about the videos. It still has to
+ * answer in this vocabulary: left to fall back on an empty moment list, the
+ * screen says "No results fit your search", which is the one sentence an
+ * unfinished search must never produce.
+ *
+ * Whatever was approved before it died is kept. Those moments were verified
+ * footage and they are still true; they are simply not the whole answer, and
+ * `search_failed` is what says so.
+ *
+ * The reason never travels verbatim. It is internal wording — on 17 September
+ * a person was shown "job stalled more than allowable limit" — so it is
+ * reduced to the fixed vocabulary and kept in full only in the log.
+ */
+export function endingForStoppedSearch(
+  lastKnown: { moments: InternetSearchMoment[]; candidatesFound: number; candidatesWatched?: number },
+  failedReason: string,
+): InternetSearchProgress {
+  return {
+    phase: 'failed',
+    moments: lastKnown.moments,
+    candidatesFound: lastKnown.candidatesFound,
+    outcome: 'search_failed',
+    ...(lastKnown.candidatesWatched === undefined ? {} : { candidatesWatched: lastKnown.candidatesWatched }),
+    failure: { kind: classifyFailure(failedReason), count: 1 },
+  };
 }

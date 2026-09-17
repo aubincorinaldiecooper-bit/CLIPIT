@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifyFailure, decideEnding, meansNothingMatched } from '../src/services/retrieval/internetSearchOutcome.js';
+import { classifyFailure, decideEnding, endingForStoppedSearch, meansNothingMatched } from '../src/services/retrieval/internetSearchOutcome.js';
 
 /** The exact string production logged on 17 September, 28 times over. */
 const DEPLOYED_WITHOUT_THE_METHOD =
@@ -127,5 +127,57 @@ describe('naming what went wrong, coarsely', () => {
       ],
     }));
     expect(ending.failure).toEqual({ kind: 'browser_unavailable', count: 3 });
+  });
+});
+
+/**
+ * A search that stopped rather than ended.
+ *
+ * On 17 September one candidate page with no video in it killed the worker,
+ * the job was re-run and killed it again, and the person was shown BullMQ's
+ * own words: "job stalled more than allowable limit". Nothing about that
+ * sentence is for a human, and nothing about the search that produced it is
+ * an answer about the videos.
+ */
+describe('a search that was cut off before it could decide anything', () => {
+  const nothing = { moments: [], candidatesFound: 0 };
+  const moment = (id: string): never =>
+    ({ id, pageUrl: `https://publisher.example/${id}`, title: id, still: null, source: null, marks: [] }) as never;
+
+  it('never lets an empty result be read as an answer about the videos', () => {
+    const done = endingForStoppedSearch({ moments: [], candidatesFound: 7 }, 'job stalled more than allowable limit');
+    expect(done.phase).toBe('failed');
+    expect(done.outcome).toBe('search_failed');
+    expect(meansNothingMatched(done)).toBe(false);
+  });
+
+  it('keeps what was actually approved before it died', () => {
+    // Those moments were verified footage. They are still true — they are
+    // just not the whole answer, which is what `search_failed` says.
+    const done = endingForStoppedSearch(
+      { moments: [moment('a'), moment('b')], candidatesFound: 7, candidatesWatched: 3 },
+      'job stalled more than allowable limit',
+    );
+    expect(done.moments).toHaveLength(2);
+    expect(done.candidatesFound).toBe(7);
+    expect(done.candidatesWatched).toBe(3);
+  });
+
+  it('does not repeat the internal wording to the person', () => {
+    const done = endingForStoppedSearch(nothing, 'job stalled more than allowable limit');
+    expect(JSON.stringify(done)).not.toContain('stalled');
+    expect(JSON.stringify(done)).not.toContain('allowable');
+    expect(done.failure).toEqual({ kind: 'unknown', count: 1 });
+  });
+
+  it('still names the cause when the reason says what it was', () => {
+    const modal = endingForStoppedSearch(nothing, "Modal cannot find clipit-videochat3/VideoChat3Service in main (Method 'watch_stream' not found on class)");
+    expect(modal.failure?.kind).toBe('video_model_unavailable');
+    const browser = endingForStoppedSearch(nothing, 'the browser refused to watch this page (503)');
+    expect(browser.failure?.kind).toBe('browser_unavailable');
+  });
+
+  it('leaves out a watched count it was never told', () => {
+    expect('candidatesWatched' in endingForStoppedSearch(nothing, 'anything')).toBe(false);
   });
 });

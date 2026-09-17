@@ -49,12 +49,49 @@ function withTerminalFailures<T>(processor: Processor<T>): Processor<T> {
   };
 }
 
+/**
+ * Say it out loud rather than dying in silence.
+ *
+ * Node ends the process on an unhandled rejection, and that is how one
+ * candidate page with no video in it took down every queue on this worker
+ * twice on 17 September — transcription, ingestion, indexing and clip
+ * generation all went with it, none of them involved. The log showed a stack
+ * and a restart and never the words "unhandled rejection", so the cause took
+ * a production post-mortem to find.
+ *
+ * These queues do not share state with each other, so one job reaching a
+ * state we did not plan for is a poor reason to stop the other twelve. We
+ * record it in full and keep serving. A crash is not a safety mechanism when
+ * the thing it protects is unrelated work.
+ */
+function reportInsteadOfDying(): void {
+  process.on('unhandledRejection', (reason: unknown) => {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    logger.error('unhandled rejection — worker kept running', {
+      err: error.message,
+      stack: error.stack,
+    });
+  });
+  process.on('uncaughtException', (error: Error) => {
+    logger.error('uncaught exception — worker kept running', {
+      err: error.message,
+      stack: error.stack,
+    });
+  });
+}
+
 function startWorker<T>(name: string, processor: Processor<T>, concurrency: number): Worker<T> {
   const worker = new Worker<T>(name, withTerminalFailures(processor), {
     connection: getWorkerConnection(),
     concurrency,
     lockDuration: 5 * 60 * 1000,
     stalledInterval: 60 * 1000,
+    // Watching seven pages costs browser time and GPU time, and a search whose
+    // worker died is re-run from the beginning — the same seven pages, the same
+    // spend, and no sign of it on the screen. A deterministic failure buys
+    // nothing the second time, so an internet search that stalls is finished
+    // rather than repeated. Every other queue keeps the default.
+    ...(name === INTERNET_SEARCH_QUEUE ? { maxStalledCount: 0 } : {}),
   });
   worker.on('failed', (job: Job<T> | undefined, error: Error) => {
     logger.error('job failed', { queue: name, jobId: job?.id, attempts: job?.attemptsMade, err: error.message });
@@ -101,6 +138,9 @@ async function enqueueSimpleMemRebuilds(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Installed before anything else can reject, so nothing slips through the
+  // gap between boot and readiness.
+  reportInsteadOfDying();
   logger.info('worker starting', {
     nodeEnv: env.NODE_ENV,
     transcription: env.TRANSCRIPTION_ENABLED,

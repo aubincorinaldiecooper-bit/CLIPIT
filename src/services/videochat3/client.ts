@@ -175,6 +175,17 @@ export async function watchStreamWithVideoChat3(input: {
       standby_max_pixels: standbyMaxPixels,
     });
 
+    // The producer runs as its own task while the loop below waits on Modal,
+    // so its rejection is caught here, at the point it is created, and kept
+    // for the join below rather than left on a promise nobody is holding.
+    //
+    // This is not tidiness. A page with no video in it fails in milliseconds
+    // and a GPU container takes seconds to answer, so the browser always
+    // loses that race; with the only `await` sitting under the loop, Node saw
+    // a rejection with no handler and ended the process. On 17 September that
+    // took the whole worker down twice over one bad candidate, and the search
+    // came back "job stalled more than allowable limit" ten minutes later.
+    let browserFailure: unknown = null;
     const producer = (async () => {
       try {
         for await (const frame of input.source.open(controller.signal)) {
@@ -218,7 +229,7 @@ export async function watchStreamWithVideoChat3(input: {
           throw error;
         }
       }
-    })();
+    })().catch((error: unknown) => { browserFailure = error; });
 
     const events: VideoChat3WatchEvent[] = [];
     let done: Record<string, unknown> | null = null;
@@ -249,9 +260,12 @@ export async function watchStreamWithVideoChat3(input: {
     }
 
     controller.abort(new Error('VideoChat3 live watch complete'));
-    await producer.catch((error) => {
-      if (!(error instanceof Error && /complete|cancel/i.test(error.message))) throw error;
-    });
+    await producer;
+    // Cancelling our own producer once the watch is complete is ordinary, and
+    // is not a browser failure worth reporting.
+    if (browserFailure !== null && !(browserFailure instanceof Error && /complete|cancel/i.test(browserFailure.message))) {
+      throw browserFailure;
+    }
     await remote.get();
     const id = identity(done);
     const remoteMetrics = done.metrics && typeof done.metrics === 'object' ? done.metrics as Record<string, unknown> : {};

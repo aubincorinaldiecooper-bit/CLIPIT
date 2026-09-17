@@ -10,6 +10,7 @@ import {
   type InternetSearchProgress,
 } from '../../queues/internetSearch.js';
 import { search } from '../../services/discovery/searxng.js';
+import { endingForStoppedSearch } from '../../services/retrieval/internetSearchOutcome.js';
 import { requireSession } from '../auth.js';
 import { enforceRateLimits, HOUR } from '../rateLimit.js';
 import { parse } from '../validation.js';
@@ -139,7 +140,30 @@ export async function registerInternetSearchRoutes(app: FastifyInstance): Promis
 
     const state = await job.getState();
     if (state === 'failed') {
-      throw HttpError.serviceUnavailable(job.failedReason || 'That search could not be finished.');
+      // A search that died still has to answer in the language the screen
+      // reads, or the screen falls back to "nothing matched" — which is the
+      // one thing an unfinished search must never say.
+      //
+      // It answers 200 rather than an error on purpose. An error is a failed
+      // *read*, which the page retries five times before giving up, so the
+      // person waits out five more rounds to be told nothing useful. This is
+      // not a failed read: the search is genuinely over, the answer is known,
+      // and the page can stop asking the moment it arrives.
+      //
+      // `failedReason` itself never travels. It is internal wording — the one
+      // that reached a person on 17 September read "job stalled more than
+      // allowable limit" — so it is classified into the fixed vocabulary here
+      // and kept verbatim only in the log.
+      const lastKnown = reportFor(job.progress, null);
+      const reason = job.failedReason || '';
+      logger.warn('internet search failed before it could finish', {
+        search_id: searchId,
+        failed_reason: reason,
+        moments_found_before_failing: lastKnown.moments.length,
+        candidates_found: lastKnown.candidatesFound,
+      });
+      const done: InternetSearchProgress = endingForStoppedSearch(lastKnown, reason);
+      return reply.send({ searchId, query: job.data.query, ...done });
     }
 
     return reply.send({ searchId, query: job.data.query, ...reportFor(job.progress, job.returnvalue) });
