@@ -26,7 +26,7 @@ vi.mock('../src/lib/logger.js', () => {
   return { logger: made };
 });
 
-const { handleInternetSearch } = await import('../src/worker/handlers/internetSearch.js');
+const { handleInternetSearch, loggablePage } = await import('../src/worker/handlers/internetSearch.js');
 
 function said(message: string) {
   return logged.filter((line) => line.message === message);
@@ -374,5 +374,97 @@ describe("what a search leaves behind while it is still running", () => {
     expect(stopped[0]?.context.candidates_announced).toEqual(['a']);
     expect(stopped[0]?.context.candidates_selected).toBe(2);
     expect(stopped[0]?.context.err).toMatch(/Redis connection lost/);
+  });
+});
+
+/**
+ * Nothing that unlocks a video may reach a shared log.
+ *
+ * Discovery returns whatever the search engine indexed, and `navigablePageUrl`
+ * (searxng.ts:150) only drops the fragment — the whole query string survives.
+ * So "these are public pages" was an assumption, not a fact, and CLAUDE.md is
+ * absolute: credentials stay server-side, signed URLs are never logged.
+ * Caught by Codex on #154.
+ */
+describe("writing a page address into the log", () => {
+  it("drops anything that could be a key, however it is spelled", () => {
+    for (const secret of [
+      'https://cdn.example/video?token=abc123',
+      'https://cdn.example/video?Signature=abc123&Expires=99',
+      'https://cdn.example/video?access_key=abc123',
+      'https://cdn.example/video?sig=abc123&policy=xyz',
+    ]) {
+      const safe = loggablePage(secret) ?? '';
+      expect(safe).toBe('https://cdn.example/video');
+      for (const leak of ['abc123', 'xyz', 'token', 'Signature', 'access_key', 'sig']) {
+        expect(safe).not.toContain(leak);
+      }
+    }
+  });
+
+  it("drops credentials carried in the address itself", () => {
+    const safe = loggablePage('https://user:hunter2@cdn.example/video') ?? '';
+    expect(safe).not.toContain('hunter2');
+    expect(safe).not.toContain('user');
+    expect(safe).toBe('https://cdn.example/video');
+  });
+
+  it("keeps the one parameter that says which video, so the log stays useful", () => {
+    // Without this every YouTube result logs as the same address and the line
+    // tells nobody anything.
+    expect(loggablePage('https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42&si=SECRET'))
+      .toBe('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+  });
+
+  it("keeps the path, which is where most sites put the video", () => {
+    expect(loggablePage('https://vimeo.com/76979871')).toBe('https://vimeo.com/76979871');
+  });
+
+  it("says nothing rather than something it could not parse", () => {
+    expect(loggablePage('not a url')).toBeNull();
+    expect(loggablePage('javascript:alert(1)')).toBeNull();
+  });
+});
+
+describe("a video that gave up a moment before its watch finished", () => {
+  /**
+   * The invariant: moments on the record always come with coverage to match.
+   * A search cut off holding verified moments while reporting nothing watched
+   * would be two halves of one answer contradicting each other.
+   *
+   * Honest note on what this does and does not prove. Codex raised the
+   * inconsistency on #154 and the reasoning is sound, but the case is not
+   * reachable as the swarm stands: `accept` runs only from the dense pass,
+   * which is gated behind a coarse inspection that returned — and a returning
+   * inspection has already marked the candidate. So this test passes with or
+   * without the early mark in `accept`, and it is NOT coverage for that line,
+   * which is defence rather than a fix.
+   *
+   * It is kept because the invariant is worth holding on its own. If the
+   * coarse gate is ever loosened, this is what notices.
+   */
+  it("has coverage to match any moment it has already published", async () => {
+    found.mockResolvedValue([candidate('a')]);
+    inspect.mockImplementation(async ({ plan, onMoment }) => {
+      // A coarse hit is what sends a scout back for the close watch, and the
+      // close watch is the one that streams evidence out as it finds it.
+      if (plan.mode === 'coarse' && plan.startSeconds === 0) {
+        return { moments: [{ startSeconds: 2, endSeconds: 3, description: 'Maybe.' }], exhausted: true, exhaustive: true };
+      }
+      if (plan.mode === 'continuous') {
+        await onMoment?.({ startSeconds: 2, endSeconds: 5, description: 'A dog on a skateboard.' });
+        // The watch never comes back after handing over its evidence.
+        throw new Error('the browser went away');
+      }
+      return { moments: [], exhausted: true, exhaustive: true };
+    });
+    const { job, reported } = fakeJob();
+    await handleInternetSearch(job);
+
+    const withMoments = reported.filter((step) => step.moments.length > 0);
+    expect(withMoments.length).toBeGreaterThan(0);
+    for (const step of withMoments) {
+      expect(step.candidatesWatched).toBeGreaterThanOrEqual(1);
+    }
   });
 });

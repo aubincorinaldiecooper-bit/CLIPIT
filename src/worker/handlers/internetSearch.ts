@@ -24,6 +24,46 @@ function boundedNumber(name: string, fallback: number, minimum: number, maximum:
   return Math.max(minimum, Math.min(maximum, value));
 }
 
+/**
+ * Query parameters that say *which* video, rather than authorise access to one.
+ *
+ * An allowlist, not a denylist, and deliberately tiny. Guessing which names
+ * look like credentials is a game you lose once and then keep losing quietly.
+ */
+const IDENTIFYING = new Set(['v']);
+
+/**
+ * A page address safe to write into a shared log.
+ *
+ * Discovery hands back whatever the search engine indexed, and
+ * `navigablePageUrl` (searxng.ts:150) only drops the fragment — the whole
+ * query string survives, credentials and all. So an address arriving as
+ * `…/video?token=…` would otherwise be written out verbatim, which
+ * `CLAUDE.md` forbids outright: credentials stay server-side and signed URLs
+ * are never logged.
+ *
+ * What is kept is the origin, the path, and the handful of parameters that
+ * name a video rather than unlock one — enough to open the page and see why
+ * it could not be watched, which is the only reason this is logged at all.
+ */
+export function loggablePage(pageUrl: string): string | null {
+  try {
+    const url = new URL(pageUrl);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    url.username = '';
+    url.password = '';
+    const keep = new URLSearchParams();
+    for (const [name, value] of url.searchParams) {
+      if (IDENTIFYING.has(name.toLowerCase())) keep.set(name, value);
+    }
+    url.search = keep.toString();
+    url.hash = '';
+    return url.toString().slice(0, 300);
+  } catch {
+    return null;
+  }
+}
+
 function sourceOf(candidate: Candidate): string | null {
   if (candidate.source) return candidate.source;
   try { return new URL(candidate.pageUrl).host.replace(/^www\./, ''); } catch { return null; }
@@ -240,7 +280,7 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
         const candidate = byId.get(progress.candidateId);
         log.info('watching a page', {
           candidate_id: progress.candidateId,
-          page_url: candidate?.pageUrl ?? null,
+          page_url: candidate ? loggablePage(candidate.pageUrl) : null,
           source: candidate ? sourceOf(candidate) : null,
           candidates_watched_so_far: progress.snapshot.candidatesWatched,
         });
