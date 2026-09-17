@@ -31,10 +31,13 @@ export function createWebFrameStreamSource(input: {
   webAccessToken: string;
   maxSeconds?: number;
   fps?: number;
+  realtimeV2?: boolean;
   fetchImpl?: typeof fetch;
 }): FrameStreamVideoSource {
   const fps = input.fps ?? 1;
-  const durationMs = Math.max(200, Math.round(1000 / Math.max(0.2, fps)));
+  // This is evidence time, not a browser sleep. At 6 fps one observation
+  // represents about 167 ms, so a 200 ms floor would make our timestamps lie.
+  const durationMs = Math.max(1, Math.round(1000 / Math.max(0.2, fps)));
   const doFetch = input.fetchImpl ?? fetch;
   let opened = false;
   let settle!: (completion: FrameStreamCompletion) => void;
@@ -54,7 +57,12 @@ export function createWebFrameStreamSource(input: {
           const response = await doFetch(new URL('/watch', input.webAccessUrl).toString(), {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-clipit-web-access-token': input.webAccessToken },
-            body: JSON.stringify({ pageUrl: input.pageUrl, maxSeconds: input.maxSeconds ?? 90, fps }),
+            body: JSON.stringify({
+              pageUrl: input.pageUrl,
+              maxSeconds: input.maxSeconds ?? 90,
+              fps,
+              realtimeV2: input.realtimeV2 === true,
+            }),
             signal,
           });
           if (!response.ok || !response.body) throw new Error(`the browser refused to watch this page (${response.status})`);
