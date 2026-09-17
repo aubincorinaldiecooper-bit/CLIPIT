@@ -38,10 +38,25 @@ export interface ScoutSwarmProgress<Candidate extends ScoutCandidate> {
   scoutId?: ScoutId; candidateId?: string; momentId?: string; snapshot: ScoutSwarmSnapshot<Candidate>;
 }
 export interface ScoutSwarmFailure { scoutId: ScoutId; candidateId: string; stage: 'inspect'; reason: string; }
+export interface ScoutInspectionTelemetry {
+  scoutId: ScoutId;
+  candidateId: string;
+  mode: ScoutInspectionPlan['mode'];
+  startSeconds: number;
+  endSeconds: number;
+  wallMs: number;
+  mediaSecondsObserved: number;
+  exhaustive: boolean;
+  exhausted: boolean;
+  success: boolean;
+  failureReason?: string;
+  metrics: Record<string, unknown>;
+}
 export interface ScoutSwarmResult<Candidate extends ScoutCandidate> {
   searchId: string; status: 'completed' | 'ceiling_reached' | 'cancelled'; scoutCount: 4; candidatesAvailable: number; candidatesConsidered: number; candidatesCompleted: number;
   candidatesPartlyExamined: number; moments: SwarmMoment<Candidate>[]; failures: ScoutSwarmFailure[];
-  metrics: { wallMs: number; inspectOperations: number; mediaSecondsObserved: number; };
+  inspections: ScoutInspectionTelemetry[];
+  metrics: { wallMs: number; inspectOperations: number; mediaSecondsObserved: number; firstMomentMs: number | null; };
 }
 
 const MERGE_GAP_SECONDS = 2;
@@ -95,8 +110,10 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
   const timeout = setTimeout(() => controller.abort(new Error('scout swarm wall-time ceiling reached')), timeoutMs); timeout.unref?.();
 
   let candidatesAssigned = 0, candidatesCompleted = 0, activeOperations = 0, inspectOperations = 0, mediaSecondsObserved = 0, momentSequence = 0, candidatesPartlyExamined = 0;
+  let firstMomentAt: number | null = null;
   const moments: SwarmMoment<Candidate>[] = [];
   const failures: ScoutSwarmFailure[] = [];
+  const inspections: ScoutInspectionTelemetry[] = [];
   const snapshot = (): ScoutSwarmSnapshot<Candidate> => ({ scoutCount: 4, candidatesTotal: candidates.length, candidatesAssigned, candidatesCompleted, activeOperations, momentsFound: moments.length, moments: moments.map((moment) => ({ ...moment })) });
   const emit = async (event: ScoutSwarmProgress<Candidate>['event'], detail: { scoutId?: ScoutId; candidateId?: string; momentId?: string } = {}) => {
     const stage: ScoutSwarmProgress<Candidate>['stage'] = controller.signal.aborted ? 'cancelled' : event === 'swarm.completed' ? 'complete' : 'searching';
@@ -129,6 +146,7 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
       await emit('moment.extended', { scoutId, candidateId: candidate.id, momentId: previous.id });
       return;
     }
+    if (firstMomentAt === null) firstMomentAt = Date.now();
     momentSequence += 1;
     const moment: SwarmMoment<Candidate> = { id: `moment-${momentSequence}`, candidate, scoutId, startSeconds: proposal.startSeconds, endSeconds: proposal.endSeconds, description: proposal.description, confidence: proposal.confidence };
     moments.push(moment);
@@ -136,15 +154,68 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
   };
 
   const inspect = async (scoutId: ScoutId, candidate: Candidate, plan: ScoutInspectionPlan, onMoment?: (moment: ScoutProposal) => Promise<void>) => {
+    const inspectionStartedAt = Date.now();
     activeOperations += 1;
     inspectOperations += 1;
     await emit('scout.candidate_assigned', { scoutId, candidateId: candidate.id });
     try {
       const inspection = await abortable(input.runtime.inspect({ scoutId, searchId: input.searchId, query: input.query, candidate, plan, signal: controller.signal, onMoment }), controller.signal);
-      mediaSecondsObserved += Math.max(0, inspection.mediaSecondsObserved ?? 0);
+      const observed = Math.max(0, inspection.mediaSecondsObserved ?? 0);
+      mediaSecondsObserved += observed;
+      const telemetry: ScoutInspectionTelemetry = {
+        scoutId,
+        candidateId: candidate.id,
+        mode: plan.mode,
+        startSeconds: plan.startSeconds,
+        endSeconds: plan.endSeconds,
+        wallMs: Date.now() - inspectionStartedAt,
+        mediaSecondsObserved: observed,
+        exhaustive: inspection.exhaustive === true,
+        exhausted: inspection.exhausted === true,
+        success: true,
+        metrics: inspection.metrics ?? {},
+      };
+      inspections.push(telemetry);
+      log.info('scout inspection finished', {
+        scout_id: scoutId,
+        candidate_id: candidate.id,
+        mode: plan.mode,
+        range_start_seconds: plan.startSeconds,
+        range_end_seconds: plan.endSeconds,
+        wall_ms: telemetry.wallMs,
+        media_seconds_observed: telemetry.mediaSecondsObserved,
+        exhaustive: telemetry.exhaustive,
+        exhausted: telemetry.exhausted,
+        ...telemetry.metrics,
+      });
       return inspection;
     } catch (error) {
-      if (!controller.signal.aborted) failures.push({ scoutId, candidateId: candidate.id, stage: 'inspect', reason: errorMessage(error) });
+      const reason = errorMessage(error);
+      if (!controller.signal.aborted) failures.push({ scoutId, candidateId: candidate.id, stage: 'inspect', reason });
+      const telemetry: ScoutInspectionTelemetry = {
+        scoutId,
+        candidateId: candidate.id,
+        mode: plan.mode,
+        startSeconds: plan.startSeconds,
+        endSeconds: plan.endSeconds,
+        wallMs: Date.now() - inspectionStartedAt,
+        mediaSecondsObserved: 0,
+        exhaustive: false,
+        exhausted: false,
+        success: false,
+        failureReason: reason,
+        metrics: {},
+      };
+      inspections.push(telemetry);
+      log.warn('scout inspection failed', {
+        scout_id: scoutId,
+        candidate_id: candidate.id,
+        mode: plan.mode,
+        range_start_seconds: plan.startSeconds,
+        range_end_seconds: plan.endSeconds,
+        wall_ms: telemetry.wallMs,
+        reason,
+      });
       return null;
     } finally {
       activeOperations -= 1;
@@ -171,8 +242,6 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
         return { scoutId, inspection };
       }));
 
-      // Sparse coverage deliberately leaves gaps, so this candidate cannot be
-      // used to prove absence even if every assigned coarse range completed.
       if (coarseRuns.some(({ inspection }) => inspection === null || inspection.exhaustive !== true)) candidatesPartlyExamined += 1;
 
       const coarseHits: Array<{ scoutId: ScoutId; proposal: ScoutProposal }> = [];
@@ -181,9 +250,6 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
         for (const proposal of inspection.moments) coarseHits.push({ scoutId, proposal });
       }
 
-      // Collapse overlapping coarse hits before spending dense GPU time. The
-      // coarse pass is only a locator; nothing is surfaced until a continuous
-      // local re-watch actually sees the requested evidence.
       coarseHits.sort((a, b) => a.proposal.startSeconds - b.proposal.startSeconds);
       const targets: Array<{ scoutId: ScoutId; proposal: ScoutProposal }> = [];
       for (const hit of coarseHits) {
@@ -233,6 +299,12 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
     candidatesPartlyExamined,
     moments,
     failures,
-    metrics: { wallMs: Date.now() - startedAt, inspectOperations, mediaSecondsObserved },
+    inspections,
+    metrics: {
+      wallMs: Date.now() - startedAt,
+      inspectOperations,
+      mediaSecondsObserved,
+      firstMomentMs: firstMomentAt === null ? null : firstMomentAt - startedAt,
+    },
   };
 }
