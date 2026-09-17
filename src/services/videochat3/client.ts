@@ -1,7 +1,7 @@
 import { QueueEmptyError } from 'modal';
 import { ExternalServiceError } from '../../lib/errors.js';
 import type { FrameStreamVideoSource } from '../video/source.js';
-import { createEphemeralModalQueue, invokeModal, spawnModal, type ModalTarget } from '../modal/invoke.js';
+import { assertModalTargetAvailable, createEphemeralModalQueue, invokeModal, spawnModal, type ModalTarget } from '../modal/invoke.js';
 
 const MODEL = 'MCG-NJU/VideoChat3-4B';
 const APP = 'clipit-videochat3';
@@ -61,6 +61,26 @@ function parseEvent(row: Record<string, unknown>): VideoChat3WatchEvent {
     description: typeof row.description === 'string' ? row.description.trim().slice(0, 1000) : '',
     ...(confidence === undefined ? {} : { confidence }),
   };
+}
+
+/**
+ * Check that the deployed VideoChat3 still offers the method we are about to
+ * call, before a search spends anything on the assumption that it does.
+ *
+ * Being deployed is not the same as being compatible. On 17 September the
+ * service was up, healthy and answering, and had no `watch_stream` on it — the
+ * deployment predated the live-watch method the searches call. Every watch
+ * failed identically, and because each failure only appeared once the browser
+ * work had been set up, the whole search died twenty-eight times over before
+ * anyone could be told why.
+ *
+ * This resolves the method handle and stops there: the same lookup `spawnModal`
+ * does, without the call that follows it. Handles are cached in the Modal
+ * layer, so the search's own spawn reuses what this resolved rather than
+ * repeating it.
+ */
+export async function assertVideoChat3Ready(method: 'watch' | 'watch_stream'): Promise<void> {
+  await assertModalTargetAvailable(method === 'watch_stream' ? WATCH_STREAM : WATCH);
 }
 
 export async function videoChat3Health(): Promise<{ model: string; revision: string; metrics: Record<string, unknown> }> {
