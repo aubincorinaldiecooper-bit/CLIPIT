@@ -58,7 +58,7 @@ describe('deciding how an internet search ended', () => {
       momentsFound: 2,
       failureReasons: ['the browser refused to watch this page (503)', 'the browser refused to watch this page (503)'],
     }));
-    expect(ending.outcome).toBe('partly_watched');
+    expect(ending.outcome).toBe('matched');
     expect(ending.candidatesWatched).toBe(5);
     expect(ending.failure?.count).toBe(2);
   });
@@ -77,7 +77,7 @@ describe('deciding how an internet search ended', () => {
     expect(meansNothingMatched(ending)).toBe(false);
   });
 
-  it('calls it a match only when everything was watched and something was found', () => {
+  it('calls it a match when positive evidence was found', () => {
     const ending = decideEnding(coverage({ candidatesFound: 3, candidatesWatched: 3, candidatesFullyWatched: 3, momentsFound: 1 }));
     expect(ending).toEqual({ phase: 'answered', outcome: 'matched', candidatesWatched: 3 });
   });
@@ -102,9 +102,10 @@ describe('naming what went wrong, coarsely', () => {
     expect(classifyFailure('watch_stream failed remotely: CUDA out of memory')).toBe('video_model_failed');
   });
 
-  it('knows a page that would not open', () => {
+  it('knows a page that would not open or did not contain a playable video', () => {
     expect(classifyFailure('the browser refused to watch this page (503)')).toBe('browser_unavailable');
     expect(classifyFailure('the video never started playing')).toBe('browser_unavailable');
+    expect(classifyFailure('no video element on the page')).toBe('browser_unavailable');
   });
 
   it('knows running out of time', () => {
