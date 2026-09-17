@@ -1,7 +1,15 @@
-import type { FrameStreamCompletion, FrameStreamVideoSource, VideoFrame } from './source.js';
+import type { FrameStreamCompletion, FrameStreamScanMode, FrameStreamVideoSource, VideoFrame } from './source.js';
 
 interface WatchFrameEvent { type: 'frame'; video_ms: number; encoding: 'jpeg' | 'png'; image: string; }
-interface WatchEndedEvent { type: 'ended'; watched: boolean; reason: string; framesSent: number; lastPositionMs?: number; }
+interface WatchEndedEvent {
+  type: 'ended';
+  watched: boolean;
+  reason: string;
+  framesSent: number;
+  lastPositionMs?: number;
+  rangeComplete?: boolean;
+  mediaSecondsObserved?: number;
+}
 type WatchEvent = WatchFrameEvent | WatchEndedEvent;
 
 async function* ndjson(body: ReadableStream<Uint8Array>): AsyncGenerator<WatchEvent> {
@@ -31,10 +39,19 @@ export function createWebFrameStreamSource(input: {
   webAccessToken: string;
   maxSeconds?: number;
   fps?: number;
+  realtimeV2?: boolean;
+  startSeconds?: number;
+  endSeconds?: number;
+  scanMode?: FrameStreamScanMode;
+  burstSeconds?: number;
+  strideSeconds?: number;
   fetchImpl?: typeof fetch;
 }): FrameStreamVideoSource {
   const fps = input.fps ?? 1;
-  const durationMs = Math.max(200, Math.round(1000 / Math.max(0.2, fps)));
+  const scanMode: FrameStreamScanMode = input.scanMode ?? 'continuous';
+  // This is evidence time, not a browser sleep. At 6 fps one observation
+  // represents about 167 ms, so a 200 ms floor would make our timestamps lie.
+  const durationMs = Math.max(1, Math.round(1000 / Math.max(0.2, fps)));
   const doFetch = input.fetchImpl ?? fetch;
   let opened = false;
   let settle!: (completion: FrameStreamCompletion) => void;
@@ -43,18 +60,30 @@ export function createWebFrameStreamSource(input: {
   return {
     kind: 'frame-stream',
     id: input.id,
+    scanMode,
     completion,
     open(signal: AbortSignal): AsyncIterable<VideoFrame> {
       if (opened) throw new Error('frame stream sources are single-use');
       opened = true;
       return (async function*() {
-        let lastPositionMs = 0;
+        let lastPositionMs = Math.max(0, (input.startSeconds ?? 0) * 1000);
+        let observedMs = 0;
         let terminal = false;
         try {
           const response = await doFetch(new URL('/watch', input.webAccessUrl).toString(), {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-clipit-web-access-token': input.webAccessToken },
-            body: JSON.stringify({ pageUrl: input.pageUrl, maxSeconds: input.maxSeconds ?? 90, fps }),
+            body: JSON.stringify({
+              pageUrl: input.pageUrl,
+              maxSeconds: input.maxSeconds ?? 90,
+              fps,
+              realtimeV2: input.realtimeV2 === true,
+              startSeconds: input.startSeconds,
+              endSeconds: input.endSeconds,
+              scanMode,
+              burstSeconds: input.burstSeconds,
+              strideSeconds: input.strideSeconds,
+            }),
             signal,
           });
           if (!response.ok || !response.body) throw new Error(`the browser refused to watch this page (${response.status})`);
@@ -63,22 +92,32 @@ export function createWebFrameStreamSource(input: {
             if (event.type === 'frame') {
               if (!Number.isFinite(event.video_ms) || event.video_ms < 0) continue;
               lastPositionMs = Math.max(lastPositionMs, event.video_ms);
+              observedMs += durationMs;
               yield { timestampMs: event.video_ms, durationMs, encoding: event.encoding, image: Buffer.from(event.image, 'base64') };
               continue;
             }
             terminal = true;
             lastPositionMs = Math.max(lastPositionMs, event.lastPositionMs ?? 0);
+            const mediaSecondsObserved = Number.isFinite(event.mediaSecondsObserved)
+              ? Math.max(0, Number(event.mediaSecondsObserved))
+              : observedMs / 1000;
             const done = {
-              exhausted: event.watched && event.reason === 'the video ended',
+              exhausted: event.watched && (event.rangeComplete === true || event.reason === 'the video ended'),
               reason: event.reason,
               watchedThroughSeconds: lastPositionMs / 1000,
+              mediaSecondsObserved,
             };
             settle(done);
             if (!event.watched) throw new Error(event.reason);
             return;
           }
         } finally {
-          if (!terminal) settle({ exhausted: false, reason: signal.aborted ? 'cancelled' : 'browser stream ended without a terminal event', watchedThroughSeconds: lastPositionMs / 1000 });
+          if (!terminal) settle({
+            exhausted: false,
+            reason: signal.aborted ? 'cancelled' : 'browser stream ended without a terminal event',
+            watchedThroughSeconds: lastPositionMs / 1000,
+            mediaSecondsObserved: observedMs / 1000,
+          });
         }
       })();
     },

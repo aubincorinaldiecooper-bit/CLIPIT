@@ -2,7 +2,7 @@ import type { Job } from 'bullmq';
 import { logger } from '../../lib/logger.js';
 import type { InternetSearchJob, InternetSearchMoment, InternetSearchProgress } from '../../queues/internetSearch.js';
 import { search, type Candidate } from '../../services/discovery/searxng.js';
-import { runScoutSwarm, type SwarmMoment } from '../../services/retrieval/scoutSwarm.js';
+import { runScoutSwarm, type ScoutInspectionPlan, type ScoutId, type SwarmMoment } from '../../services/retrieval/scoutSwarm.js';
 import { createVideoModelScoutRuntime } from '../../services/retrieval/videoModelScoutRuntime.js';
 import { videoChat3Adapter } from '../../services/video/adapters/videochat3.js';
 import { createWebFrameStreamSource } from '../../services/video/webFrameSource.js';
@@ -13,19 +13,21 @@ function required(name: string): string {
   return value.replace(/\/$/, '');
 }
 
+function enabled(name: string): boolean {
+  return ['1', 'true', 'yes', 'on'].includes((process.env[name] ?? '').trim().toLowerCase());
+}
+
+function boundedNumber(name: string, fallback: number, minimum: number, maximum: number): number {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
 function sourceOf(candidate: Candidate): string | null {
   if (candidate.source) return candidate.source;
   try { return new URL(candidate.pageUrl).host.replace(/^www\./, ''); } catch { return null; }
 }
 
-/**
- * The approved stretches of one video, gathered into the card that plays it.
- *
- * The card keeps the video's own id rather than a running number, so a video
- * that goes on being approved stays the same card on screen: it gains places
- * to jump to and may move up the band, but it never turns into a different
- * card or a second copy of itself.
- */
 function asMoment(candidate: Candidate, found: SwarmMoment<Candidate>[]): InternetSearchMoment {
   const marks = found
     .map((moment) => ({
@@ -35,9 +37,6 @@ function asMoment(candidate: Candidate, found: SwarmMoment<Candidate>[]): Intern
       ...(moment.confidence === undefined ? {} : { confidence: moment.confidence }),
     }))
     .sort((one, other) => one.startSeconds - other.startSeconds);
-  // A video is worth opening for its best moment, so the card carries the
-  // best. Nothing at all when the watcher said so about none of them: an
-  // absent number and a low one say very different things.
   const said = marks.map((mark) => mark.confidence).filter((value): value is number => value !== undefined);
   return {
     id: candidate.id,
@@ -50,26 +49,11 @@ function asMoment(candidate: Candidate, found: SwarmMoment<Candidate>[]): Intern
   };
 }
 
-/**
- * How many approvals a video has, and how much footage they cover.
- *
- * A video the watcher approved in three separate places answers the question
- * more strongly than one it approved once, so the count leads. Total approved
- * footage settles ties between videos approved the same number of times.
- */
 function strength(moment: InternetSearchMoment): [number, number] {
   const seconds = moment.marks.reduce((total, mark) => total + (mark.endSeconds - mark.startSeconds), 0);
   return [moment.marks.length, seconds];
 }
 
-/**
- * Every approved video, strongest first.
- *
- * Grouped by the video rather than by the finding, because the video is the
- * result. Sorting is stable and the grouping keeps the order the scouts found
- * them in, so videos of equal strength hold their places instead of swapping
- * between one report and the next.
- */
 function asMoments(found: SwarmMoment<Candidate>[]): InternetSearchMoment[] {
   const byVideo = new Map<string, { candidate: Candidate; found: SwarmMoment<Candidate>[] }>();
   for (const moment of found) {
@@ -87,14 +71,10 @@ function asMoments(found: SwarmMoment<Candidate>[]): InternetSearchMoment[] {
 }
 
 /**
- * Internet search now uses the same source/model ports as uploaded footage.
- * SearXNG finds pages, the browser turns a page into timestamped frames, and
- * VideoChat3's online StreamingSession watches those frames with the text query
- * attached from the first round. The scout swarm remains the coordinator.
- *
- * What comes back is videos, not findings. Each approved video is one card
- * carrying the places inside it worth jumping to, ordered by how often the
- * watcher approved it.
+ * Realtime v2 keeps discovery narrow and spends model time inside the video.
+ * The top seven candidates are searched in rank order. For each candidate all
+ * four scouts inspect separate quarters of the first ten minutes using sparse
+ * one-second bursts, then promising windows are re-watched continuously.
  */
 export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise<InternetSearchProgress> {
   const searchId = job.id ?? 'unknown';
@@ -102,8 +82,8 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const report = async (progress: InternetSearchProgress) => job.updateProgress(progress as unknown as Record<string, unknown>);
 
   await report({ phase: 'loading', moments: [], candidatesFound: 0 });
-  const candidates = await search(job.data.query);
-  if (candidates.length === 0) {
+  const discovered = await search(job.data.query);
+  if (discovered.length === 0) {
     const done: InternetSearchProgress = { phase: 'answered', moments: [], candidatesFound: 0 };
     await report(done);
     return done;
@@ -111,15 +91,30 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
 
   const webAccessUrl = required('WEB_ACCESS_URL');
   const webAccessToken = required('WEB_ACCESS_INTERNAL_TOKEN');
+  const realtimeV2 = enabled('VIDEO_STREAM_V2');
+  const captureFps = realtimeV2 ? boundedNumber('VIDEO_STREAM_CAPTURE_FPS', 6, 0.2, 30) : 1;
+  const horizonSeconds = realtimeV2 ? boundedNumber('INTERNET_WATCH_MAX_SECONDS', 600, 60, 600) : 90;
+  const maxCandidates = realtimeV2 ? Math.round(boundedNumber('INTERNET_SEARCH_MAX_CANDIDATES', 7, 1, 7)) : 7;
+  const coarseBurstSeconds = boundedNumber('VIDEO_STREAM_COARSE_BURST_SECONDS', 1, 0.25, 5);
+  const coarseStrideSeconds = boundedNumber('VIDEO_STREAM_COARSE_STRIDE_SECONDS', 5, coarseBurstSeconds, 30);
+  const densePaddingSeconds = boundedNumber('VIDEO_STREAM_DENSE_PADDING_SECONDS', 6, 1, 30);
+  const candidates = discovered.slice(0, maxCandidates);
+
   const runtime = createVideoModelScoutRuntime<Candidate>({
     model: videoChat3Adapter,
-    sourceForCandidate: (candidate) => createWebFrameStreamSource({
-      id: `${searchId}:${candidate.id}`,
+    sourceForInspection: (candidate: Candidate, plan: ScoutInspectionPlan, scoutId: ScoutId) => createWebFrameStreamSource({
+      id: `${searchId}:${candidate.id}:${scoutId}:${plan.mode}:${plan.startSeconds.toFixed(1)}-${plan.endSeconds.toFixed(1)}`,
       pageUrl: candidate.pageUrl,
       webAccessUrl,
       webAccessToken,
-      maxSeconds: 90,
-      fps: 1,
+      maxSeconds: Math.max(1, plan.endSeconds - plan.startSeconds),
+      fps: captureFps,
+      realtimeV2,
+      startSeconds: plan.startSeconds,
+      endSeconds: plan.endSeconds,
+      scanMode: plan.mode === 'coarse' ? 'coarse' : 'continuous',
+      burstSeconds: plan.burstSeconds,
+      strideSeconds: plan.strideSeconds,
     }),
   });
 
@@ -129,18 +124,19 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     query: job.data.query,
     candidates,
     runtime,
+    maxCandidates,
+    horizonSeconds,
+    coarseBurstSeconds,
+    coarseStrideSeconds,
+    densePaddingSeconds,
+    timeoutMs: realtimeV2 ? 10 * 60_000 : 5 * 60_000,
     onProgress: async (progress) => {
-      // A moment that grew is the same card with a longer stretch, not another
-      // one. Sending the swarm's whole list on either event means the screen
-      // shows what it currently holds, rather than a tally kept alongside it
-      // that has no way to take something back.
       if (progress.event !== 'moment.found' && progress.event !== 'moment.extended') return;
       await report({ phase: 'searching', moments: asMoments(progress.snapshot.moments), candidatesFound: candidates.length });
     },
   });
 
   const moments: InternetSearchMoment[] = asMoments(result.moments);
-
   const neverReached = Math.max(0, result.candidatesAvailable - result.candidatesConsidered);
   const notStarted = Math.max(0, result.candidatesConsidered - result.candidatesCompleted);
   const unexamined = result.failures.length + result.candidatesPartlyExamined + neverReached + notStarted;
@@ -154,11 +150,18 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
 
   log.info('internet search finished', {
     model: videoChat3Adapter.id,
+    stream_v2: realtimeV2,
+    capture_fps: captureFps,
+    horizon_seconds: horizonSeconds,
+    candidates_limit: maxCandidates,
+    coarse_burst_seconds: coarseBurstSeconds,
+    coarse_stride_seconds: coarseStrideSeconds,
     videos: moments.length,
     marks: moments.reduce((total, moment) => total + moment.marks.length, 0),
     candidates_considered: result.candidatesConsidered,
     candidates_completed: result.candidatesCompleted,
     partly_examined: result.candidatesPartlyExamined,
+    media_seconds_observed: result.metrics.mediaSecondsObserved,
     unexamined,
     status: result.status,
     wall_ms: result.metrics.wallMs,

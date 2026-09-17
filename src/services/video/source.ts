@@ -29,12 +29,17 @@ export interface VideoFrame {
   image: Buffer;
 }
 
+export type FrameStreamScanMode = 'continuous' | 'coarse';
+
 /** What the source itself knows when its frame stream stops. */
 export interface FrameStreamCompletion {
-  /** True only when playback reached the real end of the video. */
+  /** True when the assigned source range was actually completed. */
   exhausted: boolean;
   reason: string;
+  /** Furthest absolute timestamp reached in the source. */
   watchedThroughSeconds: number;
+  /** Seconds of visual evidence actually emitted, excluding coarse seek gaps. */
+  mediaSecondsObserved?: number;
 }
 
 /**
@@ -43,8 +48,8 @@ export interface FrameStreamCompletion {
  * `open` is a function rather than a bare AsyncIterable so a model adapter owns
  * exactly one lifecycle and can pass cancellation through to the source.
  * `completion` is separate because the model consumes pictures, while the
- * orchestration still needs to know whether the browser actually reached the
- * end instead of merely hitting a watch limit or failing halfway through.
+ * orchestration still needs to know whether the browser actually completed its
+ * assigned range instead of merely hitting a wall-time limit or failing.
  */
 export interface FrameStreamVideoSource {
   kind: 'frame-stream';
@@ -52,6 +57,8 @@ export interface FrameStreamVideoSource {
   open(signal: AbortSignal): AsyncIterable<VideoFrame>;
   completion: Promise<FrameStreamCompletion>;
   durationSeconds?: number | null;
+  /** Sparse scans intentionally jump across source time; continuous scans do not. */
+  scanMode?: FrameStreamScanMode;
 }
 
 export type VideoSourceKind = VideoSource['kind'];

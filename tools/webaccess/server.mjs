@@ -37,9 +37,6 @@ function mediaLike(url) {
   try {
     const parsed = new URL(url);
     const path = parsed.pathname.toLowerCase();
-    // Current Modal transports fetch one media file. Streaming manifests are
-    // observed but deliberately not returned until HLS/DASH segment handling
-    // is implemented end to end.
     return ['.mp4', '.webm', '.mov', '.m4v'].some((suffix) => path.endsWith(suffix));
   } catch {
     return false;
@@ -60,13 +57,10 @@ async function resolveMedia(pageUrl) {
     });
     page.on('response', (response) => {
       const type = (response.headers()['content-type'] || '').toLowerCase();
-      if (type.startsWith('video/') || type.includes('mpegurl') || type.includes('dash+xml')) {
-        candidates.add(response.url());
-      }
+      if (type.startsWith('video/') || type.includes('mpegurl') || type.includes('dash+xml')) candidates.add(response.url());
     });
 
     await page.goto(safePageUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
-
     const domCandidates = await page.evaluate(() => {
       const out = [];
       for (const node of document.querySelectorAll('video, video source')) {
@@ -120,18 +114,6 @@ function send(res, status, body) {
   res.end(encoded);
 }
 
-/**
- * Watch a page and stream what is on screen, one line of NDJSON per event.
- *
- * Streamed rather than collected because the point is to watch in step with
- * something else watching: a scout feeds each picture to Gander as it arrives,
- * and a response that only came back at the end would make the whole page a
- * wait rather than a watch.
- *
- * The pictures are base64 inside the JSON line. At about one frame a second
- * that costs little, and it keeps the stream one thing a reader can parse
- * line by line instead of two interleaved framings.
- */
 async function streamWatch(req, res, body) {
   const pageUrl = await assertPublicHttpUrl(String(body.pageUrl || '').trim());
   const controller = new AbortController();
@@ -140,17 +122,13 @@ async function streamWatch(req, res, body) {
   res.writeHead(200, {
     'content-type': 'application/x-ndjson',
     'cache-control': 'no-store',
-    // Nothing downstream should buffer this; the value is in its timing.
     'x-accel-buffering': 'no',
   });
 
-  const write = (event) =>
-    new Promise((resolve) => {
-      // Respect back-pressure: a consumer slower than the capture should slow
-      // the capture, not accumulate pictures nobody has looked at yet.
-      if (res.write(`${JSON.stringify(event)}\n`)) resolve();
-      else res.once('drain', resolve);
-    });
+  const write = (event) => new Promise((resolve) => {
+    if (res.write(`${JSON.stringify(event)}\n`)) resolve();
+    else res.once('drain', resolve);
+  });
 
   try {
     const outcome = await watchPage(
@@ -158,21 +136,20 @@ async function streamWatch(req, res, body) {
         pageUrl,
         maxSeconds: Number(body.maxSeconds) || undefined,
         fps: Number(body.fps) || undefined,
+        realtimeV2: body.realtimeV2 === true,
+        startSeconds: Number.isFinite(Number(body.startSeconds)) ? Number(body.startSeconds) : undefined,
+        endSeconds: Number.isFinite(Number(body.endSeconds)) ? Number(body.endSeconds) : undefined,
+        scanMode: body.scanMode === 'coarse' ? 'coarse' : 'continuous',
+        burstSeconds: Number.isFinite(Number(body.burstSeconds)) ? Number(body.burstSeconds) : undefined,
+        strideSeconds: Number.isFinite(Number(body.strideSeconds)) ? Number(body.strideSeconds) : undefined,
         signal: controller.signal,
       },
       async (frame) => {
-        await write({
-          type: 'frame',
-          video_ms: frame.videoMs,
-          encoding: frame.encoding,
-          image: frame.image.toString('base64'),
-        });
+        await write({ type: 'frame', video_ms: frame.videoMs, encoding: frame.encoding, image: frame.image.toString('base64') });
       },
     );
     await write({ type: 'ended', ...outcome });
   } catch (error) {
-    // The stream has already started, so the failure is a line in it rather
-    // than a status code nobody is waiting on any more.
     await write({ type: 'ended', watched: false, reason: error instanceof Error ? error.message : 'watch failed', framesSent: 0 });
   } finally {
     res.end();

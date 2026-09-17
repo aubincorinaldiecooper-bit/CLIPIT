@@ -1,8 +1,14 @@
 FROM mcr.microsoft.com/playwright:v1.58.2-noble
 
 WORKDIR /app
-RUN npm init -y >/dev/null 2>&1 && npm install --omit=dev playwright@1.58.2
+# Stagehand is a semantic fallback only. The realtime capture loop remains
+# deterministic Playwright once the primary player has been resolved.
+RUN npm init -y >/dev/null 2>&1 && npm install --omit=dev \
+    playwright@1.58.2 \
+    playwright-core@1.58.2 \
+    @browserbasehq/stagehand@3.7.3
 COPY tools/webaccess/server.mjs ./server.mjs
+COPY tools/webaccess/watch.mjs ./watch.mjs
 
 ENV NODE_ENV=production PORT=8080
 EXPOSE 8080

@@ -1,23 +1,22 @@
 import type { VideoModelAdapter } from '../video/model.js';
 import { watchVideo } from '../video/model.js';
 import type { FrameStreamVideoSource } from '../video/source.js';
-import type { ScoutCandidate, ScoutRuntime } from './scoutSwarm.js';
+import type { ScoutCandidate, ScoutInspectionPlan, ScoutRuntime, ScoutId } from './scoutSwarm.js';
 
 /**
- * Generic scout runtime: candidate -> video source -> chosen video model.
+ * Generic scout runtime: candidate + inspection plan -> video source -> model.
  *
- * This is the seam that makes internet search model-agnostic. Swapping
- * VideoChat3 for another live-capable model changes the adapter, not discovery,
- * browser playback, scout coordination, timestamps, or frontend progress.
+ * This keeps internet search model-agnostic while allowing the orchestration to
+ * decide where and how densely to look in a video.
  */
 export function createVideoModelScoutRuntime<Candidate extends ScoutCandidate>(input: {
   model: VideoModelAdapter;
-  sourceForCandidate(candidate: Candidate): FrameStreamVideoSource;
+  sourceForInspection(candidate: Candidate, plan: ScoutInspectionPlan, scoutId: ScoutId): FrameStreamVideoSource;
   maxEvents?: number;
 }): ScoutRuntime<Candidate> {
   return {
-    async inspect({ query, candidate, signal, onMoment }) {
-      const source = input.sourceForCandidate(candidate);
+    async inspect({ query, candidate, scoutId, plan, signal, onMoment }) {
+      const source = input.sourceForInspection(candidate, plan, scoutId);
       const watched = await watchVideo({
         model: input.model,
         source,
@@ -26,13 +25,12 @@ export function createVideoModelScoutRuntime<Candidate extends ScoutCandidate>(i
         maxEvents: input.maxEvents,
         onMoment,
       });
+      const completion = await source.completion;
       return {
-        // Live moments have already been emitted through onMoment. Returning
-        // them again would duplicate cards in the swarm. Direct callers that do
-        // not supply a callback still receive the model's collected moments.
         moments: onMoment ? [] : watched.moments,
-        mediaSecondsObserved: watched.watchedThroughSeconds,
-        exhausted: watched.exhausted,
+        mediaSecondsObserved: completion.mediaSecondsObserved ?? watched.watchedThroughSeconds,
+        exhausted: completion.exhausted && watched.exhausted === true,
+        exhaustive: source.scanMode !== 'coarse' && completion.exhausted && watched.exhausted === true,
         metrics: { model: watched.model, revision: watched.revision, ...watched.metrics },
       };
     },
