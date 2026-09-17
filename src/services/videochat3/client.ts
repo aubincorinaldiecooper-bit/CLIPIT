@@ -39,20 +39,15 @@ function identity(raw: Record<string, unknown>): { model: string; revision: stri
   if (raw.model !== MODEL) throw new ExternalServiceError('videochat3', `VideoChat3 service answered for unexpected model "${String(raw.model)}"`, { retryable: false });
   return { model: MODEL, revision: typeof raw.revision === 'string' && raw.revision.trim() ? raw.revision : 'unknown' };
 }
-/**
- * How sure the watcher said it was, when it said so and the answer is usable.
- *
- * The watcher is asked to end a finding with a number, and a model asked for
- * something does not have to give it: most of the time there is nothing here,
- * and that is an ordinary outcome rather than a failure. Anything outside 0 to
- * 1 is dropped rather than clamped — a number that arrived wrong is not
- * evidence of anything, and squeezing it into range would turn a broken answer
- * into a confident-looking one.
- */
 function sureness(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   if (value < 0 || value > 1) return undefined;
   return value;
+}
+function envNumber(name: string, fallback: number, minimum: number, maximum: number): number {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.max(minimum, Math.min(maximum, raw));
 }
 
 function parseEvent(row: Record<string, unknown>): VideoChat3WatchEvent {
@@ -88,13 +83,22 @@ export async function watchWithVideoChat3(input: { videoUrl: string; query: stri
   return { ...id, durationSeconds, watchedThroughSeconds: durationSeconds, exhausted: true, events, metrics: (raw.metrics as Record<string, unknown>) ?? {} };
 }
 
-/** Feed a real timestamped browser stream into one stateful VideoChat3 session. */
+/**
+ * Feed a timestamped browser stream into one stateful VideoChat3 session.
+ *
+ * V2 deliberately separates capture density from inference cadence. The browser
+ * may supply six frames each second, while Modal groups those frames into one
+ * temporal round. A small in-flight ceiling keeps the model close to the live
+ * player: when inference falls behind, we discard excess observations rather
+ * than building a queue that turns "realtime" into delayed playback.
+ */
 export async function watchStreamWithVideoChat3(input: {
   source: FrameStreamVideoSource;
   query: string;
   signal?: AbortSignal;
   maxRounds?: number;
   maxEvents?: number;
+  realtimeV2?: boolean;
   onMoment?: (event: VideoChat3WatchEvent) => void | Promise<void>;
 }): Promise<VideoChat3WatchResult> {
   const inputQueue = await createEphemeralModalQueue();
@@ -103,29 +107,94 @@ export async function watchStreamWithVideoChat3(input: {
   const forwardAbort = () => controller.abort(input.signal?.reason ?? new Error('live watch cancelled'));
   if (input.signal?.aborted) forwardAbort(); else input.signal?.addEventListener('abort', forwardAbort, { once: true });
 
+  const realtimeV2 = input.realtimeV2 === true;
+  const historyRounds = realtimeV2
+    ? Math.round(input.maxRounds ?? envNumber('VIDEO_STREAM_HISTORY_ROUNDS', 16, 1, 64))
+    : Math.round(input.maxRounds ?? 256);
+  const maxFrames = realtimeV2
+    ? Math.round(envNumber('VIDEO_STREAM_MAX_FRAMES', 4096, 1, 100_000))
+    : Math.round(input.maxRounds ?? 256);
+  const roundWindowMs = realtimeV2
+    ? Math.round(envNumber('VIDEO_STREAM_ROUND_MS', 1000, 100, 5000))
+    : 0;
+  const maxInflightFrames = realtimeV2
+    ? Math.round(envNumber('VIDEO_STREAM_MAX_INFLIGHT_FRAMES', 12, 1, 120))
+    : Number.MAX_SAFE_INTEGER;
+  const normalMaxPixels = realtimeV2
+    ? Math.round(envNumber('VIDEOCHAT3_STREAM_NORMAL_MAX_PIXELS', 224 * 224, 28 * 28, 2_000_000))
+    : 100352;
+  const standbyMaxPixels = realtimeV2
+    ? Math.round(envNumber('VIDEOCHAT3_STREAM_STANDBY_MAX_PIXELS', normalMaxPixels * 4, normalMaxPixels, 4_000_000))
+    : 100352;
+
+  let sentFrames = 0;
+  let processedFrames = 0;
+  let droppedFrames = 0;
+  let latestProducedMs = 0;
+  let latestProcessedMs = 0;
+  let currentLagMs = 0;
+  let maxLagMs = 0;
+
+  const refreshLag = () => {
+    currentLagMs = Math.max(0, latestProducedMs - latestProcessedMs);
+    maxLagMs = Math.max(maxLagMs, currentLagMs);
+  };
+
   let remote: Awaited<ReturnType<typeof spawnModal>> | null = null;
   try {
     remote = await spawnModal(WATCH_STREAM, {
       input_queue_id: inputQueue.queueId,
       output_queue_id: outputQueue.queueId,
       query: input.query,
-      max_rounds: input.maxRounds ?? 256,
+      max_rounds: historyRounds,
+      max_frames: maxFrames,
       max_events: input.maxEvents ?? 64,
+      round_window_ms: roundWindowMs,
+      adaptive_resolution: realtimeV2,
+      normal_max_pixels: normalMaxPixels,
+      standby_max_pixels: standbyMaxPixels,
     });
 
     const producer = (async () => {
       try {
         for await (const frame of input.source.open(controller.signal)) {
           if (controller.signal.aborted) break;
+          latestProducedMs = Math.max(latestProducedMs, frame.timestampMs + frame.durationMs);
+          refreshLag();
+
+          // At six capture fps, twelve in-flight frames are about two seconds
+          // of visual evidence. Past that point freshness is more valuable than
+          // preserving every stale frame, so consume the browser stream but do
+          // not enqueue another model item until progress catches up.
+          if (realtimeV2 && sentFrames - processedFrames >= maxInflightFrames) {
+            droppedFrames += 1;
+            continue;
+          }
+
           const encoded = frame.image.toString('base64');
           if (encoded.length > 980_000) throw new ExternalServiceError('videochat3-watch-stream', 'browser frame exceeds Modal queue item limit', { retryable: false });
           await inputQueue.put({ type: 'frame', timestamp_ms: frame.timestampMs, duration_ms: frame.durationMs, image_base64: encoded }, { timeoutMs: 30_000 });
+          sentFrames += 1;
         }
         const completion = await input.source.completion;
-        await inputQueue.put({ type: 'end', exhausted: completion.exhausted, reason: completion.reason, watched_through_seconds: completion.watchedThroughSeconds }, { timeoutMs: 30_000 });
+        latestProducedMs = Math.max(latestProducedMs, completion.watchedThroughSeconds * 1000);
+        refreshLag();
+        await inputQueue.put({
+          type: 'end',
+          exhausted: completion.exhausted,
+          reason: completion.reason,
+          watched_through_seconds: completion.watchedThroughSeconds,
+          dropped_frames: droppedFrames,
+        }, { timeoutMs: 30_000 });
       } catch (error) {
         if (!controller.signal.aborted) {
-          await inputQueue.put({ type: 'end', exhausted: false, reason: error instanceof Error ? error.message : String(error), watched_through_seconds: 0 }, { timeoutMs: 5_000 }).catch(() => undefined);
+          await inputQueue.put({
+            type: 'end',
+            exhausted: false,
+            reason: error instanceof Error ? error.message : String(error),
+            watched_through_seconds: latestProducedMs / 1000,
+            dropped_frames: droppedFrames,
+          }, { timeoutMs: 5_000 }).catch(() => undefined);
           throw error;
         }
       }
@@ -140,7 +209,15 @@ export async function watchStreamWithVideoChat3(input: {
       catch (error) { if (error instanceof QueueEmptyError) continue; throw error; }
       if (!message || typeof message !== 'object') continue;
       const row = message as Record<string, unknown>;
-      if (row.type === 'moment') {
+      if (row.type === 'progress') {
+        if (typeof row.frames_processed === 'number' && Number.isFinite(row.frames_processed)) {
+          processedFrames = Math.max(processedFrames, row.frames_processed);
+        }
+        if (typeof row.processed_through_ms === 'number' && Number.isFinite(row.processed_through_ms)) {
+          latestProcessedMs = Math.max(latestProcessedMs, row.processed_through_ms);
+        }
+        refreshLag();
+      } else if (row.type === 'moment') {
         const event = parseEvent(row);
         events.push(event);
         await input.onMoment?.(event);
@@ -157,13 +234,25 @@ export async function watchStreamWithVideoChat3(input: {
     });
     await remote.get();
     const id = identity(done);
+    const remoteMetrics = done.metrics && typeof done.metrics === 'object' ? done.metrics as Record<string, unknown> : {};
     return {
       ...id,
       durationSeconds: finite(done.duration_seconds, 'stream duration'),
       watchedThroughSeconds: finite(done.watched_through_seconds, 'watched through'),
       exhausted: done.exhausted === true,
       events,
-      metrics: (done.metrics as Record<string, unknown>) ?? {},
+      metrics: {
+        ...remoteMetrics,
+        realtime_v2: realtimeV2,
+        client_frames_sent: sentFrames,
+        client_frames_processed: processedFrames,
+        client_frames_dropped_for_lag: droppedFrames,
+        latest_source_ms: latestProducedMs,
+        latest_processed_ms: latestProcessedMs,
+        current_video_lag_ms: currentLagMs,
+        max_video_lag_ms: maxLagMs,
+        max_inflight_frames: realtimeV2 ? maxInflightFrames : null,
+      },
     };
   } finally {
     controller.abort(new Error('live watch closed'));
