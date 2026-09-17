@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - modal/videochat3.py
+      - scripts/verify-modal-videochat3.py
       - .github/workflows/deploy-videochat3.yml
   workflow_dispatch:
 
@@ -27,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Require Modal credentials
         shell: bash
@@ -38,43 +39,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Install Modal CLI
-        run: python -m pip install 'modal>=1.5,<2'
+      - name: Install Modal
+        run: python -m pip install "modal==1.5.0"
 
       - name: Deploy VideoChat3 to Modal main
         run: modal deploy -e main modal/videochat3.py
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-
-      - name: Install Node dependencies
-        run: npm ci
-
-      - name: Verify deployed contract
-        shell: bash
-        run: |
-          node --input-type=module <<'NODE'
-          import { ModalClient } from 'modal';
-
-          const client = new ModalClient({
-            tokenId: process.env.MODAL_TOKEN_ID,
-            tokenSecret: process.env.MODAL_TOKEN_SECRET,
-            environment: 'main',
-          });
-
-          const cls = await client.cls.fromName('clipit-videochat3', 'VideoChat3Service');
-          const instance = await cls.instance();
-          const required = ['health', 'watch', 'watch_stream', 'verify_intervals'];
-
-          for (const method of required) {
-            await instance.method(method);
-            console.log(`verified ${method}`);
-          }
-
-          console.log('VideoChat3 Modal contract verified in environment main');
-          NODE
+      - name: Verify deployed VideoChat3 contract
+        run: python scripts/verify-modal-videochat3.py
