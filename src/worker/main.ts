@@ -32,6 +32,7 @@ import { handleScheduledPublish } from './handlers/scheduledPublish.js';
 import { handleLearningReport } from './handlers/learningReport.js';
 import { handleInternetSearch } from './handlers/internetSearch.js';
 import { handleInternetVideoSearch } from './handlers/internetVideoSearch.js';
+import { assertVideoChat3WorkerReady } from './startup/videochat3.js';
 
 const workers: Worker[] = [];
 
@@ -112,6 +113,10 @@ async function main(): Promise<void> {
   checkVideoProviderConfig();
   await checkBinaries();
   await runMigrations();
+
+  if (env.RETRIEVAL_PRIMARY === 'videochat3') {
+    await assertVideoChat3WorkerReady();
+  }
 
   if (env.VIDEO_PROVIDER === 'minicpm') {
     await assertMiniCpmDeploymentAvailable();
