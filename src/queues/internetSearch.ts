@@ -25,6 +25,11 @@ export interface InternetSearchMark {
    * answers.
    */
   confidence?: number;
+  /**
+   * How many independent scouts marked this same area as promising.
+   * This is a signal-strength count, not a probability.
+   */
+  scoutVotes?: number;
 }
 
 /**

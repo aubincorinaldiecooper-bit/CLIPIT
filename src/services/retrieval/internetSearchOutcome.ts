@@ -46,7 +46,7 @@ export interface InternetSearchCoverage {
    * than from success, because success only says the watch came back.
    */
   candidatesFullyWatched: number;
-  /** Moments approved across every video. Never decides the outcome alone. */
+  /** Positive candidate signals observed across the videos. */
   momentsFound: number;
   /** Every failed inspection's reason, verbatim, in the order they happened. */
   failureReasons: readonly string[];
@@ -67,7 +67,7 @@ export interface InternetSearchEnding {
  */
 const KINDS: ReadonlyArray<[InternetSearchFailureKind, RegExp]> = [
   ['video_model_unavailable', /not found on class|cannot find \S+\/\S+ in |is not configured|rejected Clipit's credentials|cannot read source kind/i],
-  ['browser_unavailable', /browser refused to watch|never started playing|could not open the page|web[- ]access/i],
+  ['browser_unavailable', /browser refused to watch|never started playing|could not open the page|no video element on the page|web[- ]access/i],
   ['video_model_failed', /Modal internal failure|failed remotely|Modal call failed|live watch failed|returned (?:an )?invalid|could not create live video queue|queue item limit/i],
   ['timed_out', /timed out|timeout|exceeded the \d+s client deadline|exceeded its Modal timeout/i],
 ];
@@ -119,10 +119,14 @@ export function decideEnding(coverage: InternetSearchCoverage): InternetSearchEn
   const failure = summarise(coverage.failureReasons);
 
   if (found === 0) return { phase: 'answered', outcome: 'no_candidates', candidatesWatched: 0 };
+  // Positive evidence does not require exhaustive coverage. Sparse scouts are
+  // intentionally a candidate generator: once at least one real signal was
+  // observed, the truthful answer is that we found a match candidate. The
+  // strict coverage rule is only needed before making a negative claim.
+  if (coverage.momentsFound > 0) return { phase: 'answered', outcome: 'matched', candidatesWatched: watched, ...(failure ? { failure } : {}) };
   if (watched === 0) return { phase: 'failed', outcome: 'watch_failed', candidatesWatched: 0, ...(failure ? { failure } : {}) };
   if (throughout < found) return { phase: 'answered', outcome: 'partly_watched', candidatesWatched: watched, ...(failure ? { failure } : {}) };
-  if (coverage.momentsFound === 0) return { phase: 'answered', outcome: 'no_matches', candidatesWatched: watched, ...(failure ? { failure } : {}) };
-  return { phase: 'answered', outcome: 'matched', candidatesWatched: watched, ...(failure ? { failure } : {}) };
+  return { phase: 'answered', outcome: 'no_matches', candidatesWatched: watched, ...(failure ? { failure } : {}) };
 }
 
 /**
