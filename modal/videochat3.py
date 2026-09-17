@@ -77,6 +77,32 @@ _SURENESS_ASK = (
 )
 
 
+def _stop_watching(
+    now: float,
+    started: float,
+    heard_at: float,
+    max_session_sec: float,
+    max_silence_sec: float,
+) -> str | None:
+    """Why a live watch should stop, or None to keep going.
+
+    The thing feeding a live watch can die without saying so — a worker killed
+    mid-watch, which a redeploy does routinely, never gets to send its ``end``.
+    Left unbounded the session polls an empty queue until the container's own
+    timeout: half an hour of an L4 doing nothing, billed, with nothing anywhere
+    saying so.
+
+    Silence is the telling signal, since the browser sends a frame about every
+    second. The session ceiling is the backstop for a client that keeps talking
+    but never finishes.
+    """
+    if now - started > max_session_sec:
+        return "VideoChat3 stopped a live watch that ran too long"
+    if now - heard_at > max_silence_sec:
+        return "the browser stopped sending frames"
+    return None
+
+
 def _sureness(said: str) -> tuple[str, float | None]:
     """Split what the watcher said from how sure it said it was.
 
@@ -293,8 +319,30 @@ class VideoChat3Service:
         query: str,
         max_rounds: int = 256,
         max_events: int = 64,
+        max_silence_sec: float = 120.0,
+        max_session_sec: float = 600.0,
     ) -> dict[str, Any]:
-        """Watch timestamped browser frames through one stateful session."""
+        """Watch timestamped browser frames through one stateful session.
+
+        Two bounds, because the thing feeding this can die without saying so.
+
+        The browser sends a frame about every second and says ``end`` when it
+        stops, so nothing arriving for ``max_silence_sec`` means the client is
+        gone rather than slow — a worker killed mid-watch, which a redeploy
+        does routinely, never gets to send that ``end``. Without a bound the
+        loop polls an empty queue until the container's own ``timeout``, which
+        is half an hour of an L4 doing nothing, billed, with nothing anywhere
+        saying so.
+
+        ``max_session_sec`` is the backstop for everything else: a client that
+        keeps sending but never finishes cannot hold the GPU indefinitely
+        either.
+
+        Both are checked between polls, so either fires within one poll of its
+        limit rather than exactly on it. Neither sets ``exhausted``, so a watch
+        cut short is reported as a page not fully examined — which is what it
+        is, and not the same as a page that held nothing.
+        """
         from PIL import Image
 
         input_queue = modal.Queue.from_id(input_queue_id)
@@ -315,14 +363,22 @@ class VideoChat3Service:
         exhausted = False
         end_reason = "the frame stream ended without a terminal event"
 
+        heard_at = started
+
         try:
             while frames_seen < max_rounds and len(events) < max_events:
+                giving_up = _stop_watching(time.time(), started, heard_at, max_session_sec, max_silence_sec)
+                if giving_up:
+                    end_reason = giving_up
+                    break
                 try:
                     item = input_queue.get(timeout=30)
                 except queue.Empty:
                     # Browser navigation/cold starts can leave the queue empty
-                    # briefly. An empty poll is not the end of the video.
+                    # briefly. An empty poll is not the end of the video — the
+                    # silence bound above decides when it is.
                     continue
+                heard_at = time.time()
                 if not isinstance(item, dict):
                     raise ValueError("stream queue item must be an object")
                 kind = item.get("type")
