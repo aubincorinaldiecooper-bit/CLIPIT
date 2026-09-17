@@ -16,7 +16,21 @@ vi.mock('../src/services/video/adapters/videochat3.js', () => ({
   videoChat3Adapter: { id: 'videochat3', sourceKinds: new Set(['frame-stream']), assertReady: (kind: string) => assertReady(kind) },
 }));
 
+const logged: Array<{ level: string; message: string; context: Record<string, unknown> }> = [];
+vi.mock('../src/lib/logger.js', () => {
+  const record = (level: string) => (message: string, context: Record<string, unknown> = {}) => {
+    logged.push({ level, message, context });
+  };
+  const made: Record<string, unknown> = { error: record('error'), warn: record('warn'), info: record('info'), debug: record('debug') };
+  made.child = () => made;
+  return { logger: made };
+});
+
 const { handleInternetSearch } = await import('../src/worker/handlers/internetSearch.js');
+
+function said(message: string) {
+  return logged.filter((line) => line.message === message);
+}
 
 function candidate(id: string, source: string | null = 'youtube.com'): Candidate {
   return { id, query: 'a dog on a skateboard', title: `page ${id}`, pageUrl: `https://publisher.example/watch/${id}`, thumbnailUrl: `https://publisher.example/still/${id}.jpg`, source };
@@ -36,6 +50,7 @@ beforeEach(() => {
   inspect.mockReset();
   assertReady.mockReset();
   assertReady.mockResolvedValue(undefined);
+  logged.length = 0;
   process.env.WEB_ACCESS_URL = 'http://web-access.internal:8080';
   process.env.WEB_ACCESS_INTERNAL_TOKEN = 'token';
   process.env.VIDEO_STREAM_V2 = 'true';
@@ -276,5 +291,88 @@ describe('refusing to search against a watcher that cannot take the call', () =>
     const { job } = fakeJob();
     await handleInternetSearch(job);
     expect(assertReady).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Telemetry has to survive the thing it is there to diagnose.
+ *
+ * On 17 September a search died and left nothing behind: no
+ * `internet search finished` line, no per-candidate record, no page address —
+ * because every one of those is written at the end, and the end never came.
+ * The post-mortem had a stack trace and a guess.
+ */
+describe("what a search leaves behind while it is still running", () => {
+  it("reports how many videos it has read as it goes, not only at the end", async () => {
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: true });
+    const { job, reported } = fakeJob();
+    await handleInternetSearch(job);
+
+    // A search cut off half way is answered from the last progress it wrote,
+    // so the count has to be in there before the summary exists.
+    const midFlight = reported.filter((step) => step.phase === 'searching');
+    expect(midFlight.length).toBeGreaterThan(1);
+    expect(midFlight.at(-1)?.candidatesWatched).toBe(2);
+    // And it starts honest: nothing watched yet is nothing claimed.
+    expect(midFlight[0]?.candidatesWatched).toBe(0);
+  });
+
+  it("counts a video as read only once something was actually read from it", async () => {
+    // Candidate 'a' fails every way; 'b' succeeds. The swarm finishes with
+    // both, but only one of them was ever opened.
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockImplementation(async ({ candidate: page }) => {
+      if (page.id === 'a') throw new Error('the browser refused to watch this page (503)');
+      return { moments: [], exhausted: true, exhaustive: true };
+    });
+    const { job, reported } = fakeJob();
+    await handleInternetSearch(job);
+
+    const midFlight = reported.filter((step) => step.phase === 'searching');
+    expect(midFlight.at(-1)?.candidatesWatched).toBe(1);
+  });
+
+  it("names the page each scout went to, so a failure points somewhere", async () => {
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: true });
+    const { job } = fakeJob();
+    await handleInternetSearch(job);
+
+    const pages = said('watching a page');
+    // Once per video, not once per scout: four scouts take a quarter of the
+    // same video each, and four identical lines say nothing extra.
+    expect(pages).toHaveLength(2);
+    expect(pages.map((line) => line.context.page_url)).toEqual([
+      'https://publisher.example/watch/a',
+      'https://publisher.example/watch/b',
+    ]);
+  });
+
+  it("writes down what it knew before letting the error through", async () => {
+    // Redis going away mid-search is the realistic version of this: reporting
+    // progress throws, the swarm carries it out, and the summary at the bottom
+    // of the handler never runs.
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: true });
+    const { job } = fakeJob();
+    let updates = 0;
+    (job as unknown as { updateProgress: (p: unknown) => Promise<void> }).updateProgress = async () => {
+      updates += 1;
+      if (updates > 2) throw new Error('Redis connection lost');
+    };
+
+    await expect(handleInternetSearch(job)).rejects.toThrow(/Redis connection lost/);
+
+    const stopped = said('internet search stopped part-way');
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.level).toBe('error');
+    expect(stopped[0]?.context).toMatchObject({ status: 'stopped', candidates_selected: 2 });
+    // It got to the first video and not the second, and the record says so.
+    // That is the whole point: the account is of how far it actually got, not
+    // of what it set out to do.
+    expect(stopped[0]?.context.candidates_announced).toEqual(['a']);
+    expect(stopped[0]?.context.candidates_selected).toBe(2);
+    expect(stopped[0]?.context.err).toMatch(/Redis connection lost/);
   });
 });
