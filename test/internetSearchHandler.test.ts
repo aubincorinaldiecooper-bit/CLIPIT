@@ -164,9 +164,9 @@ describe('what a finished internet search is allowed to claim', () => {
     expect(reported.at(-1)?.outcome).toBe('watch_failed');
   });
 
-  it('says nothing matched when every video was watched right through and had nothing', async () => {
+  it('says nothing matched only when every second of every video was actually seen', async () => {
     found.mockResolvedValue([candidate('a'), candidate('b')]);
-    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: false });
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: true });
     const { job } = fakeJob();
     const result = await handleInternetSearch(job);
 
@@ -174,6 +174,31 @@ describe('what a finished internet search is allowed to claim', () => {
     expect(result.outcome).toBe('no_matches');
     expect(result.candidatesWatched).toBe(2);
     expect(result.failure).toBeUndefined();
+  });
+
+  it('will not call a sampled scan "watched", however cleanly it succeeded', async () => {
+    // Every candidate is first read by a coarse scan, which looks at one
+    // second in every five and comes back `exhaustive: false` having
+    // succeeded. Counting that as full coverage would let a fifth of a video
+    // stand in for all of it — the same false absence, one level down.
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: false });
+    const { job } = fakeJob();
+    const result = await handleInternetSearch(job);
+
+    expect(result.outcome).toBe('partly_watched');
+    // Nothing failed, so nothing is reported as unwatchable — it is the depth
+    // of the watching that was short, not the number of videos opened.
+    expect(result.candidatesWatched).toBe(2);
+    expect(result.failure).toBeUndefined();
+  });
+
+  it('will not call a watch cut short by its event cap a complete one', async () => {
+    found.mockResolvedValue([candidate('a')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: false, exhaustive: true });
+    const { job } = fakeJob();
+    const result = await handleInternetSearch(job);
+    expect(result.outcome).toBe('partly_watched');
   });
 
   it('calls a search partial when one video was watched and another could not be', async () => {
@@ -208,9 +233,9 @@ describe('what a finished internet search is allowed to claim', () => {
   it('calls it a match when the video was watched through and something was found', async () => {
     found.mockResolvedValue([candidate('a')]);
     inspect.mockImplementation(async ({ plan }) => {
-      if (plan.mode === 'coarse' && plan.startSeconds === 0) return { moments: [{ startSeconds: 2, endSeconds: 3, description: 'Maybe.' }], exhausted: true, exhaustive: false };
+      if (plan.mode === 'coarse' && plan.startSeconds === 0) return { moments: [{ startSeconds: 2, endSeconds: 3, description: 'Maybe.' }], exhausted: true, exhaustive: true };
       if (plan.mode === 'continuous') return { moments: [{ startSeconds: 2, endSeconds: 5, description: 'A dog on a skateboard.' }], exhausted: true, exhaustive: true };
-      return { moments: [], exhausted: true, exhaustive: false };
+      return { moments: [], exhausted: true, exhaustive: true };
     });
     const { job } = fakeJob();
     const result = await handleInternetSearch(job);

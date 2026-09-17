@@ -236,10 +236,20 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   // cancelled search — neither of which says whether the video was opened.
   const watchedCandidates = new Set(successful.map((inspection) => inspection.candidateId));
   const failedInspections = result.inspections.filter((inspection) => !inspection.success);
-  const failedCandidates = new Set(failedInspections.map((inspection) => inspection.candidateId));
-  // Watched right through means every range a scout took came back. One failed
-  // range leaves a stretch of that video nobody opened.
-  const fullyWatched = [...watchedCandidates].filter((id) => !failedCandidates.has(id));
+  // Watched right through means every second of the video was actually seen —
+  // which is stricter than every watch coming back. A coarse scan samples a
+  // second out of every five and reports `exhaustive: false` having succeeded,
+  // and a watch stopped by its event cap reports `exhausted: false`. Counting
+  // either as full coverage would let a fifth of a video stand in for all of
+  // it, which is the same false absence this whole path exists to prevent,
+  // one level down. A failed inspection carries both flags false already, so
+  // this excludes those too.
+  const seenInFull = new Map<string, boolean>();
+  for (const inspection of result.inspections) {
+    const whole = inspection.exhaustive === true && inspection.exhausted === true;
+    seenInFull.set(inspection.candidateId, (seenInFull.get(inspection.candidateId) ?? true) && whole);
+  }
+  const fullyWatched = [...seenInFull.entries()].filter(([, whole]) => whole).map(([id]) => id);
   const failureReasons = failedInspections.map((inspection) => inspection.failureReason ?? 'the watch failed without saying why');
   const ending = decideEnding({
     candidatesFound: candidates.length,

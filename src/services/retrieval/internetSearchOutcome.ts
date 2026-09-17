@@ -31,13 +31,19 @@ export interface InternetSearchCoverage {
   /** Of those, the ones at least one scout got any watch out of at all. */
   candidatesWatched: number;
   /**
-   * Of those, the ones watched right through with nothing failing.
+   * Of those, the ones where every second was actually seen.
    *
-   * Counted separately because coverage can be lost inside a single video as
-   * well as across the set: four scouts take a quarter of a video each, and
-   * three succeeding while the fourth fails leaves a quarter nobody opened.
-   * That video was watched, but not watched through, and a search resting on
-   * it has not earned the right to say the thing was not there.
+   * Not the same as "no watch failed", and the difference is the whole point.
+   * Coverage is lost two ways inside a single video. Four scouts take a
+   * quarter each, and three succeeding while the fourth fails leaves a
+   * quarter nobody opened. And a coarse scan — which is how every candidate
+   * is first read — samples a second out of every five by design, so it
+   * succeeds having seen a fifth of what it was pointed at.
+   *
+   * Both are watched. Neither is watched through, and a search resting on
+   * either has not earned the right to say the thing was not there. The
+   * caller reads this from the `exhaustive` and `exhausted` telemetry rather
+   * than from success, because success only says the watch came back.
    */
   candidatesFullyWatched: number;
   /** Moments approved across every video. Never decides the outcome alone. */
