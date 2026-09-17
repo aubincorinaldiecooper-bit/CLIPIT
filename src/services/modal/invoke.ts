@@ -33,6 +33,10 @@ function configured(label: string): void {
   if (!env.MODAL_TOKEN_ID || !env.MODAL_TOKEN_SECRET) throw new ExternalServiceError(label, `${label} is not configured`, { retryable: false });
 }
 
+function truthy(value: string | undefined): boolean {
+  return ['1', 'true', 'yes', 'on'].includes((value ?? '').trim().toLowerCase());
+}
+
 function key(target: ModalTarget): string { return `${target.app}/${target.className}/${target.method}`; }
 
 function lookup(target: ModalTarget): Promise<Function_> {
@@ -40,7 +44,18 @@ function lookup(target: ModalTarget): Promise<Function_> {
   let handle = handles.get(cacheKey);
   if (!handle) {
     handle = (async () => {
-      const cls = await modalClient().cls.fromName(target.app, target.className);
+      let cls = await modalClient().cls.fromName(target.app, target.className);
+      // Realtime v2 uses four logical scouts, but the first operating target is
+      // one physical L4. Modal input concurrency lets those long-lived stream
+      // sessions share the one loaded model instead of autoscaling four copies.
+      if (target.label === 'videochat3-watch-stream' && truthy(process.env.VIDEO_STREAM_V2)) {
+        const shared = !['0', 'false', 'no', 'off'].includes((process.env.VIDEOCHAT3_SHARED_GPU_STREAMS ?? '').trim().toLowerCase());
+        if (shared) {
+          cls = cls
+            .withOptions({ maxContainers: 1, scaledownWindowMs: 120_000 })
+            .withConcurrency({ maxInputs: 4, targetInputs: 4 });
+        }
+      }
       const instance = await cls.instance();
       return instance.method(target.method);
     })();
