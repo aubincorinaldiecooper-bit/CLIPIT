@@ -15,6 +15,16 @@ export interface InternetSearchMark {
   endSeconds: number;
   /** What the watcher said was happening there. */
   description: string;
+  /**
+   * How sure the watcher said it was, 0 to 1.
+   *
+   * Absent when it did not say, which is ordinary: it is asked for a number
+   * and a model asked for something does not have to give it. Absent is not
+   * zero. This is the watcher's opinion of its own reading, not a measure of
+   * how often it is right — nothing here has ever been scored against known
+   * answers.
+   */
+  confidence?: number;
 }
 
 /**
@@ -44,6 +54,13 @@ export interface InternetSearchMoment {
   source: string | null;
   /** Everywhere the watcher approved, earliest first. Never empty. */
   marks: InternetSearchMark[];
+  /**
+   * The surest the watcher was about anything in this video, 0 to 1.
+   *
+   * Absent when it said so about none of them. A video is worth opening for
+   * its best moment, so the best is what the card carries.
+   */
+  confidence?: number;
 }
 
 /**

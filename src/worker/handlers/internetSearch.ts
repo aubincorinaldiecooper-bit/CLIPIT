@@ -27,15 +27,26 @@ function sourceOf(candidate: Candidate): string | null {
  * card or a second copy of itself.
  */
 function asMoment(candidate: Candidate, found: SwarmMoment<Candidate>[]): InternetSearchMoment {
+  const marks = found
+    .map((moment) => ({
+      startSeconds: moment.startSeconds,
+      endSeconds: moment.endSeconds,
+      description: moment.description,
+      ...(moment.confidence === undefined ? {} : { confidence: moment.confidence }),
+    }))
+    .sort((one, other) => one.startSeconds - other.startSeconds);
+  // A video is worth opening for its best moment, so the card carries the
+  // best. Nothing at all when the watcher said so about none of them: an
+  // absent number and a low one say very different things.
+  const said = marks.map((mark) => mark.confidence).filter((value): value is number => value !== undefined);
   return {
     id: candidate.id,
     pageUrl: candidate.pageUrl,
     title: candidate.title,
     still: candidate.thumbnailUrl,
     source: sourceOf(candidate),
-    marks: found
-      .map((moment) => ({ startSeconds: moment.startSeconds, endSeconds: moment.endSeconds, description: moment.description }))
-      .sort((one, other) => one.startSeconds - other.startSeconds),
+    marks,
+    ...(said.length === 0 ? {} : { confidence: Math.max(...said) }),
   };
 }
 

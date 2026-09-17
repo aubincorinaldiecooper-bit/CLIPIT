@@ -13,6 +13,32 @@ describe('VideoChat3 Modal client contract', () => {
     vi.clearAllMocks();
   });
 
+  it('carries how sure the watcher said it was, and only when it is usable', async () => {
+    invokeModal.mockResolvedValue({
+      ok: true,
+      model: 'MCG-NJU/VideoChat3-4B',
+      revision: '37fa901',
+      duration_seconds: 60,
+      events: [
+        { start: 1, end: 2, description: 'said so', confidence: 0.8 },
+        { start: 3, end: 4, description: 'said nothing' },
+        { start: 5, end: 6, description: 'said something silly', confidence: 4.2 },
+        { start: 7, end: 8, description: 'said a word', confidence: 'very' },
+        { start: 9, end: 10, description: 'said the floor', confidence: 0 },
+      ],
+      metrics: {},
+    });
+
+    const watched = await watchWithVideoChat3({ videoUrl: 'https://example.test/v.mp4', query: 'anything' });
+
+    // Out of range and not-a-number are dropped rather than squeezed into
+    // shape: a number that arrived wrong is not evidence of anything.
+    expect(watched.events.map((event) => event.confidence)).toEqual([0.8, undefined, undefined, undefined, 0]);
+    // Zero is a real answer and survives; saying nothing is absent, not zero.
+    expect('confidence' in watched.events[1]!).toBe(false);
+    expect(watched.events[4]!.confidence).toBe(0);
+  });
+
   it('sends expected_bytes to watch, matching the deployed Python method', async () => {
     invokeModal.mockResolvedValue({
       ok: true,

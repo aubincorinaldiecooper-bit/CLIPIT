@@ -63,6 +63,41 @@ weights = modal.Volume.from_name("clipit-videochat3-weights", create_if_missing=
 _RESPONSE_RE = re.compile(r"^\s*</Response>\s*(.*)$", re.DOTALL)
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+# How sure the watcher says it is, if it says at all: a number in brackets at
+# the very end of what it said. Tolerant of a fraction or a percentage,
+# because a model asked for one will sometimes give the other.
+_SURENESS_RE = re.compile(r"\s*\[\s*(\d{1,3}(?:\.\d+)?)\s*(%?)\s*\]\s*$")
+
+# Appended to the question the watcher is answering. Kept to one sentence and
+# added at the end, because the question is what the model is being asked
+# ABOUT THE VIDEO and rewriting it would change what gets found.
+_SURENESS_ASK = (
+    " When you describe something, end with how sure you are in square"
+    " brackets, like [0.8]."
+)
+
+
+def _sureness(said: str) -> tuple[str, float | None]:
+    """Split what the watcher said from how sure it said it was.
+
+    Returns the description with the bracket removed, and the sureness as a
+    fraction — or None when it did not say, which is an ordinary outcome. A
+    model given an instruction does not have to take it, and a number invented
+    here to fill the gap would be worth less than nothing: it would look like
+    the model's judgement while being ours.
+    """
+    found = _SURENESS_RE.search(said)
+    if not found:
+        return said, None
+    value = float(found.group(1))
+    # A percentage either because it was marked as one, or because a fraction
+    # cannot be greater than 1 and 80 plainly means 80%.
+    if found.group(2) == "%" or value > 1:
+        value = value / 100.0
+    if value < 0 or value > 1:
+        return said[: found.start()].rstrip(), None
+    return said[: found.start()].rstrip(), value
+
 
 def _download(url: str, destination: Path, expected_bytes: int | None = None) -> int:
     request = urllib.request.Request(url, headers={"User-Agent": "clipit-videochat3/1"})
@@ -267,7 +302,7 @@ class VideoChat3Service:
         started = time.time()
         session = self.StreamingSession(
             self.engine,
-            question=query,
+            question=query + _SURENESS_ASK,
             question_time=0,
             max_rounds=max_rounds,
             global_question=True,
@@ -326,12 +361,18 @@ class VideoChat3Service:
                 frames_seen += 1
                 response = _RESPONSE_RE.match(answer or "")
                 if response:
+                    described, sureness = _sureness(response.group(1).strip())
                     event = {
                         "type": "moment",
                         "start": round(start_seconds, 3),
                         "end": round(end_seconds, 3),
-                        "description": response.group(1).strip()[:1000],
+                        "description": described[:1000],
                     }
+                    # Absent rather than zero when the watcher did not say: a
+                    # zero would read as "sure it is wrong", which is not what
+                    # saying nothing means.
+                    if sureness is not None:
+                        event["confidence"] = round(sureness, 3)
                     events.append(event)
                     output_queue.put(event)
 
