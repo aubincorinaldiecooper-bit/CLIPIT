@@ -3,282 +3,185 @@ import {
   runScoutSwarm,
   SCOUT_IDS,
   type ScoutCandidate,
+  type ScoutInspectionPlan,
   type ScoutRuntime,
   type ScoutId,
 } from '../src/services/retrieval/scoutSwarm.js';
 
-interface Candidate extends ScoutCandidate {
-  label: string;
-}
+interface Candidate extends ScoutCandidate { label: string; }
 
-function runtimeFor(input: {
-  inspect: (scoutId: ScoutId, candidate: Candidate) => Promise<Array<{ startSeconds: number; endSeconds: number; description: string }>>;
-}): ScoutRuntime<Candidate> {
-  return {
-    async inspect({ scoutId, candidate }) {
-      return {
-        moments: await input.inspect(scoutId, candidate),
-        mediaSecondsObserved: 30,
-      };
-    },
-  };
-}
-
-/** A runtime that reports findings as it goes, the way a live watcher does. */
-function streamingRuntimeFor(input: {
-  frames: (candidate: Candidate) => Array<{ startSeconds: number; endSeconds: number; description: string; confidence?: number }>;
-}): ScoutRuntime<Candidate> {
-  return {
-    async inspect({ candidate, onMoment }) {
-      for (const frame of input.frames(candidate)) await onMoment?.(frame);
-      return { moments: [], mediaSecondsObserved: 30, exhausted: true };
-    },
-  };
-}
-
-/**
- * One finding per second of an event, which is what a watcher asked about each
- * frame in turn actually produces.
- */
-function secondBySecond(from: number, to: number, description: string) {
-  return Array.from({ length: to - from }, (_, index) => ({
-    startSeconds: from + index,
-    endSeconds: from + index + 1,
-    description,
-  }));
-}
+function candidate(id = 'c-1'): Candidate { return { id, label: id }; }
 
 describe('runScoutSwarm', () => {
-  it('uses exactly four scouts across the whole search and surfaces a found moment directly', async () => {
-    const inspectors = new Set<ScoutId>();
-    const progress: string[] = [];
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-1',
-      query: 'find the red backpack',
-      candidates: Array.from({ length: 8 }, (_, index) => ({ id: `c-${index + 1}`, label: `candidate ${index + 1}` })),
-      runtime: runtimeFor({
-        async inspect(scoutId, candidate) {
-          inspectors.add(scoutId);
-          if (candidate.id !== 'c-1') return [];
-          return [{ startSeconds: 10, endSeconds: 32, description: 'A person picks up the red backpack.' }];
-        },
-      }),
-      onProgress(event) {
-        progress.push(event.event);
+  it('splits one candidate into four concurrent 150-second coarse sections', async () => {
+    const seen: Array<{ scoutId: ScoutId; plan: ScoutInspectionPlan }> = [];
+    const runtime: ScoutRuntime<Candidate> = {
+      async inspect({ scoutId, plan }) {
+        seen.push({ scoutId, plan });
+        return { moments: [], mediaSecondsObserved: 30, exhausted: true, exhaustive: false };
       },
-    });
+    };
+
+    const result = await runScoutSwarm({ searchId: 's', query: 'thing', candidates: [candidate()], runtime });
 
     expect(SCOUT_IDS).toHaveLength(4);
     expect(result.scoutCount).toBe(4);
-    expect(inspectors.size).toBeLessThanOrEqual(4);
-    expect(result.moments).toHaveLength(1);
-    expect(result.moments[0]?.candidate.id).toBe('c-1');
-    expect(progress).toContain('moment.found');
+    expect(seen).toHaveLength(4);
+    expect(seen.map((row) => [row.plan.startSeconds, row.plan.endSeconds])).toEqual([
+      [0, 150],
+      [150, 300],
+      [300, 450],
+      [450, 600],
+    ]);
+    expect(seen.every((row) => row.plan.mode === 'coarse')).toBe(true);
+    expect(result.metrics.mediaSecondsObserved).toBe(120);
   });
 
-  it('does not require replay or independent verification before returning a relevant moment', async () => {
-    let inspections = 0;
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-2',
-      query: 'find the wave',
-      candidates: [{ id: 'only', label: 'only candidate' }],
-      runtime: runtimeFor({
-        async inspect() {
-          inspections += 1;
-          return [{ startSeconds: 4, endSeconds: 12, description: 'The person waves.' }];
-        },
-      }),
+  it('caps ranked candidates at seven', async () => {
+    let calls = 0;
+    const runtime: ScoutRuntime<Candidate> = {
+      async inspect() {
+        calls += 1;
+        return { moments: [], exhausted: true, exhaustive: false };
+      },
+    };
+    const result = await runScoutSwarm({
+      searchId: 's', query: 'thing', runtime,
+      candidates: Array.from({ length: 12 }, (_, index) => candidate(`c-${index + 1}`)),
     });
-
-    expect(inspections).toBe(1);
-    expect(result.moments).toHaveLength(1);
-    expect(result.metrics.inspectOperations).toBe(1);
+    expect(result.status).toBe('ceiling_reached');
+    expect(result.candidatesConsidered).toBe(7);
+    expect(result.candidatesCompleted).toBe(7);
+    expect(calls).toBe(28);
   });
 
-  it('does not force moments when scouts find none', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-3',
-      query: 'find something that is not present',
-      candidates: [
-        { id: 'a', label: 'a' },
-        { id: 'b', label: 'b' },
-      ],
-      runtime: runtimeFor({
-        async inspect() {
-          return [];
-        },
-      }),
-    });
-
+  it('does not spend dense inference when coarse search finds nothing', async () => {
+    const modes: string[] = [];
+    const runtime: ScoutRuntime<Candidate> = {
+      async inspect({ plan }) {
+        modes.push(plan.mode);
+        return { moments: [], exhausted: true, exhaustive: false };
+      },
+    };
+    const result = await runScoutSwarm({ searchId: 's', query: 'missing', candidates: [candidate()], runtime });
+    expect(modes).toEqual(['coarse', 'coarse', 'coarse', 'coarse']);
     expect(result.moments).toEqual([]);
   });
 
-  it('allows exactly one valid result without trying to manufacture more', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-4',
-      query: 'find the only occurrence',
-      candidates: [
-        { id: 'a', label: 'a' },
-        { id: 'b', label: 'b' },
-        { id: 'c', label: 'c' },
-      ],
-      runtime: runtimeFor({
-        async inspect(_scoutId, candidate) {
-          return candidate.id === 'b'
-            ? [{ startSeconds: 20, endSeconds: 45, description: 'The only matching moment.' }]
-            : [];
-        },
-      }),
-    });
-
-    expect(result.moments).toHaveLength(1);
-    expect(result.moments[0]?.candidate.id).toBe('b');
-  });
-
-  it('caps the search at fifteen candidates', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-5',
-      query: 'anything',
-      candidates: Array.from({ length: 20 }, (_, index) => ({ id: `candidate-${index}`, label: String(index) })),
-      runtime: runtimeFor({
-        async inspect() {
-          return [];
-        },
-      }),
-    });
-
-    expect(result.status).toBe('ceiling_reached');
-    expect(result.candidatesConsidered).toBe(15);
-    expect(result.candidatesCompleted).toBe(15);
-  });
-  it('keeps one card for one event when the watcher answers about every frame', async () => {
-    const events: string[] = [];
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-6',
-      query: 'find when the skateboarder falls',
-      candidates: [{ id: 'only', label: 'only candidate' }],
-      runtime: streamingRuntimeFor({ frames: () => secondBySecond(42, 46, 'The skateboarder loses balance.') }),
-      onProgress(progress) {
-        events.push(progress.event);
+  it('uses a coarse hit only as a locator and surfaces the dense re-watch result', async () => {
+    const plans: ScoutInspectionPlan[] = [];
+    const runtime: ScoutRuntime<Candidate> = {
+      async inspect({ plan, onMoment }) {
+        plans.push(plan);
+        if (plan.mode === 'coarse' && plan.startSeconds === 150) {
+          return {
+            moments: [{ startSeconds: 210, endSeconds: 211, description: 'Possible red backpack.', confidence: 0.55 }],
+            exhausted: true,
+            exhaustive: false,
+          };
+        }
+        if (plan.mode === 'continuous') {
+          const dense = { startSeconds: 209.5, endSeconds: 212, description: 'A person picks up the red backpack.', confidence: 0.93 };
+          await onMoment?.(dense);
+          return { moments: [], exhausted: true, exhaustive: true };
+        }
+        return { moments: [], exhausted: true, exhaustive: false };
       },
+    };
+    const events: string[] = [];
+    const result = await runScoutSwarm({
+      searchId: 's', query: 'red backpack', candidates: [candidate()], runtime,
+      onProgress(progress) { events.push(progress.event); },
     });
 
+    expect(plans.filter((plan) => plan.mode === 'continuous')).toHaveLength(1);
+    expect(plans.find((plan) => plan.mode === 'continuous')).toMatchObject({ startSeconds: 204, endSeconds: 217 });
     expect(result.moments).toHaveLength(1);
-    expect(result.moments[0]?.startSeconds).toBe(42);
-    expect(result.moments[0]?.endSeconds).toBe(46);
-    expect(result.moments[0]?.description).toBe('The skateboarder loses balance.');
-    expect(events.filter((event) => event === 'moment.found')).toHaveLength(1);
-    expect(events.filter((event) => event === 'moment.extended')).toHaveLength(3);
+    expect(result.moments[0]).toMatchObject({ startSeconds: 209.5, endSeconds: 212, confidence: 0.93 });
+    expect(result.moments[0]?.description).toBe('A person picks up the red backpack.');
+    expect(events).toContain('moment.found');
+    expect(JSON.stringify(result.moments)).not.toContain('Possible red backpack');
   });
 
-  it('keeps the surest look when the same event is seen frame after frame', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-11',
-      query: 'find the fall',
-      candidates: [{ id: 'only', label: 'only candidate' }],
-      runtime: streamingRuntimeFor({
-        frames: () => [
-          { startSeconds: 10, endSeconds: 11, description: 'He falls.', confidence: 0.4 },
-          { startSeconds: 11, endSeconds: 12, description: 'He falls.', confidence: 0.9 },
-          { startSeconds: 12, endSeconds: 13, description: 'He falls.', confidence: 0.5 },
-        ],
-      }),
-    });
-
-    // The frames either side of a clear one are the event's edges, where the
-    // thing is half in view. The moment is as sure as its best look, not as
-    // unsure as its worst.
+  it('deduplicates overlapping coarse hits before dense re-watch', async () => {
+    let denseCalls = 0;
+    const runtime: ScoutRuntime<Candidate> = {
+      async inspect({ plan }) {
+        if (plan.mode === 'coarse' && plan.startSeconds === 0) {
+          return {
+            moments: [
+              { startSeconds: 20, endSeconds: 21, description: 'Maybe.' },
+              { startSeconds: 22, endSeconds: 23, description: 'Maybe.' },
+            ],
+            exhausted: true,
+            exhaustive: false,
+          };
+        }
+        if (plan.mode === 'continuous') {
+          denseCalls += 1;
+          return { moments: [{ startSeconds: 20, endSeconds: 23, description: 'Confirmed.' }], exhausted: true, exhaustive: true };
+        }
+        return { moments: [], exhausted: true, exhaustive: false };
+      },
+    };
+    const result = await runScoutSwarm({ searchId: 's', query: 'thing', candidates: [candidate()], runtime });
+    expect(denseCalls).toBe(1);
     expect(result.moments).toHaveLength(1);
-    expect(result.moments[0]?.confidence).toBe(0.9);
-  })
+  });
 
-  it('leaves a moment with no number when the watcher never gave one', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-12',
-      query: 'find the fall',
-      candidates: [{ id: 'only', label: 'only candidate' }],
-      runtime: streamingRuntimeFor({ frames: () => secondBySecond(10, 13, 'He falls.') }),
-    });
+  it('keeps separate dense findings as separate moments', async () => {
+    const runtime: ScoutRuntime<Candidate> = {
+      async inspect({ plan }) {
+        if (plan.mode === 'coarse' && plan.startSeconds === 0) {
+          return {
+            moments: [
+              { startSeconds: 20, endSeconds: 21, description: 'First maybe.' },
+              { startSeconds: 80, endSeconds: 81, description: 'Second maybe.' },
+            ],
+            exhausted: true,
+            exhaustive: false,
+          };
+        }
+        if (plan.mode === 'continuous' && plan.startSeconds < 50) {
+          return { moments: [{ startSeconds: 20, endSeconds: 22, description: 'First confirmed.' }], exhausted: true, exhaustive: true };
+        }
+        if (plan.mode === 'continuous') {
+          return { moments: [{ startSeconds: 80, endSeconds: 82, description: 'Second confirmed.' }], exhausted: true, exhaustive: true };
+        }
+        return { moments: [], exhausted: true, exhaustive: false };
+      },
+    };
+    const result = await runScoutSwarm({ searchId: 's', query: 'thing', candidates: [candidate()], runtime });
+    expect(result.moments.map((moment) => moment.startSeconds)).toEqual([20, 80]);
+  });
 
+  it('marks sparse candidates as partly examined so zero is not presented as exhaustive absence', async () => {
+    const runtime: ScoutRuntime<Candidate> = {
+      async inspect() { return { moments: [], exhausted: true, exhaustive: false }; },
+    };
+    const result = await runScoutSwarm({ searchId: 's', query: 'missing', candidates: [candidate()], runtime });
+    expect(result.candidatesPartlyExamined).toBe(1);
+  });
+
+  it('merges frame-by-frame dense repeats of the same event and keeps the strongest confidence', async () => {
+    const runtime: ScoutRuntime<Candidate> = {
+      async inspect({ plan, onMoment }) {
+        if (plan.mode === 'coarse' && plan.startSeconds === 0) {
+          return { moments: [{ startSeconds: 10, endSeconds: 11, description: 'Maybe.' }], exhausted: true, exhaustive: false };
+        }
+        if (plan.mode === 'continuous') {
+          for (const row of [
+            { startSeconds: 10, endSeconds: 11, description: 'He falls.', confidence: 0.4 },
+            { startSeconds: 11, endSeconds: 12, description: 'He falls.', confidence: 0.9 },
+            { startSeconds: 12, endSeconds: 13, description: 'He falls.', confidence: 0.5 },
+          ]) await onMoment?.(row);
+          return { moments: [], exhausted: true, exhaustive: true };
+        }
+        return { moments: [], exhausted: true, exhaustive: false };
+      },
+    };
+    const result = await runScoutSwarm({ searchId: 's', query: 'fall', candidates: [candidate()], runtime });
     expect(result.moments).toHaveLength(1);
-    expect(result.moments[0]?.confidence).toBeUndefined()
-  })
-
-  it('starts a new moment when the next finding is not part of the same event', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-7',
-      query: 'find every wave',
-      candidates: [{ id: 'only', label: 'only candidate' }],
-      runtime: streamingRuntimeFor({
-        frames: () => [...secondBySecond(10, 12, 'She waves.'), ...secondBySecond(30, 31, 'She waves again.')],
-      }),
-    });
-
-    expect(result.moments).toHaveLength(2);
-    expect(result.moments[0]).toMatchObject({ startSeconds: 10, endSeconds: 12, description: 'She waves.' });
-    expect(result.moments[1]).toMatchObject({ startSeconds: 30, endSeconds: 31, description: 'She waves again.' });
-  });
-
-  it('keeps two things seen a second apart as two moments, not one', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-10',
-      query: 'find people waving',
-      candidates: [{ id: 'only', label: 'only candidate' }],
-      runtime: streamingRuntimeFor({
-        frames: () => [
-          ...secondBySecond(10, 11, 'A woman waves from the left.'),
-          ...secondBySecond(12, 13, 'A man waves from the right.'),
-        ],
-      }),
-    });
-
-    // One second apart, so near enough in time to join. Different accounts of
-    // what is happening, so two different things: keeping one would put the
-    // woman's words over the man's moment and lose his entirely.
-    expect(result.moments).toHaveLength(2);
-    expect(result.moments.map((moment) => moment.description)).toEqual([
-      'A woman waves from the left.',
-      'A man waves from the right.',
-    ]);
-    expect(result.moments.map((moment) => [moment.startSeconds, moment.endSeconds])).toEqual([
-      [10, 11],
-      [12, 13],
-    ]);
-  });
-
-  it('never joins findings that came from two different pages', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-8',
-      query: 'find the dog',
-      candidates: [
-        { id: 'a', label: 'a' },
-        { id: 'b', label: 'b' },
-      ],
-      runtime: streamingRuntimeFor({ frames: (candidate) => secondBySecond(5, 8, `A dog on ${candidate.id}.`) }),
-    });
-
-    // One moment per page: each page's own run joins up, and the two pages
-    // never join each other however close their timestamps are.
-    expect(result.moments).toHaveLength(2);
-    expect(result.moments.map((moment) => moment.candidate.id).sort()).toEqual(['a', 'b']);
-    for (const moment of result.moments) expect(moment).toMatchObject({ startSeconds: 5, endSeconds: 8 });
-  });
-
-  it('stops a moment growing at the maximum length instead of making one long card', async () => {
-    const result = await runScoutSwarm<Candidate>({
-      searchId: 'search-9',
-      query: 'find the thing that never stops',
-      candidates: [{ id: 'only', label: 'only candidate' }],
-      maxMomentSeconds: 4,
-      runtime: streamingRuntimeFor({ frames: () => secondBySecond(0, 10, 'It is still happening.') }),
-    });
-
-    // Ten seconds of continuous matching, cut into the longest moments the
-    // ceiling allows rather than one card per second or one card of ten.
-    expect(result.moments.map((moment) => [moment.startSeconds, moment.endSeconds])).toEqual([
-      [0, 4],
-      [4, 8],
-      [8, 10],
-    ]);
+    expect(result.moments[0]).toMatchObject({ startSeconds: 10, endSeconds: 13, confidence: 0.9 });
   });
 });
