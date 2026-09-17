@@ -1,0 +1,44 @@
+name: Deploy VideoChat3 to Modal
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "modal/videochat3.py"
+      - "scripts/verify-modal-videochat3.py"
+      - ".github/workflows/modal-videochat3-deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: modal-videochat3-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy VideoChat3
+    runs-on: ubuntu-latest
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Modal
+        run: python -m pip install "modal==1.5.0"
+
+      - name: Deploy VideoChat3 to Modal main
+        run: modal deploy -e main modal/videochat3.py
+
+      - name: Verify deployed VideoChat3 contract
+        run: python scripts/verify-modal-videochat3.py
