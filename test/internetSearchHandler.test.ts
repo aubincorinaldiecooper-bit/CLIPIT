@@ -11,7 +11,10 @@ vi.mock('../src/services/discovery/searxng.js', () => ({ search: () => found() }
 vi.mock('../src/services/retrieval/videoModelScoutRuntime.js', () => ({
   createVideoModelScoutRuntime: () => ({ inspect: (input: { candidate: Candidate; plan: ScoutInspectionPlan; onMoment?: (moment: any) => Promise<void> | void }) => inspect(input) }),
 }));
-vi.mock('../src/services/video/adapters/videochat3.js', () => ({ videoChat3Adapter: { id: 'videochat3', sourceKinds: new Set(['frame-stream']) } }));
+const assertReady = vi.fn<[string], Promise<void>>();
+vi.mock('../src/services/video/adapters/videochat3.js', () => ({
+  videoChat3Adapter: { id: 'videochat3', sourceKinds: new Set(['frame-stream']), assertReady: (kind: string) => assertReady(kind) },
+}));
 
 const { handleInternetSearch } = await import('../src/worker/handlers/internetSearch.js');
 
@@ -31,6 +34,8 @@ function fakeJob() {
 beforeEach(() => {
   found.mockReset();
   inspect.mockReset();
+  assertReady.mockReset();
+  assertReady.mockResolvedValue(undefined);
   process.env.WEB_ACCESS_URL = 'http://web-access.internal:8080';
   process.env.WEB_ACCESS_INTERNAL_TOKEN = 'token';
   process.env.VIDEO_STREAM_V2 = 'true';
@@ -44,7 +49,7 @@ describe('internet search handler', () => {
     const { job, reported } = fakeJob();
     const result = await handleInternetSearch(job);
     expect(reported[0]).toEqual({ phase: 'loading', moments: [], candidatesFound: 0 });
-    expect(result).toEqual({ phase: 'answered', moments: [], candidatesFound: 0 });
+    expect(result).toEqual({ phase: 'answered', moments: [], candidatesFound: 0, candidatesWatched: 0, outcome: 'no_candidates' });
   });
 
   it('limits the ranked discovery set to seven videos', async () => {
@@ -130,5 +135,121 @@ describe('internet search handler', () => {
     const { job } = fakeJob();
     const result = await handleInternetSearch(job);
     expect(result.unexamined).toBeGreaterThanOrEqual(2);
+  });
+});
+
+/**
+ * The 17 September production failure, and the four other ways a search can
+ * end. Every one of these ran green before the fix and told the person the
+ * same thing: an empty list. The point of these is that the five endings are
+ * now distinguishable, and that only two of them are allowed to mean "we
+ * looked and it is not there".
+ */
+describe('what a finished internet search is allowed to claim', () => {
+  const DEPLOYED_WITHOUT_THE_METHOD =
+    "Modal cannot find clipit-videochat3/VideoChat3Service in main (Method 'watch_stream' not found on class)";
+
+  it('does not say nothing matched when every watch failed', async () => {
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockRejectedValue(new Error(DEPLOYED_WITHOUT_THE_METHOD));
+    const { job, reported } = fakeJob();
+    const result = await handleInternetSearch(job);
+
+    expect(result.phase).toBe('failed');
+    expect(result.outcome).toBe('watch_failed');
+    expect(result.candidatesWatched).toBe(0);
+    expect(result.moments).toEqual([]);
+    expect(result.failure).toEqual({ kind: 'video_model_unavailable', count: 8 });
+    // Nothing that reaches the screen may be read as an answer about the videos.
+    expect(reported.at(-1)?.outcome).toBe('watch_failed');
+  });
+
+  it('says nothing matched when every video was watched right through and had nothing', async () => {
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: false });
+    const { job } = fakeJob();
+    const result = await handleInternetSearch(job);
+
+    expect(result.phase).toBe('answered');
+    expect(result.outcome).toBe('no_matches');
+    expect(result.candidatesWatched).toBe(2);
+    expect(result.failure).toBeUndefined();
+  });
+
+  it('calls a search partial when one video was watched and another could not be', async () => {
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockImplementation(async ({ candidate: page }) => {
+      if (page.id === 'a') throw new Error('the browser refused to watch this page (503)');
+      return { moments: [], exhausted: true, exhaustive: false };
+    });
+    const { job } = fakeJob();
+    const result = await handleInternetSearch(job);
+
+    expect(result.outcome).toBe('partly_watched');
+    expect(result.candidatesWatched).toBe(1);
+    expect(result.failure).toEqual({ kind: 'browser_unavailable', count: 4 });
+  });
+
+  it('calls a search partial when a stretch of the only video was never opened', async () => {
+    found.mockResolvedValue([candidate('a')]);
+    let calls = 0;
+    inspect.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('the video never started playing');
+      return { moments: [], exhausted: true, exhaustive: false };
+    });
+    const { job } = fakeJob();
+    const result = await handleInternetSearch(job);
+
+    expect(result.outcome).toBe('partly_watched');
+    expect(result.candidatesWatched).toBe(1);
+  });
+
+  it('calls it a match when the video was watched through and something was found', async () => {
+    found.mockResolvedValue([candidate('a')]);
+    inspect.mockImplementation(async ({ plan }) => {
+      if (plan.mode === 'coarse' && plan.startSeconds === 0) return { moments: [{ startSeconds: 2, endSeconds: 3, description: 'Maybe.' }], exhausted: true, exhaustive: false };
+      if (plan.mode === 'continuous') return { moments: [{ startSeconds: 2, endSeconds: 5, description: 'A dog on a skateboard.' }], exhausted: true, exhaustive: true };
+      return { moments: [], exhausted: true, exhaustive: false };
+    });
+    const { job } = fakeJob();
+    const result = await handleInternetSearch(job);
+
+    expect(result.phase).toBe('answered');
+    expect(result.outcome).toBe('matched');
+    expect(result.moments).toHaveLength(1);
+    expect(result.failure).toBeUndefined();
+  });
+});
+
+describe('refusing to search against a watcher that cannot take the call', () => {
+  it('stops before any page is opened, and says so', async () => {
+    found.mockResolvedValue([candidate('a'), candidate('b'), candidate('c')]);
+    assertReady.mockRejectedValue(new Error("Modal cannot find clipit-videochat3/VideoChat3Service in main (Method 'watch_stream' not found on class)"));
+    const { job, reported } = fakeJob();
+    const result = await handleInternetSearch(job);
+
+    expect(result.phase).toBe('failed');
+    expect(result.outcome).toBe('watch_failed');
+    expect(result.failure?.kind).toBe('video_model_unavailable');
+    // The whole point: not one browser session, not one Modal queue.
+    expect(inspect).not.toHaveBeenCalled();
+    // And the screen is never told pages are being watched when none will be.
+    expect(reported.some((step) => step.phase === 'searching')).toBe(false);
+  });
+
+  it('checks the method the scouts will actually call, not merely that something is deployed', async () => {
+    found.mockResolvedValue([candidate('a')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: false });
+    const { job } = fakeJob();
+    await handleInternetSearch(job);
+    expect(assertReady).toHaveBeenCalledWith('frame-stream');
+  });
+
+  it('does not reach for the watcher at all when there is nothing to watch', async () => {
+    found.mockResolvedValue([]);
+    const { job } = fakeJob();
+    await handleInternetSearch(job);
+    expect(assertReady).not.toHaveBeenCalled();
   });
 });

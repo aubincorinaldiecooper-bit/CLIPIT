@@ -2,6 +2,7 @@ import type { Job } from 'bullmq';
 import { logger } from '../../lib/logger.js';
 import type { InternetSearchJob, InternetSearchMoment, InternetSearchProgress } from '../../queues/internetSearch.js';
 import { search, type Candidate } from '../../services/discovery/searxng.js';
+import { decideEnding } from '../../services/retrieval/internetSearchOutcome.js';
 import { runScoutSwarm, type ScoutInspectionPlan, type ScoutId, type SwarmMoment } from '../../services/retrieval/scoutSwarm.js';
 import { createVideoModelScoutRuntime } from '../../services/retrieval/videoModelScoutRuntime.js';
 import { videoChat3Adapter } from '../../services/video/adapters/videochat3.js';
@@ -106,7 +107,7 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const discovered = await search(job.data.query);
   const discoveryMs = Date.now() - discoveryStartedAt;
   if (discovered.length === 0) {
-    const done: InternetSearchProgress = { phase: 'answered', moments: [], candidatesFound: 0 };
+    const done: InternetSearchProgress = { phase: 'answered', moments: [], candidatesFound: 0, candidatesWatched: 0, outcome: 'no_candidates' };
     await report(done);
     log.info('internet search finished', {
       model: videoChat3Adapter.id,
@@ -118,7 +119,7 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
       marks: 0,
       wall_ms: Date.now() - searchStartedAt,
       status: 'completed',
-      zero_reason: 'discovery returned no candidates',
+      outcome: 'no_candidates',
     });
     return done;
   }
@@ -148,6 +149,44 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     coarse_stride_seconds: coarseStrideSeconds,
     dense_padding_seconds: densePaddingSeconds,
   });
+
+  // Being deployed is not the same as being able to take the call. If the
+  // watcher cannot, there is nothing to learn from finding that out once per
+  // page: stop here, name it, and spend nothing on browsers or queues.
+  try {
+    await videoChat3Adapter.assertReady?.('frame-stream');
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    const ending = decideEnding({ candidatesFound: candidates.length, candidatesWatched: 0, candidatesFullyWatched: 0, momentsFound: 0, failureReasons: [reason] });
+    const done: InternetSearchProgress = {
+      phase: ending.phase,
+      moments: [],
+      candidatesFound: candidates.length,
+      candidatesWatched: 0,
+      unexamined: candidates.length,
+      outcome: ending.outcome,
+      ...(ending.failure ? { failure: ending.failure } : {}),
+    };
+    await report(done);
+    log.error('internet search could not start', {
+      model: videoChat3Adapter.id,
+      stream_v2: realtimeV2,
+      query_length: job.data.query.length,
+      discovery_ms: discoveryMs,
+      candidates_discovered: discovered.length,
+      candidates_selected: candidates.length,
+      candidates_watched: 0,
+      videos: 0,
+      marks: 0,
+      unexamined: candidates.length,
+      outcome: ending.outcome,
+      failure_kind: ending.failure?.kind ?? null,
+      readiness_reason: reason,
+      wall_ms: Date.now() - searchStartedAt,
+      status: 'failed',
+    });
+    return done;
+  }
 
   const runtime = createVideoModelScoutRuntime<Candidate>({
     model: videoChat3Adapter,
@@ -189,15 +228,38 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const neverReached = Math.max(0, result.candidatesAvailable - result.candidatesConsidered);
   const notStarted = Math.max(0, result.candidatesConsidered - result.candidatesCompleted);
   const unexamined = result.failures.length + result.candidatesPartlyExamined + neverReached + notStarted;
+
+  const successful = result.inspections.filter((inspection) => inspection.success);
+  // A video counts as watched when at least one scout got a watch out of it.
+  // Read from the inspections and not from `failures`, which also holds
+  // moments rejected for being too long and drops inspections cut short by a
+  // cancelled search — neither of which says whether the video was opened.
+  const watchedCandidates = new Set(successful.map((inspection) => inspection.candidateId));
+  const failedInspections = result.inspections.filter((inspection) => !inspection.success);
+  const failedCandidates = new Set(failedInspections.map((inspection) => inspection.candidateId));
+  // Watched right through means every range a scout took came back. One failed
+  // range leaves a stretch of that video nobody opened.
+  const fullyWatched = [...watchedCandidates].filter((id) => !failedCandidates.has(id));
+  const failureReasons = failedInspections.map((inspection) => inspection.failureReason ?? 'the watch failed without saying why');
+  const ending = decideEnding({
+    candidatesFound: candidates.length,
+    candidatesWatched: watchedCandidates.size,
+    candidatesFullyWatched: fullyWatched.length,
+    momentsFound: moments.length,
+    failureReasons,
+  });
+
   const done: InternetSearchProgress = {
-    phase: 'answered',
+    phase: ending.phase,
     moments,
     candidatesFound: candidates.length,
+    candidatesWatched: ending.candidatesWatched,
+    outcome: ending.outcome,
     ...(unexamined > 0 ? { unexamined } : {}),
+    ...(ending.failure ? { failure: ending.failure } : {}),
   };
   await report(done);
 
-  const successful = result.inspections.filter((inspection) => inspection.success);
   const inspectionMetrics = successful.map((inspection) => inspection.metrics);
   const containers = [...new Set(inspectionMetrics.map((metrics) => text(metrics, 'container')).filter((value): value is string => value !== null))];
   const framesSent = sum(inspectionMetrics.map((metrics) => numeric(metrics, 'client_frames_sent')));
@@ -220,7 +282,8 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     description: moment.description,
   }));
 
-  log.info('internet search finished', {
+  const record = ending.phase === 'failed' ? log.error.bind(log) : log.info.bind(log);
+  record(ending.phase === 'failed' ? 'internet search failed' : 'internet search finished', {
     model: videoChat3Adapter.id,
     stream_v2: realtimeV2,
     query_length: job.data.query.length,
@@ -234,6 +297,11 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     candidates_discovered: discovered.length,
     videos: moments.length,
     marks: moments.reduce((total, moment) => total + moment.marks.length, 0),
+    candidates_watched: watchedCandidates.size,
+    candidates_watched_through: fullyWatched.length,
+    outcome: ending.outcome,
+    failure_kind: ending.failure?.kind ?? null,
+    failure_count: ending.failure?.count ?? 0,
     candidates_considered: result.candidatesConsidered,
     candidates_completed: result.candidatesCompleted,
     partly_examined: result.candidatesPartlyExamined,
@@ -242,7 +310,8 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     first_moment_ms: result.metrics.firstMomentMs,
     unexamined,
     failures: result.failures,
-    status: result.status,
+    status: ending.phase === 'failed' ? 'failed' : result.status,
+    swarm_status: result.status,
     wall_ms: result.metrics.wallMs,
     total_request_wall_ms: Date.now() - searchStartedAt,
     frames_sent: framesSent,

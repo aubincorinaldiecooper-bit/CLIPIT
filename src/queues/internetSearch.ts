@@ -64,25 +64,82 @@ export interface InternetSearchMoment {
 }
 
 /**
+ * Why a search ended, and whether its silence means anything.
+ *
+ * "Nothing matched" and "we could not look" are different answers, and only
+ * one of them is about the videos. These five say which was true, so that a
+ * search that never managed to watch anything can never be drawn as a search
+ * that watched everything and came back empty.
+ */
+export type InternetSearchOutcome =
+  /** Discovery turned up no video pages at all. There was nothing to watch. */
+  | 'no_candidates'
+  /** Every video found was watched. None of them had the thing in it. */
+  | 'no_matches'
+  /** Every video found was watched, and at least one had the thing in it. */
+  | 'matched'
+  /** Some videos were watched and some could not be. What came back is partial. */
+  | 'partly_watched'
+  /** Videos were found and not one could be watched. Nothing was looked at. */
+  | 'watch_failed';
+
+/**
+ * What went wrong, in the coarsest terms that are still useful.
+ *
+ * Deliberately a short fixed list rather than the underlying error text. The
+ * real reasons are kept in the worker log, where they belong: they name
+ * internal services and can carry addresses, and neither is the browser's
+ * business. This is only enough for the screen to say something true.
+ */
+export type InternetSearchFailureKind =
+  /** The watcher could not be reached or does not offer what we called. */
+  | 'video_model_unavailable'
+  /** The watcher was reached and the watch itself broke. */
+  | 'video_model_failed'
+  /** The pages could not be opened or would not play. */
+  | 'browser_unavailable'
+  /** The watch ran out of time before it read anything. */
+  | 'timed_out'
+  /** Something else. The log has the reason; this does not guess at it. */
+  | 'unknown';
+
+export interface InternetSearchFailure {
+  kind: InternetSearchFailureKind;
+  /** How many inspections failed this way in total. */
+  count: number;
+}
+
+/**
  * What the screen is told while a search runs.
  *
- * The three states the results stage draws, and nothing else. `loading` is
- * every search's first state, before it is known whether there is anything to
- * watch; `searching` means pages were found and are being watched, which is
- * what puts the slots up; `answered` means the scouts are done and `moments`
- * is everything they found, which may be none.
+ * `loading` is every search's first state, before it is known whether there is
+ * anything to watch; `searching` means pages were found and are being watched,
+ * which is what puts the slots up; `answered` means the watchers finished and
+ * `moments` is what they found, which may be none; `failed` means they did not
+ * finish and nothing was watched, so `moments` being empty says nothing about
+ * the videos.
+ *
+ * `outcome` is set on the two ending states and is the field to draw from. An
+ * empty `moments` list is not a result on its own — only `no_candidates` and
+ * `no_matches` mean the search genuinely came back with nothing.
  *
  * Moments are carried in full on every update rather than as a delta. A page
  * that polls every couple of seconds and misses one update would otherwise be
  * permanently short a moment, and the list is at most a handful of small rows.
  */
 export interface InternetSearchProgress {
-  phase: 'loading' | 'searching' | 'answered';
+  phase: 'loading' | 'searching' | 'answered' | 'failed';
   moments: InternetSearchMoment[];
   /** How many pages the scouts were given. Never shown as results. */
   candidatesFound: number;
   /** Set when the search ended without looking at everything it found. */
   unexamined?: number;
+  /** How many of those pages were actually watched. Set on an ending state. */
+  candidatesWatched?: number;
+  /** Why the search ended. Set on `answered` and `failed`, never before. */
+  outcome?: InternetSearchOutcome;
+  /** Set when at least one watch failed, whether or not others succeeded. */
+  failure?: InternetSearchFailure;
 }
 
 export type InternetSearchResult = InternetSearchProgress;

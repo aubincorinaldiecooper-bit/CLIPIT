@@ -1,6 +1,7 @@
 import { ExternalServiceError } from '../../../lib/errors.js';
-import { verifyWithVideoChat3, watchStreamWithVideoChat3, watchWithVideoChat3 } from '../../videochat3/client.js';
+import { assertVideoChat3Ready, verifyWithVideoChat3, watchStreamWithVideoChat3, watchWithVideoChat3 } from '../../videochat3/client.js';
 import type { VideoModelAdapter, VideoVerificationCandidate, VideoWatchResult } from '../model.js';
+import type { VideoSourceKind } from '../source.js';
 import { isFrameStreamVideoSource, isStoredVideoSource } from '../source.js';
 
 const DEFAULT_MAX_EVENTS = 64;
@@ -12,6 +13,10 @@ function realtimeV2Enabled(): boolean {
 export const videoChat3Adapter: VideoModelAdapter = {
   id: 'videochat3',
   sourceKinds: new Set(['stored-video', 'frame-stream']),
+
+  async assertReady(kind: VideoSourceKind): Promise<void> {
+    await assertVideoChat3Ready(kind === 'frame-stream' ? 'watch_stream' : 'watch');
+  },
 
   async watch({ source, query, maxEvents, signal, onMoment }): Promise<VideoWatchResult> {
     const eventCap = maxEvents ?? DEFAULT_MAX_EVENTS;

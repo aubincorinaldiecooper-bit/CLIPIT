@@ -58,6 +58,18 @@ export interface VideoModelAdapter {
     candidates: VideoVerificationCandidate[];
     signal?: AbortSignal;
   }): Promise<VideoVerificationBatch>;
+  /**
+   * Check that what is deployed can actually take the call we are about to
+   * make, before anything expensive is started.
+   *
+   * A deployment that is merely reachable is not the same as a deployment that
+   * still offers the method we call, and the second is what a search depends
+   * on. Resolves when it does, throws when it does not, and is expected to be
+   * cheap enough to run at the head of every search.
+   *
+   * Optional: an adapter with nothing to check simply does not have one.
+   */
+  assertReady?(kind: VideoSourceKind): Promise<void>;
 }
 
 export function assertModelAcceptsSource(model: VideoModelAdapter, source: VideoSource): void {
