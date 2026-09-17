@@ -36,6 +36,7 @@ function asMoment(candidate: Candidate, found: SwarmMoment<Candidate>[]): Intern
       endSeconds: moment.endSeconds,
       description: moment.description,
       ...(moment.confidence === undefined ? {} : { confidence: moment.confidence }),
+      scoutVotes: moment.scoutVotes,
     }))
     .sort((one, other) => one.startSeconds - other.startSeconds);
   const said = marks.map((mark) => mark.confidence).filter((value): value is number => value !== undefined);
@@ -50,9 +51,10 @@ function asMoment(candidate: Candidate, found: SwarmMoment<Candidate>[]): Intern
   };
 }
 
-function strength(moment: InternetSearchMoment): [number, number] {
+function strength(moment: InternetSearchMoment): [number, number, number] {
+  const maxVotes = moment.marks.reduce((best, mark) => Math.max(best, mark.scoutVotes ?? 1), 1);
   const seconds = moment.marks.reduce((total, mark) => total + (mark.endSeconds - mark.startSeconds), 0);
-  return [moment.marks.length, seconds];
+  return [maxVotes, moment.marks.length, seconds];
 }
 
 function asMoments(found: SwarmMoment<Candidate>[]): InternetSearchMoment[] {
@@ -65,9 +67,9 @@ function asMoments(found: SwarmMoment<Candidate>[]): InternetSearchMoment[] {
   return [...byVideo.values()]
     .map((gathered) => asMoment(gathered.candidate, gathered.found))
     .sort((one, other) => {
-      const [oneMarks, oneSeconds] = strength(one);
-      const [otherMarks, otherSeconds] = strength(other);
-      return otherMarks - oneMarks || otherSeconds - oneSeconds;
+      const [oneVotes, oneMarks, oneSeconds] = strength(one);
+      const [otherVotes, otherMarks, otherSeconds] = strength(other);
+      return otherVotes - oneVotes || otherMarks - oneMarks || otherSeconds - oneSeconds;
     });
 }
 
@@ -93,8 +95,9 @@ function max(values: Array<number | null>): number | null {
 /**
  * Realtime v2 keeps discovery narrow and spends model time inside the video.
  * The top seven candidates are searched in rank order. For each candidate all
- * four scouts inspect separate quarters of the first ten minutes using sparse
- * one-second bursts, then promising windows are re-watched continuously.
+ * four scouts make staggered sparse passes over the same first-ten-minute
+ * horizon. Their overlapping signals are aggregated into candidate strength;
+ * search does not spend time re-watching promising windows.
  */
 export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise<InternetSearchProgress> {
   const searchId = job.id ?? 'unknown';
@@ -132,7 +135,6 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const maxCandidates = realtimeV2 ? Math.round(boundedNumber('INTERNET_SEARCH_MAX_CANDIDATES', 7, 1, 7)) : 7;
   const coarseBurstSeconds = boundedNumber('VIDEO_STREAM_COARSE_BURST_SECONDS', 1, 0.25, 5);
   const coarseStrideSeconds = boundedNumber('VIDEO_STREAM_COARSE_STRIDE_SECONDS', 5, coarseBurstSeconds, 30);
-  const densePaddingSeconds = boundedNumber('VIDEO_STREAM_DENSE_PADDING_SECONDS', 6, 1, 30);
   const candidates = discovered.slice(0, maxCandidates);
 
   log.info('internet search started', {
@@ -147,7 +149,6 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     candidates_limit: maxCandidates,
     coarse_burst_seconds: coarseBurstSeconds,
     coarse_stride_seconds: coarseStrideSeconds,
-    dense_padding_seconds: densePaddingSeconds,
   });
 
   // Being deployed is not the same as being able to take the call. If the
@@ -216,7 +217,6 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     horizonSeconds,
     coarseBurstSeconds,
     coarseStrideSeconds,
-    densePaddingSeconds,
     timeoutMs: realtimeV2 ? 10 * 60_000 : 5 * 60_000,
     onProgress: async (progress) => {
       if (progress.event !== 'moment.found' && progress.event !== 'moment.extended') return;
@@ -289,6 +289,7 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     start_seconds: moment.startSeconds,
     end_seconds: moment.endSeconds,
     confidence: moment.confidence ?? null,
+    scout_votes: moment.scoutVotes,
     description: moment.description,
   }));
 
@@ -303,7 +304,6 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     candidates_limit: maxCandidates,
     coarse_burst_seconds: coarseBurstSeconds,
     coarse_stride_seconds: coarseStrideSeconds,
-    dense_padding_seconds: densePaddingSeconds,
     candidates_discovered: discovered.length,
     videos: moments.length,
     marks: moments.reduce((total, moment) => total + moment.marks.length, 0),
