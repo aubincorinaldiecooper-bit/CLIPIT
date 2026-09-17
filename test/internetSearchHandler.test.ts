@@ -16,7 +16,21 @@ vi.mock('../src/services/video/adapters/videochat3.js', () => ({
   videoChat3Adapter: { id: 'videochat3', sourceKinds: new Set(['frame-stream']), assertReady: (kind: string) => assertReady(kind) },
 }));
 
-const { handleInternetSearch } = await import('../src/worker/handlers/internetSearch.js');
+const logged: Array<{ level: string; message: string; context: Record<string, unknown> }> = [];
+vi.mock('../src/lib/logger.js', () => {
+  const record = (level: string) => (message: string, context: Record<string, unknown> = {}) => {
+    logged.push({ level, message, context });
+  };
+  const made: Record<string, unknown> = { error: record('error'), warn: record('warn'), info: record('info'), debug: record('debug') };
+  made.child = () => made;
+  return { logger: made };
+});
+
+const { handleInternetSearch, loggablePage } = await import('../src/worker/handlers/internetSearch.js');
+
+function said(message: string) {
+  return logged.filter((line) => line.message === message);
+}
 
 function candidate(id: string, source: string | null = 'youtube.com'): Candidate {
   return { id, query: 'a dog on a skateboard', title: `page ${id}`, pageUrl: `https://publisher.example/watch/${id}`, thumbnailUrl: `https://publisher.example/still/${id}.jpg`, source };
@@ -36,6 +50,7 @@ beforeEach(() => {
   inspect.mockReset();
   assertReady.mockReset();
   assertReady.mockResolvedValue(undefined);
+  logged.length = 0;
   process.env.WEB_ACCESS_URL = 'http://web-access.internal:8080';
   process.env.WEB_ACCESS_INTERNAL_TOKEN = 'token';
   process.env.VIDEO_STREAM_V2 = 'true';
@@ -276,5 +291,180 @@ describe('refusing to search against a watcher that cannot take the call', () =>
     const { job } = fakeJob();
     await handleInternetSearch(job);
     expect(assertReady).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Telemetry has to survive the thing it is there to diagnose.
+ *
+ * On 17 September a search died and left nothing behind: no
+ * `internet search finished` line, no per-candidate record, no page address —
+ * because every one of those is written at the end, and the end never came.
+ * The post-mortem had a stack trace and a guess.
+ */
+describe("what a search leaves behind while it is still running", () => {
+  it("reports how many videos it has read as it goes, not only at the end", async () => {
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: true });
+    const { job, reported } = fakeJob();
+    await handleInternetSearch(job);
+
+    // A search cut off half way is answered from the last progress it wrote,
+    // so the count has to be in there before the summary exists.
+    const midFlight = reported.filter((step) => step.phase === 'searching');
+    expect(midFlight.length).toBeGreaterThan(1);
+    expect(midFlight.at(-1)?.candidatesWatched).toBe(2);
+    // And it starts honest: nothing watched yet is nothing claimed.
+    expect(midFlight[0]?.candidatesWatched).toBe(0);
+  });
+
+  it("counts a video as read only once something was actually read from it", async () => {
+    // Candidate 'a' fails every way; 'b' succeeds. The swarm finishes with
+    // both, but only one of them was ever opened.
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockImplementation(async ({ candidate: page }) => {
+      if (page.id === 'a') throw new Error('the browser refused to watch this page (503)');
+      return { moments: [], exhausted: true, exhaustive: true };
+    });
+    const { job, reported } = fakeJob();
+    await handleInternetSearch(job);
+
+    const midFlight = reported.filter((step) => step.phase === 'searching');
+    expect(midFlight.at(-1)?.candidatesWatched).toBe(1);
+  });
+
+  it("names the page each scout went to, so a failure points somewhere", async () => {
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: true });
+    const { job } = fakeJob();
+    await handleInternetSearch(job);
+
+    const pages = said('watching a page');
+    // Once per video, not once per scout: four scouts take a quarter of the
+    // same video each, and four identical lines say nothing extra.
+    expect(pages).toHaveLength(2);
+    expect(pages.map((line) => line.context.page_url)).toEqual([
+      'https://publisher.example/watch/a',
+      'https://publisher.example/watch/b',
+    ]);
+  });
+
+  it("writes down what it knew before letting the error through", async () => {
+    // Redis going away mid-search is the realistic version of this: reporting
+    // progress throws, the swarm carries it out, and the summary at the bottom
+    // of the handler never runs.
+    found.mockResolvedValue([candidate('a'), candidate('b')]);
+    inspect.mockResolvedValue({ moments: [], exhausted: true, exhaustive: true });
+    const { job } = fakeJob();
+    let updates = 0;
+    (job as unknown as { updateProgress: (p: unknown) => Promise<void> }).updateProgress = async () => {
+      updates += 1;
+      if (updates > 2) throw new Error('Redis connection lost');
+    };
+
+    await expect(handleInternetSearch(job)).rejects.toThrow(/Redis connection lost/);
+
+    const stopped = said('internet search stopped part-way');
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.level).toBe('error');
+    expect(stopped[0]?.context).toMatchObject({ status: 'stopped', candidates_selected: 2 });
+    // It got to the first video and not the second, and the record says so.
+    // That is the whole point: the account is of how far it actually got, not
+    // of what it set out to do.
+    expect(stopped[0]?.context.candidates_announced).toEqual(['a']);
+    expect(stopped[0]?.context.candidates_selected).toBe(2);
+    expect(stopped[0]?.context.err).toMatch(/Redis connection lost/);
+  });
+});
+
+/**
+ * Nothing that unlocks a video may reach a shared log.
+ *
+ * Discovery returns whatever the search engine indexed, and `navigablePageUrl`
+ * (searxng.ts:150) only drops the fragment — the whole query string survives.
+ * So "these are public pages" was an assumption, not a fact, and CLAUDE.md is
+ * absolute: credentials stay server-side, signed URLs are never logged.
+ * Caught by Codex on #154.
+ */
+describe("writing a page address into the log", () => {
+  it("drops anything that could be a key, however it is spelled", () => {
+    for (const secret of [
+      'https://cdn.example/video?token=abc123',
+      'https://cdn.example/video?Signature=abc123&Expires=99',
+      'https://cdn.example/video?access_key=abc123',
+      'https://cdn.example/video?sig=abc123&policy=xyz',
+    ]) {
+      const safe = loggablePage(secret) ?? '';
+      expect(safe).toBe('https://cdn.example/video');
+      for (const leak of ['abc123', 'xyz', 'token', 'Signature', 'access_key', 'sig']) {
+        expect(safe).not.toContain(leak);
+      }
+    }
+  });
+
+  it("drops credentials carried in the address itself", () => {
+    const safe = loggablePage('https://user:hunter2@cdn.example/video') ?? '';
+    expect(safe).not.toContain('hunter2');
+    expect(safe).not.toContain('user');
+    expect(safe).toBe('https://cdn.example/video');
+  });
+
+  it("keeps the one parameter that says which video, so the log stays useful", () => {
+    // Without this every YouTube result logs as the same address and the line
+    // tells nobody anything.
+    expect(loggablePage('https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42&si=SECRET'))
+      .toBe('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+  });
+
+  it("keeps the path, which is where most sites put the video", () => {
+    expect(loggablePage('https://vimeo.com/76979871')).toBe('https://vimeo.com/76979871');
+  });
+
+  it("says nothing rather than something it could not parse", () => {
+    expect(loggablePage('not a url')).toBeNull();
+    expect(loggablePage('javascript:alert(1)')).toBeNull();
+  });
+});
+
+describe("a video that gave up a moment before its watch finished", () => {
+  /**
+   * The invariant: moments on the record always come with coverage to match.
+   * A search cut off holding verified moments while reporting nothing watched
+   * would be two halves of one answer contradicting each other.
+   *
+   * Honest note on what this does and does not prove. Codex raised the
+   * inconsistency on #154 and the reasoning is sound, but the case is not
+   * reachable as the swarm stands: `accept` runs only from the dense pass,
+   * which is gated behind a coarse inspection that returned — and a returning
+   * inspection has already marked the candidate. So this test passes with or
+   * without the early mark in `accept`, and it is NOT coverage for that line,
+   * which is defence rather than a fix.
+   *
+   * It is kept because the invariant is worth holding on its own. If the
+   * coarse gate is ever loosened, this is what notices.
+   */
+  it("has coverage to match any moment it has already published", async () => {
+    found.mockResolvedValue([candidate('a')]);
+    inspect.mockImplementation(async ({ plan, onMoment }) => {
+      // A coarse hit is what sends a scout back for the close watch, and the
+      // close watch is the one that streams evidence out as it finds it.
+      if (plan.mode === 'coarse' && plan.startSeconds === 0) {
+        return { moments: [{ startSeconds: 2, endSeconds: 3, description: 'Maybe.' }], exhausted: true, exhaustive: true };
+      }
+      if (plan.mode === 'continuous') {
+        await onMoment?.({ startSeconds: 2, endSeconds: 5, description: 'A dog on a skateboard.' });
+        // The watch never comes back after handing over its evidence.
+        throw new Error('the browser went away');
+      }
+      return { moments: [], exhausted: true, exhaustive: true };
+    });
+    const { job, reported } = fakeJob();
+    await handleInternetSearch(job);
+
+    const withMoments = reported.filter((step) => step.moments.length > 0);
+    expect(withMoments.length).toBeGreaterThan(0);
+    for (const step of withMoments) {
+      expect(step.candidatesWatched).toBeGreaterThanOrEqual(1);
+    }
   });
 });

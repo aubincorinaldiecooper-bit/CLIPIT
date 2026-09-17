@@ -24,6 +24,46 @@ function boundedNumber(name: string, fallback: number, minimum: number, maximum:
   return Math.max(minimum, Math.min(maximum, value));
 }
 
+/**
+ * Query parameters that say *which* video, rather than authorise access to one.
+ *
+ * An allowlist, not a denylist, and deliberately tiny. Guessing which names
+ * look like credentials is a game you lose once and then keep losing quietly.
+ */
+const IDENTIFYING = new Set(['v']);
+
+/**
+ * A page address safe to write into a shared log.
+ *
+ * Discovery hands back whatever the search engine indexed, and
+ * `navigablePageUrl` (searxng.ts:150) only drops the fragment — the whole
+ * query string survives, credentials and all. So an address arriving as
+ * `…/video?token=…` would otherwise be written out verbatim, which
+ * `CLAUDE.md` forbids outright: credentials stay server-side and signed URLs
+ * are never logged.
+ *
+ * What is kept is the origin, the path, and the handful of parameters that
+ * name a video rather than unlock one — enough to open the page and see why
+ * it could not be watched, which is the only reason this is logged at all.
+ */
+export function loggablePage(pageUrl: string): string | null {
+  try {
+    const url = new URL(pageUrl);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    url.username = '';
+    url.password = '';
+    const keep = new URLSearchParams();
+    for (const [name, value] of url.searchParams) {
+      if (IDENTIFYING.has(name.toLowerCase())) keep.set(name, value);
+    }
+    url.search = keep.toString();
+    url.hash = '';
+    return url.toString().slice(0, 300);
+  } catch {
+    return null;
+  }
+}
+
 function sourceOf(candidate: Candidate): string | null {
   if (candidate.source) return candidate.source;
   try { return new URL(candidate.pageUrl).host.replace(/^www\./, ''); } catch { return null; }
@@ -206,8 +246,24 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     }),
   });
 
-  await report({ phase: 'searching', moments: [], candidatesFound: candidates.length });
-  const result = await runScoutSwarm<Candidate>({
+  await report({ phase: 'searching', moments: [], candidatesFound: candidates.length, candidatesWatched: 0 });
+
+  // Which page each scout went to, recorded as it happens.
+  //
+  // The swarm is generic over candidates and knows only their ids, so this is
+  // the only place that can put a page address next to one. Without it, a
+  // search that dies leaves "no video element on the page" and no way to tell
+  // which page — which is exactly where the 17 September post-mortem stalled.
+  // Once per candidate rather than once per scout: four scouts take a quarter
+  // of the same video each, and four identical lines say nothing extra.
+  const announced = new Set<string>();
+  const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+  // The last thing we knew, kept outside the run so it is still here if the
+  // run does not come back.
+  let watchedSoFar = 0;
+  let momentsSoFar = 0;
+
+  const started = await runScoutSwarm<Candidate>({
     searchId,
     query: job.data.query,
     candidates,
@@ -219,10 +275,56 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     densePaddingSeconds,
     timeoutMs: realtimeV2 ? 10 * 60_000 : 5 * 60_000,
     onProgress: async (progress) => {
-      if (progress.event !== 'moment.found' && progress.event !== 'moment.extended') return;
-      await report({ phase: 'searching', moments: asMoments(progress.snapshot.moments), candidatesFound: candidates.length });
+      if (progress.event === 'scout.candidate_assigned' && progress.candidateId && !announced.has(progress.candidateId)) {
+        announced.add(progress.candidateId);
+        const candidate = byId.get(progress.candidateId);
+        log.info('watching a page', {
+          candidate_id: progress.candidateId,
+          page_url: candidate ? loggablePage(candidate.pageUrl) : null,
+          source: candidate ? sourceOf(candidate) : null,
+          candidates_watched_so_far: progress.snapshot.candidatesWatched,
+        });
+      }
+      // Coverage is reported as it changes, not only at the end. A search that
+      // dies is answered from whatever progress last recorded, so a completed
+      // candidate that never reaches the summary still counts.
+      const moved = progress.event === 'moment.found'
+        || progress.event === 'moment.extended'
+        || progress.event === 'scout.candidate_completed';
+      if (!moved) return;
+      watchedSoFar = progress.snapshot.candidatesWatched;
+      momentsSoFar = progress.snapshot.momentsFound;
+      await report({
+        phase: 'searching',
+        moments: asMoments(progress.snapshot.moments),
+        candidatesFound: candidates.length,
+        candidatesWatched: progress.snapshot.candidatesWatched,
+      });
     },
+  }).catch((error: unknown) => {
+    // A search that throws used to take its whole account with it. The summary
+    // below never ran, so the 17 September post-mortem had a stack trace, no
+    // per-candidate record, and no idea how far the search had got. Whatever
+    // was known at the last progress event is written down here before the
+    // error carries on to fail the job.
+    log.error('internet search stopped part-way', {
+      model: videoChat3Adapter.id,
+      stream_v2: realtimeV2,
+      query_length: job.data.query.length,
+      discovery_ms: discoveryMs,
+      candidates_discovered: discovered.length,
+      candidates_selected: candidates.length,
+      candidates_watched: watchedSoFar,
+      candidates_announced: [...announced],
+      moments_so_far: momentsSoFar,
+      wall_ms: Date.now() - searchStartedAt,
+      status: 'stopped',
+      err: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    throw error;
   });
+  const result = started;
 
   const moments: InternetSearchMoment[] = asMoments(result.moments);
   const neverReached = Math.max(0, result.candidatesAvailable - result.candidatesConsidered);

@@ -31,7 +31,25 @@ export interface ScoutRuntime<Candidate extends ScoutCandidate> {
   closeScout?(scoutId: ScoutId): Promise<void>;
 }
 export interface SwarmMoment<Candidate extends ScoutCandidate> { id: string; candidate: Candidate; scoutId: ScoutId; startSeconds: number; endSeconds: number; description: string; confidence?: number; }
-export interface ScoutSwarmSnapshot<Candidate extends ScoutCandidate> { scoutCount: 4; candidatesTotal: number; candidatesAssigned: number; candidatesCompleted: number; activeOperations: number; momentsFound: number; moments: SwarmMoment<Candidate>[]; }
+export interface ScoutSwarmSnapshot<Candidate extends ScoutCandidate> {
+  scoutCount: 4;
+  candidatesTotal: number;
+  candidatesAssigned: number;
+  /** Candidates the swarm has finished with, whether or not they were read. */
+  candidatesCompleted: number;
+  /**
+   * Candidates at least one scout has actually got a watch out of, so far.
+   *
+   * Deliberately not `candidatesCompleted`, which counts a candidate whose
+   * every inspection failed. A search that dies half way is answered from this
+   * snapshot, and answering it from the wrong number would tell somebody their
+   * videos were read when nobody opened them.
+   */
+  candidatesWatched: number;
+  activeOperations: number;
+  momentsFound: number;
+  moments: SwarmMoment<Candidate>[];
+}
 export interface ScoutSwarmProgress<Candidate extends ScoutCandidate> {
   stage: 'searching' | 'complete' | 'cancelled';
   event: 'swarm.started' | 'scout.candidate_assigned' | 'scout.candidate_completed' | 'moment.found' | 'moment.extended' | 'swarm.completed' | 'swarm.cancelled';
@@ -110,11 +128,15 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
   const timeout = setTimeout(() => controller.abort(new Error('scout swarm wall-time ceiling reached')), timeoutMs); timeout.unref?.();
 
   let candidatesAssigned = 0, candidatesCompleted = 0, activeOperations = 0, inspectOperations = 0, mediaSecondsObserved = 0, momentSequence = 0, candidatesPartlyExamined = 0;
+  // Which candidates have actually been read, updated as it happens rather
+  // than counted at the end, so a search that never reaches the end can still
+  // say how far it got.
+  const watchedCandidates = new Set<string>();
   let firstMomentAt: number | null = null;
   const moments: SwarmMoment<Candidate>[] = [];
   const failures: ScoutSwarmFailure[] = [];
   const inspections: ScoutInspectionTelemetry[] = [];
-  const snapshot = (): ScoutSwarmSnapshot<Candidate> => ({ scoutCount: 4, candidatesTotal: candidates.length, candidatesAssigned, candidatesCompleted, activeOperations, momentsFound: moments.length, moments: moments.map((moment) => ({ ...moment })) });
+  const snapshot = (): ScoutSwarmSnapshot<Candidate> => ({ scoutCount: 4, candidatesTotal: candidates.length, candidatesAssigned, candidatesCompleted, candidatesWatched: watchedCandidates.size, activeOperations, momentsFound: moments.length, moments: moments.map((moment) => ({ ...moment })) });
   const emit = async (event: ScoutSwarmProgress<Candidate>['event'], detail: { scoutId?: ScoutId; candidateId?: string; momentId?: string } = {}) => {
     const stage: ScoutSwarmProgress<Candidate>['stage'] = controller.signal.aborted ? 'cancelled' : event === 'swarm.completed' ? 'complete' : 'searching';
     const progress: ScoutSwarmProgress<Candidate> = { stage, event, ...detail, snapshot: snapshot() };
@@ -133,6 +155,12 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
   };
 
   const accept = async (proposal: ScoutProposal, scoutId: ScoutId, candidate: Candidate) => {
+    // A moment out of a video is proof the video was read, and it is proof now
+    // rather than when the inspection finally returns. Waiting for that would
+    // let a search be cut off holding verified moments and still reporting
+    // nothing watched — the two halves of the same answer contradicting each
+    // other, in exactly the interrupted case the count exists for.
+    watchedCandidates.add(candidate.id);
     if (!Number.isFinite(proposal.startSeconds) || !Number.isFinite(proposal.endSeconds)) return;
     if (proposal.startSeconds < 0 || proposal.endSeconds <= proposal.startSeconds) return;
     if (proposal.endSeconds - proposal.startSeconds > maxMomentSeconds) {
@@ -176,6 +204,9 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
         metrics: inspection.metrics ?? {},
       };
       inspections.push(telemetry);
+      // Also here, for a watch that came back having seen nothing worth
+      // reporting: read and found nothing is still read.
+      watchedCandidates.add(candidate.id);
       log.info('scout inspection finished', {
         scout_id: scoutId,
         candidate_id: candidate.id,
