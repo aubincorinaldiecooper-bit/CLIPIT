@@ -81,7 +81,16 @@ export type InternetSearchOutcome =
   /** Some videos were watched and some could not be. What came back is partial. */
   | 'partly_watched'
   /** Videos were found and not one could be watched. Nothing was looked at. */
-  | 'watch_failed';
+  | 'watch_failed'
+  /**
+   * The search stopped before it could finish, and never decided anything.
+   *
+   * Distinct from the four above, which describe how a search *ended*. This
+   * one did not end; it was cut off — the worker died, or the job was given
+   * up on. Whatever `moments` carries is what had been found by then, and it
+   * says nothing about what the unwatched videos contain.
+   */
+  | 'search_failed';
 
 /**
  * What went wrong, in the coarsest terms that are still useful.

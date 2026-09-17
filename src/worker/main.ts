@@ -49,12 +49,69 @@ function withTerminalFailures<T>(processor: Processor<T>): Processor<T> {
   };
 }
 
+/**
+ * Say it out loud, and treat the two kinds of escape differently.
+ *
+ * Both used to end the process in silence, and that is how one candidate page
+ * with no video in it took down every queue on this worker twice on
+ * 17 September — transcription, ingestion, indexing and clip generation all
+ * went with it, none of them involved. The log showed a stack, then
+ * "Node.js v22.23.2", then a restart, and never the words "unhandled
+ * rejection", so the cause took a production post-mortem to find rather than
+ * a log search.
+ *
+ * An unhandled rejection is a promise chain that failed with nobody holding
+ * it. The damage is bounded by that chain; nothing else unwound, and these
+ * queues share no state with each other. So it is recorded in full and the
+ * worker keeps serving, because stopping twelve unrelated queues is a poor
+ * answer to one job going wrong.
+ *
+ * An uncaught exception is not that. A synchronous throw escaped every
+ * try/catch on the stack, unwinding through arbitrary code on the way out —
+ * possibly a half-written record or a transaction nobody will close. Node's
+ * own guidance is that the process is in an undefined state afterwards and
+ * resuming is unsafe, and swallowing it also denies the supervisor the
+ * restart that would clear it. So that one is logged and then shut down
+ * cleanly, exiting non-zero so Railway knows it was not a planned stop.
+ *
+ * The distinction came from Codex's review of #153: the first version treated
+ * both the same, which quietly widened "keep running" from the case it was
+ * chosen for to one with a real chance of corrupt state behind it.
+ */
+let crashing = false;
+
+function installCrashPolicy(): void {
+  process.on('unhandledRejection', (reason: unknown) => {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    logger.error('unhandled rejection — worker kept running', {
+      err: error.message,
+      stack: error.stack,
+    });
+  });
+  process.on('uncaughtException', (error: Error) => {
+    logger.error('uncaught exception — worker shutting down', {
+      err: error.message,
+      stack: error.stack,
+    });
+    // A second throw while unwinding must not restart the unwinding.
+    if (crashing) return;
+    crashing = true;
+    void shutdown('uncaughtException', 1);
+  });
+}
+
 function startWorker<T>(name: string, processor: Processor<T>, concurrency: number): Worker<T> {
   const worker = new Worker<T>(name, withTerminalFailures(processor), {
     connection: getWorkerConnection(),
     concurrency,
     lockDuration: 5 * 60 * 1000,
     stalledInterval: 60 * 1000,
+    // Watching seven pages costs browser time and GPU time, and a search whose
+    // worker died is re-run from the beginning — the same seven pages, the same
+    // spend, and no sign of it on the screen. A deterministic failure buys
+    // nothing the second time, so an internet search that stalls is finished
+    // rather than repeated. Every other queue keeps the default.
+    ...(name === INTERNET_SEARCH_QUEUE ? { maxStalledCount: 0 } : {}),
   });
   worker.on('failed', (job: Job<T> | undefined, error: Error) => {
     logger.error('job failed', { queue: name, jobId: job?.id, attempts: job?.attemptsMade, err: error.message });
@@ -101,6 +158,9 @@ async function enqueueSimpleMemRebuilds(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Installed before anything else can throw or reject, so nothing slips
+  // through the gap between boot and readiness.
+  installCrashPolicy();
   logger.info('worker starting', {
     nodeEnv: env.NODE_ENV,
     transcription: env.TRANSCRIPTION_ENABLED,
@@ -182,8 +242,8 @@ async function main(): Promise<void> {
   }
 }
 
-async function shutdown(signal: string): Promise<void> {
-  logger.info('worker shutting down', { signal });
+async function shutdown(signal: string, code = 0): Promise<void> {
+  logger.info('worker shutting down', { signal, code });
   try {
     await Promise.all(workers.map((worker) => worker.close()));
     await closeQueues();
@@ -192,7 +252,7 @@ async function shutdown(signal: string): Promise<void> {
   } catch (error) {
     logger.error('error during shutdown', { err: error });
   }
-  process.exit(0);
+  process.exit(code);
 }
 
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
