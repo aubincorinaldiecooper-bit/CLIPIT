@@ -30,7 +30,7 @@ export interface ScoutRuntime<Candidate extends ScoutCandidate> {
   }): Promise<ScoutInspection>;
   closeScout?(scoutId: ScoutId): Promise<void>;
 }
-export interface SwarmMoment<Candidate extends ScoutCandidate> { id: string; candidate: Candidate; scoutId: ScoutId; startSeconds: number; endSeconds: number; description: string; confidence?: number; }
+export interface SwarmMoment<Candidate extends ScoutCandidate> { id: string; candidate: Candidate; scoutId: ScoutId; startSeconds: number; endSeconds: number; description: string; confidence?: number; scoutVotes: number; }
 export interface ScoutSwarmSnapshot<Candidate extends ScoutCandidate> { scoutCount: 4; candidatesTotal: number; candidatesAssigned: number; candidatesCompleted: number; activeOperations: number; momentsFound: number; moments: SwarmMoment<Candidate>[]; }
 export interface ScoutSwarmProgress<Candidate extends ScoutCandidate> {
   stage: 'searching' | 'complete' | 'cancelled';
@@ -57,13 +57,6 @@ export interface ScoutSwarmResult<Candidate extends ScoutCandidate> {
   candidatesPartlyExamined: number; moments: SwarmMoment<Candidate>[]; failures: ScoutSwarmFailure[];
   inspections: ScoutInspectionTelemetry[];
   metrics: { wallMs: number; inspectOperations: number; mediaSecondsObserved: number; firstMomentMs: number | null; };
-}
-
-const MERGE_GAP_SECONDS = 2;
-
-function sameThing(one: string, other: string): boolean {
-  const plain = (text: string) => text.trim().toLowerCase().replace(/\s+/g, ' ');
-  return plain(one) === plain(other);
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
@@ -99,10 +92,9 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
   const horizonSeconds = Math.max(4, Math.min(600, input.horizonSeconds ?? 600));
   const coarseBurstSeconds = Math.max(0.25, Math.min(5, input.coarseBurstSeconds ?? 1));
   const coarseStrideSeconds = Math.max(coarseBurstSeconds, Math.min(30, input.coarseStrideSeconds ?? 5));
-  const densePaddingSeconds = Math.max(1, Math.min(30, input.densePaddingSeconds ?? 6));
-  const maxDenseWindows = Math.max(1, Math.min(8, input.maxDenseWindowsPerCandidate ?? 4));
   const candidates = input.candidates.slice(0, maxCandidates);
-  const sectionSeconds = horizonSeconds / SCOUT_IDS.length;
+  const scoutOffsetSeconds = coarseStrideSeconds / SCOUT_IDS.length;
+  const voteWindowSeconds = Math.max(coarseBurstSeconds, scoutOffsetSeconds * 1.5);
   const log = logger.child({ search_id: input.searchId, component: 'scout_swarm' });
   const controller = new AbortController();
   const forwardAbort = () => controller.abort(input.signal?.reason ?? new Error('search cancelled'));
@@ -120,37 +112,6 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
     const progress: ScoutSwarmProgress<Candidate> = { stage, event, ...detail, snapshot: snapshot() };
     log.debug(event, { scout_id: detail.scoutId, candidate_id: detail.candidateId, moment_id: detail.momentId, ...progress.snapshot });
     await input.onProgress?.(progress);
-  };
-
-  const continues = (proposal: ScoutProposal, candidate: Candidate): SwarmMoment<Candidate> | null => {
-    const previous = moments.findLast((moment) => moment.candidate.id === candidate.id);
-    if (!previous) return null;
-    if (proposal.startSeconds < previous.startSeconds) return null;
-    if (proposal.startSeconds - previous.endSeconds > MERGE_GAP_SECONDS) return null;
-    if (!sameThing(proposal.description, previous.description)) return null;
-    if (Math.max(previous.endSeconds, proposal.endSeconds) - previous.startSeconds > maxMomentSeconds) return null;
-    return previous;
-  };
-
-  const accept = async (proposal: ScoutProposal, scoutId: ScoutId, candidate: Candidate) => {
-    if (!Number.isFinite(proposal.startSeconds) || !Number.isFinite(proposal.endSeconds)) return;
-    if (proposal.startSeconds < 0 || proposal.endSeconds <= proposal.startSeconds) return;
-    if (proposal.endSeconds - proposal.startSeconds > maxMomentSeconds) {
-      failures.push({ scoutId, candidateId: candidate.id, stage: 'inspect', reason: `proposed moment exceeds ${maxMomentSeconds}s maximum` });
-      return;
-    }
-    const previous = continues(proposal, candidate);
-    if (previous) {
-      previous.endSeconds = Math.max(previous.endSeconds, proposal.endSeconds);
-      if (proposal.confidence !== undefined) previous.confidence = previous.confidence === undefined ? proposal.confidence : Math.max(previous.confidence, proposal.confidence);
-      await emit('moment.extended', { scoutId, candidateId: candidate.id, momentId: previous.id });
-      return;
-    }
-    if (firstMomentAt === null) firstMomentAt = Date.now();
-    momentSequence += 1;
-    const moment: SwarmMoment<Candidate> = { id: `moment-${momentSequence}`, candidate, scoutId, startSeconds: proposal.startSeconds, endSeconds: proposal.endSeconds, description: proposal.description, confidence: proposal.confidence };
-    moments.push(moment);
-    await emit('moment.found', { scoutId, candidateId: candidate.id, momentId: moment.id });
   };
 
   const inspect = async (scoutId: ScoutId, candidate: Candidate, plan: ScoutInspectionPlan, onMoment?: (moment: ScoutProposal) => Promise<void>) => {
@@ -229,12 +190,14 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
       if (controller.signal.aborted) break;
       candidatesAssigned += 1;
 
+      // Every scout covers the same horizon, but starts at a different offset
+      // inside the sparse stride. That gives us independent looks at the same
+      // area without replaying promising windows a second time.
       const coarseRuns = await Promise.all(SCOUT_IDS.map(async (scoutId, index) => {
-        const startSeconds = index * sectionSeconds;
-        const endSeconds = Math.min(horizonSeconds, startSeconds + sectionSeconds);
+        const startSeconds = index * scoutOffsetSeconds;
         const inspection = await inspect(scoutId, candidate, {
           startSeconds,
-          endSeconds,
+          endSeconds: horizonSeconds,
           mode: 'coarse',
           burstSeconds: coarseBurstSeconds,
           strideSeconds: coarseStrideSeconds,
@@ -247,36 +210,69 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
       const coarseHits: Array<{ scoutId: ScoutId; proposal: ScoutProposal }> = [];
       for (const { scoutId, inspection } of coarseRuns) {
         if (!inspection) continue;
-        for (const proposal of inspection.moments) coarseHits.push({ scoutId, proposal });
+        for (const proposal of inspection.moments) {
+          if (!Number.isFinite(proposal.startSeconds) || !Number.isFinite(proposal.endSeconds)) continue;
+          if (proposal.startSeconds < 0 || proposal.endSeconds <= proposal.startSeconds) continue;
+          if (proposal.endSeconds - proposal.startSeconds > maxMomentSeconds) {
+            failures.push({ scoutId, candidateId: candidate.id, stage: 'inspect', reason: `proposed moment exceeds ${maxMomentSeconds}s maximum` });
+            continue;
+          }
+          coarseHits.push({ scoutId, proposal });
+        }
       }
 
       coarseHits.sort((a, b) => a.proposal.startSeconds - b.proposal.startSeconds);
-      const targets: Array<{ scoutId: ScoutId; proposal: ScoutProposal }> = [];
+
+      type SignalCluster = {
+        startSeconds: number;
+        endSeconds: number;
+        hits: Array<{ scoutId: ScoutId; proposal: ScoutProposal }>;
+        scouts: Set<ScoutId>;
+      };
+      const clusters: SignalCluster[] = [];
       for (const hit of coarseHits) {
-        const overlaps = targets.some((target) => {
-          const a0 = hit.proposal.startSeconds - densePaddingSeconds;
-          const a1 = hit.proposal.endSeconds + densePaddingSeconds;
-          const b0 = target.proposal.startSeconds - densePaddingSeconds;
-          const b1 = target.proposal.endSeconds + densePaddingSeconds;
-          return a0 <= b1 && b0 <= a1;
-        });
-        if (!overlaps) targets.push(hit);
-        if (targets.length >= maxDenseWindows) break;
+        const cluster = clusters.find((candidateCluster) =>
+          hit.proposal.startSeconds <= candidateCluster.endSeconds + voteWindowSeconds
+          && hit.proposal.endSeconds >= candidateCluster.startSeconds - voteWindowSeconds
+        );
+        if (cluster) {
+          cluster.startSeconds = Math.min(cluster.startSeconds, hit.proposal.startSeconds);
+          cluster.endSeconds = Math.max(cluster.endSeconds, hit.proposal.endSeconds);
+          cluster.hits.push(hit);
+          cluster.scouts.add(hit.scoutId);
+        } else {
+          clusters.push({
+            startSeconds: hit.proposal.startSeconds,
+            endSeconds: hit.proposal.endSeconds,
+            hits: [hit],
+            scouts: new Set([hit.scoutId]),
+          });
+        }
       }
 
-      await Promise.all(targets.map(async (target, index) => {
-        const scoutId = SCOUT_IDS[index % SCOUT_IDS.length]!;
-        let streamed = 0;
-        const dense = await inspect(scoutId, candidate, {
-          startSeconds: Math.max(0, target.proposal.startSeconds - densePaddingSeconds),
-          endSeconds: Math.min(horizonSeconds, target.proposal.endSeconds + densePaddingSeconds),
-          mode: 'continuous',
-        }, async (proposal) => {
-          streamed += 1;
-          await accept(proposal, scoutId, candidate);
-        });
-        if (dense && streamed === 0) for (const proposal of dense.moments) await accept(proposal, scoutId, candidate);
-      }));
+      for (const cluster of clusters) {
+        const strongest = [...cluster.hits].sort((one, other) => (other.proposal.confidence ?? -1) - (one.proposal.confidence ?? -1))[0]!;
+        const startSeconds = cluster.endSeconds - cluster.startSeconds > maxMomentSeconds
+          ? strongest.proposal.startSeconds
+          : cluster.startSeconds;
+        const endSeconds = cluster.endSeconds - cluster.startSeconds > maxMomentSeconds
+          ? strongest.proposal.endSeconds
+          : cluster.endSeconds;
+        if (firstMomentAt === null) firstMomentAt = Date.now();
+        momentSequence += 1;
+        const moment: SwarmMoment<Candidate> = {
+          id: `moment-${momentSequence}`,
+          candidate,
+          scoutId: strongest.scoutId,
+          startSeconds,
+          endSeconds,
+          description: strongest.proposal.description,
+          ...(strongest.proposal.confidence === undefined ? {} : { confidence: strongest.proposal.confidence }),
+          scoutVotes: cluster.scouts.size,
+        };
+        moments.push(moment);
+        await emit('moment.found', { scoutId: strongest.scoutId, candidateId: candidate.id, momentId: moment.id });
+      }
 
       candidatesCompleted += 1;
     }
