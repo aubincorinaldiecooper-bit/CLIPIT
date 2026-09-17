@@ -86,6 +86,26 @@ describe('one internet search, from a question to its moments', () => {
       source: 'publisher.example',
     });
   });
+  it('carries the surest thing the watcher said about a video, and nothing when it never said', async () => {
+    found.mockResolvedValue([candidate('said'), candidate('quiet')]);
+    inspect.mockImplementation(async ({ candidate: page }) => page.id === 'said'
+      ? { moments: [
+          { startSeconds: 10, endSeconds: 12, description: 'The first.', confidence: 0.4 },
+          { startSeconds: 40, endSeconds: 43, description: 'The second.', confidence: 0.9 },
+        ], exhausted: true }
+      : { moments: [{ startSeconds: 5, endSeconds: 9, description: 'No number given.' }], exhausted: true });
+    const { job } = fakeJob(); const result = await handleInternetSearch(job);
+
+    const said = result.moments.find((moment) => moment.id === 'said')!;
+    const quiet = result.moments.find((moment) => moment.id === 'quiet')!;
+    // A video is worth opening for its best moment, so the card carries the
+    // best — while each place keeps its own.
+    expect(said.confidence).toBe(0.9);
+    expect(said.marks.map((mark) => mark.confidence)).toEqual([0.4, 0.9]);
+    // Said nothing is absent, not zero: the two mean very different things.
+    expect('confidence' in quiet).toBe(false);
+    expect('confidence' in quiet.marks[0]!).toBe(false);
+  });
   it('never returns a page nothing was approved in', async () => {
     found.mockResolvedValue([candidate('watched'), candidate('empty')]);
     inspect.mockImplementation(async ({ candidate: page }) => page.id === 'watched'

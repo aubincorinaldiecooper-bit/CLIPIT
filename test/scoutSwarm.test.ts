@@ -26,7 +26,7 @@ function runtimeFor(input: {
 
 /** A runtime that reports findings as it goes, the way a live watcher does. */
 function streamingRuntimeFor(input: {
-  frames: (candidate: Candidate) => Array<{ startSeconds: number; endSeconds: number; description: string }>;
+  frames: (candidate: Candidate) => Array<{ startSeconds: number; endSeconds: number; description: string; confidence?: number }>;
 }): ScoutRuntime<Candidate> {
   return {
     async inspect({ candidate, onMoment }) {
@@ -170,6 +170,39 @@ describe('runScoutSwarm', () => {
     expect(events.filter((event) => event === 'moment.found')).toHaveLength(1);
     expect(events.filter((event) => event === 'moment.extended')).toHaveLength(3);
   });
+
+  it('keeps the surest look when the same event is seen frame after frame', async () => {
+    const result = await runScoutSwarm<Candidate>({
+      searchId: 'search-11',
+      query: 'find the fall',
+      candidates: [{ id: 'only', label: 'only candidate' }],
+      runtime: streamingRuntimeFor({
+        frames: () => [
+          { startSeconds: 10, endSeconds: 11, description: 'He falls.', confidence: 0.4 },
+          { startSeconds: 11, endSeconds: 12, description: 'He falls.', confidence: 0.9 },
+          { startSeconds: 12, endSeconds: 13, description: 'He falls.', confidence: 0.5 },
+        ],
+      }),
+    });
+
+    // The frames either side of a clear one are the event's edges, where the
+    // thing is half in view. The moment is as sure as its best look, not as
+    // unsure as its worst.
+    expect(result.moments).toHaveLength(1);
+    expect(result.moments[0]?.confidence).toBe(0.9);
+  })
+
+  it('leaves a moment with no number when the watcher never gave one', async () => {
+    const result = await runScoutSwarm<Candidate>({
+      searchId: 'search-12',
+      query: 'find the fall',
+      candidates: [{ id: 'only', label: 'only candidate' }],
+      runtime: streamingRuntimeFor({ frames: () => secondBySecond(10, 13, 'He falls.') }),
+    });
+
+    expect(result.moments).toHaveLength(1);
+    expect(result.moments[0]?.confidence).toBeUndefined()
+  })
 
   it('starts a new moment when the next finding is not part of the same event', async () => {
     const result = await runScoutSwarm<Candidate>({

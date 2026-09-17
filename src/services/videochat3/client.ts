@@ -12,7 +12,13 @@ const WATCH_STREAM: ModalTarget = { app: APP, className: CLASS, method: 'watch_s
 const VERIFY: ModalTarget = { app: APP, className: CLASS, method: 'verify_intervals', label: 'videochat3-verify' };
 const HEALTH: ModalTarget = { app: APP, className: CLASS, method: 'health', label: 'videochat3-health' };
 
-export interface VideoChat3WatchEvent { startSeconds: number; endSeconds: number; description: string; }
+export interface VideoChat3WatchEvent {
+  startSeconds: number;
+  endSeconds: number;
+  description: string;
+  /** How sure the watcher said it was, 0 to 1. Absent when it did not say. */
+  confidence?: number;
+}
 export interface VideoChat3WatchResult {
   model: string;
   revision: string;
@@ -33,11 +39,33 @@ function identity(raw: Record<string, unknown>): { model: string; revision: stri
   if (raw.model !== MODEL) throw new ExternalServiceError('videochat3', `VideoChat3 service answered for unexpected model "${String(raw.model)}"`, { retryable: false });
   return { model: MODEL, revision: typeof raw.revision === 'string' && raw.revision.trim() ? raw.revision : 'unknown' };
 }
+/**
+ * How sure the watcher said it was, when it said so and the answer is usable.
+ *
+ * The watcher is asked to end a finding with a number, and a model asked for
+ * something does not have to give it: most of the time there is nothing here,
+ * and that is an ordinary outcome rather than a failure. Anything outside 0 to
+ * 1 is dropped rather than clamped — a number that arrived wrong is not
+ * evidence of anything, and squeezing it into range would turn a broken answer
+ * into a confident-looking one.
+ */
+function sureness(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  if (value < 0 || value > 1) return undefined;
+  return value;
+}
+
 function parseEvent(row: Record<string, unknown>): VideoChat3WatchEvent {
   const startSeconds = finite(row.start, 'event start');
   const endSeconds = finite(row.end, 'event end');
   if (startSeconds < 0 || endSeconds <= startSeconds) throw new ExternalServiceError('videochat3-watch', 'VideoChat3 returned an invalid watch interval', { retryable: false });
-  return { startSeconds, endSeconds, description: typeof row.description === 'string' ? row.description.trim().slice(0, 1000) : '' };
+  const confidence = sureness(row.confidence);
+  return {
+    startSeconds,
+    endSeconds,
+    description: typeof row.description === 'string' ? row.description.trim().slice(0, 1000) : '',
+    ...(confidence === undefined ? {} : { confidence }),
+  };
 }
 
 export async function videoChat3Health(): Promise<{ model: string; revision: string; metrics: Record<string, unknown> }> {

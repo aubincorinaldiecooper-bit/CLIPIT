@@ -131,6 +131,16 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
       // cover it; a second card would only say the same thing again. The words
       // stay as first given — they are what the model said as it began.
       previous.endSeconds = Math.max(previous.endSeconds, proposal.endSeconds);
+      // One event answered about frame by frame, so these are the same thing
+      // seen again. The moment keeps the surest of those looks: the frames
+      // either side of a clear one are its edges, where the thing is half in
+      // view, and letting those pull the number down would understate what
+      // was actually seen.
+      if (proposal.confidence !== undefined) {
+        previous.confidence = previous.confidence === undefined
+          ? proposal.confidence
+          : Math.max(previous.confidence, proposal.confidence);
+      }
       await emit('moment.extended', { scoutId, candidateId: candidate.id, momentId: previous.id });
       return;
     }
