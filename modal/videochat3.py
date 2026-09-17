@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -38,6 +39,21 @@ FLASH_ATTN_WHEEL = (
     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/"
     "flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
 )
+
+# Match the official proactive demo: routine rounds use a 224x224-equivalent
+# pixel budget and the round after </Standby> gets 2x width/height = 4x pixels.
+STREAM_NORMAL_MAX_PIXELS = max(
+    28 * 28,
+    int(os.environ.get("VIDEOCHAT3_STREAM_NORMAL_MAX_PIXELS", str(224 * 224))),
+)
+STREAM_STANDBY_MAX_PIXELS = max(
+    STREAM_NORMAL_MAX_PIXELS,
+    int(os.environ.get("VIDEOCHAT3_STREAM_STANDBY_MAX_PIXELS", str(STREAM_NORMAL_MAX_PIXELS * 4))),
+)
+# The processor-wide ceiling must be at least as high as a Standby round. Each
+# StreamingSession turn still carries its own lower frame_max_pixels budget.
+STREAM_ENGINE_MAX_PIXELS = max(100352, STREAM_STANDBY_MAX_PIXELS)
+OFFLINE_WATCH_MAX_PIXELS = 100352
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -62,15 +78,7 @@ weights = modal.Volume.from_name("clipit-videochat3-weights", create_if_missing=
 
 _RESPONSE_RE = re.compile(r"^\s*</Response>\s*(.*)$", re.DOTALL)
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-# How sure the watcher says it is, if it says at all: a number in brackets at
-# the very end of what it said. Tolerant of a fraction or a percentage,
-# because a model asked for one will sometimes give the other.
 _SURENESS_RE = re.compile(r"\s*\[\s*(\d{1,3}(?:\.\d+)?)\s*(%?)\s*\]\s*$")
-
-# Appended to the question the watcher is answering. Kept to one sentence and
-# added at the end, because the question is what the model is being asked
-# ABOUT THE VIDEO and rewriting it would change what gets found.
 _SURENESS_ASK = (
     " When you describe something, end with how sure you are in square"
     " brackets, like [0.8]."
@@ -84,18 +92,7 @@ def _stop_watching(
     max_session_sec: float,
     max_silence_sec: float,
 ) -> str | None:
-    """Why a live watch should stop, or None to keep going.
-
-    The thing feeding a live watch can die without saying so — a worker killed
-    mid-watch, which a redeploy does routinely, never gets to send its ``end``.
-    Left unbounded the session polls an empty queue until the container's own
-    timeout: half an hour of an L4 doing nothing, billed, with nothing anywhere
-    saying so.
-
-    Silence is the telling signal, since the browser sends a frame about every
-    second. The session ceiling is the backstop for a client that keeps talking
-    but never finishes.
-    """
+    """Why a live watch should stop, or None to keep going."""
     if now - started > max_session_sec:
         return "VideoChat3 stopped a live watch that ran too long"
     if now - heard_at > max_silence_sec:
@@ -104,25 +101,40 @@ def _stop_watching(
 
 
 def _sureness(said: str) -> tuple[str, float | None]:
-    """Split what the watcher said from how sure it said it was.
-
-    Returns the description with the bracket removed, and the sureness as a
-    fraction — or None when it did not say, which is an ordinary outcome. A
-    model given an instruction does not have to take it, and a number invented
-    here to fill the gap would be worth less than nothing: it would look like
-    the model's judgement while being ours.
-    """
+    """Split what the watcher said from how sure it said it was."""
     found = _SURENESS_RE.search(said)
     if not found:
         return said, None
     value = float(found.group(1))
-    # A percentage either because it was marked as one, or because a fraction
-    # cannot be greater than 1 and 80 plainly means 80%.
     if found.group(2) == "%" or value > 1:
         value = value / 100.0
     if value < 0 or value > 1:
         return said[: found.start()].rstrip(), None
     return said[: found.start()].rstrip(), value
+
+
+def _resize_stream_frame(frame: Any, max_pixels: int) -> Any:
+    """Resize like VideoChat3's official proactive demo, aligned to 28 px."""
+    width, height = frame.size
+    if width <= 0 or height <= 0:
+        raise ValueError("stream frame has invalid dimensions")
+    if max(width, height) / min(width, height) > 200:
+        raise ValueError("stream frame aspect ratio is too extreme")
+    factor = 28
+    beta = math.sqrt((height * width) / max_pixels)
+    h_bar = max(factor, math.floor(height / beta / factor) * factor)
+    w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    return frame.resize((w_bar, h_bar))
+
+
+def _stream_state(answer: str) -> str:
+    if "</Response>" in answer:
+        return "response"
+    if "</Standby>" in answer:
+        return "standby"
+    if "</Silence>" in answer:
+        return "silence"
+    return "unknown"
 
 
 def _download(url: str, destination: Path, expected_bytes: int | None = None) -> int:
@@ -225,6 +237,7 @@ class VideoChat3Service:
             self.model_path,
             device="auto",
             attn_implementation="flash_attention_2",
+            max_pixels=STREAM_ENGINE_MAX_PIXELS,
         )
         self.attention = "flash_attention_2"
         self.flash_attention_version = getattr(flash_attn, "__version__", "unknown")
@@ -241,6 +254,8 @@ class VideoChat3Service:
             "revision": self.revision,
             "attention": self.attention,
             "flash_attention_version": self.flash_attention_version,
+            "stream_normal_max_pixels": STREAM_NORMAL_MAX_PIXELS,
+            "stream_standby_max_pixels": STREAM_STANDBY_MAX_PIXELS,
             "container": self.container,
             "startup_ms": self.startup_ms,
         }
@@ -280,6 +295,7 @@ class VideoChat3Service:
                     answer = session.step(
                         frame,
                         round_idx=round_idx,
+                        frame_max_pixels=OFFLINE_WATCH_MAX_PIXELS,
                         time_start=start_seconds,
                         time_end=end_seconds,
                     )
@@ -317,56 +333,130 @@ class VideoChat3Service:
         input_queue_id: str,
         output_queue_id: str,
         query: str,
-        max_rounds: int = 256,
+        max_rounds: int = 16,
+        max_frames: int = 4096,
         max_events: int = 64,
+        round_window_ms: int = 1000,
+        adaptive_resolution: bool = True,
+        normal_max_pixels: int = STREAM_NORMAL_MAX_PIXELS,
+        standby_max_pixels: int = STREAM_STANDBY_MAX_PIXELS,
         max_silence_sec: float = 120.0,
         max_session_sec: float = 600.0,
     ) -> dict[str, Any]:
-        """Watch timestamped browser frames through one stateful session.
+        """Watch a live browser stream as temporal VideoChat3 rounds.
 
-        Two bounds, because the thing feeding this can die without saying so.
+        ``max_rounds`` is only the model's sliding-history window. It is not a
+        lifetime frame ceiling. ``max_frames`` separately bounds a whole watch,
+        avoiding the old 256-frame coupling that would truncate a 6-fps stream
+        after roughly 43 seconds.
 
-        The browser sends a frame about every second and says ``end`` when it
-        stops, so nothing arriving for ``max_silence_sec`` means the client is
-        gone rather than slow — a worker killed mid-watch, which a redeploy
-        does routinely, never gets to send that ``end``. Without a bound the
-        loop polls an empty queue until the container's own ``timeout``, which
-        is half an hour of an L4 doing nothing, billed, with nothing anywhere
-        saying so.
+        When ``round_window_ms`` is positive, frames from the same source-time
+        window are passed to one official ``StreamingSession.step`` call as a
+        list. This preserves the temporal evidence while keeping model decisions
+        around one per second instead of one per captured frame.
 
-        ``max_session_sec`` is the backstop for everything else: a client that
-        keeps sending but never finishes cannot hold the GPU indefinitely
-        either.
-
-        Both are checked between polls, so either fires within one poll of its
-        limit rather than exactly on it. Neither sets ``exhausted``, so a watch
-        cut short is reported as a page not fully examined — which is what it
-        is, and not the same as a page that held nothing.
+        The official proactive behavior is preserved too: a ``</Standby>``
+        response makes the next temporal round use the larger visual pixel
+        budget. The browser/worker may also drop frames to stay realtime; any
+        such dropped evidence makes this a partial, not exhausted, watch.
         """
         from PIL import Image
 
         input_queue = modal.Queue.from_id(input_queue_id)
         output_queue = modal.Queue.from_id(output_queue_id)
         started = time.time()
+        history_rounds = max(1, int(max_rounds))
+        frame_ceiling = max(1, int(max_frames))
+        window_ms = max(0, int(round_window_ms))
+        normal_pixels = max(28 * 28, min(int(normal_max_pixels), STREAM_ENGINE_MAX_PIXELS))
+        standby_pixels = max(normal_pixels, min(int(standby_max_pixels), STREAM_ENGINE_MAX_PIXELS))
+
         session = self.StreamingSession(
             self.engine,
             question=query + _SURENESS_ASK,
             question_time=0,
-            max_rounds=max_rounds,
+            max_rounds=history_rounds,
             global_question=True,
             max_tokens=128,
             temperature=0.0,
         )
-        events: list[dict[str, Any]] = []
-        frames_seen = 0
-        last_end = 0.0
-        exhausted = False
-        end_reason = "the frame stream ended without a terminal event"
 
+        events: list[dict[str, Any]] = []
+        pending: list[tuple[Any, float, float]] = []
+        pending_bucket: int | None = None
+        frames_received = 0
+        frames_processed = 0
+        rounds_processed = 0
+        high_res_rounds = 0
+        standby_remaining = 0
+        processed_through = 0.0
+        source_through = 0.0
+        source_dropped_frames = 0
+        source_exhausted = False
+        terminal_received = False
+        end_reason = "the frame stream ended without a terminal event"
         heard_at = started
 
+        def process_round(batch: list[tuple[Any, float, float]]) -> None:
+            nonlocal frames_processed, rounds_processed, high_res_rounds
+            nonlocal standby_remaining, processed_through
+            if not batch or len(events) >= max_events:
+                return
+
+            high_res = adaptive_resolution and standby_remaining > 0
+            if standby_remaining > 0:
+                standby_remaining -= 1
+            max_pixels = standby_pixels if high_res else normal_pixels
+            if high_res:
+                high_res_rounds += 1
+
+            frames = [_resize_stream_frame(row[0], max_pixels) for row in batch]
+            start_seconds = min(row[1] for row in batch)
+            end_seconds = max(row[2] for row in batch)
+            payload: Any = frames if len(frames) > 1 else frames[0]
+            answer = session.step(
+                payload,
+                round_idx=rounds_processed,
+                frame_max_pixels=max_pixels,
+                time_start=start_seconds,
+                time_end=end_seconds,
+            ) or ""
+            frames_processed += len(batch)
+            rounds_processed += 1
+            processed_through = max(processed_through, end_seconds)
+            state = _stream_state(answer)
+
+            # Exactly like the official proactive demo: Standby increases the
+            # visual budget for the *next* temporal round, not retroactively.
+            if adaptive_resolution and state == "standby":
+                standby_remaining = 1
+
+            output_queue.put({
+                "type": "progress",
+                "processed_through_ms": round(processed_through * 1000),
+                "frames_processed": frames_processed,
+                "rounds_processed": rounds_processed,
+                "state": state,
+                "high_res": high_res,
+                "max_pixels": max_pixels,
+            })
+
+            response = _RESPONSE_RE.match(answer)
+            if response:
+                described, sureness = _sureness(response.group(1).strip())
+                event = {
+                    "type": "moment",
+                    "start": round(start_seconds, 3),
+                    "end": round(end_seconds, 3),
+                    "description": described[:1000],
+                }
+                if sureness is not None:
+                    event["confidence"] = round(sureness, 3)
+                events.append(event)
+                output_queue.put(event)
+
         try:
-            while frames_seen < max_rounds and len(events) < max_events:
+            while frames_received < frame_ceiling and len(events) < max_events:
                 giving_up = _stop_watching(time.time(), started, heard_at, max_session_sec, max_silence_sec)
                 if giving_up:
                     end_reason = giving_up
@@ -374,21 +464,25 @@ class VideoChat3Service:
                 try:
                     item = input_queue.get(timeout=30)
                 except queue.Empty:
-                    # Browser navigation/cold starts can leave the queue empty
-                    # briefly. An empty poll is not the end of the video — the
-                    # silence bound above decides when it is.
                     continue
+
                 heard_at = time.time()
                 if not isinstance(item, dict):
                     raise ValueError("stream queue item must be an object")
                 kind = item.get("type")
+
                 if kind == "end":
-                    exhausted = bool(item.get("exhausted"))
+                    terminal_received = True
+                    source_exhausted = bool(item.get("exhausted"))
                     end_reason = str(item.get("reason") or "stream ended")[:500]
                     watched = item.get("watched_through_seconds")
                     if isinstance(watched, (int, float)) and watched >= 0:
-                        last_end = max(last_end, float(watched))
+                        source_through = max(source_through, float(watched))
+                    dropped = item.get("dropped_frames")
+                    if isinstance(dropped, (int, float)) and dropped >= 0:
+                        source_dropped_frames = int(dropped)
                     break
+
                 if kind != "frame":
                     raise ValueError(f"unsupported stream item type: {kind!r}")
 
@@ -402,54 +496,71 @@ class VideoChat3Service:
 
                 raw = base64.b64decode(encoded, validate=True)
                 with Image.open(io.BytesIO(raw)) as picture:
-                    # The upstream StreamingSession contract takes PIL images.
-                    # copy() detaches the frame before the BytesIO/image closes.
                     frame = picture.convert("RGB").copy()
                 start_seconds = timestamp_ms / 1000.0
                 end_seconds = (timestamp_ms + duration_ms) / 1000.0
-                last_end = max(last_end, end_seconds)
-                answer = session.step(
-                    frame,
-                    round_idx=frames_seen,
-                    time_start=start_seconds,
-                    time_end=end_seconds,
-                )
-                frames_seen += 1
-                response = _RESPONSE_RE.match(answer or "")
-                if response:
-                    described, sureness = _sureness(response.group(1).strip())
-                    event = {
-                        "type": "moment",
-                        "start": round(start_seconds, 3),
-                        "end": round(end_seconds, 3),
-                        "description": described[:1000],
-                    }
-                    # Absent rather than zero when the watcher did not say: a
-                    # zero would read as "sure it is wrong", which is not what
-                    # saying nothing means.
-                    if sureness is not None:
-                        event["confidence"] = round(sureness, 3)
-                    events.append(event)
-                    output_queue.put(event)
+                source_through = max(source_through, end_seconds)
+                frames_received += 1
 
-            if frames_seen >= max_rounds and not exhausted:
+                if window_ms <= 0:
+                    process_round([(frame, start_seconds, end_seconds)])
+                    continue
+
+                bucket = int(timestamp_ms // window_ms)
+                if pending and pending_bucket is not None and bucket != pending_bucket:
+                    process_round(pending)
+                    pending = []
+                    pending_bucket = None
+                    if len(events) >= max_events:
+                        break
+                if not pending:
+                    pending_bucket = bucket
+                pending.append((frame, start_seconds, end_seconds))
+
+            # A source can end or hit a ceiling in the middle of a one-second
+            # bucket. Those frames are still evidence and must not be discarded.
+            if pending and len(events) < max_events:
+                process_round(pending)
+                pending = []
+
+            hit_frame_ceiling = frames_received >= frame_ceiling and not terminal_received
+            hit_event_ceiling = len(events) >= max_events and not terminal_received
+            if hit_frame_ceiling:
                 end_reason = "VideoChat3 reached its live frame ceiling"
-            if len(events) >= max_events and not exhausted:
+            elif hit_event_ceiling:
                 end_reason = "VideoChat3 reached its live moment ceiling"
 
+            exhausted = (
+                terminal_received
+                and source_exhausted
+                and source_dropped_frames == 0
+                and not hit_frame_ceiling
+                and not hit_event_ceiling
+            )
+            duration_seconds = max(source_through, processed_through)
             result = {
                 "model": MODEL_ID,
                 "revision": self.revision,
                 "mode": "watch_stream",
-                "duration_seconds": last_end,
-                "watched_through_seconds": last_end,
+                "duration_seconds": duration_seconds,
+                "watched_through_seconds": processed_through,
                 "exhausted": exhausted,
                 "reason": end_reason,
                 "events": events,
                 "metrics": {
                     "container": self.container,
                     "startup_ms": self.startup_ms,
-                    "frames_seen": frames_seen,
+                    "frames_received": frames_received,
+                    "frames_processed": frames_processed,
+                    "rounds_processed": rounds_processed,
+                    "history_rounds": history_rounds,
+                    "round_window_ms": window_ms,
+                    "high_res_rounds": high_res_rounds,
+                    "normal_max_pixels": normal_pixels,
+                    "standby_max_pixels": standby_pixels,
+                    "source_dropped_frames": source_dropped_frames,
+                    "source_through_seconds": source_through,
+                    "processed_through_seconds": processed_through,
                     "total_ms": int((time.time() - started) * 1000),
                 },
             }
