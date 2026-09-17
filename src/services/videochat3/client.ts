@@ -175,6 +175,7 @@ export async function watchStreamWithVideoChat3(input: {
       standby_max_pixels: standbyMaxPixels,
     });
 
+    let producerFailure: unknown = null;
     const producer = (async () => {
       try {
         for await (const frame of input.source.open(controller.signal)) {
@@ -218,7 +219,14 @@ export async function watchStreamWithVideoChat3(input: {
           throw error;
         }
       }
-    })();
+    })().catch((error: unknown) => {
+      // Attach the rejection handler immediately. Without this, a browser-side
+      // failure such as "no video element on the page" can reject the producer
+      // before the consumer awaits it, which Node treats as an unhandled
+      // rejection and terminates the whole worker process.
+      producerFailure = error;
+      if (!controller.signal.aborted) controller.abort(error);
+    });
 
     const events: VideoChat3WatchEvent[] = [];
     let done: Record<string, unknown> | null = null;
@@ -249,9 +257,8 @@ export async function watchStreamWithVideoChat3(input: {
     }
 
     controller.abort(new Error('VideoChat3 live watch complete'));
-    await producer.catch((error) => {
-      if (!(error instanceof Error && /complete|cancel/i.test(error.message))) throw error;
-    });
+    await producer;
+    if (producerFailure) throw producerFailure;
     await remote.get();
     const id = identity(done);
     const remoteMetrics = done.metrics && typeof done.metrics === 'object' ? done.metrics as Record<string, unknown> : {};
