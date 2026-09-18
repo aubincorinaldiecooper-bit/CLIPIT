@@ -1,4 +1,5 @@
 import type {
+  InternetSearchCandidate,
   InternetSearchFailure,
   InternetSearchFailureKind,
   InternetSearchMoment,
@@ -154,7 +155,12 @@ export function meansNothingMatched(progress: Pick<InternetSearchProgress, 'outc
  * reduced to the fixed vocabulary and kept in full only in the log.
  */
 export function endingForStoppedSearch(
-  lastKnown: { moments: InternetSearchMoment[]; candidatesFound: number; candidatesWatched?: number },
+  lastKnown: {
+    moments: InternetSearchMoment[];
+    candidatesFound: number;
+    candidatesWatched?: number;
+    candidates?: InternetSearchCandidate[];
+  },
   failedReason: string,
 ): InternetSearchProgress {
   return {
@@ -163,6 +169,25 @@ export function endingForStoppedSearch(
     candidatesFound: lastKnown.candidatesFound,
     outcome: 'search_failed',
     ...(lastKnown.candidatesWatched === undefined ? {} : { candidatesWatched: lastKnown.candidatesWatched }),
+    ...(lastKnown.candidates === undefined ? {} : { candidates: settle(lastKnown.candidates) }),
     failure: { kind: classifyFailure(failedReason), count: 1 },
   };
+}
+
+/**
+ * Nobody is watching any more.
+ *
+ * The last thing the search wrote down was written while it was still going,
+ * so any page a scout had open is recorded as `watching`. The search is over.
+ * Leaving that word there would have the screen showing a spinner, for ever,
+ * against a page nothing is looking at.
+ *
+ * They become `unwatched` and not `not_reached`: a scout really was sent, and
+ * we really never got a watch back. Which of those two it is matters — one
+ * says we tried, the other says we never did.
+ */
+function settle(candidates: InternetSearchCandidate[]): InternetSearchCandidate[] {
+  return candidates.map((candidate) =>
+    candidate.state === 'watching' ? { ...candidate, state: 'unwatched' as const } : candidate,
+  );
 }

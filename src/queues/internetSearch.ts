@@ -136,6 +136,34 @@ export interface InternetSearchFailure {
  * that polls every couple of seconds and misses one update would otherwise be
  * permanently short a moment, and the list is at most a handful of small rows.
  */
+/**
+ * One page the search was given, and how far it got with it.
+ *
+ * `page` is redacted, and is display text rather than a link. Discovery hands
+ * back whatever the search engine indexed and `navigablePageUrl` clears only
+ * the fragment, so the query string survives — an address arriving as
+ * `…/video?token=…` would otherwise go straight into a browser other people
+ * can see. `loggablePage` keeps the origin, the path and an allowlist of
+ * parameters that name a video rather than unlock one. The matched moments
+ * carry real links; these do not, because these include pages nobody watched.
+ *
+ * The four states are four different claims and the difference is the point:
+ *
+ *   watching     a scout is on it now
+ *   watched      a scout got a watch out of it
+ *   unwatched    a scout was sent and no watch ever came back
+ *   not_reached  nobody was ever sent — no claim about the page at all
+ *
+ * `not_reached` exists so a page the swarm never got to is never reported as
+ * one that would not open.
+ */
+export interface InternetSearchCandidate {
+  id: string;
+  page: string | null;
+  source: string | null;
+  state: 'watching' | 'watched' | 'unwatched' | 'not_reached';
+}
+
 export interface InternetSearchProgress {
   phase: 'loading' | 'searching' | 'answered' | 'failed';
   moments: InternetSearchMoment[];
@@ -149,6 +177,13 @@ export interface InternetSearchProgress {
   outcome?: InternetSearchOutcome;
   /** Set when at least one watch failed, whether or not others succeeded. */
   failure?: InternetSearchFailure;
+  /**
+   * The pages themselves, as far as we got with each.
+   *
+   * Absent before the scouts are given anything. Capped, because this rides
+   * every poll.
+   */
+  candidates?: InternetSearchCandidate[];
 }
 
 export type InternetSearchResult = InternetSearchProgress;

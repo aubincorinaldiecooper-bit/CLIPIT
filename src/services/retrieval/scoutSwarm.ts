@@ -46,6 +46,15 @@ export interface ScoutSwarmSnapshot<Candidate extends ScoutCandidate> {
    * videos were read when nobody opened them.
    */
   candidatesWatched: number;
+  /**
+   * Which ones, not just how many.
+   *
+   * The count alone forces anyone downstream to guess which candidate moved
+   * by watching the number change against the event stream, and events are
+   * async — two watches landing together make that guess wrong. The set is
+   * already kept here; handing it over costs nothing and removes the guess.
+   */
+  watchedIds: string[];
   activeOperations: number;
   momentsFound: number;
   moments: SwarmMoment<Candidate>[];
@@ -136,7 +145,7 @@ export async function runScoutSwarm<Candidate extends ScoutCandidate>(input: {
   const moments: SwarmMoment<Candidate>[] = [];
   const failures: ScoutSwarmFailure[] = [];
   const inspections: ScoutInspectionTelemetry[] = [];
-  const snapshot = (): ScoutSwarmSnapshot<Candidate> => ({ scoutCount: 4, candidatesTotal: candidates.length, candidatesAssigned, candidatesCompleted, candidatesWatched: watchedCandidates.size, activeOperations, momentsFound: moments.length, moments: moments.map((moment) => ({ ...moment })) });
+  const snapshot = (): ScoutSwarmSnapshot<Candidate> => ({ scoutCount: 4, candidatesTotal: candidates.length, candidatesAssigned, candidatesCompleted, candidatesWatched: watchedCandidates.size, watchedIds: [...watchedCandidates], activeOperations, momentsFound: moments.length, moments: moments.map((moment) => ({ ...moment })) });
   const emit = async (event: ScoutSwarmProgress<Candidate>['event'], detail: { scoutId?: ScoutId; candidateId?: string; momentId?: string } = {}) => {
     const stage: ScoutSwarmProgress<Candidate>['stage'] = controller.signal.aborted ? 'cancelled' : event === 'swarm.completed' ? 'complete' : 'searching';
     const progress: ScoutSwarmProgress<Candidate> = { stage, event, ...detail, snapshot: snapshot() };
