@@ -322,8 +322,10 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     densePaddingSeconds,
     timeoutMs: realtimeV2 ? 10 * 60_000 : 5 * 60_000,
     onProgress: async (progress) => {
+      let firstSightOf = false;
       if (progress.event === 'scout.candidate_assigned' && progress.candidateId && !announced.has(progress.candidateId)) {
         announced.add(progress.candidateId);
+        firstSightOf = true;
         const candidate = byId.get(progress.candidateId);
         log.info('watching a page', {
           candidate_id: progress.candidateId,
@@ -335,10 +337,19 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
       // Coverage is reported as it changes, not only at the end. A search that
       // dies is answered from whatever progress last recorded, so a completed
       // candidate that never reaches the summary still counts.
+      //
+      // Handing a page to a scout counts as a change, and only the first time
+      // for each page. `announced` grew in memory but nothing was written
+      // down, so a worker killed between the hand-out and the first result
+      // left the persisted progress at the opening roll, where every page
+      // reads `not_reached`. A page four scouts had open would then be
+      // reported to the person as one nobody ever went to — the mirror of the
+      // mistake `not_reached` was added to prevent, and in exactly the case
+      // this record exists for. Caught by Codex on #155.
       const moved = progress.event === 'moment.found'
         || progress.event === 'moment.extended'
         || progress.event === 'scout.candidate_completed';
-      if (!moved) return;
+      if (!moved && !firstSightOf) return;
       watchedSoFar = progress.snapshot.candidatesWatched;
       momentsSoFar = progress.snapshot.momentsFound;
       lastRoll = candidateRoll(candidates, announced, progress.snapshot.watchedIds, true);

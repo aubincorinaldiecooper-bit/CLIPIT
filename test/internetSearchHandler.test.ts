@@ -84,7 +84,15 @@ describe('internet search handler', () => {
     const { job } = fakeJob();
     await handleInternetSearch(job);
     const coarse = inspect.mock.calls.map(([input]) => input.plan).filter((plan) => plan.mode === 'coarse');
-    expect(coarse.map((plan) => [plan.startSeconds, plan.endSeconds])).toEqual([
+    // Sorted, because the order four parallel scouts happen to be dispatched
+    // in is not a contract — it moves with any await on the way to the first
+    // inspect, and it moved when the handler started writing down a page the
+    // moment it was handed out. What is a contract is that the first 600
+    // seconds are covered by exactly four sections with no gap and no
+    // overlap, and sorting still holds all of that: a duplicated section or a
+    // missing one fails this just as loudly.
+    const sections = coarse.map((plan) => [plan.startSeconds, plan.endSeconds]).sort((a, b) => a[0] - b[0]);
+    expect(sections).toEqual([
       [0, 150],
       [150, 300],
       [300, 450],
