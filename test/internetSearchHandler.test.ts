@@ -64,7 +64,9 @@ describe('internet search handler', () => {
     const { job, reported } = fakeJob();
     const result = await handleInternetSearch(job);
     expect(reported[0]).toEqual({ phase: 'loading', moments: [], candidatesFound: 0 });
-    expect(result).toEqual({ phase: 'answered', moments: [], candidatesFound: 0, candidatesWatched: 0, outcome: 'no_candidates' });
+    // An empty roll, not a missing one. Discovery ran and turned up nothing;
+    // that is a different fact from having no record of what it turned up.
+    expect(result).toEqual({ phase: 'answered', moments: [], candidatesFound: 0, candidatesWatched: 0, outcome: 'no_candidates', candidates: [] });
   });
 
   it('limits the ranked discovery set to seven videos', async () => {

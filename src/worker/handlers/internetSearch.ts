@@ -1,6 +1,6 @@
 import type { Job } from 'bullmq';
 import { logger } from '../../lib/logger.js';
-import type { InternetSearchJob, InternetSearchMoment, InternetSearchProgress } from '../../queues/internetSearch.js';
+import type { InternetSearchCandidate, InternetSearchJob, InternetSearchMoment, InternetSearchProgress } from '../../queues/internetSearch.js';
 import { search, type Candidate } from '../../services/discovery/searxng.js';
 import { decideEnding } from '../../services/retrieval/internetSearchOutcome.js';
 import { runScoutSwarm, type ScoutInspectionPlan, type ScoutId, type SwarmMoment } from '../../services/retrieval/scoutSwarm.js';
@@ -62,6 +62,44 @@ export function loggablePage(pageUrl: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * How many pages ride along on each poll. Twenty discovered candidates is the
+ * usual shape; the cap is here so a strange day cannot put a megabyte through
+ * a two-second poll.
+ */
+export const MAX_REPORTED_CANDIDATES = 40;
+
+/**
+ * The pages the search was given, and how far it got with each.
+ *
+ * Everything this needs is already assembled where the search reports
+ * progress — the discovered list, which ids have been handed to a scout, and
+ * which the swarm has got a watch out of. Until now it went into a log line
+ * and no further, so the only way to ask "which of the seven would not open"
+ * was to read the worker's logs.
+ *
+ * The one rule it exists to hold: a page nobody was ever sent to is
+ * `not_reached`, never `unwatched`. The swarm takes at most `maxCandidates`
+ * of what discovery found, and a search that dies stops handing them out, so
+ * "we never tried" is a real and common outcome. Reporting it as "would not
+ * open" would be inventing a failure for a page that was never opened.
+ */
+export function candidateRoll(
+  candidates: Candidate[],
+  announced: ReadonlySet<string>,
+  watchedIds: Iterable<string>,
+  stillRunning: boolean,
+): InternetSearchCandidate[] {
+  const watched = new Set(watchedIds);
+  return candidates.slice(0, MAX_REPORTED_CANDIDATES).map((candidate) => {
+    let state: InternetSearchCandidate['state'];
+    if (watched.has(candidate.id)) state = 'watched';
+    else if (!announced.has(candidate.id)) state = 'not_reached';
+    else state = stillRunning ? 'watching' : 'unwatched';
+    return { id: candidate.id, page: loggablePage(candidate.pageUrl), source: sourceOf(candidate), state };
+  });
 }
 
 function sourceOf(candidate: Candidate): string | null {
@@ -147,7 +185,7 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   const discovered = await search(job.data.query);
   const discoveryMs = Date.now() - discoveryStartedAt;
   if (discovered.length === 0) {
-    const done: InternetSearchProgress = { phase: 'answered', moments: [], candidatesFound: 0, candidatesWatched: 0, outcome: 'no_candidates' };
+    const done: InternetSearchProgress = { phase: 'answered', moments: [], candidatesFound: 0, candidatesWatched: 0, outcome: 'no_candidates', candidates: [] };
     await report(done);
     log.info('internet search finished', {
       model: videoChat3Adapter.id,
@@ -246,7 +284,13 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     }),
   });
 
-  await report({ phase: 'searching', moments: [], candidatesFound: candidates.length, candidatesWatched: 0 });
+  await report({
+    phase: 'searching',
+    moments: [],
+    candidatesFound: candidates.length,
+    candidatesWatched: 0,
+    candidates: candidateRoll(candidates, new Set(), [], true),
+  });
 
   // Which page each scout went to, recorded as it happens.
   //
@@ -262,6 +306,9 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
   // run does not come back.
   let watchedSoFar = 0;
   let momentsSoFar = 0;
+  // Kept out here for the same reason as the counts above: if the run does not
+  // come back, this is the last true thing we knew about the pages.
+  let lastRoll: InternetSearchCandidate[] = candidateRoll(candidates, new Set(), [], true);
 
   const started = await runScoutSwarm<Candidate>({
     searchId,
@@ -294,9 +341,11 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
       if (!moved) return;
       watchedSoFar = progress.snapshot.candidatesWatched;
       momentsSoFar = progress.snapshot.momentsFound;
+      lastRoll = candidateRoll(candidates, announced, progress.snapshot.watchedIds, true);
       await report({
         phase: 'searching',
         moments: asMoments(progress.snapshot.moments),
+        candidates: lastRoll,
         candidatesFound: candidates.length,
         candidatesWatched: progress.snapshot.candidatesWatched,
       });
@@ -367,6 +416,10 @@ export async function handleInternetSearch(job: Job<InternetSearchJob>): Promise
     candidatesFound: candidates.length,
     candidatesWatched: ending.candidatesWatched,
     outcome: ending.outcome,
+    // Settled from the inspections rather than the last snapshot, which is the
+    // same source `candidatesWatched` is taken from just above, so the roll and
+    // the count cannot disagree at the one moment anyone reads them carefully.
+    candidates: candidateRoll(candidates, announced, watchedCandidates, false),
     ...(unexamined > 0 ? { unexamined } : {}),
     ...(ending.failure ? { failure: ending.failure } : {}),
   };
