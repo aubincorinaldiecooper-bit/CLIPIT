@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -260,6 +261,73 @@ def test_haptics_and_the_morph_are_optional_and_the_switch_is_real(harness):
     assert not [line for line in source.splitlines() if line.startswith("import ")]
     assert 'id="haptics"' in body
     assert "if (!this.engine || !this.enabled) return;" in source
+
+
+def test_gander_has_a_bounded_semantic_haptic_output_tool():
+    """The model chooses meaning; it never gets access to raw vibration timing."""
+
+    from gander_runtime.online_duplex import (
+        MODEL_HAPTIC_CUES,
+        _model_haptic_control,
+        _model_tool_schemas,
+    )
+
+    runtime = SimpleNamespace(settings=SimpleNamespace(tool_schemas=()))
+    schemas = _model_tool_schemas(runtime)
+    haptic = next(schema for schema in schemas if schema["name"] == "haptic")
+    assert tuple(haptic["parameters"]["properties"]["cue"]["enum"]) == MODEL_HAPTIC_CUES
+    assert haptic["parameters"]["additionalProperties"] is False
+    assert not any(
+        name in haptic["parameters"]["properties"]
+        for name in ("duration", "frequency", "pattern", "intensity")
+    )
+
+    event = SimpleNamespace(
+        is_tool_call=True,
+        tool_error=None,
+        tool_calls=[{"name": "haptic", "arguments": {"cue": "confirmation"}}],
+    )
+    assert _model_haptic_control(event) == {
+        "type": "haptic.cue",
+        "cue": "confirmation",
+        "source": "model",
+    }
+
+
+def test_haptic_is_reserved_for_the_runtime():
+    """A deployment cannot replace the safe semantic haptic contract."""
+
+    from gander_runtime.online_duplex import _model_tool_schemas
+
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(
+            tool_schemas=(
+                {
+                    "name": "haptic",
+                    "description": "unsafe replacement",
+                    "parameters": {"type": "object"},
+                },
+            )
+        )
+    )
+    with pytest.raises(ValueError, match="reserved"):
+        _model_tool_schemas(runtime)
+
+
+def test_the_phone_renders_model_haptics_as_device_presets(harness):
+    """The websocket carries semantics and the browser owns the physical feel."""
+
+    h = harness()
+    with TestClient(h.app) as client:
+        source = client.get("/assets/live.js").text
+
+    assert "case 'haptic.cue':" in source
+    assert "attention: 'medium'" in source
+    assert "proximity: 'selection'" in source
+    assert "confirmation: 'success'" in source
+    assert "warning: 'warning'" in source
+    assert "lastModelHapticAt" in source
+    assert "performance.now() - live.lastModelHapticAt < 750" in source
 
 
 def test_a_long_status_wraps_instead_of_leaving_the_screen(harness):
