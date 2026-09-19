@@ -1,123 +1,154 @@
-/* The phone surface, on the GANDER brand system.
+/* The phone surface, on the gnsis brand system (Brand Guidelines v2, 2026-09).
  *
- * Palette and type are taken from the brand guidelines rather than invented:
- * Electric Blue is the primary, Soft White is the ground, Deep Black carries
- * the words, and the warm gradient appears only as a supporting accent, which
- * is the one use the guidelines allow it.
+ * Nothing here is invented. The six named colours and the warm off-white
+ * ground are the palette page; Roboto Condensed ExtraBold carries the one
+ * statement on the screen and Roboto carries everything else, at the type
+ * scale's sizes; radius, shadow and motion values are the tokens page; the
+ * QR sits on a Night panel because that is what the utility-surface page
+ * says; and the character breathes and blinks by its own motion table. Page
+ * numbers in the comments below point into the guideline.
  *
- * Two deliberate departures, both so the page does not quietly overstate what
- * it has:
+ * The fonts are self-hosted (OFL, licence files alongside them) rather than
+ * loaded from Google Fonts, which the guideline allows either way: a public
+ * camera page should not reach out to a third party on open, and an offline
+ * deploy should still look like itself.
  *
- * The display face is a system condensed stack, not Anton or Bebas Neue.
- * Loading either from a font CDN would make a public camera page reach out to
- * a third party on open and would break on an offline deploy. Vendoring the
- * real face is a small, separate decision — when it is made, only `--display`
- * changes.
- *
- * The GANDER character is not drawn here. It is not in the repository, and the
- * guidelines say not to add outlines or effects or to distort it, which is
- * precisely what an approximation from a screenshot would be. The slot is
- * marked in the markup and waits for the real asset.
+ * The character is the guideline's own vector, lifted from the PDF: the body
+ * outline and both eyes are its paths, unaltered. Only the gradient is built
+ * here, from the words that describe it.
  */
 :root {
-  /* 04 — Colour palette, verbatim. */
-  --sky: #4CC3FF;        /* fresh, open, uplifting */
-  --electric: #0077FF;   /* bold, confident — primary */
-  --soft-white: #F8FBFF; /* clean, spacious, versatile */
-  --deep-black: #0F1720; /* solid, legible, focused */
-  --warm-glow: #FFC247;  /* optimistic, energizing, supporting */
-  --coral: #FF5B6B;      /* creative, human, expressive */
+  /* 13 — Colour palette. One name per colour; the dark is always Night. */
+  --night: #111827;   /* primary text, utility surfaces */
+  --mist: #F5F8FB;    /* primary canvas, cards */
+  --peach: #FFD3B4;   /* soft warmth: ground glow, hover tints */
+  --coral: #FF6676;   /* gnsis core and glow — never text on light */
+  --orange: #FFAA3D;  /* gnsis top, planet — never text on light */
+  --glow: #FFE6B1;    /* orbit ring, highlight */
+  --warm: #FFF8F5;    /* the signature gradient's ground */
+  --ink-2: #4B5563;   /* body and secondary text, 7.6:1 on white */
 
-  --ink: var(--deep-black);
-  --ink-2: #5a6775;
-  --line: #e3ebf3;
+  /* 15 — Typography, with the guideline's fallback stack. */
+  --display: "Roboto Condensed", "Roboto", "Helvetica Neue", Arial, sans-serif;
+  --body: "Roboto", "Helvetica Neue", Arial, sans-serif;
 
-  /* 05 — Typography. Condensed bold display for headings; a clean sans for
-     everything else, in the order the guidelines name them. */
-  --display: "Anton", "Bebas Neue", "Haettenschweiler", "Arial Narrow",
-             system-ui, sans-serif;
-  --body: "Inter", "Manrope", -apple-system, "SF Pro Text", system-ui, sans-serif;
+  /* 19 — Tokens. */
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 20px;
+  --r-pill: 999px;
+  --shadow-card: 0 1px 3px rgba(17, 24, 39, 0.08);
+  --shadow-panel: 0 4px 16px rgba(17, 24, 39, 0.12);
+  --fast: 150ms;
+  --base: 250ms;
+  --slow: 400ms;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+}
 
-  /* 06 — Clear space is expressed as one unit, so spacing stays proportional. */
-  --unit: 12px;
+@font-face {
+  font-family: "Roboto";
+  src: url("/assets/live/Roboto.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Roboto Condensed";
+  src: url("/assets/live/RobotoCondensed-800.woff2") format("woff2");
+  font-weight: 800;
+  font-style: normal;
+  font-display: swap;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
 body {
-  background: var(--soft-white);
-  color: var(--ink);
-  font: 400 16px/1.5 var(--body);
+  background: var(--mist);
+  color: var(--night);
+  font: 400 16px/24px var(--body);   /* Body: 16 / 24 */
   -webkit-font-smoothing: antialiased;
   overscroll-behavior: none;
 }
 
+/* 12 — Light first. The landing is the one warm moment; the camera view is a
+   utility screen and sits on Mist so the Night stage is the only dark thing. */
 .live {
   position: relative;
   display: grid;
   grid-template-rows: auto 1fr auto auto;
   height: 100dvh;
-  padding: max(var(--unit), env(safe-area-inset-top)) 16px
-           max(16px, env(safe-area-inset-bottom));
-  gap: calc(var(--unit) * 1.2);
+  padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+  gap: 16px;
+  background: var(--warm);
   isolation: isolate;
+  overflow: hidden;
 }
+[data-view="camera"].live { background: var(--mist); }
 
-/* 07 — "Do use the warm gradient as a supporting asset." Supporting: it sits
-   behind everything, tinting the top of the page, and carries no words. */
-.glow {
+/* 13 — The signature gradient: two blurred blobs on the warm ground, soft and
+   low-contrast, with no words on them. */
+.blobs {
   position: absolute;
-  z-index: -1;
-  top: -18%;
-  right: -28%;
-  width: 92%;
-  aspect-ratio: 1;
+  inset: 0;
+  z-index: -2;
   background:
-    radial-gradient(closest-side, rgba(255, 194, 71, 0.62), transparent 72%),
-    radial-gradient(closest-side, rgba(255, 91, 107, 0.48), transparent 76%);
-  background-position: 30% 30%, 62% 58%;
-  background-repeat: no-repeat;
-  filter: blur(42px);
+    radial-gradient(closest-side, rgba(255, 102, 118, 0.34), transparent 70%) -18% 78% / 70vw 70vw no-repeat,
+    radial-gradient(closest-side, rgba(255, 170, 61, 0.30), transparent 72%) 118% 6% / 68vw 68vw no-repeat,
+    radial-gradient(closest-side, rgba(255, 230, 177, 0.55), transparent 70%) 70% -10% / 60vw 60vw no-repeat;
+  filter: blur(28px);
   pointer-events: none;
 }
-/* On a wide screen the same percentages become an enormous slab of orange,
-   which is not what "supporting" means. Bounded and quietened instead. */
-@media (min-width: 760px) {
-  .glow {
-    top: -22%;
-    right: -6%;
-    width: min(46vw, 620px);
-    opacity: 0.55;
-    filter: blur(64px);
-  }
+/* 17 — One orbit per screen, cropped at the page edge, behind content at
+   40–70%. Never beside gnsis at the same scale: the mark in the header is a
+   tenth of its size. */
+.orbit {
+  position: absolute;
+  z-index: -1;
+  top: -4%;
+  right: -26%;
+  width: min(72vw, 420px);
+  height: auto;
+  opacity: 0.55;
+  pointer-events: none;
 }
+@media (min-width: 760px) {
+  .blobs { filter: blur(48px); opacity: 0.8; }
+  .orbit { top: -8%; right: -6%; width: 460px; opacity: 0.5; }
+}
+[data-view="camera"] .blobs,
+[data-view="camera"] .orbit { display: none; }
 
-.bar { display: flex; align-items: center; justify-content: center; gap: 10px; }
+/* 11 — In product, gnsis alone is the mark. Flat tier, 40 px. */
+.bar { display: flex; align-items: center; justify-content: center; }
+.mark { width: 40px; height: 40px; display: block; overflow: visible; }
 
 /* Which door this device is shown. A QR is useless on the phone you would
    scan it with, so the split is by input type rather than by width: a coarse
    pointer is a finger, and a finger is holding the camera. */
 .onQR, .onTouch { display: none; }
-@media (pointer: coarse) { .onTouch { display: grid; gap: 14px; } }
+@media (pointer: coarse) { .onTouch { display: grid; gap: 12px; justify-items: center; } }
 @media (pointer: fine)   { .onQR   { display: grid; gap: 16px; justify-items: center; } }
 /* Neither door is locked: a desktop can opt in, and a device that reports
    nothing useful still gets the button rather than a dead end. */
-[data-force="touch"] .onTouch { display: grid; gap: 14px; }
+[data-force="touch"] .onTouch { display: grid; gap: 12px; justify-items: center; }
 [data-force="touch"] .onQR { display: none; }
 
 [data-view="landing"] .camera { display: none; }
 [data-view="camera"] .landing { display: none; }
-.camera { display: grid; grid-template-rows: 1fr auto auto; gap: calc(var(--unit) * 1.2); min-height: 0; }
-.landing { display: grid; align-content: center; justify-items: center; gap: 26px; text-align: center; }
+.camera { display: grid; grid-template-rows: 1fr auto auto; gap: 16px; min-height: 0; }
+.landing { display: grid; align-content: center; justify-items: center; gap: 32px; text-align: center; }
 
+/* 15/16 — Statement: Condensed 800, 56 / 54, −1%, all caps. One per screen,
+   with a cap-height of clear space around it (14). */
 .headline {
   font-family: var(--display);
-  font-weight: 700;
-  font-size: clamp(30px, 8vw, 44px);
-  line-height: 1.04;
-  letter-spacing: 0.01em;
+  font-weight: 800;
+  font-size: clamp(40px, 11vw, 56px);
+  line-height: 0.965;
+  letter-spacing: -0.01em;
   text-transform: uppercase;
-  max-width: 14ch;
+  max-width: 11ch;
+  padding: 0.35em 0;
 }
 /* The headline arrives word by word: Spell UI's WordsStagger, with its values
    kept — each word from faded, 10px low and blurred to rest over 0.5s
@@ -139,32 +170,103 @@ body {
   to   { opacity: 1; transform: translateY(0);    filter: blur(0); }
 }
 
-.qr {
-  display: grid;
-  justify-items: center;
-  gap: 12px;
-  padding: 18px;
-  background: #fff;
-  border-radius: 22px;
-  box-shadow: 0 1px 2px rgba(15, 23, 32, 0.06), 0 14px 34px rgba(15, 23, 32, 0.10);
+/* 18 — The QR is a Night panel: white dotted modules, rounded finders, radius
+   20, the panel shadow, and two modules of quiet zone inside the panel (the
+   picture carries them). Copy stays minimal. */
+.qr { display: grid; justify-items: center; gap: 12px; }
+.qr .panel {
+  width: 224px;
+  height: 224px;
+  border-radius: var(--r-xl);
+  overflow: hidden;
+  background: var(--night);
+  box-shadow: var(--shadow-panel);
 }
-.qr img { display: block; width: 180px; height: 180px; }
-.qr figcaption { font-size: 14px; color: var(--ink-2); }
+.qr img { display: block; width: 100%; height: 100%; }
+.qr figcaption { font-size: 13px; line-height: 18px; color: var(--ink-2); }   /* Utility */
 
-.fineprint { font-size: 13.5px; color: var(--ink-2); max-width: 30ch; }
-.arrow { display: inline-block; margin-left: 6px; }
+.fineprint { font-size: 13px; line-height: 18px; color: var(--ink-2); max-width: 32ch; }
 
+/* The one setting: a label and a switch, on the landing only. Safari draws
+   the switch itself; elsewhere the checkbox is drawn as one. */
+.setting {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: var(--r-pill);
+  font: 700 14px/20px var(--body);
+  color: var(--night);
+  cursor: pointer;
+}
+.setting input:not(.native) {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 44px;
+  height: 26px;
+  margin: 0;
+  border-radius: var(--r-pill);
+  background: rgba(17, 24, 39, 0.16);
+  position: relative;
+  cursor: pointer;
+  transition: background-color var(--fast) var(--ease);
+}
+.setting input:not(.native)::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: var(--shadow-card);
+  transition: transform var(--fast) var(--ease);
+}
+.setting input:not(.native):checked { background: var(--night); }
+.setting input:not(.native):checked::after { transform: translateX(18px); }
+.setting input:focus-visible { outline: 2px solid var(--night); outline-offset: 2px; }
+
+/* Read by assistive tech, never seen. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 19 — Icons: 24 px grid, 1.75 px stroke, round caps. */
+.icon {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: 0 0 auto;
+}
+
+/* Label: Roboto 700, 14 / 20. Night, never a warm colour (6, 12). */
 .link {
   appearance: none;
   background: none;
   border: 0;
-  padding: 6px;
-  font: 500 14px/1 var(--body);
-  color: var(--electric);
+  padding: 8px;
+  font: 700 14px/20px var(--body);
+  color: var(--night);
   cursor: pointer;
   text-decoration: underline;
   text-underline-offset: 3px;
+  border-radius: var(--r-md);
 }
+.link:hover { background: rgba(255, 211, 180, 0.35); }   /* Peach hover tint */
 
 /* The permission sheet. Brand-side of the native prompt, and dismissible. */
 .sheet {
@@ -173,7 +275,7 @@ body {
   z-index: 10;
   display: grid;
   align-items: end;
-  background: rgba(15, 23, 32, 0.46);
+  background: rgba(17, 24, 39, 0.46);
   padding: 16px;
   padding-bottom: max(16px, env(safe-area-inset-bottom));
   /* Everything behind the question is blurred out until it is answered, so
@@ -187,51 +289,36 @@ body {
    backdrop-filter is not supported the heavier dim above stands alone, which
    is why it is written as the default rather than as the fallback. */
 @supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  .sheet { background: rgba(15, 23, 32, 0.30); }
+  .sheet { background: rgba(17, 24, 39, 0.30); }
 }
 .sheet[hidden] { display: none; }
 @media (pointer: fine) { .sheet { align-items: center; justify-items: center; } }
 .sheet-card {
   display: grid;
-  gap: 14px;
+  gap: 12px;
   width: min(100%, 420px);
-  background: var(--soft-white);
-  border-radius: 26px;
-  padding: 26px 22px 20px;
-  box-shadow: 0 24px 60px rgba(15, 23, 32, 0.28);
-  animation: rise 260ms cubic-bezier(0.23, 1, 0.32, 1) both;
+  background: #fff;
+  border-radius: var(--r-xl);
+  padding: 24px 20px 16px;
+  box-shadow: var(--shadow-panel), 0 24px 48px rgba(17, 24, 39, 0.18);
+  animation: rise var(--base) var(--ease) both;
 }
-.ask {
-  font-family: var(--display);
-  font-weight: 700;
-  font-size: 25px;
-  line-height: 1.1;
-  letter-spacing: 0.01em;
-  text-transform: uppercase;
-}
-.askbody { font-size: 15px; color: var(--ink-2); line-height: 1.5; }
+.sheet-card .action { margin-top: 8px; }
+.ask { font: 700 20px/26px var(--body); }                 /* Subhead */
+.askbody { font-size: 16px; line-height: 24px; }            /* Body */
+.askfine { font-size: 13px; line-height: 18px; color: var(--ink-2); }   /* Utility */
 @keyframes rise { from { transform: translateY(16px); opacity: 0; } }
-/* Waiting for the real character asset. Deliberately empty rather than an
-   approximation of it. */
-.mark { width: 26px; height: 26px; flex: 0 0 auto; }
-.wordmark {
-  font-family: var(--display);
-  font-weight: 700;
-  font-size: 22px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--ink);
-}
 
+/* 3 — Night panels provide contrast for camera and video. */
 .stage {
   position: relative;
   min-height: 0;
-  border-radius: 26px;           /* soft, rounded, friendly */
+  border-radius: var(--r-xl);
   overflow: hidden;
-  background: var(--deep-black); /* the camera has to read against something */
+  background: var(--night);
   display: grid;
   place-items: center;
-  box-shadow: 0 1px 2px rgba(15, 23, 32, 0.06), 0 18px 40px rgba(15, 23, 32, 0.10);
+  box-shadow: var(--shadow-panel);
 }
 .preview {
   position: absolute;
@@ -240,67 +327,112 @@ body {
   height: 100%;
   object-fit: cover;
   opacity: 0;
-  transition: opacity 240ms ease;
+  transition: opacity var(--base) var(--ease);
 }
 .scratch { display: none; }
 [data-state="live"] .preview,
 [data-state="connecting"] .preview { opacity: 1; }
 
-.readout { min-height: 64px; }
-/* The status line is hidden rather than empty when there is nothing to say:
-   an empty one still reserved its dot and its row, which read as a stalled
-   session. `.readout` holds the height so nothing below it moves. */
+.readout { min-height: 68px; display: grid; gap: 8px; justify-items: start; }
+/* 8 — The status is the guideline's own pattern: the flat mark beside a short
+   line, on a white pill. Hidden rather than empty when there is nothing to
+   say, so an empty pill never reads as a stalled session; `.readout` holds
+   the height so nothing below it moves. */
 .status[hidden] { display: none; }
+/* The text morph (torph) takes over this element's layout, so the mark in
+   front of the words is an inline-block box of its own rather than a flex
+   item, and holds its size whatever the element's display becomes. */
 .status {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  font-size: 15px;
-  color: var(--ink-2);
+  display: inline-block;
+  padding: 6px 14px 6px 8px;
+  background: #fff;
+  border-radius: var(--r-pill);
+  box-shadow: var(--shadow-card);
+  font: 700 14px/20px var(--body);
+  color: var(--night);
 }
 .status::before {
   content: "";
-  width: 9px; height: 9px;
-  border-radius: 50%;
-  background: var(--ink-2);
-  flex: 0 0 auto;
+  display: inline-block;
+  vertical-align: middle;
+  margin: -3px 8px -1px 0;
+  width: 22px;
+  height: 22px;
+  background: url("/assets/live/gnsis-flat.svg") center / contain no-repeat;
 }
-/* Three tones, all from the palette: blue is working, warm is wait a moment,
-   coral is something went wrong. */
-[data-tone="live"] .status::before { background: var(--electric); }
-[data-tone="busy"] .status::before { background: var(--warm-glow); }
-[data-tone="bad"]  .status::before { background: var(--coral); }
-[data-tone="live"] .status { color: var(--ink); }
+/* Something to wait for or something wrong: a small dot in a warm colour
+   instead of the mark. The colour is on the dot, never on the words (12). */
+[data-tone="busy"] .status::before,
+[data-tone="bad"] .status::before {
+  width: 8px;
+  height: 8px;
+  margin: -2px 15px 0 7px;
+  border-radius: 50%;
+  background: var(--orange);
+}
+[data-tone="bad"] .status::before { background: var(--coral); }
 
-.says { margin-top: 8px; font-size: 16px; color: var(--ink); min-height: 1.5em; }
+.says { font-size: 16px; line-height: 24px; min-height: 24px; }
 
 .controls { display: grid; }
 .action {
   appearance: none;
   border: 0;
-  border-radius: 999px;
-  padding: 18px 24px;
-  font: 600 16px/1 var(--body);
+  border-radius: var(--r-pill);
+  padding: 14px 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font: 700 16px/24px var(--body);
   white-space: nowrap;
   cursor: pointer;
-  transition: transform 120ms ease, background-color 160ms ease;
+  transition: transform var(--fast) var(--ease), box-shadow var(--fast) var(--ease);
 }
-.start {
-  background: var(--electric);
-  color: #fff;
-  box-shadow: 0 6px 18px rgba(0, 119, 255, 0.28);
-}
+/* Warm colours never become large flat fills (12), so the primary action is
+   Night with white words. */
+.start { background: var(--night); color: #fff; box-shadow: var(--shadow-card); }
+.start:hover { box-shadow: var(--shadow-panel); transform: translateY(-1px); }
 .start:active { transform: scale(0.985); }
 .end {
-  background: transparent;
-  color: var(--ink-2);
-  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--night);
+  box-shadow: var(--shadow-card), inset 0 0 0 1px rgba(17, 24, 39, 0.08);
 }
+.end:hover { background: var(--mist); }
 .action:disabled { opacity: 0.45; }
 
+/* 10 — Motion basics. gnsis moves like something breathing, not something
+   bouncing: the body scales 1.00 → 1.02 over 4 s, ease-in-out, and loops; the
+   eyes blink (squash to 10% height) every 4–7 s. While the session is
+   listening or watching, the rim brightens and the body lifts 2% over 900 ms.
+   Never rotated, mirrored, or squashed as a whole. */
+/* The lift lives on the mark as a whole, not on the body: the body's transform
+   belongs to the breathing animation, and an animation always wins over a
+   transform set beside it, so a lift put there would never happen. */
+.mark { transition: transform 900ms var(--ease); }
+.gnsis-body {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: breathe 4s ease-in-out infinite alternate;
+}
+@keyframes breathe { from { transform: scale(1); } to { transform: scale(1.02); } }
+.gnsis-eyes path {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: blink 5.5s linear infinite;
+}
+@keyframes blink {
+  0%, 96%, 100% { transform: scaleY(1); }
+  97.5%          { transform: scaleY(0.1); }
+}
+.gnsis-rim { transition: stroke-opacity 900ms var(--ease); }
+[data-state="live"] .mark { transform: translateY(-2%); }
+[data-state="live"] .mark .gnsis-rim { stroke-opacity: 1; }
+
 @media (prefers-reduced-motion: reduce) {
-  .preview, .action { transition: none; }
-  .sheet-card { animation: none; }
+  .preview, .action, .mark, .gnsis-rim { transition: none; }
+  .sheet-card, .gnsis-body, .gnsis-eyes path { animation: none; }
   /* The words are simply there. */
   .headline.stagger .word { animation: none; }
 }

@@ -83,8 +83,8 @@ def styled_svg(
     size: int = _CANVAS,
     px: int | None = None,
     quiet: int = 0,
-    fg: str = "#0F1720",
-    bg: str = "#ffffff",
+    fg: str = "#FFFFFF",
+    bg: str = "#111827",
     label: str | None = None,
 ) -> str:
     """Spell UI's QR code, drawn from a module matrix.
@@ -95,7 +95,8 @@ def styled_svg(
     of radius one third of a module at the module's centre; each finder three
     nested rounded squares — seven modules of foreground (rx 12), five of
     background inset one module (rx 8), three of foreground inset two (rx 3) —
-    on a background rounded to 12. The radii are canvas units, as upstream,
+    on a background rounded to 12, white on Night by default because that is
+    the brand's QR surface. The radii are canvas units, as upstream,
     so the corners look the same whatever the module count.
 
     Upstream draws no quiet zone and leaves the margin to whatever surrounds

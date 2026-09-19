@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Genesis live — the phone surface over Gander's existing WebSocket runtime.
+ * gnsis live — the phone surface over Gander's existing WebSocket runtime.
  *
  * This adds no transport and no protocol. It speaks exactly what the desktop
  * client already speaks: `/ws/duplex` for PCM16 audio both ways, `/ws/screen`
@@ -8,9 +8,9 @@
  *
  * Two rules shape the whole file.
  *
- * It never claims Genesis can see before the server has said so. "Genesis can
- * see your camera" appears on the first `screen.frame.accepted` and not one
- * moment earlier — sending a frame is not evidence that a frame arrived.
+ * It never claims sight before the server has said so. "Session ready"
+ * appears on the first `screen.frame.accepted` and not one moment earlier —
+ * sending a frame is not evidence that a frame arrived.
  *
  * And End means off. Tracks stopped, sockets closed, worklet released,
  * playback dropped, so the phone's own camera and microphone indicators go out.
@@ -29,6 +29,8 @@ const ui = {
   preview: document.getElementById('preview'),
   scratch: document.getElementById('scratch'),
   status: document.getElementById('status'),
+  statusText: document.getElementById('statusText'),
+  hapticsSwitch: document.getElementById('haptics'),
   says: document.getElementById('says'),
   start: document.getElementById('start'),
   end: document.getElementById('end'),
@@ -36,6 +38,63 @@ const ui = {
 
 /** Everything a running session owns, so End can let go of all of it. */
 let live = null;
+
+// --- feel ----------------------------------------------------------------
+
+/**
+ * Haptics (web-haptics, vendored; MIT). On Android this is the Vibration
+ * API; on iOS Safari the library taps a hidden switch, which is the one thing
+ * on that platform that produces a haptic from a page. Each moment gets the
+ * library's preset closest to what it means: a light tap acknowledges a
+ * touch, "success" is the session becoming real, "selection" is the first
+ * word of a reply, "warning" and "error" are what they say, and End is a
+ * single firm tick. Intensity sits under the library's default: the brand is
+ * calm, not buzzy.
+ *
+ * On by default, remembered on this phone, and switchable on the landing.
+ * Off means nothing is ever triggered. If the library fails to load, the
+ * page is simply silent to the hand.
+ */
+const HAPTICS_KEY = 'gnsis.haptics';
+const haptics = {
+  engine: null,
+  intensity: 0.55,
+  get enabled() {
+    try { return localStorage.getItem(HAPTICS_KEY) !== 'off'; } catch { return true; }
+  },
+  set enabled(on) {
+    try { localStorage.setItem(HAPTICS_KEY, on ? 'on' : 'off'); } catch { /* not remembered */ }
+  },
+  async load() {
+    try {
+      const mod = await import('/assets/live/web-haptics.mjs');
+      this.engine = new mod.WebHaptics();
+    } catch {
+      this.engine = null;
+    }
+  },
+  play(preset) {
+    if (!this.engine || !this.enabled) return;
+    try { void this.engine.trigger(preset, { intensity: this.intensity }); } catch { /* nothing */ }
+  },
+};
+
+/** The status line morphs between messages (torph, vendored; MIT). */
+let morph = null;
+async function loadMorph() {
+  try {
+    const mod = await import('/assets/live/torph.mjs');
+    morph = new mod.TextMorph({
+      element: ui.status,
+      text: ui.status.textContent || '',
+      duration: 250,
+      ease: 'cubic-bezier(0.4, 0, 0.2, 1)',
+      respectReducedMotion: true,
+    });
+  } catch {
+    morph = null;
+  }
+}
 
 // --- headline ------------------------------------------------------------
 
@@ -72,8 +131,52 @@ function staggerWords(heading) {
 
 staggerWords(document.getElementById('headline'));
 
+/**
+ * Let the mark breathe.
+ *
+ * It is served as a picture so a page whose script never ran still shows it.
+ * Here the same file is fetched and put inline, which is what lets CSS reach
+ * the body and the eyes for the idle and attention motion the guideline
+ * describes. If the fetch fails the picture simply stays.
+ */
+async function inlineMark(img) {
+  if (!img) return;
+  try {
+    const response = await fetch(img.getAttribute('src'));
+    if (!response.ok) return;
+    const doc = new DOMParser().parseFromString(await response.text(), 'image/svg+xml');
+    const svg = doc.documentElement;
+    if (!svg || svg.nodeName !== 'svg') return;
+    svg.setAttribute('class', 'mark');
+    svg.setAttribute('id', img.id);
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', img.alt || 'gnsis');
+    img.replaceWith(svg);
+  } catch {
+    // The picture stays.
+  }
+}
+
+void inlineMark(document.getElementById('mark'));
+
+if (ui.hapticsSwitch) {
+  // Where the browser knows what a switch is (Safari 17.4+), it draws it and
+  // gives its own haptic on toggle; the page's drawing is for everywhere else.
+  if ('switch' in ui.hapticsSwitch) ui.hapticsSwitch.classList.add('native');
+  ui.hapticsSwitch.checked = haptics.enabled;
+  ui.hapticsSwitch.addEventListener('change', () => {
+    haptics.enabled = ui.hapticsSwitch.checked;
+    // Turning it on says so, once, in the hand.
+    if (ui.hapticsSwitch.checked) haptics.play('selection');
+  });
+}
+void haptics.load();
+void loadMorph();
+
 function show(text, { state, tone } = {}) {
-  ui.status.textContent = text;
+  if (morph) morph.update(text || '');
+  else ui.status.textContent = text;
+  ui.statusText.textContent = text;
   ui.status.hidden = !text;
   if (state) ui.root.dataset.state = state;
   if (tone === null) delete ui.root.dataset.tone;
@@ -231,7 +334,7 @@ async function startMicrophone(session) {
 function attachScreen(session, ready) {
   const screen = ready.screen || {};
   if (!screen.enabled || !screen.token) {
-    show('Genesis is not accepting video right now.', { tone: 'busy' });
+    show('Video is off on this server.', { tone: 'busy' });
     return null;
   }
   const socket = new WebSocket(
@@ -250,7 +353,8 @@ function attachScreen(session, ready) {
       live.stats.accepted += 1;
       if (live.stats.accepted === 1) {
         // The first proof that a real frame arrived. Only now is it true.
-        show('Genesis can see your camera. Listening…', { state: 'live', tone: 'live' });
+        show('Session ready.', { state: 'live', tone: 'live' });
+        haptics.play('success');
       }
       return;
     }
@@ -284,7 +388,7 @@ function handleDuplex(session, event) {
         }));
         show('Turning the camera on…', { state: 'connecting' });
       } else {
-        show('Genesis is not accepting video right now.', { tone: 'busy' });
+        show('Video is off on this server.', { tone: 'busy' });
       }
       void startMicrophone(session).then((mic) => { if (live) live.mic = mic; });
       break;
@@ -292,7 +396,7 @@ function handleDuplex(session, event) {
       // Only now is the server willing to look at a frame.
       if (!live.screen && live.ready) {
         live.screen = attachScreen(session, live.ready);
-        show('Connected. Waiting for the first frame…', { state: 'connecting' });
+        show('Waiting for the first frame…', { state: 'connecting' });
       }
       break;
     case 'media.mode.rejected':
@@ -309,6 +413,7 @@ function handleDuplex(session, event) {
       // only acknowledges a transcript the client sent and carries no text,
       // so reading it left the page silent whenever speech was off.
       if (payload.text) {
+        if (!live.reply) haptics.play('selection');
         live.reply = (live.reply || '') + payload.text;
         say(live.reply);
       }
@@ -316,7 +421,8 @@ function handleDuplex(session, event) {
       break;
     case 'error':
       // Raw engineering wording never reaches the page.
-      show(payload.fatal ? 'Genesis could not start.' : 'Something went wrong.', { tone: 'bad' });
+      show(payload.fatal ? 'The session could not start.' : 'Something went wrong.', { tone: 'bad' });
+      haptics.play('error');
       break;
     default:
       break;
@@ -369,14 +475,16 @@ async function start() {
     if (!live || live.stopped) return;
     if (event.code === 1013) {
       // The single model slot is taken. Say that in words a person can act on.
-      show('Genesis is in another live session right now. Try again in a moment.', { tone: 'busy' });
+      show('Another session is open. Try again in a moment.', { tone: 'busy' });
+      haptics.play('warning');
     } else {
       show('Connection lost.', { tone: 'bad' });
+      haptics.play('error');
     }
     void stop({ keepMessage: true });
   });
   duplex.addEventListener('error', () => {
-    if (live && !live.stopped) show('Could not connect to Genesis.', { tone: 'bad' });
+    if (live && !live.stopped) show('Could not connect.', { tone: 'bad' });
   });
 }
 
@@ -392,7 +500,7 @@ async function stop({ keepMessage = false } = {}) {
   //
   // Closing the socket outright reads to the server as a dropped connection,
   // which parks the Thinker and holds the single model slot for the whole
-  // reconnect grace. End, then scan again, and the next person is told Genesis
+  // reconnect grace. End, then scan again, and the next person is told it
   // is busy — by a session the last person deliberately ended. An explicit
   // stop is never parked.
   const duplex = session.duplex;
@@ -457,7 +565,7 @@ function dismiss() {
   ui.root.dataset.view = 'landing';
 }
 
-ui.start.addEventListener('click', ask);
+ui.start.addEventListener('click', () => { haptics.play('light'); ask(); });
 // A desktop with a webcam is not shut out; it just is not the default door.
 if (ui.useThis) {
   ui.useThis.addEventListener('click', () => {
@@ -466,6 +574,7 @@ if (ui.useThis) {
   });
 }
 ui.allow.addEventListener('click', () => {
+  haptics.play('light');
   ui.permission.hidden = true;
   void start();
 });
@@ -478,6 +587,6 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !ui.permission.hidden) dismiss();
 });
 
-ui.end.addEventListener('click', () => { void stop(); });
+ui.end.addEventListener('click', () => { haptics.play('rigid'); void stop(); });
 // A backgrounded or closed tab must not leave the camera on.
 window.addEventListener('pagehide', () => { void stop({ keepMessage: true }); });

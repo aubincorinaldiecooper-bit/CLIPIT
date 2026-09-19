@@ -10,6 +10,7 @@ a browser does that, and a real device does it properly.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -28,9 +29,11 @@ def test_live_page_is_served(harness):
         assert page.status_code == 200
         assert "text/html" in page.headers["content-type"]
         body = page.text
-        # The page must not promise sight before the server has confirmed one.
-        assert "Let Genesis see what you see." in body
-        assert "Genesis can see" not in body
+        # The statement, in the guideline's words.
+        assert "Let it see what you see." in body
+        # The page must not promise a working session before the server has
+        # confirmed a frame: "Session ready" lives in the script, not the page.
+        assert "Session ready" not in body
 
 
 def test_both_doors_are_in_the_page(harness):
@@ -109,8 +112,8 @@ def test_the_headline_arrives_word_by_word_and_is_still_a_sentence(harness):
         css = client.get("/assets/live.css").text
         source = client.get("/assets/live.js").text
     # The words live in the markup, not the script.
-    assert "Let Genesis see what you see." in body
-    assert "Let Genesis see what you see." not in source
+    assert "Let it see what you see." in body
+    assert "Let it see what you see." not in source
     # Upstream's recipe, verbatim.
     keyframes = css.split("@keyframes word-in")[1].split("}\n}")[0]
     assert "opacity: 0" in keyframes
@@ -181,6 +184,82 @@ def test_live_assets_are_served(harness, path, kind):
         asset = client.get(path)
         assert asset.status_code == 200
         assert kind in asset.headers["content-type"]
+
+
+@pytest.mark.parametrize(
+    "name,kind",
+    [
+        ("Roboto.woff2", "font/woff2"),
+        ("RobotoCondensed-800.woff2", "font/woff2"),
+        ("gnsis-flat.svg", "image/svg+xml"),
+        ("gnsis-mark.svg", "image/svg+xml"),
+        ("gnsis-mark-white.svg", "image/svg+xml"),
+        ("orbit.svg", "image/svg+xml"),
+        # The two vendored libraries, as modules, with their licences.
+        ("web-haptics.mjs", "text/javascript"),
+        ("web-haptics-core.mjs", "text/javascript"),
+        ("torph.mjs", "text/javascript"),
+        # Every licence travels with what it covers.
+        ("OFL-Roboto.txt", "text/plain"),
+        ("OFL-RobotoCondensed.txt", "text/plain"),
+        ("LICENSE-web-haptics.txt", "text/plain"),
+        ("LICENSE-torph.txt", "text/plain"),
+    ],
+)
+def test_the_brands_files_are_served(harness, name, kind):
+    h = harness()
+    with TestClient(h.app) as client:
+        asset = client.get(f"/assets/live/{name}")
+        assert asset.status_code == 200
+        assert kind in asset.headers["content-type"]
+        assert len(asset.content) > 100
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/assets/live/nope.svg",            # not there
+        "/assets/live/live.css",            # there, but not in this folder
+        "/assets/live/..",                  # not a file name
+        "/assets/live/.hidden",             # hidden
+        "/assets/live/..%2Flive.html",      # a slash, however it is spelled
+    ],
+)
+def test_the_brand_route_serves_only_that_folder(harness, path):
+    h = harness()
+    with TestClient(h.app) as client:
+        assert client.get(path).status_code == 404
+
+
+def test_the_brands_files_ship_with_the_package():
+    """A folder the wheel leaves behind is a page with no fonts and no mark."""
+
+    from mcpmft.infer.web import STATIC_DIR
+
+    static = Path(STATIC_DIR)
+    pyproject = static.parents[2] / "pyproject.toml"
+    assert '"static/live/*"' in pyproject.read_text()
+    assert (static / "live" / "gnsis-flat.svg").is_file()
+
+
+def test_haptics_and_the_morph_are_optional_and_the_switch_is_real(harness):
+    """Two vendored libraries, neither of which the page may depend on.
+
+    Both are loaded with a dynamic import inside a try, so a missing or broken
+    file leaves the page working and merely silent to the hand. The switch is
+    a real input the person can turn off, and off means nothing is triggered.
+    """
+
+    h = harness()
+    with TestClient(h.app) as client:
+        body = client.get("/live").text
+        source = client.get("/assets/live.js").text
+    assert "import('/assets/live/web-haptics.mjs')" in source
+    assert "import('/assets/live/torph.mjs')" in source
+    # No static import: the page must not fail to load over a helper.
+    assert not [line for line in source.splitlines() if line.startswith("import ")]
+    assert 'id="haptics"' in body
+    assert "if (!this.engine || !this.enabled) return;" in source
 
 
 def test_the_phone_client_asks_for_the_rear_camera(harness):

@@ -43,7 +43,7 @@ mcpmft-data = "mcpmft.data_cli:main"
 include = ["mcpmft*"]
 
 [tool.setuptools.package-data]
-"mcpmft.infer" = ["static/*.html", "static/*.css", "static/*.js"]
+"mcpmft.infer" = ["static/*.html", "static/*.css", "static/*.js", "static/live/*"]
 
 [tool.ruff]
 line-length = 100
