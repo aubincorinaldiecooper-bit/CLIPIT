@@ -428,6 +428,43 @@ def _duplex_params(config: DuplexConfig) -> DuplexParams:
     )
 
 
+def _duplex_settings(config: ReleaseConfig) -> "OnlineDuplexSettings":
+    """Map a loaded config onto the duplex runtime's settings.
+
+    Split out of `build_app` so it can be tested without loading a model. A
+    field that exists on `DuplexConfig` but is never forwarded here is an
+    option no deployment can actually take, which is exactly the shape of
+    the bug Codex found in `persist_camera_frames`.
+    """
+
+    from .online_duplex import OnlineDuplexSettings
+
+    duplex = config.duplex
+    return OnlineDuplexSettings(
+        decode_mode=duplex.decode_mode,
+        system_prompt=duplex.system_prompt,
+        ref_audio_path=duplex.ref_audio_path,
+        trailing_silence_sec=duplex.trailing_silence_sec,
+        asr_base_url=asr_base_url(config.asr),
+        asr_timeout_sec=config.asr.request_timeout_sec,
+        turn_bind_grace_sec=duplex.turn_bind_grace_sec,
+        media_mode=duplex.media_mode,
+        persist_camera_frames=duplex.persist_camera_frames,
+        allow_client_video=duplex.allow_client_video,
+        client_video_mode=duplex.client_video_mode,
+        client_video_sources=tuple(duplex.client_video_sources),
+        vision_max_slice_nums=duplex.vision_max_slice_nums,
+        vision_batch_feed=duplex.vision_batch_feed,
+        max_screen_frame_bytes=duplex.max_screen_frame_bytes,
+        max_screen_pixels=duplex.max_screen_pixels,
+        codex_frame_rate_multiplier=duplex.codex_frame_rate_multiplier,
+        codex_screen_history_seconds=duplex.codex_screen_history_seconds,
+        tool_schemas=_tool_schemas(duplex.tools_path),
+        expose_task_slate_to_model=duplex.expose_task_slate_to_model,
+        warm_first_unit=duplex.warm_first_unit,
+    )
+
+
 def build_app(config: ReleaseConfig):
     from mcpmft.infer.common import load_for_infer
 
@@ -503,29 +540,7 @@ def build_app(config: ReleaseConfig):
             ),
         )
     params = _duplex_params(duplex)
-    settings = OnlineDuplexSettings(
-        decode_mode=duplex.decode_mode,
-        system_prompt=duplex.system_prompt,
-        ref_audio_path=duplex.ref_audio_path,
-        trailing_silence_sec=duplex.trailing_silence_sec,
-        asr_base_url=asr_base_url(config.asr),
-        asr_timeout_sec=config.asr.request_timeout_sec,
-        turn_bind_grace_sec=duplex.turn_bind_grace_sec,
-        media_mode=duplex.media_mode,
-        persist_camera_frames=duplex.persist_camera_frames,
-        allow_client_video=duplex.allow_client_video,
-        client_video_mode=duplex.client_video_mode,
-        client_video_sources=tuple(duplex.client_video_sources),
-        vision_max_slice_nums=duplex.vision_max_slice_nums,
-        vision_batch_feed=duplex.vision_batch_feed,
-        max_screen_frame_bytes=duplex.max_screen_frame_bytes,
-        max_screen_pixels=duplex.max_screen_pixels,
-        codex_frame_rate_multiplier=duplex.codex_frame_rate_multiplier,
-        codex_screen_history_seconds=duplex.codex_screen_history_seconds,
-        tool_schemas=_tool_schemas(duplex.tools_path),
-        expose_task_slate_to_model=duplex.expose_task_slate_to_model,
-        warm_first_unit=duplex.warm_first_unit,
-    )
+    settings = _duplex_settings(config)
     memory_provider = (
         HttpMemoryProvider(
             config.memory.url,

@@ -73,8 +73,16 @@ def test_the_view_is_blurred_while_permission_is_still_being_asked(harness):
     h = harness()
     with TestClient(h.app) as client:
         sheet = client.get("/assets/live.css").text.split(".sheet {")[1].split("}")[0]
-    assert "-webkit-backdrop-filter: blur(" in sheet
-    assert "backdrop-filter: blur(" in sheet
+    # Matched per declaration, not as a substring of the block: the prefixed
+    # property contains the plain one, so `"backdrop-filter: blur(" in sheet`
+    # passes with the plain property deleted. It did.
+    declared = {
+        line.strip().split(":")[0].strip()
+        for line in sheet.splitlines()
+        if ":" in line and not line.strip().startswith(("/*", "*"))
+    }
+    assert "backdrop-filter" in declared
+    assert "-webkit-backdrop-filter" in declared
 
 
 def test_the_qr_encodes_this_server_not_a_caller_supplied_url(harness):
@@ -201,7 +209,7 @@ def test_the_camera_opt_in_can_actually_be_set(tmp_path):
     Codex.
     """
 
-    from gander_runtime.cli import load_config
+    from gander_runtime.cli import _duplex_settings, load_config
 
     config = load_config(
         _config(tmp_path, "none", "optin", persist_camera_frames=True)
@@ -211,6 +219,20 @@ def test_the_camera_opt_in_can_actually_be_set(tmp_path):
     assert load_config(
         _config(tmp_path, "none", "default")
     ).duplex.persist_camera_frames is False
+
+    # Parsing the key is only half of reachable. The value has to survive the
+    # trip into the runtime's own settings, and `build_app` loads a model, so
+    # that mapping is tested through the function split out of it. Without
+    # this the forwarding line could be deleted and every test still passed —
+    # which is exactly what happened, and what the commit message claimed had
+    # been ruled out.
+    assert _duplex_settings(config).persist_camera_frames is True
+    assert (
+        _duplex_settings(
+            load_config(_config(tmp_path, "none", "default2"))
+        ).persist_camera_frames
+        is False
+    )
 
 
 def test_the_client_negotiates_camera_mode_before_opening_the_screen(harness):
