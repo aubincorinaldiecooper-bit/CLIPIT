@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import math
@@ -61,7 +62,7 @@ class _StartupFlood(Exception):
     """A client sent more before `ready` than the startup buffer will hold."""
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,19 @@ class OnlineDuplexSettings:
     max_screen_pixels: int = 4096 * 4096
     codex_frame_rate_multiplier: float = 3.0
     codex_screen_history_seconds: float = 8.0
+    # Write sampled camera frames to disk for back-brain context.
+    #
+    # Off by default, and deliberately narrower than it looks. Persistence only
+    # ever existed to feed `coordinator.remember_media`, so a session with no
+    # coordinator wrote frames nobody read: in lean mode every sampled frame
+    # went to disk and the reference was dropped on the next line. That is a
+    # privacy cost with no reader, and it sat directly behind a public camera.
+    #
+    # Screen sharing with a coordinator is a different bargain — the operator
+    # chose to share a window with a worker that needs to look at it — so that
+    # keeps working. A phone camera pointed at a room is not that, and it now
+    # stays in memory unless someone turns this on deliberately.
+    persist_camera_frames: bool = False
     tool_schemas: tuple[dict[str, Any], ...] = ()
     expose_task_slate_to_model: bool = False
     warm_first_unit: bool = True
@@ -123,7 +137,7 @@ class _Runtime:
     settings: OnlineDuplexSettings
     media_dir: Path
     gateway_factory: Callable[[str], Any]
-    provider_name: str
+    provider_name: str | None
     detached_talker: Any | None = None
     prefix_snapshot: Any | None = None
     prefix_cache_status: str = "pending"
@@ -145,6 +159,35 @@ async def _warm_backbrain_providers(gateway: Any) -> None:
 
     for provider in gateway.providers.values():
         await provider.warmup()
+
+
+def _should_persist_frame(runtime: _Runtime, source: str | None) -> bool:
+    """Whether this frame is worth writing to disk.
+
+    Two conditions, and only the second is a policy choice.
+
+    The first is that a persisted frame has exactly one reader: it is handed to
+    `remember_media` so a back brain can look at it later. A lean server has no
+    back brain — no coordinator, no worker provider — so the write was dead on
+    arrival. Every sampled frame went to disk and the reference was discarded
+    on the next line. `provider_name` is None precisely when no worker was
+    built, which makes it the honest signal here.
+
+    (The obvious-looking check, `active.coordinator is None`, is wrong: that is
+    the per-session realtime task coordinator, which is built for every session
+    including lean ones. It would almost never be None.)
+
+    The second is policy: a camera frame is written only when someone asked for
+    it in so many words. Screen sharing to a back brain is a different bargain
+    — an operator chose to show a window to a worker that has to read it — so
+    that is unchanged. A phone camera pointed at a room is not that.
+    """
+
+    if runtime.provider_name is None:
+        return False
+    if source == "camera":
+        return runtime.settings.persist_camera_frames
+    return True
 
 
 async def _screen_media_ref(
@@ -643,7 +686,7 @@ def create_online_duplex_app(
     *,
     params: Any,
     gateway_factory: Callable[[str], Any],
-    provider_name: str,
+    provider_name: str | None,
     settings: OnlineDuplexSettings | None = None,
     media_dir: str | Path,
     detached_talker: Any | None = None,
@@ -751,6 +794,78 @@ def create_online_duplex_app(
         return FileResponse(
             STATIC_DIR / "video.js",
             media_type="text/javascript",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # The phone surface. A separate page rather than a responsive pass over the
+    # desktop client: that client carries gates, meters, task slates and ASR
+    # controls, none of which belong in front of someone who has just scanned a
+    # QR code. It speaks the same two sockets and the same events.
+    @app.get("/live")
+    async def live() -> FileResponse:
+        return FileResponse(
+            STATIC_DIR / "live.html",
+            media_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/live/qr.svg")
+    async def live_qr(request: Request) -> Response:
+        """A QR code for this server's own live page.
+
+        The address is derived from the request, never taken from the query
+        string. Rendering an arbitrary caller-supplied URL would turn this into
+        a QR generator for anyone who can reach it — a code served from your
+        domain, pointing wherever the requester liked. It is also why the
+        result is checked before it is drawn: no credentials, no query, and no
+        plain http off localhost, because a browser will not grant camera
+        access on an insecure origin.
+        """
+
+        from .live_qr import UnsafeQRTarget, public_live_url
+
+        forwarded_proto = request.headers.get("x-forwarded-proto")
+        scheme = (forwarded_proto or request.url.scheme).split(",")[0].strip()
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if not host:
+            return Response("no host", status_code=400, media_type="text/plain")
+        try:
+            target = public_live_url(f"{scheme}://{host}/live")
+        except UnsafeQRTarget as unsafe:
+            return Response(str(unsafe), status_code=409, media_type="text/plain")
+
+        try:
+            import segno
+        except ModuleNotFoundError:
+            return Response(
+                "QR rendering needs segno: install gander-runtime[qr]",
+                status_code=501,
+                media_type="text/plain",
+            )
+
+        buffer = io.BytesIO()
+        segno.make(target, error="m").save(
+            buffer, kind="svg", scale=6, border=2, dark="#0F1720", light=None
+        )
+        return Response(
+            buffer.getvalue(),
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/assets/live.js")
+    async def live_js() -> FileResponse:
+        return FileResponse(
+            STATIC_DIR / "live.js",
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/assets/live.css")
+    async def live_css() -> FileResponse:
+        return FileResponse(
+            STATIC_DIR / "live.css",
+            media_type="text/css",
             headers={"Cache-Control": "no-store"},
         )
 
@@ -1006,9 +1121,9 @@ def create_online_duplex_app(
                             }
                         )
                     )
-                    if context_sampled:
+                    source = header.video_source or active.video_source
+                    if context_sampled and _should_persist_frame(runtime, source):
                         # Tag webcam and screen frames separately for back-brain context.
-                        source = header.video_source or active.video_source
                         media = await _screen_media_ref(
                             runtime,
                             session_id,

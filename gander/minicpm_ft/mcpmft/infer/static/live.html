@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#F8FBFF">
+<title>Genesis — live</title>
+<link rel="stylesheet" href="/assets/live.css">
+</head>
+<body>
+<main class="live" id="live" data-view="landing" data-state="idle">
+  <!-- Supporting accent only, per the brand rules: behind everything, no words. -->
+  <div class="glow" aria-hidden="true"></div>
+
+  <header class="bar">
+    <!-- Reserved for the GANDER character. Left empty on purpose: the asset is
+         not in this repository, and an approximation drawn from a screenshot
+         would be the distortion the guidelines rule out. -->
+    <span class="mark" aria-hidden="true"></span>
+    <span class="wordmark">Genesis</span>
+  </header>
+
+  <!-- Landing. A QR is useless on the device you would scan it with, so the
+       two devices are offered different doors and neither is locked. -->
+  <section class="landing" id="landing">
+    <h1 class="headline">Let Genesis see what you see.</h1>
+
+    <div class="onQR">
+      <figure class="qr">
+        <img src="/live/qr.svg" alt="QR code linking to this page" width="180" height="180">
+        <figcaption>Scan with your phone</figcaption>
+      </figure>
+      <button class="link" id="useThis" type="button">Or use this computer's camera</button>
+    </div>
+
+    <div class="onTouch">
+      <button class="action start" id="start" type="button">
+        Start <span class="arrow" aria-hidden="true">&rarr;</span>
+      </button>
+      <p class="fineprint">Camera and microphone, only while the session is open.</p>
+    </div>
+  </section>
+
+  <!-- Camera. -->
+  <section class="camera" id="camera" hidden>
+    <div class="stage">
+      <video class="preview" id="preview" playsinline autoplay muted></video>
+      <canvas class="scratch" id="scratch" aria-hidden="true"></canvas>
+    </div>
+
+    <div class="readout">
+      <!-- Never promises sight before a frame has actually been accepted. -->
+      <p class="status" id="status" role="status" aria-live="polite" hidden></p>
+      <p class="says" id="says"></p>
+    </div>
+
+    <div class="controls">
+      <button class="action end" id="end" type="button">End</button>
+    </div>
+  </section>
+
+  <!-- Asked in our own words before the browser asks in its own. On a phone a
+       dismissed native prompt is hard to recover from, so it is worth saying
+       what is about to be asked, and why, while refusing still costs nothing. -->
+  <div class="sheet" id="permission" hidden>
+    <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="askTitle">
+      <h2 class="ask" id="askTitle">Genesis needs your camera and microphone</h2>
+      <p class="askbody">
+        Point your camera at something and talk normally. Nothing is recorded:
+        what the camera sees stays in memory for as long as the session is open,
+        and stops the moment you press End.
+      </p>
+      <button class="action start" id="allow" type="button">Allow camera and microphone</button>
+      <button class="link" id="cancel" type="button">Not now</button>
+    </div>
+  </div>
+</main>
+<script src="/assets/live.js" type="module"></script>
+</body>
+</html>
