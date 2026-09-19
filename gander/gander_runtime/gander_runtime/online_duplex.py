@@ -1419,9 +1419,13 @@ def create_online_duplex_app(
             speech_output_task = None
             speech_output_stop = None
 
-        async def emit_model_event(event: Any) -> None:
+        async def emit_model_event(
+            event: Any,
+            output: Any | None = None,
+        ) -> None:
             assert coordinator is not None
-            output = coordinator.model_output(event)
+            if output is None:
+                output = coordinator.model_output(event)
             haptic_control = _model_haptic_control(event)
             if haptic_control is not None:
                 # Haptics are a local output modality, not an external side effect.
@@ -1638,13 +1642,10 @@ def create_online_duplex_app(
                                 output.value,
                                 wait_sent=output.delivery_id is not None,
                             )
+                            if output.delivery_id is not None:
+                                coordinator.acknowledge_output(output)
                         else:
-                            await send_model_event(
-                                output.value,
-                                wait_sent=output.delivery_id is not None,
-                            )
-                        if output.delivery_id is not None:
-                            coordinator.acknowledge_output(output)
+                            await emit_model_event(output.value, output)
 
                 outbound_task = asyncio.create_task(
                     forward_tool_outputs(),
