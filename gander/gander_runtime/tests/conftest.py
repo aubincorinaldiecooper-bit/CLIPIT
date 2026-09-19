@@ -160,6 +160,8 @@ class Harness:
     thinkers: list[StubThinker]
     coordinators: list[StubCoordinator]
     open_gate: threading.Event | None = None
+    # Where the server would write frames, so a test can look and find nothing.
+    media_dir: Any = None
 
 
 @pytest.fixture
@@ -171,6 +173,9 @@ def harness(monkeypatch, tmp_path):
         warmup_fails: bool = False,
         warmup_gate: threading.Event | None = None,
         open_gate: threading.Event | None = None,
+        # None models a lean server: no coordinator, no worker provider, and
+        # so nothing downstream that would ever read a persisted frame.
+        provider_name: str | None = "stub",
         **settings_kwargs: Any,
     ) -> Harness:
         from gander_runtime import online_duplex
@@ -205,7 +210,7 @@ def harness(monkeypatch, tmp_path):
             StubBundle(),
             params=StubParams(),
             gateway_factory=lambda _session_id: gateway,
-            provider_name="stub",
+            provider_name=provider_name,
             settings=online_duplex.OnlineDuplexSettings(
                 **{"reconnect_grace_sec": 0.3, **settings_kwargs}
             ),
@@ -213,6 +218,7 @@ def harness(monkeypatch, tmp_path):
         )
         return Harness(
             app=app,
+            media_dir=tmp_path / "media",
             provider=provider,
             gateway=gateway,
             thinkers=thinkers,

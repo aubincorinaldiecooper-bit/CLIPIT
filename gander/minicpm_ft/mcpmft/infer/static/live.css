@@ -1,0 +1,103 @@
+/* The phone surface for Genesis live. Deliberately small: one stage, one
+   status line, one control. Everything else belongs to the desktop client. */
+:root {
+  --ground: #0b0d10;
+  --surface: #14181d;
+  --ink: #f2f4f6;
+  --ink-2: #99a2ac;
+  --line: #262c33;
+  --live: #2fbf71;
+  --warn: #e0b341;
+  --bad: #e06b5a;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font: 400 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+.live {
+  display: grid;
+  grid-template-rows: auto 1fr auto auto;
+  height: 100dvh;
+  padding: max(12px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+  gap: 14px;
+}
+.bar { display: flex; align-items: center; justify-content: center; }
+.wordmark { font-weight: 700; letter-spacing: -0.01em; font-size: 17px; }
+
+/* One box that holds the pitch before Start and the camera after it, so the
+   layout does not jump when a session begins. */
+.stage {
+  position: relative;
+  min-height: 0;
+  border-radius: 20px;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+}
+.intro { padding: 24px; text-align: center; }
+.pitch { color: var(--ink-2); font-size: 15px; max-width: 24ch; }
+.preview {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity 240ms ease;
+}
+.scratch { display: none; }
+[data-state="live"] .preview,
+[data-state="connecting"] .preview { opacity: 1; }
+[data-state="live"] .intro,
+[data-state="connecting"] .intro { opacity: 0; }
+
+.readout { min-height: 68px; }
+/* At rest the stage carries the one line of copy. A status line repeating it
+   read as a mistake, which it was. */
+.status[hidden] { display: none; }
+.status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 15px;
+  color: var(--ink-2);
+}
+.status::before {
+  content: "";
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--ink-2);
+  flex: 0 0 auto;
+}
+[data-tone="live"] .status::before { background: var(--live); }
+[data-tone="busy"] .status::before { background: var(--warn); }
+[data-tone="bad"]  .status::before { background: var(--bad); }
+[data-tone="live"] .status { color: var(--ink); }
+
+.says { margin-top: 8px; font-size: 15px; color: var(--ink); min-height: 1.5em; }
+
+.controls { display: grid; }
+.action {
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  padding: 17px 24px;
+  font: inherit;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.start { background: var(--ink); color: #0b0d10; }
+.end { background: transparent; color: var(--ink-2); border: 1px solid var(--line); }
+.action:disabled { opacity: 0.45; }
+
+@media (prefers-reduced-motion: reduce) {
+  .preview { transition: none; }
+}

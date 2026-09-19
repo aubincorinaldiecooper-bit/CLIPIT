@@ -237,9 +237,18 @@ def validate_release_config(config: ReleaseConfig) -> None:
 def preflight_config(config: ReleaseConfig) -> None:
     from .providers import builtin_provider_registry
 
-    configured_provider = builtin_provider_registry().configure(
-        config.worker.provider,
-        config.worker.settings,
+    # A lean server has no coordinator, so it never dispatches to a worker.
+    # Checking for one anyway is what made a stock `gander-serve` demand a
+    # Codex binary just to answer "what am I looking at?" — a direct camera
+    # experience refusing to boot over an action layer it will never call.
+    needs_worker = config.server.mode == "coordinator"
+    configured_provider = (
+        builtin_provider_registry().configure(
+            config.worker.provider,
+            config.worker.settings,
+        )
+        if needs_worker
+        else None
     )
     _require_directory("model.model_name_or_path", config.model.model_name_or_path)
     if config.model.processor_name_or_path:
@@ -258,11 +267,13 @@ def preflight_config(config: ReleaseConfig) -> None:
     if config.duplex.tools_path:
         _require_file("duplex.tools_path", config.duplex.tools_path)
         _tool_schemas(config.duplex.tools_path)
-    _require_directory("worker.cwd", config.worker.cwd)
-    if config.server.mode == "coordinator" and config.coordinator.cwd:
-        _require_directory("coordinator.cwd", config.coordinator.cwd)
+    if needs_worker:
+        _require_directory("worker.cwd", config.worker.cwd)
+        if config.coordinator.cwd:
+            _require_directory("coordinator.cwd", config.coordinator.cwd)
 
-    if config.worker.provider == "codex":
+    if needs_worker and config.worker.provider == "codex":
+        assert configured_provider is not None
         _require_executable(
             "worker.settings.codex_bin",
             str(getattr(configured_provider.settings, "codex_bin")),
@@ -425,9 +436,17 @@ def build_app(config: ReleaseConfig):
     coordinator_cwd = str(
         Path(config.coordinator.cwd or worker_cwd).expanduser().resolve()
     )
-    provider_factory = builtin_provider_registry().configure(
-        config.worker.provider,
-        config.worker.settings,
+    # See preflight_config: lean mode has no coordinator and therefore nothing
+    # to dispatch, so it builds no worker provider. Ornith and Codex remain
+    # exactly where they were for coordinator mode.
+    needs_worker = config.server.mode == "coordinator"
+    provider_factory = (
+        builtin_provider_registry().configure(
+            config.worker.provider,
+            config.worker.settings,
+        )
+        if needs_worker
+        else None
     )
     detached = duplex.detached_talker_device is not None
     thinker_model = replace(config.model, init_tts=False) if detached else config.model
@@ -504,13 +523,21 @@ def build_app(config: ReleaseConfig):
         session_key = storage_key(session_id)
         ledger_dir.mkdir(parents=True, exist_ok=True)
         ledger = TaskLedger(ledger_dir / f"{session_key}.sqlite")
-        provider = provider_factory.create(
-            ProviderBuildContext(
-                workspace=Path(worker_cwd),
-                runtime_dir=runtime_dir / config.worker.provider / session_key,
-                runtime_profile=config.worker.profile,
+        providers = ProviderRegistry()
+        if provider_factory is not None:
+            providers = ProviderRegistry(
+                (
+                    provider_factory.create(
+                        ProviderBuildContext(
+                            workspace=Path(worker_cwd),
+                            runtime_dir=(
+                                runtime_dir / config.worker.provider / session_key
+                            ),
+                            runtime_profile=config.worker.profile,
+                        )
+                    ),
+                )
             )
-        )
         coordinator = (
             CodexCoordinator(
                 CodexCoordinatorConfig(
@@ -530,7 +557,7 @@ def build_app(config: ReleaseConfig):
         )
         return GanderGateway(
             coordinator=coordinator,
-            providers=ProviderRegistry((provider,)),
+            providers=providers,
             ledger=ledger,
             mode=server.mode,
             memory_provider=memory_provider,
@@ -544,7 +571,9 @@ def build_app(config: ReleaseConfig):
         params=params,
         settings=settings,
         gateway_factory=gateway_factory,
-        provider_name=provider_factory.provider_name,
+        provider_name=(
+            provider_factory.provider_name if provider_factory is not None else None
+        ),
         media_dir=runtime_dir / "media",
         detached_talker=detached_talker,
     )

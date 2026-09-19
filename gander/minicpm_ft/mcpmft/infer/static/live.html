@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#0b0d10">
+<title>Genesis</title>
+<link rel="stylesheet" href="/assets/live.css">
+</head>
+<body>
+<main class="live" id="live" data-state="idle">
+  <header class="bar"><span class="wordmark">Genesis</span></header>
+
+  <section class="stage">
+    <!-- The preview and the pitch occupy the same space, so nothing moves when
+         the session starts. -->
+    <div class="intro" id="intro">
+      <p class="pitch">Let Genesis see what you see.</p>
+    </div>
+    <video class="preview" id="preview" playsinline autoplay muted></video>
+    <canvas class="scratch" id="scratch" aria-hidden="true"></canvas>
+  </section>
+
+  <section class="readout">
+    <!-- Never promises sight before a frame has actually been accepted. -->
+    <p class="status" id="status" role="status" aria-live="polite" hidden></p>
+    <p class="says" id="says"></p>
+  </section>
+
+  <footer class="controls">
+    <button class="action start" id="start" type="button">Start</button>
+    <button class="action end" id="end" type="button" hidden>End</button>
+  </footer>
+</main>
+<script src="/assets/live.js" type="module"></script>
+</body>
+</html>
