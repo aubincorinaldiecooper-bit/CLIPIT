@@ -157,6 +157,18 @@ body {
   background: rgba(15, 23, 32, 0.46);
   padding: 16px;
   padding-bottom: max(16px, env(safe-area-inset-bottom));
+  /* Everything behind the question is blurred out until it is answered, so
+     the sheet reads as the only live thing on screen. Prefixed as well as
+     plain: Safari is most of the phones this page is for, and it only
+     understands the prefix. */
+  -webkit-backdrop-filter: blur(18px) saturate(118%);
+  backdrop-filter: blur(18px) saturate(118%);
+}
+/* With the blur doing the separating, the dim can come back a long way. Where
+   backdrop-filter is not supported the heavier dim above stands alone, which
+   is why it is written as the default rather than as the fallback. */
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .sheet { background: rgba(15, 23, 32, 0.30); }
 }
 .sheet[hidden] { display: none; }
 @media (pointer: fine) { .sheet { align-items: center; justify-items: center; } }
@@ -202,13 +214,6 @@ body {
   place-items: center;
   box-shadow: 0 1px 2px rgba(15, 23, 32, 0.06), 0 18px 40px rgba(15, 23, 32, 0.10);
 }
-.intro { padding: 26px; text-align: center; }
-.pitch {
-  color: #c9d6e3;
-  font-size: 16px;
-  max-width: 22ch;
-  line-height: 1.45;
-}
 .preview {
   position: absolute;
   inset: 0;
@@ -221,12 +226,11 @@ body {
 .scratch { display: none; }
 [data-state="live"] .preview,
 [data-state="connecting"] .preview { opacity: 1; }
-[data-state="live"] .intro,
-[data-state="connecting"] .intro { opacity: 0; }
 
 .readout { min-height: 64px; }
-/* At rest the stage carries the one line of copy. A status line repeating it
-   read as a mistake, which it was. */
+/* The status line is hidden rather than empty when there is nothing to say:
+   an empty one still reserved its dot and its row, which read as a stalled
+   session. `.readout` holds the height so nothing below it moves. */
 .status[hidden] { display: none; }
 .status {
   display: flex;

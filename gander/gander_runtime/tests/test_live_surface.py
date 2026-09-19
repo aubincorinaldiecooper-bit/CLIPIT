@@ -61,6 +61,22 @@ def test_permission_is_asked_in_our_own_words_first(harness):
     assert "getUserMedia" not in start_handler
 
 
+def test_the_view_is_blurred_while_permission_is_still_being_asked(harness):
+    """Nothing behind the question stays sharp until the question is answered.
+
+    Asserted on the stylesheet rather than on a render, because this suite has
+    no browser. What it can hold is the part that silently rots: the plain
+    property alone does nothing in Safari, which is most of the phones this
+    page is for, so the prefix is the half that has to be here.
+    """
+
+    h = harness()
+    with TestClient(h.app) as client:
+        sheet = client.get("/assets/live.css").text.split(".sheet {")[1].split("}")[0]
+    assert "-webkit-backdrop-filter: blur(" in sheet
+    assert "backdrop-filter: blur(" in sheet
+
+
 def test_the_qr_encodes_this_server_not_a_caller_supplied_url(harness):
     """A QR generator that draws any URL you hand it is a phishing tool.
 
