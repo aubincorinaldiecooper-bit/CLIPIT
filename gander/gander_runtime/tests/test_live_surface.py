@@ -262,6 +262,24 @@ def test_haptics_and_the_morph_are_optional_and_the_switch_is_real(harness):
     assert "if (!this.engine || !this.enabled) return;" in source
 
 
+def test_a_long_status_wraps_instead_of_leaving_the_screen(harness):
+    """torph keeps a morph on one line with a rule it injects after ours.
+
+    On a 320px phone the busy message then runs to x=371 and the page's
+    overflow: hidden cuts off the half that says what to do. Caught by Codex
+    on #158, reproduced in a browser. The pill wraps instead, and it has to
+    be `!important`: the library's rule arrives later and keys on its own
+    attribute name, so specificity alone is a bet on that name.
+    """
+
+    h = harness()
+    with TestClient(h.app) as client:
+        css = client.get("/assets/live.css").text
+    pill = css.split(".status {")[1].split("}")[0]
+    assert "white-space: normal !important" in pill
+    assert "max-width: 100%" in pill
+
+
 def test_the_phone_client_asks_for_the_rear_camera(harness):
     """Someone pointing a phone at a thing wants the lens on the far side."""
 

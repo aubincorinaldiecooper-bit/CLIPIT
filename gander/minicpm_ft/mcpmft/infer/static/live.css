@@ -341,9 +341,19 @@ body {
 .status[hidden] { display: none; }
 /* The text morph (torph) takes over this element's layout, so the mark in
    front of the words is an inline-block box of its own rather than a flex
-   item, and holds its size whatever the element's display becomes. */
+   item, and holds its size whatever the element's display becomes.
+   It also injects `[torph-root] { white-space: nowrap }` into <head>, after
+   this sheet, to keep a morph on one line. On a 320px phone that pushes a
+   long message past the edge, where `.live { overflow: hidden }` cuts off
+   the half that says what to do (Codex, #158). So the pill wraps instead:
+   `!important` because the library's rule arrives later and keys on its own
+   attribute name. The morph copes — it measures the wrapped size and
+   animates to it (probed at 320px: 189→288 wide, 35→52 tall over the 250ms,
+   nothing past the edge). */
 .status {
   display: inline-block;
+  max-width: 100%;
+  white-space: normal !important;
   padding: 6px 14px 6px 8px;
   background: #fff;
   border-radius: var(--r-pill);
