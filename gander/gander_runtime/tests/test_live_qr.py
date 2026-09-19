@@ -83,9 +83,11 @@ def test_the_finders_are_three_nested_rounded_squares_with_upstreams_radii():
     svg = styled_svg(matrix)
     for rx, span in ((12, 7), (8, 5), (3, 3)):
         side = _num(span * module)
-        assert svg.count(f'width="{side}" height="{side}" fill="#{"0F1720" if rx != 8 else "ffffff"}" rx="{rx}" ry="{rx}"') == 3
-    # And the canvas itself is rounded to 12, like upstream's background.
-    assert '<rect width="268" height="268" fill="#ffffff" rx="12" ry="12"/>' in svg
+        colour = "#111827" if rx == 8 else "#FFFFFF"
+        assert svg.count(f'width="{side}" height="{side}" fill="{colour}" rx="{rx}" ry="{rx}"') == 3
+    # And the canvas itself is rounded to 12, like upstream's background, on
+    # the brand's Night surface.
+    assert '<rect width="268" height="268" fill="#111827" rx="12" ry="12"/>' in svg
 
 
 def test_a_quiet_zone_moves_the_code_in_and_keeps_the_canvas():

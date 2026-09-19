@@ -681,6 +681,16 @@ async def _drain(
     await asyncio.to_thread(session.close, drain_speech=True)
 
 
+# What /assets/live/{name} will serve, by extension. Anything else is 404.
+_LIVE_ASSET_TYPES = {
+    ".woff2": "font/woff2",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+}
+
+
 def create_online_duplex_app(
     bundle: Any,
     *,
@@ -843,11 +853,12 @@ def create_online_duplex_app(
                 media_type="text/plain",
             )
 
-        # Spell UI's treatment, drawn by hand (see live_qr.styled_svg). No
-        # quiet zone here: the page's white card provides it, as the
-        # upstream component leaves that to its container.
+        # Spell UI's treatment, drawn by hand (see live_qr.styled_svg), on the
+        # brand's Night surface: white dots, and two modules of quiet zone
+        # inside the panel rather than around it (guideline p.18).
         svg = styled_svg(
             segno.make(target, error="m").matrix,
+            quiet=2,
             label=f"QR code for {target}",
         )
         return Response(
@@ -870,6 +881,28 @@ def create_online_duplex_app(
             STATIC_DIR / "live.css",
             media_type="text/css",
             headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/assets/live/{name}")
+    async def live_asset(name: str) -> Response:
+        """The brand's own files: the fonts, the character, the orbit.
+
+        A plain file name only, and only one that exists in the folder with a
+        type this route knows. The path parameter never matches a slash, and a
+        name that is not its own basename (`..`) or is hidden is refused before
+        the disk is looked at, so this cannot be walked out of.
+        """
+
+        if name != Path(name).name or name.startswith("."):
+            return Response("not found", status_code=404, media_type="text/plain")
+        path = STATIC_DIR / "live" / name
+        media_type = _LIVE_ASSET_TYPES.get(path.suffix.lower())
+        if media_type is None or not path.is_file():
+            return Response("not found", status_code=404, media_type="text/plain")
+        return FileResponse(
+            path,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=86400"},
         )
 
     @app.get("/assets/mic-worklet.js")
