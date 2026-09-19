@@ -85,6 +85,41 @@ def test_the_view_is_blurred_while_permission_is_still_being_asked(harness):
     assert "-webkit-backdrop-filter" in declared
 
 
+def test_the_headline_arrives_word_by_word_and_is_still_a_sentence(harness):
+    """Spell UI's WordsStagger, ported: each word from faded, 10px low and
+    blurred to rest over 0.5s, 0.1s apart. The values are the upstream ones.
+
+    Text assertions, because this suite has no browser. What they hold is the
+    part that would rot quietly: the sentence must stay in the markup (a page
+    whose script never ran still says it), the words must be separated by real
+    spaces rather than glued into flex items (so it reads and wraps as one
+    sentence), and reduced motion must switch the whole thing off.
+    """
+
+    h = harness()
+    with TestClient(h.app) as client:
+        body = client.get("/live").text
+        css = client.get("/assets/live.css").text
+        source = client.get("/assets/live.js").text
+    # The words live in the markup, not the script.
+    assert "Let Genesis see what you see." in body
+    assert "Let Genesis see what you see." not in source
+    # Upstream's recipe, verbatim.
+    keyframes = css.split("@keyframes word-in")[1].split("}\n}")[0]
+    assert "opacity: 0" in keyframes
+    assert "translateY(10px)" in keyframes
+    assert "blur(10px)" in keyframes
+    rule = css.split(".headline.stagger .word {")[1].split("}")[0]
+    assert "0.5s ease-out" in rule
+    assert "--word-stagger: 0.1s" in rule
+    # A real space between words, so the sentence stays one sentence.
+    assert "heading.append(' ')" in source
+    # Reduced motion turns it off rather than merely speeding it up.
+    # Up to the block's own closing brace, not the first rule's.
+    reduced = css.split("prefers-reduced-motion: reduce")[1].split("\n}")[0]
+    assert ".headline.stagger .word { animation: none; }" in reduced
+
+
 def test_the_qr_encodes_this_server_not_a_caller_supplied_url(harness):
     """A QR generator that draws any URL you hand it is a phishing tool.
 

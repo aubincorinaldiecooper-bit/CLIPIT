@@ -37,6 +37,41 @@ const ui = {
 /** Everything a running session owns, so End can let go of all of it. */
 let live = null;
 
+// --- headline ------------------------------------------------------------
+
+/**
+ * Bring the headline in one word at a time (Spell UI's WordsStagger, ported).
+ *
+ * The sentence is taken from the markup, so it is written once and a page
+ * whose script never ran still shows it. Words are wrapped in spans separated
+ * by real spaces — not flex items with a non-breaking space inside — so the
+ * line wraps and centres as text and assistive tech reads one sentence.
+ *
+ * The animation is CSS, so the page's reduced-motion rule covers it. The
+ * `stagger` class comes off when the last word lands: the landing is hidden
+ * with display:none while the camera is up, and a CSS animation replays every
+ * time an element returns from that, which would make Not now a light show.
+ */
+function staggerWords(heading) {
+  if (!heading) return;
+  const words = heading.textContent.split(' ').filter((word) => word.length > 0);
+  if (words.length === 0) return;
+  heading.textContent = '';
+  words.forEach((word, index) => {
+    const span = document.createElement('span');
+    span.className = 'word';
+    span.style.setProperty('--i', String(index));
+    span.textContent = word;
+    heading.append(span);
+    if (index < words.length - 1) heading.append(' ');
+  });
+  heading.classList.add('stagger');
+  const last = heading.lastElementChild;
+  last.addEventListener('animationend', () => heading.classList.remove('stagger'), { once: true });
+}
+
+staggerWords(document.getElementById('headline'));
+
 function show(text, { state, tone } = {}) {
   ui.status.textContent = text;
   ui.status.hidden = !text;
