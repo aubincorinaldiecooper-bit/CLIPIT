@@ -56,6 +56,13 @@ let live = null;
  * page is simply silent to the hand.
  */
 const HAPTICS_KEY = 'gnsis.haptics';
+const MODEL_HAPTIC_PRESETS = Object.freeze({
+  attention: 'medium',
+  proximity: 'selection',
+  confirmation: 'success',
+  warning: 'warning',
+});
+
 const haptics = {
   engine: null,
   intensity: 0.55,
@@ -408,12 +415,28 @@ function handleDuplex(session, event) {
     case 'playback.cancel':
       live.playback.cancel();
       break;
+    case 'haptic.cue': {
+      // Gander chooses meaning, never a raw motor pattern. The device owns how
+      // that meaning feels, which keeps the protocol stable across hardware.
+      const preset = MODEL_HAPTIC_PRESETS[payload.cue];
+      if (preset) {
+        haptics.play(preset);
+        live.lastModelHapticAt = performance.now();
+      }
+      break;
+    }
     case 'chunk':
       // Where the model's words actually come from. `turn.final.accepted`
       // only acknowledges a transcript the client sent and carries no text,
       // so reading it left the page silent whenever speech was off.
       if (payload.text) {
-        if (!live.reply) haptics.play('selection');
+        // A model-directed cue immediately before speech already supplied the
+        // tactile intent. Do not stack the generic first-word tick on top.
+        const justFeltModelCue = (
+          live.lastModelHapticAt != null
+          && performance.now() - live.lastModelHapticAt < 750
+        );
+        if (!live.reply && !justFeltModelCue) haptics.play('selection');
         live.reply = (live.reply || '') + payload.text;
         say(live.reply);
       }
@@ -460,6 +483,7 @@ async function start() {
     frameTimer: null,
     pendingAudio: null,
     sessionId: null,
+    lastModelHapticAt: null,
     stopped: false,
     stats: { sent: 0, accepted: 0, dropped: 0, audio: 0 },
   };
