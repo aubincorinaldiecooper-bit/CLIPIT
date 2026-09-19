@@ -43,6 +43,27 @@ from .task_tools_online import TaskToolsRealtimeCoordinator
 LOGGER = logging.getLogger(__name__)
 _SESSION_ID = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9_.-]{1,128}$")
 ONLINE_TASK_PROTOCOL = "task_tools_v1"
+MODEL_HAPTIC_CUES = ("attention", "proximity", "confirmation", "warning")
+MODEL_HAPTIC_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "haptic",
+    "description": (
+        "设备端触觉输出。仅当触觉本身能传达当前实时感知信息时使用；"
+        "不要把它当作普通回复装饰。attention=需要用户注意，"
+        "proximity=视觉证据表明目标明显靠近，confirmation=确认用户刚完成或指认的动作，"
+        "warning=需要立即留意的风险或异常。"
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["cue"],
+        "properties": {
+            "cue": {
+                "type": "string",
+                "enum": list(MODEL_HAPTIC_CUES),
+            }
+        },
+    },
+}
 # Longest we wait for the talker to finish draining before cancelling it.
 # Teardown holds the single model slot, so it must be bounded.
 SPEECH_PUMP_DRAIN_TIMEOUT_SEC = 5.0
@@ -219,9 +240,7 @@ def _build_session(
 ) -> GanderDuplexSession:
     from mcpmft.infer.realtime import DuplexLiveConfig, DuplexLiveSession
     from mcpmft.prompts import GANDER_DUPLEX_SYSTEM_PROMPT
-    from mcpmft.tool_protocol import ensure_lean_task_tools
-
-    tools = ensure_lean_task_tools(runtime.settings.tool_schemas)
+    tools = _model_tool_schemas(runtime)
 
     live = DuplexLiveSession(
         runtime.bundle,
@@ -257,8 +276,6 @@ def _prepare_static_prefix(runtime: _Runtime) -> None:
     """Prefill the process-static system/tool prefix once for all live sessions."""
     from mcpmft.infer.online import OnlineRunner
     from mcpmft.prompts import GANDER_DUPLEX_SYSTEM_PROMPT
-    from mcpmft.tool_protocol import ensure_lean_task_tools
-
     started = time.perf_counter()
     runner_params = runtime.params
     if runtime.detached_talker is not None:
@@ -271,7 +288,7 @@ def _prepare_static_prefix(runtime: _Runtime) -> None:
         ref_audio_path=(
             None if runtime.detached_talker is not None else runtime.settings.ref_audio_path
         ),
-        tools=ensure_lean_task_tools(runtime.settings.tool_schemas),
+        tools=_model_tool_schemas(runtime),
     )
     runtime.prefix_snapshot = runner.capture_prefix_snapshot()
     runtime.prefix_prepare_seconds = time.perf_counter() - started
@@ -321,11 +338,45 @@ async def _open_session(
     )
 
 
+def _model_tool_schemas(runtime: _Runtime) -> list[dict[str, Any]]:
+    """Return the model-visible tool set, including Gander's local touch output."""
+
+    from mcpmft.tool_protocol import ensure_lean_task_tools
+
+    configured = list(runtime.settings.tool_schemas)
+    if any(str(schema.get("name") or "") == "haptic" for schema in configured):
+        raise ValueError("haptic is a reserved built-in realtime output tool")
+    return ensure_lean_task_tools([*configured, MODEL_HAPTIC_TOOL_SCHEMA])
+
+
 def _tool_names(runtime: _Runtime) -> list[str]:
-    names = [str(schema.get("name") or "") for schema in runtime.settings.tool_schemas]
-    names = [name for name in names if name]
-    required = ("task_start", "task_send", "task_resolve")
-    return list(dict.fromkeys([*names, *required]))
+    return [
+        str(schema.get("name") or "")
+        for schema in _model_tool_schemas(runtime)
+        if schema.get("name")
+    ]
+
+
+def _model_haptic_control(event: Any) -> dict[str, str] | None:
+    """Translate one valid model-owned haptic tool call into a client event."""
+
+    if not bool(getattr(event, "is_tool_call", False)):
+        return None
+    if getattr(event, "tool_error", None):
+        return None
+    calls = list(getattr(event, "tool_calls", ()) or ())
+    if len(calls) != 1:
+        return None
+    call = calls[0]
+    if not isinstance(call, dict) or call.get("name") != "haptic":
+        return None
+    arguments = call.get("arguments")
+    if not isinstance(arguments, dict):
+        return None
+    cue = arguments.get("cue")
+    if cue not in MODEL_HAPTIC_CUES:
+        return None
+    return {"type": "haptic.cue", "cue": str(cue), "source": "model"}
 
 
 def _codex_frame_interval_ms(runtime: _Runtime) -> float:
@@ -1371,6 +1422,27 @@ def create_online_duplex_app(
         async def emit_model_event(event: Any) -> None:
             assert coordinator is not None
             output = coordinator.model_output(event)
+            haptic_control = _model_haptic_control(event)
+            if haptic_control is not None:
+                # Haptics are a local output modality, not an external side effect.
+                # The model chooses the semantic cue; the phone owns the physical
+                # pattern. Do not expose the underlying tool.call to the client.
+                await send_text(
+                    haptic_control,
+                    wait_sent=output.delivery_id is not None,
+                )
+                if output.delivery_id is not None:
+                    coordinator.acknowledge_output(output)
+                followup = await asyncio.to_thread(
+                    session.feed_tool_response,
+                    {
+                        "status": "accepted",
+                        "cue": haptic_control["cue"],
+                    },
+                )
+                if followup is not None:
+                    await emit_model_event(followup)
+                return
             await send_model_event(
                 event,
                 wait_sent=output.delivery_id is not None,
