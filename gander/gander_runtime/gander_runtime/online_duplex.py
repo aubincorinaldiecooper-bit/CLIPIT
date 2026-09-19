@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import math
@@ -61,7 +62,7 @@ class _StartupFlood(Exception):
     """A client sent more before `ready` than the startup buffer will hold."""
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 
 @dataclass(frozen=True)
@@ -805,6 +806,50 @@ def create_online_duplex_app(
         return FileResponse(
             STATIC_DIR / "live.html",
             media_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/live/qr.svg")
+    async def live_qr(request: Request) -> Response:
+        """A QR code for this server's own live page.
+
+        The address is derived from the request, never taken from the query
+        string. Rendering an arbitrary caller-supplied URL would turn this into
+        a QR generator for anyone who can reach it — a code served from your
+        domain, pointing wherever the requester liked. It is also why the
+        result is checked before it is drawn: no credentials, no query, and no
+        plain http off localhost, because a browser will not grant camera
+        access on an insecure origin.
+        """
+
+        from .live_qr import UnsafeQRTarget, public_live_url
+
+        forwarded_proto = request.headers.get("x-forwarded-proto")
+        scheme = (forwarded_proto or request.url.scheme).split(",")[0].strip()
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if not host:
+            return Response("no host", status_code=400, media_type="text/plain")
+        try:
+            target = public_live_url(f"{scheme}://{host}/live")
+        except UnsafeQRTarget as unsafe:
+            return Response(str(unsafe), status_code=409, media_type="text/plain")
+
+        try:
+            import segno
+        except ModuleNotFoundError:
+            return Response(
+                "QR rendering needs segno: install gander-runtime[qr]",
+                status_code=501,
+                media_type="text/plain",
+            )
+
+        buffer = io.BytesIO()
+        segno.make(target, error="m").save(
+            buffer, kind="svg", scale=6, border=2, dark="#0F1720", light=None
+        )
+        return Response(
+            buffer.getvalue(),
+            media_type="image/svg+xml",
             headers={"Cache-Control": "no-store"},
         )
 

@@ -22,6 +22,10 @@ const MAX_EDGE = 640;
 
 const ui = {
   root: document.getElementById('live'),
+  permission: document.getElementById('permission'),
+  allow: document.getElementById('allow'),
+  cancel: document.getElementById('cancel'),
+  useThis: document.getElementById('useThis'),
   preview: document.getElementById('preview'),
   scratch: document.getElementById('scratch'),
   status: document.getElementById('status'),
@@ -264,8 +268,12 @@ async function start() {
     media = await openCamera();
   } catch (error) {
     const denied = error && (error.name === 'NotAllowedError' || error.name === 'SecurityError');
+    // Back to the landing, where the offer still stands.
+    ui.root.dataset.view = 'landing';
     show(
-      denied ? 'Camera or microphone access was not granted.' : 'This device would not start the camera.',
+      denied
+        ? 'Camera or microphone access was not granted.'
+        : 'This device would not start the camera.',
       { state: 'idle', tone: 'bad' }
     );
     ui.start.disabled = false;
@@ -287,8 +295,7 @@ async function start() {
     stats: { sent: 0, accepted: 0, dropped: 0, audio: 0 },
   };
 
-  ui.start.hidden = true;
-  ui.end.hidden = false;
+  ui.root.dataset.view = 'camera';
   show('Connecting…', { state: 'connecting' });
 
   const duplex = new WebSocket(socketUrl('/ws/duplex'));
@@ -335,14 +342,52 @@ async function stop({ keepMessage = false } = {}) {
   }
   ui.preview.srcObject = null;
 
-  ui.end.hidden = true;
-  ui.start.hidden = false;
+  ui.root.dataset.view = 'landing';
   ui.start.disabled = false;
   if (!keepMessage) show('Session ended.', { state: 'idle', tone: null });
   else ui.root.dataset.state = 'idle';
 }
 
-ui.start.addEventListener('click', () => { void start(); });
+/**
+ * Ask in our own words before the browser asks in its own.
+ *
+ * `getUserMedia` is deliberately not called here. On a phone a dismissed
+ * native prompt is awkward to recover from — on iOS it means digging through
+ * Settings — so the sheet explains what is about to be asked while saying no
+ * still costs nothing. The native prompt fires on Allow, and only then.
+ */
+function ask() {
+  ui.root.dataset.view = 'camera';
+  ui.permission.hidden = false;
+  ui.allow.focus({ preventScroll: true });
+}
+
+function dismiss() {
+  ui.permission.hidden = true;
+  ui.root.dataset.view = 'landing';
+}
+
+ui.start.addEventListener('click', ask);
+// A desktop with a webcam is not shut out; it just is not the default door.
+if (ui.useThis) {
+  ui.useThis.addEventListener('click', () => {
+    ui.root.dataset.force = 'touch';
+    ask();
+  });
+}
+ui.allow.addEventListener('click', () => {
+  ui.permission.hidden = true;
+  void start();
+});
+ui.cancel.addEventListener('click', dismiss);
+ui.permission.addEventListener('click', (event) => {
+  // Tapping the dimmed area is a refusal too.
+  if (event.target === ui.permission) dismiss();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !ui.permission.hidden) dismiss();
+});
+
 ui.end.addEventListener('click', () => { void stop(); });
 // A backgrounded or closed tab must not leave the camera on.
 window.addEventListener('pagehide', () => { void stop({ keepMessage: true }); });
