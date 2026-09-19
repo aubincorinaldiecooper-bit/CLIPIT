@@ -41,6 +41,11 @@ class DuplexConfig:
     detached_talker_device: str | None = None
     talker_emit_speech_tokens: int = 25
     generate_audio: bool = False
+    # Write sampled camera frames to disk for back-brain context. Off by
+    # default. Without this field the opt-in existed only in Python and no
+    # deployment could reach it, which Codex caught: unknown YAML keys are
+    # rejected, so there was no way to say yes.
+    persist_camera_frames: bool = False
     decode_mode: Literal["sampling", "greedy"] = "sampling"
     system_prompt: str = GANDER_DUPLEX_SYSTEM_PROMPT
     ref_audio_path: str | None = None
@@ -175,7 +180,9 @@ def validate_release_config(config: ReleaseConfig) -> None:
     if config.worker.profile not in {"task_scoped", "full"}:
         raise ValueError("worker.profile must be 'task_scoped' or 'full'")
     if not config.worker.provider:
-        raise ValueError("worker.provider must not be empty")
+        raise ValueError(
+            "worker.provider must not be empty; use 'none' for no action layer"
+        )
     if not isinstance(config.worker.settings, dict):
         raise ValueError("worker.settings must be a YAML mapping")
     validate_asr_config(config.asr)
@@ -237,11 +244,21 @@ def validate_release_config(config: ReleaseConfig) -> None:
 def preflight_config(config: ReleaseConfig) -> None:
     from .providers import builtin_provider_registry
 
-    # A lean server has no coordinator, so it never dispatches to a worker.
-    # Checking for one anyway is what made a stock `gander-serve` demand a
-    # Codex binary just to answer "what am I looking at?" — a direct camera
-    # experience refusing to boot over an action layer it will never call.
-    needs_worker = config.server.mode == "coordinator"
+    # `worker.provider: none` is how a deployment says it has no action layer.
+    #
+    # The first version of this keyed off `server.mode` instead, on the theory
+    # that lean mode never dispatches to a worker. That was wrong, and Codex
+    # caught it: lean mode omits the LLM *coordinator*, not worker dispatch.
+    # `task_start`, `task_send` and `task_resolve` are native tools the model
+    # can call directly, and `gateway.task_start` looks up a provider itself —
+    # with an empty registry every one of them would have been refused with
+    # `no_eligible_worker`.
+    #
+    # So the provider is built whenever there is one, exactly as before. What
+    # changed is that a deployment can now say it wants none, which is what the
+    # direct camera experience wants: boot with no Codex binary, and have the
+    # task tools honestly report that there is no worker.
+    needs_worker = config.worker.provider != "none"
     configured_provider = (
         builtin_provider_registry().configure(
             config.worker.provider,
@@ -436,10 +453,9 @@ def build_app(config: ReleaseConfig):
     coordinator_cwd = str(
         Path(config.coordinator.cwd or worker_cwd).expanduser().resolve()
     )
-    # See preflight_config: lean mode has no coordinator and therefore nothing
-    # to dispatch, so it builds no worker provider. Ornith and Codex remain
-    # exactly where they were for coordinator mode.
-    needs_worker = config.server.mode == "coordinator"
+    # See preflight_config. `none` means no action layer; anything else builds
+    # its provider exactly as before.
+    needs_worker = config.worker.provider != "none"
     provider_factory = (
         builtin_provider_registry().configure(
             config.worker.provider,
@@ -496,6 +512,7 @@ def build_app(config: ReleaseConfig):
         asr_timeout_sec=config.asr.request_timeout_sec,
         turn_bind_grace_sec=duplex.turn_bind_grace_sec,
         media_mode=duplex.media_mode,
+        persist_camera_frames=duplex.persist_camera_frames,
         allow_client_video=duplex.allow_client_video,
         client_video_mode=duplex.client_video_mode,
         client_video_sources=tuple(duplex.client_video_sources),

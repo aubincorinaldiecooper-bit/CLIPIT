@@ -1,4 +1,12 @@
-"""The /live phone surface, and what a lean server needs in order to boot."""
+"""The /live phone surface, and what a server needs in order to boot.
+
+A note on what half of these prove. The config tests run the real
+`preflight_config` and `load_config`, so they hold actual behaviour. The client
+tests read `live.js` as text and assert on what is in it, because this suite
+has no browser: they will catch the protocol mistakes coming back, which is
+what they are for, but they cannot tell you the page works. Only driving it in
+a browser does that, and a real device does it properly.
+"""
 from __future__ import annotations
 
 import pytest
@@ -117,47 +125,122 @@ def test_the_phone_client_asks_for_the_rear_camera(harness):
     assert "exact:" not in source
 
 
-def _config(tmp_path, mode: str) -> str:
-    """A release config whose worker cannot possibly be satisfied."""
+def _config(tmp_path, provider: str, name: str, **duplex) -> str:
+    """A release config whose worker, if it has one, cannot be satisfied."""
 
     model_dir = tmp_path / "model"
-    model_dir.mkdir()
+    model_dir.mkdir(exist_ok=True)
     checkpoint = tmp_path / "duplex.pt"
     checkpoint.write_bytes(b"")
     document = {
         "model": {"model_name_or_path": str(model_dir)},
-        "duplex": {"checkpoint": str(checkpoint)},
-        "server": {"mode": mode},
+        "duplex": {"checkpoint": str(checkpoint), **duplex},
+        "server": {"mode": "lean"},
         "worker": {
-            "provider": "codex",
+            "provider": provider,
             "cwd": str(tmp_path / "nowhere"),
             "settings": {"codex_bin": str(tmp_path / "no-such-codex")},
         },
     }
-    path = tmp_path / f"{mode}.yaml"
+    path = tmp_path / f"{name}.yaml"
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
     return str(path)
 
 
-def test_a_lean_server_boots_without_codex(tmp_path):
-    """The direct camera experience must not need an action layer to start.
+def test_a_server_with_no_action_layer_boots_without_codex(tmp_path):
+    """`worker.provider: none` is how a deployment says it has no action layer.
 
-    A stock config names Codex as the worker provider. Lean mode has no
-    coordinator and so never dispatches to it, but preflight used to demand the
-    binary anyway — a server refusing to answer "what am I looking at?" over a
-    tool it will never call.
+    The direct camera experience does not dispatch work, and a stock config
+    names Codex, so it refused to boot over a binary it would never call.
     """
 
     from gander_runtime.cli import load_config, preflight_config
 
-    preflight_config(load_config(_config(tmp_path, "lean")))
+    preflight_config(load_config(_config(tmp_path, "none", "none")))
 
 
-def test_a_coordinator_server_still_demands_its_worker(tmp_path):
-    """The check is relaxed where it was pointless, not removed."""
+def test_a_configured_worker_is_still_demanded(tmp_path):
+    """Naming a provider still means it has to be there.
+
+    This is the correction to the first attempt, which keyed off `server.mode`
+    on the theory that lean mode never dispatches. It does: `task_start`,
+    `task_send` and `task_resolve` are native tools the model can call, and
+    `gateway.task_start` resolves a provider itself. An empty registry would
+    have refused every one of them with `no_eligible_worker`. Caught by Codex.
+    """
 
     from gander_runtime.cli import load_config, preflight_config
 
     with pytest.raises(Exception) as raised:
-        preflight_config(load_config(_config(tmp_path, "coordinator")))
+        preflight_config(load_config(_config(tmp_path, "codex", "codex")))
     assert "worker" in str(raised.value).lower()
+
+
+def test_the_camera_opt_in_can_actually_be_set(tmp_path):
+    """An opt-in no deployment can reach is not an opt-in.
+
+    `persist_camera_frames` lived only on the Python settings object; unknown
+    YAML keys are rejected and nothing forwarded a value, so every real
+    `gander-serve` was stuck at false whatever its operator wanted. Caught by
+    Codex.
+    """
+
+    from gander_runtime.cli import load_config
+
+    config = load_config(
+        _config(tmp_path, "none", "optin", persist_camera_frames=True)
+    )
+    assert config.duplex.persist_camera_frames is True
+    # And off unless asked, which is the half that matters for a public QR.
+    assert load_config(
+        _config(tmp_path, "none", "default")
+    ).duplex.persist_camera_frames is False
+
+
+def test_the_client_negotiates_camera_mode_before_opening_the_screen(harness):
+    """A session starts in voice mode and refuses every frame while it is.
+
+    Opening /ws/screen first looks like it works and then waits for a frame
+    that will never be accepted. Caught by Codex.
+    """
+
+    h = harness()
+    with TestClient(h.app) as client:
+        source = client.get("/assets/live.js").text
+    assert "'media.mode'" in source
+    assert "media.mode.done" in source
+    # The screen socket is attached from the mode acknowledgement, not from
+    # `ready`. If `attachScreen` moves back under `ready`, this fails.
+    after_ready = source.split("case 'ready':")[1].split("case 'media.mode.done'")[0]
+    assert "attachScreen" not in after_ready
+
+
+def test_the_client_renders_model_chunks(harness):
+    """`turn.final.accepted` carries no text; `chunk` does.
+
+    Reading the wrong one left the page silent whenever speech was off.
+    """
+
+    h = harness()
+    with TestClient(h.app) as client:
+        source = client.get("/assets/live.js").text
+    assert "case 'chunk':" in source
+    assert "case 'turn.final.accepted':" not in source
+
+
+def test_end_says_stop_rather_than_dropping_the_socket(harness):
+    """An explicit stop is never parked; a dropped socket is.
+
+    Closing outright holds the single model slot for the whole reconnect
+    grace, so ending a session and scanning again told the next person Genesis
+    was busy — because of the session they had just ended. Caught by Codex.
+    """
+
+    h = harness()
+    with TestClient(h.app) as client:
+        source = client.get("/assets/live.js").text
+    assert "type: 'stop'" in source
+    assert "session.done" in source
+    # Bounded: a server that never answers must not strand a live camera.
+    stop_block = source.split("type: 'stop'")[0]
+    assert "setTimeout(resolve" in stop_block

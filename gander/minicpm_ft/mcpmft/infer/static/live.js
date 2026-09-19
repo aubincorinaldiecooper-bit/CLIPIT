@@ -238,9 +238,30 @@ function handleDuplex(session, event) {
   switch (payload.type) {
     case 'ready':
       live.sessionId = payload.session_id;
-      live.screen = attachScreen(session, payload);
-      show('Connected. Waiting for the first frame…', { state: 'connecting' });
+      live.ready = payload;
+      // The session starts in voice mode, and /ws/screen refuses every frame
+      // while it is ("media_mode is voice"). Opening the socket first looks
+      // like it works and then sits on "Waiting for the first frame…" for
+      // ever. So ask for camera mode and wait to be told yes.
+      if (payload.screen && payload.screen.enabled) {
+        live.duplex.send(JSON.stringify({
+          type: 'media.mode', video: true, source: 'camera',
+        }));
+        show('Turning the camera on…', { state: 'connecting' });
+      } else {
+        show('Genesis is not accepting video right now.', { tone: 'busy' });
+      }
       void startMicrophone(session).then((mic) => { if (live) live.mic = mic; });
+      break;
+    case 'media.mode.done':
+      // Only now is the server willing to look at a frame.
+      if (!live.screen && live.ready) {
+        live.screen = attachScreen(session, live.ready);
+        show('Connected. Waiting for the first frame…', { state: 'connecting' });
+      }
+      break;
+    case 'media.mode.rejected':
+      show('This session cannot use the camera.', { tone: 'busy' });
       break;
     case 'audio.chunk':
       live.pendingAudio = payload;
@@ -248,8 +269,15 @@ function handleDuplex(session, event) {
     case 'playback.cancel':
       live.playback.cancel();
       break;
-    case 'turn.final.accepted':
-      if (payload.text) say(payload.text);
+    case 'chunk':
+      // Where the model's words actually come from. `turn.final.accepted`
+      // only acknowledges a transcript the client sent and carries no text,
+      // so reading it left the page silent whenever speech was off.
+      if (payload.text) {
+        live.reply = (live.reply || '') + payload.text;
+        say(live.reply);
+      }
+      if (payload.end_of_turn || payload.interrupted) live.reply = '';
       break;
     case 'error':
       // Raw engineering wording never reaches the page.
@@ -324,6 +352,33 @@ async function stop({ keepMessage = false } = {}) {
   live = null;
 
   if (session.frameTimer) clearInterval(session.frameTimer);
+
+  // Say stop, and wait to be told the session is done.
+  //
+  // Closing the socket outright reads to the server as a dropped connection,
+  // which parks the Thinker and holds the single model slot for the whole
+  // reconnect grace. End, then scan again, and the next person is told Genesis
+  // is busy — by a session the last person deliberately ended. An explicit
+  // stop is never parked.
+  const duplex = session.duplex;
+  if (duplex && duplex.readyState === WebSocket.OPEN) {
+    await new Promise((resolve) => {
+      // The wait is bounded: a server that never answers must not strand the
+      // page with the camera still on.
+      const giveUp = setTimeout(resolve, 1500);
+      duplex.addEventListener('message', function done(event) {
+        if (typeof event.data !== 'string') return;
+        try {
+          if (JSON.parse(event.data).type !== 'session.done') return;
+        } catch { return; }
+        duplex.removeEventListener('message', done);
+        clearTimeout(giveUp);
+        resolve();
+      });
+      try { duplex.send(JSON.stringify({ type: 'stop' })); } catch { resolve(); }
+    });
+  }
+
   for (const socket of [session.screen, session.duplex]) {
     if (socket && socket.readyState <= WebSocket.OPEN) {
       try { socket.close(1000, 'ended'); } catch { /* already closing */ }
