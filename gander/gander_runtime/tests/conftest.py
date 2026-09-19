@@ -144,12 +144,21 @@ class StubBundle:
 
 @dataclass
 class StubParams:
+    """The `DuplexParams` fields the runtime reads, with the real defaults.
+
+    A missing one is not a test failure but a fatal `error` on a live socket,
+    which is how `speak_text_tokens_per_unit` was found: in a browser, after
+    every test had passed.
+    """
+
     chunk_ms: int = 1000
     generate_audio: bool = False
     sliding_window_mode: str = "context_no_previous"
     context_max_units: int = 64
     context_previous_max_tokens: int = 0
     decode_mode: str = "sampling"
+    # Read when a client switches media mode (estimated_tokens_per_unit).
+    speak_text_tokens_per_unit: int = 4
 
 
 @dataclass
