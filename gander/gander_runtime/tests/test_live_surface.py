@@ -9,9 +9,16 @@ a browser does that, and a real device does it properly.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 import yaml
 from starlette.testclient import TestClient
+
+from starlette.websockets import WebSocketDisconnect
+
+from test_duplex_lifecycle import _drain_until, _jpeg, _settle, connect
+from test_live_camera_privacy import _camera_header
 
 
 def test_live_page_is_served(harness):
@@ -136,6 +143,10 @@ def test_the_qr_encodes_this_server_not_a_caller_supplied_url(harness):
     assert hijack.status_code in {200, 501}
     if hijack.status_code == 200:
         assert b"evil.example" not in hijack.content
+        # The code names its own address, and it is this server's.
+        assert b'aria-label="QR code for https://genesis.example/live"' in hijack.content
+        # Spell UI's treatment: dots, not squares.
+        assert b"<circle " in hijack.content
 
 
 def test_the_qr_refuses_an_origin_where_the_camera_cannot_work(harness):
@@ -286,6 +297,68 @@ def test_the_client_negotiates_camera_mode_before_opening_the_screen(harness):
     # `ready`. If `attachScreen` moves back under `ready`, this fails.
     after_ready = source.split("case 'ready':")[1].split("case 'media.mode.done'")[0]
     assert "attachScreen" not in after_ready
+
+
+def _answer(ws, wanted: str) -> dict:
+    """`_drain_until`, except a fatal `error` fails now rather than never."""
+
+    for _ in range(20):
+        message = ws.receive_json()
+        if message.get("type") == wanted:
+            return message
+        if message.get("type") == "error" and message.get("fatal"):
+            raise AssertionError(f"fatal error before {wanted!r}: {message.get('message')}")
+    raise AssertionError(f"never received {wanted!r}")
+
+
+def test_a_voice_session_takes_camera_frames_only_after_media_mode(harness):
+    """The server side of the phone client's handshake, which nothing tested.
+
+    A session starts in voice mode, and a screen channel attached while it is
+    in voice mode is refused and closed. The client therefore asks for video
+    with `media.mode`, waits for `media.mode.done`, and only then attaches
+    (the fix Codex asked for). This pins the server that fix was written
+    against, in that order.
+
+    It also pins the harness. Driving the real page in a browser against this
+    suite's stubs, the `media.mode` request was answered with a fatal error
+    naming a params field the stub did not have. Every test was green because
+    none of them made the request. This one does, so the stub has to be whole.
+    """
+
+    # The public-QR shape: lean, voice to begin with, client video allowed.
+    h = harness(allow_client_video=True, provider_name=None)
+    with TestClient(h.app) as client:
+        with connect(client, "/ws/duplex?session_id=s1") as ws:
+            ready = _settle(ws)
+            screen = ready["screen"]
+            assert screen["enabled"] is True
+            attach = f"/ws/screen?session_id={ready['session_id']}&token={screen['token']}"
+
+            # Attached too early: told why, and closed. This is the behaviour
+            # that makes negotiating first necessary rather than polite.
+            with connect(client, attach) as early:
+                refused = early.receive_json()
+                assert refused["type"] == "error"
+                assert "voice" in refused["message"]
+                with pytest.raises(WebSocketDisconnect):
+                    early.receive_json()
+
+            ws.send_json({"type": "media.mode", "video": True, "source": "camera"})
+            done = _answer(ws, "media.mode.done")
+            assert done["video"] is True
+            assert done["source"] == "camera"
+
+            # Attached after: ready, and a camera frame is seen.
+            with connect(client, attach) as screen_ws:
+                _drain_until(screen_ws, "screen.ready")
+                screen_ws.send_text(json.dumps(_camera_header("f1")))
+                screen_ws.send_bytes(_jpeg())
+                accepted = _drain_until(screen_ws, "screen.frame.accepted")
+                assert accepted["frame_id"] == "f1"
+    # And, lean, nothing kept.
+    written = [p for p in h.media_dir.rglob("*") if p.is_file()] if h.media_dir.exists() else []
+    assert written == []
 
 
 def test_the_client_renders_model_chunks(harness):

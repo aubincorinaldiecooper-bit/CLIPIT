@@ -822,7 +822,7 @@ def create_online_duplex_app(
         access on an insecure origin.
         """
 
-        from .live_qr import UnsafeQRTarget, public_live_url
+        from .live_qr import UnsafeQRTarget, public_live_url, styled_svg
 
         forwarded_proto = request.headers.get("x-forwarded-proto")
         scheme = (forwarded_proto or request.url.scheme).split(",")[0].strip()
@@ -843,12 +843,15 @@ def create_online_duplex_app(
                 media_type="text/plain",
             )
 
-        buffer = io.BytesIO()
-        segno.make(target, error="m").save(
-            buffer, kind="svg", scale=6, border=2, dark="#0F1720", light=None
+        # Spell UI's treatment, drawn by hand (see live_qr.styled_svg). No
+        # quiet zone here: the page's white card provides it, as the
+        # upstream component leaves that to its container.
+        svg = styled_svg(
+            segno.make(target, error="m").matrix,
+            label=f"QR code for {target}",
         )
         return Response(
-            buffer.getvalue(),
+            svg,
             media_type="image/svg+xml",
             headers={"Cache-Control": "no-store"},
         )
