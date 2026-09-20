@@ -7,7 +7,7 @@ import { logger } from '../../lib/logger.js';
  * Discovery, as a search provider and nothing more.
  *
  * A candidate is a page worth opening, not a file worth downloading. The
- * browser runtime plays the page and Gander watches the result, so nothing
+ * browser runtime plays the page and the video model watches the result, so nothing
  * here tries to resolve a page down to a media URL — that was the old
  * download-oriented path and it is deliberately absent.
  */
