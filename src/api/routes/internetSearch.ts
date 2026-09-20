@@ -66,7 +66,7 @@ export function reportFor(
  * are no predetermined categories here.
  *
  * The reply answers in one step. It returns pages, not files — the browser
- * runtime opens them and Gander watches the result — so nothing is downloaded
+ * runtime opens them and the video model watches the result — so nothing is downloaded
  * or resolved to a media URL on the way out.
  */
 export async function registerInternetSearchRoutes(app: FastifyInstance): Promise<void> {
